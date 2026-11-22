@@ -3,61 +3,50 @@
  * requests this person could approve), the newest of them for the desktop notice, and whether to
  * show "Pause all agents" (AgentRequestCount, lib/agent/contract.ts).
  *
- * Polled every few seconds, so it reads the pending requests ONCE and takes both the badge and the
- * notice from that one list: the service's person listing (it settles expired requests, reads at
- * most a few hundred rows and judges each one this person may see), one company setting, one count
- * of agents, and one check of the person's own access. Taking both from one list also keeps them in
- * step: the badge never counts a request the notice cannot name. The notice carries the request's
- * own summary (built from the operation, never the agent's words).
+ * Polled every 20 seconds or so while the window shows, and every 90 seconds while it is hidden (only
+ * to raise the desktop notice), so it is a thin handler with no query of its own:
+ *  - badgeForPerson (lib/services/agentRequests.ts) gives the badge and the newest request from ONE
+ *    scan, so the two never disagree. It judges each request for this person with `atHost`, the same
+ *    test an approval uses: a teammate's window does not count a host-only request it could not
+ *    approve there.
+ *  - agentCount and agentsBlockedFor (lib/services/agents.ts): one count of the agents that are not
+ *    removed, one company setting.
+ *  - mayPauseAllAgents (lib/services/agentPolicies.ts): the check "Pause all agents" itself makes,
+ *    so the button shows exactly when it would work. It fails closed: an error is "no".
+ *
+ * The notice carries the app's own summary of the request, built from the operation, never the
+ * agent's words: the four fields are copied one by one, so nothing else the service may hold (the
+ * agent's reason above all) can reach the notice.
  *
  * A person's window only (app/api/agent-requests/_guards.ts).
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { and, eq, isNull, sql } from 'drizzle-orm';
 import { getServerContext } from '@/lib/context';
-import { agents } from '@/lib/db/schema';
-import { listRequestsForPerson } from '@/lib/services/agentRequests';
-import { agentsBlockedFor } from '@/lib/services/agents';
+import { badgeForPerson } from '@/lib/services/agentRequests';
+import { agentCount, agentsBlockedFor } from '@/lib/services/agents';
 import { mayPauseAllAgents } from '@/lib/services/agentPolicies';
 import type { ServiceContext } from '@/lib/services/_base';
-import type { AgentRequestCount } from '@/lib/agent/contract';
+import type { AgentRequestCount, BadgeForPerson } from '@/lib/agent/contract';
 import { routeError } from '@/lib/routeErrors';
-import { NO_STORE, refuseAgent } from '@/app/api/agent-requests/_guards';
+import { NO_STORE, atHostWindow, refuseAgent } from '@/app/api/agent-requests/_guards';
 
 export const dynamic = 'force-dynamic';
 
-/**
- * How many pending requests the badge looks through: the service's own upper bound for one listing,
- * and what pendingCountForPerson counts among. Nobody has this many waiting in practice.
- */
-const BADGE_SCAN = 500;
+type Newest = Awaited<ReturnType<BadgeForPerson>>['newest'];
 
-type Approvable = Awaited<ReturnType<typeof listRequestsForPerson>>[number];
-
-/**
- * Agents of this company that are not removed (paused ones count: the button can resume them).
- * Written here because lib/services/agents.ts has no count yet and its list is for an Admin only;
- * an agentCount(db, companyId) there is asked for in the unit's handoff, and this goes when it lands.
- */
-async function activeAgentCount(ctx: ServiceContext): Promise<number> {
-  const [row] = await ctx.db
-    .select({ n: sql<number>`count(*)::int` })
-    .from(agents)
-    .where(and(eq(agents.companyId, ctx.companyId), isNull(agents.revokedAt)));
-  return Number(row?.n ?? 0);
+/** The notice's four fields and nothing else. */
+function newestOf(n: Newest): AgentRequestCount['newest'] {
+  if (!n) return null;
+  return { id: n.id, agentName: n.agentName, summary: n.summary, createdAt: n.createdAt };
 }
 
-/**
- * The pending requests this person could approve, newest first. Nothing for a context without a
- * signed-in person, as pendingCountForPerson answers 0 there (the agent cases are refused before).
- */
-async function approvablePending(ctx: ServiceContext): Promise<Approvable[]> {
-  if (!ctx.userId) return [];
-  const listed = await listRequestsForPerson(ctx, { status: 'pending', limit: BADGE_SCAN });
-  return listed
-    .filter((r) => r.status === 'pending' && r.canApprove)
-    // The service lists newest first already; sorting again costs nothing and does not rely on it.
-    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+/** Only a plain yes shows the button; an error or anything else is no. */
+async function canPauseAll(ctx: ServiceContext): Promise<boolean> {
+  try {
+    return (await mayPauseAllAgents(ctx)) === true;
+  } catch {
+    return false;
+  }
 }
 
 export async function GET(req: NextRequest) {
@@ -65,16 +54,13 @@ export async function GET(req: NextRequest) {
     const ctx = await getServerContext();
     const refused = refuseAgent(ctx, req);
     if (refused) return refused;
-    const approvable = await approvablePending(ctx);
-    const newest = approvable[0];
+    const badge = await badgeForPerson(ctx, { atHost: atHostWindow(req) });
     const answer: AgentRequestCount = {
-      pending: approvable.length,
-      newest: newest ? { id: newest.id, agentName: newest.agentName, summary: newest.summary, createdAt: newest.createdAt } : null,
-      agents: await activeAgentCount(ctx),
+      pending: badge.pending,
+      newest: newestOf(badge.newest),
+      agents: await agentCount(ctx.db, ctx.companyId),
       allPaused: await agentsBlockedFor(ctx.db, ctx.companyId),
-      // The same check "Pause all agents" itself makes (lib/services/agentPolicies.ts), so the
-      // button shows exactly when the route would accept it.
-      canPauseAll: await mayPauseAllAgents(ctx),
+      canPauseAll: await canPauseAll(ctx),
     };
     return NextResponse.json(answer, { headers: NO_STORE });
   } catch (err) {

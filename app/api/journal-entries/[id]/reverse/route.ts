@@ -12,7 +12,8 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { reverseEntry } from '@/lib/services/journal';
 import { serviceErrorStatus } from '@/lib/routeErrors';
-import { parseDateInput } from '@/lib/validation/helpers';
+import { bodyValidationError, parseDateInput } from '@/lib/validation/helpers';
+import { reverseJournalEntrySchema } from '@/lib/validation/journal';
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -30,6 +31,12 @@ export async function POST(req: NextRequest, { params }: Params) {
         return NextResponse.json({ error: 'asOfDate must be a valid ISO date.', code: 'VALIDATION' }, { status: 400 });
       }
       asOfDate = parsed;
+    }
+    // The body as agents read it described (lib/validation/journal.ts). The check above answers
+    // first, and a body that is not an object is still read as no body, as it always was.
+    if (body && typeof body === 'object' && !Array.isArray(body)) {
+      const checked = reverseJournalEntrySchema.safeParse(body);
+      if (!checked.success) throw bodyValidationError(checked.error);
     }
 
     const entry = await reverseEntry(ctx, id, asOfDate);

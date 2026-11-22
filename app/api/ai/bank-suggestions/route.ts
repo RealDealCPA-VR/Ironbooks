@@ -18,12 +18,8 @@ import {
   suggestBankCategories,
 } from '@/lib/services/aiCategorizer';
 import { zodErrorBody } from '@/lib/validation/helpers';
+import { bankSuggestionActionSchema } from '@/lib/validation/ai';
 import { aiErrorResponse } from '../_errors';
-
-const postSchema = z.discriminatedUnion('action', [
-  z.object({ action: z.literal('auto-apply'), bankAccountId: z.string().uuid() }),
-  z.object({ action: z.literal('llm'), bankTransactionId: z.string().uuid() }),
-]);
 
 export async function GET(req: NextRequest) {
   try {
@@ -41,7 +37,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = postSchema.safeParse(await req.json().catch(() => ({})));
+    const parsed = bankSuggestionActionSchema.safeParse(await req.json().catch(() => ({})));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     if (parsed.data.action === 'auto-apply') {
       return NextResponse.json(await autoApplyBankSuggestions(ctx, parsed.data.bankAccountId));

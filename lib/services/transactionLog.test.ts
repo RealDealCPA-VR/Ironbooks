@@ -4,7 +4,9 @@
  *  - rolled-back work (incl. a rolled-back nested savepoint) is never logged;
  *  - verifyTransactionLog passes for an intact log and catches tampering, deletion and
  *    posted journal entries that bypassed the log;
- *  - queryTransactionLog filters by type / user / text and returns newest first.
+ *  - queryTransactionLog filters by type / user / text and returns newest first;
+ *  - an agent's change is named with how it was allowed, and a person's decision on an agent's
+ *    request carries only the request's (and a grant's) id.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
@@ -269,5 +271,36 @@ describe('running transaction log', () => {
     expect(agentActorName(actor, { approvedBy: 'Pat Approver', grant: { givenBy: 'Gina Giver', until: '2026-11-20 17:30' } })).toBe(
       'Ledger bot (agent), approved by Pat Approver',
     );
+    // A grant on file whose giver is not: a person did give it.
+    expect(agentActorName(actor, { grant: { givenBy: null, until: '2026-11-20 18:00', giverRemoved: true } })).toBe(
+      'Ledger bot (agent), under standing permission from a removed user until 2026-11-20 18:00',
+    );
+    expect(agentActorName(actor, { grant: { givenBy: null, until: null, giverRemoved: true } })).toBe(
+      'Ledger bot (agent), under standing permission from a removed user',
+    );
+    expect(agentActorName(actor, { grant: { givenBy: null, until: '2026-11-20 18:00' } })).toBe('Ledger bot (agent), under standing permission until 2026-11-20 18:00');
+    expect(agentActorName(actor, { grant: { givenBy: 'Gina Giver', until: null } })).toBe('Ledger bot (agent), under permission from Gina Giver');
+  });
+
+  it("a person's decision on an agent's request names the request (and any grant it gave), never an agent or an approver", async () => {
+    const requestId = '22222222-0000-4000-8000-0000000000aa';
+    const grantId = '33333333-0000-4000-8000-0000000000aa';
+    // As agentRequests.ts auditDecision writes it: the deciding person's own context.
+    await writeAudit({ ...ctx, approval: { approvedBy: null, requestId, grantId } }, {
+      action: 'update',
+      entityType: 'agent_permission_request',
+      entityId: requestId,
+      oldValues: { status: 'pending' },
+      newValues: { status: 'executed', grantId },
+    });
+    const rec = readAllTransactionLog(TEST_DIR).records.find((r) => r.entityId === requestId)!;
+    expect(rec).toMatchObject({ userId: ctx.userId, userName: 'Log Tester', agentRequestId: requestId, agentGrantId: grantId });
+    expect('agentId' in rec).toBe(false);
+    expect('approvedBy' in rec).toBe(false);
+    // Any other change by a person keeps the old shape.
+    await writeAudit(ctx, { action: 'update', entityType: 'vendor', entityId: requestId, newValues: { displayName: 'Plain' } });
+    const plain = readAllTransactionLog(TEST_DIR).records.filter((r) => r.entityId === requestId).pop()!;
+    expect(Object.keys(plain)).toEqual(['seq', 'ts', 'userId', 'userName', 'companyId', 'action', 'entityType', 'entityId', 'summary', 'data', 'prevHash', 'hash']);
+    expect((await verifyTransactionLog(db, TEST_DIR)).chainIntact).toBe(true);
   });
 });

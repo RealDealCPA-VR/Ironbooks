@@ -144,13 +144,13 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   },
   /**
    * Agent full access (lib/desktop/agentNotice.ts): a desktop notice when an agent asks while this
-   * window is not in front. Title and body only; clicking it brings the window forward on the
-   * approval center. Resolves true when it was shown.
+   * window is not in front. Only the page to open goes to the main process: it words the notice
+   * itself from the app's own server (the newest request's agent and summary), so no text of the
+   * page is ever shown in it. Clicking it brings the window forward on the approval center.
+   * Resolves true when it was shown.
    */
   agentNotice: (notice) =>
     ipcRenderer.invoke('agent:notice', {
-      title: String((notice && notice.title) ?? ''),
-      body: String((notice && notice.body) ?? ''),
       href: String((notice && notice.href) ?? ''),
     }),
   isDesktop: true,

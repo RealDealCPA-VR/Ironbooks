@@ -10,6 +10,8 @@
 //     data\          the database folder the app server runs on (BKA_DATA_DIR)
 //     state.json     which company file it belongs to, the save it was opened from, and whether
 //                    it holds changes not yet saved to the company file (crash recovery)
+//     agent-files\   files agents staged while the file was open (lib/agent/files.ts): never part
+//                    of the company file, removed when it closes and when it opens (clearAgentFiles)
 //
 // On the next open of the same company file from this computer, the working copy is reused when
 // the company file hasn't changed since (quick to open, even over a slow network), recovered when
@@ -31,6 +33,12 @@ const format = require('./companyFileFormat');
 const pgData = require('./pgDataCheck');
 
 const STATE_FILE = 'state.json';
+/** lib/agent/files.ts FOLDER_NAME: where agents' staged files are kept in a working copy. */
+const AGENT_FILES_DIR = 'agent-files';
+/** lib/agent/files.ts MARKER: every folder of staged files carries it (the root included). */
+const AGENT_FILES_MARKER = '.ironbooks-agent-files';
+/** lib/agent/contract.ts STAGED_FILE_HOURS: a staged file is never read after this. */
+const AGENT_FILES_MAX_AGE_MS = 24 * 3600 * 1000;
 /** lib/services/backupHistory.ts BACKUP_HISTORY_FILE. */
 const BACKUP_HISTORY_FILE = '.backup-history.json';
 const STATE_SCHEMA = 'ironbooks-working-copy/v1';
@@ -468,6 +476,10 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
   if (plan === 'conflict') {
     const keep = onConflict ? await onConflict({ state, manifest, workDir, reason: conflictReason }) : true;
     if (!keep) return { workDir, dataDir: dataDirOf(workDir), plan: 'cancelled', manifest };
+  }
+  // Opening: agents' files staged in an earlier session that never closed (a crash) go now.
+  clearAgentFiles(workDir);
+  if (plan === 'conflict') {
     if (isProtectedData(dataDirOf(workDir))) {
       // The unsaved changes are of books protected with passwords, and this shell never has their
       // key: they are never written out in plain text next to the company file. They stay on this
@@ -726,6 +738,8 @@ async function prepareSealed(companyFile, { workDir, state, manifest, plan, onCo
     const keep = onConflict ? await onConflict({ state, manifest, workDir, reason: conflictReason }) : true;
     if (!keep) return { workDir, dataDir: dataDirOf(workDir), plan: 'cancelled', manifest, sealed: null };
   }
+  // Opening: agents' files staged in an earlier session that never closed (a crash) go now.
+  clearAgentFiles(workDir);
   if (plan === 'extract') {
     // An old working copy of another save (nothing unsaved in it): never needed again, and its
     // books are in plain text on this computer — remove it now.
@@ -778,13 +792,144 @@ function discardProtectedWorkingData(workDir, companyFile) {
 }
 
 /**
+ * Remove the files agents staged in a working copy (lib/agent/files.ts keeps them in
+ * <workDir>/agent-files): bank statements and report PDFs, in plain text even for a company file
+ * protected with passwords. They never outlive the session that staged them: removed when the
+ * company file closes (electron/main.js, on quit) and when it opens (prepareWorkingCopy: what a
+ * crash left). A link or file in that place is removed itself, never followed. Best effort, never
+ * throws: true when nothing is left there.
+ */
+function clearAgentFiles(workDir) {
+  if (typeof workDir !== 'string' || !workDir) return true;
+  const dir = path.join(workDir, AGENT_FILES_DIR);
+  let st;
+  try {
+    st = fs.lstatSync(dir);
+  } catch {
+    return true;
+  }
+  try {
+    if (st.isDirectory()) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    else fs.unlinkSync(dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where lib/agent/files.ts keeps staged files while no company file's working copy is open (a
+ * company folder or a practice copy is): this computer's app data folder for Ironbooks, worked out
+ * with the very words of files.ts appDataRoot (test/agentShell.test.ts compares the two).
+ */
+function appDataAgentFilesRoot({ platform = process.platform, env = process.env, home } = {}) {
+  const h = home || require('node:os').homedir();
+  if (platform === 'win32') return path.join(env.LOCALAPPDATA || path.join(h, 'AppData', 'Local'), 'Ironbooks', AGENT_FILES_DIR);
+  if (platform === 'darwin') return path.join(h, 'Library', 'Application Support', 'Ironbooks', AGENT_FILES_DIR);
+  return path.join(env.XDG_STATE_HOME || path.join(h, '.local', 'state'), 'ironbooks', AGENT_FILES_DIR);
+}
+
+/**
+ * Remove the files agents staged in this computer's app data folder (appDataAgentFilesRoot):
+ * statements and report PDFs kept there while a company folder was open, which no working copy
+ * takes away with it. Like those of a working copy they never outlive their session: removed when
+ * the app quits and when its server starts (electron/main.js). Only a real folder that carries
+ * files.ts's marker (MARKER) is removed: one that merely has the name may be anyone's, and a link
+ * there is never followed or removed. Best effort, never throws: true when nothing of ours is left.
+ */
+function clearAppDataAgentFiles(opts = {}) {
+  let dir;
+  try {
+    dir = appDataAgentFilesRoot(opts);
+  } catch {
+    return false;
+  }
+  let st;
+  try {
+    st = fs.lstatSync(dir);
+  } catch {
+    return true;
+  }
+  if (!st.isDirectory()) return false;
+  try {
+    if (!fs.lstatSync(path.join(dir, AGENT_FILES_MARKER)).isFile()) return false;
+  } catch {
+    return false;
+  }
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The newest change to anything under `dir` (links not followed, a bounded look), or null when unknown. */
+function newestChangeIn(dir) {
+  let newest = 0;
+  let seen = 0;
+  const walk = (d, depth) => {
+    let names;
+    try {
+      names = fs.readdirSync(d);
+    } catch {
+      return false;
+    }
+    for (const n of names) {
+      if (++seen > 20_000) return false;
+      let st;
+      try {
+        st = fs.lstatSync(path.join(d, n));
+      } catch {
+        return false;
+      }
+      newest = Math.max(newest, st.mtimeMs || 0);
+      if (st.isDirectory() && (depth <= 0 || !walk(path.join(d, n), depth - 1))) return false;
+    }
+    return true;
+  };
+  try {
+    newest = fs.lstatSync(dir).mtimeMs || 0;
+  } catch {
+    return null;
+  }
+  return walk(dir, 4) ? newest : null;
+}
+
+/**
+ * The staged files left in a working copy that is not open (a crash, a file never opened again):
+ * removed once nothing in them changed for STAGED_FILE_HOURS, since no agent can read them after
+ * that anyway (lib/agent/files.ts readStagedFile). Something else in that place goes at once.
+ */
+function pruneStaleAgentFiles(workDir, now = Date.now()) {
+  const dir = path.join(workDir, AGENT_FILES_DIR);
+  let st;
+  try {
+    st = fs.lstatSync(dir);
+  } catch {
+    return false;
+  }
+  if (!st.isDirectory()) return clearAgentFiles(workDir);
+  const newest = newestChangeIn(dir);
+  if (newest === null || now - newest < AGENT_FILES_MAX_AGE_MS) return false;
+  return clearAgentFiles(workDir);
+}
+
+/**
  * What a working copy folder holds that is only a cache: the database copy, its state and
- * leftovers of writing them. Anything else in the folder was put there by the app server next to
- * the database folder — condense archive copies (the only way back after Condense Data), safety
- * copies made before a restore, scheduled report exports — and is never deleted with the cache.
+ * leftovers of writing them, and agents' staged files. Anything else in the folder was put there
+ * by the app server next to the database folder — condense archive copies (the only way back after
+ * Condense Data), safety copies made before a restore, scheduled report exports — and is never
+ * deleted with the cache.
  */
 function isCacheEntry(name) {
-  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore|unseal|period-copy|recover)-\d+$/.test(name);
+  return (
+    name === 'data' ||
+    name === STATE_FILE ||
+    name === AGENT_FILES_DIR ||
+    (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) ||
+    /^data\.(restore-tmp|pre-restore|refused-restore|unseal|period-copy|recover)-\d+$/.test(name)
+  );
 }
 
 /** Remove the cache of working copies not used for a long time, except `keep` (best effort). */
@@ -804,6 +949,8 @@ function pruneWorkingCopies(root, keep = [], now = Date.now()) {
     // in the working folder of the file being opened too.
     if (st && Array.isArray(st.damagedPlain) && st.damagedPlain.length) pruneDamagedPlain(dir, now);
     if (keepKeys.has(pathKey(dir))) continue;
+    // Agents' staged files left in a working copy not open now go after a day, whatever its age.
+    if (st) pruneStaleAgentFiles(dir, now);
     // Never throw away unsaved work, whatever its age.
     if (!st || st.unsavedSince) continue;
     // A protected file's plain-text books the app server could not remove right after a clean
@@ -838,6 +985,12 @@ function pruneWorkingCopies(root, keep = [], now = Date.now()) {
 module.exports = {
   STATE_FILE,
   STATE_SCHEMA,
+  AGENT_FILES_DIR,
+  clearAgentFiles,
+  appDataAgentFilesRoot,
+  clearAppDataAgentFiles,
+  pruneStaleAgentFiles,
+  isCacheEntry,
   workingRoot,
   sandboxRoot,
   moveLegacySandboxes,

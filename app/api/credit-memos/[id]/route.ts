@@ -20,8 +20,8 @@ import {
   unapplyCreditApplication,
 } from '@/lib/services/creditMemos';
 import { ServiceError } from '@/lib/services/_base';
-import { parseDateInput, zodErrorBody } from '@/lib/validation/helpers';
-import { createCreditMemoSchema } from '@/lib/validation/creditMemos';
+import { bodyValidationError, parseDateInput, zodErrorBody } from '@/lib/validation/helpers';
+import { createCreditMemoSchema, creditMemoActionSchema } from '@/lib/validation/creditMemos';
 import { requireJsonObject, serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
@@ -31,6 +31,16 @@ function errorResponse(err: unknown) {
   }
   console.error('[credit-memos/[id]/route]', err);
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+}
+
+/**
+ * The POST body as agents read it described (lib/validation/creditMemos.ts creditMemoActionSchema).
+ * Called once the checks of the action answered, so it refuses only a value the service could not
+ * have used.
+ */
+function checkActionBody(body: unknown): void {
+  const checked = creditMemoActionSchema.safeParse(body);
+  if (!checked.success) throw bodyValidationError(checked.error);
 }
 
 type RouteContext = { params: Promise<{ id: string }> };
@@ -71,6 +81,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         }
       }
 
+      checkActionBody(body);
       const result = await applyToInvoice(ctx, {
         creditMemoId: id,
         invoiceId: body.invoiceId,
@@ -94,6 +105,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       if (body.date && !date) {
         return NextResponse.json({ error: `date: "${body.date}" is not a valid date`, code: 'VALIDATION' }, { status: 400 });
       }
+      checkActionBody(body);
       const result = await refundCreditMemo(ctx, {
         creditMemoId: id,
         bankAccountId: body.bankAccountId,
@@ -109,6 +121,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       if (!body.applicationId) {
         return NextResponse.json({ error: 'applicationId is required', code: 'VALIDATION' }, { status: 400 });
       }
+      checkActionBody(body);
       const apps = await listCreditApplications(ctx, { creditMemoId: id });
       if (!apps.some((a) => a.id === body.applicationId)) {
         return NextResponse.json({ error: 'Credit application not found', code: 'NOT_FOUND' }, { status: 404 });

@@ -13,13 +13,15 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
-import { createServer, serve } from '../../mcp/protocol.mjs';
+import { ToolError, createServer, serve } from '../../mcp/protocol.mjs';
 import { HOST, IronbooksClient, IronbooksError, expectedProof } from '../../mcp/client.mjs';
 import { DATE_PRESETS, OTHER_LISTS, READ_TOOLS, TOOLS, TXN_TYPES, shapeReport } from '../../mcp/tools.mjs';
 import { LIST_TYPES, TRANSACTION_TYPES, WRITE_READ_TOOLS, WRITE_TOOLS, camelize, shapeAnswer, shapeRecord } from '../../mcp/write-tools.mjs';
 import { BANKING_READ_TOOLS, BANKING_WRITE_TOOLS } from '../../mcp/banking-tools.mjs';
 import { OPERATION_TOOLS } from '../../mcp/operations-tools.mjs';
 import { FILE_TOOLS } from '../../mcp/files-tools.mjs';
+import { ENTRY_TOOLS } from '../../mcp/entry-tools.mjs';
+import { REPORT_TOOLS, shapeReport as shapeReportHere } from '../../mcp/report-tools.mjs';
 import { ALL_AGENT_ACTIONS as AGENT_ACTIONS, AGENT_LIST_TYPES, AGENT_TRANSACTION_TYPES } from '@/lib/agent/catalog';
 import { AGENT_ACTION_ROUTE, agentRouteAllowed } from '@/lib/permissions/agentAccess';
 import { operationForPath } from '@/lib/agent/operations/registry';
@@ -140,11 +142,15 @@ describe('the tools and the app agree on names', () => {
     // (the plain route for those may ask an AI service; the action never does). list_my_proposals
     // is now an alias of list_my_requests, a verb (mcp/operations-tools.mjs, test/mcp/operations.test.ts).
     expect(acted.sort()).toEqual(['bank_feed_suggestions']);
-    // The tools are the reads, the tools that change the books, the generic door and files, each named once.
+    // The tools are the reads, the reports, the tools that change the books, the entry tools, the
+    // generic door and files, each named once (test/mcp/entryTools.test.ts, reportTools.test.ts).
     expect(TOOLS.length).toBe(
-      READ_TOOLS.length + WRITE_READ_TOOLS.length + BANKING_READ_TOOLS.length + WRITE_TOOLS.length + BANKING_WRITE_TOOLS.length + OPERATION_TOOLS.length + FILE_TOOLS.length,
+      READ_TOOLS.length + WRITE_READ_TOOLS.length + BANKING_READ_TOOLS.length + REPORT_TOOLS.length + WRITE_TOOLS.length + BANKING_WRITE_TOOLS.length +
+        ENTRY_TOOLS.length + OPERATION_TOOLS.length + FILE_TOOLS.length,
     );
     expect(new Set(TOOLS.map((t) => t.name)).size).toBe(TOOLS.length);
+    // Well under the ~100 tools past which clients slow down and models choose badly (plan §6).
+    expect(TOOLS.length).toBe(82);
     expect(AGENT_ACTION_ROUTE).toBe('/api/agent/actions');
   });
 
@@ -448,6 +454,12 @@ describe('reports', () => {
     expect(cut.notes.join(' ')).toMatch(/cut this report short/);
     expect(cut.notes.join(' ')).toMatch(/first 1 of 3 rows/);
     expect(shapeReport({}, undefined)).toMatchObject({ report: 'Report', columns: [], row_count: 0, rows: [] });
+    // The same function as the report tools' (it lives in mcp/report-tools.mjs); with ids, each
+    // column keeps its key and each row its id, for report_drilldown.
+    expect(shapeReport).toBe(shapeReportHere);
+    const ids = shapeReport(REPORT, undefined, { ids: true });
+    expect(ids.columns).toEqual([{ name: 'Account', key: 'label' }, { name: 'Amount', key: 'amount', type: 'money' }]);
+    expect(ids.rows[1]).toEqual({ row_id: 'b', kind: 'data', level: 1, cells: ['Sales', '100.00'], journal_entry_id: ID });
   });
 
   it('a refusal from Ironbooks reaches the agent in plain words', async () => {
@@ -557,7 +569,12 @@ describe('tools that change the books', () => {
     });
     expect(shapeAnswer({ outcome: 'posted', result: { id: ID }, ledger })).toMatchObject({ outcome: 'posted', said: 'Entered.', ledger: [{ journal_entry_id: ID, lines }] });
     expect(shapeAnswer({ outcome: 'posted', result: { id: ID }, ledger: { entries: [], changes: [] } })).toEqual({ outcome: 'posted', said: 'Entered.', result: { id: ID } });
-    expect(shapeAnswer({ outcome: 'proposed', proposalId: ID2, ledger })).toMatchObject({ outcome: 'proposed', said: 'Not entered. Waiting for a person to approve it in Ironbooks.', proposal_id: ID2 });
+    const proposed = shapeAnswer({ outcome: 'proposed', proposalId: ID2, ledger });
+    expect(proposed).toMatchObject({ outcome: 'proposed', said: 'Not entered. Waiting for a person to approve it in Ironbooks.', proposal_id: ID2 });
+    // Nothing is entered yet: what it would post, never as if it were posted.
+    expect(proposed).toMatchObject({ would_post: [{ journal_entry_id: ID, lines }] });
+    expect(proposed).not.toHaveProperty('ledger');
+    expect(proposed.next).toMatch(/list_my_requests/);
     expect(shapeAnswer({ outcome: 'posted', replayed: true, result: { id: ID } })).toMatchObject({ repeated: true, note_repeat: expect.stringMatching(/Nothing was entered again/) });
   });
 
@@ -575,6 +592,23 @@ describe('tools that change the books', () => {
     expect(r.data.who_decides).toMatch(/may work in the closed period must approve it/);
     expect(r.data.who_decides).toMatch(/Two different people/);
     expect(r.data.who_decides).toMatch(/type the closing-date password on their own screen; you never see it, and must not ask for it/);
+  });
+
+  it('the curated actions through the door: "asked" or the older "proposed", the same way by whichever id comes back', async () => {
+    const needs = { admin: true, fileAdmin: false, hostOnly: false, flag: null, secrets: [], twoPerson: false, grantable: 'no' };
+    for (const outcome of ['asked', 'proposed']) {
+      const { client, sent } = acting({ outcome, requestId: ID2, status: 'pending', needs });
+      const r = await call(client, 'add_vendor', { name: 'Paper Co', request_id: `v-${outcome}` });
+      expect(sent[0]).toEqual({ action: 'add_vendor', requestId: `v-${outcome}`, input: { displayName: 'Paper Co' } });
+      expect(r.isError, outcome).toBe(false);
+      expect(r.data, outcome).toMatchObject({ outcome, request_id: ID2, status: 'pending', who_decides: 'An Admin must approve it.' });
+      expect(r.data.next, outcome).toMatch(new RegExp(`wait_for_decision with request_id "${ID2}"`));
+    }
+    // An old proposal with no request id: list_my_requests, and not to send it again.
+    const { client } = acting({ outcome: 'proposed', proposalId: ID });
+    const old = await call(client, 'match_bank_line', { bank_transaction_id: ID, journal_entry_id: ID2, request_id: 'm-old' });
+    expect(old.data).toMatchObject({ outcome: 'proposed', proposal_id: ID });
+    expect(old.data.next).toBe('A person decides in Ironbooks. list_my_requests shows this request and, later, what the person decided. Do not send it again.');
   });
 
   it('needs_confirmation: the warning, the field that accepts it, and to resend with a new request id', async () => {
@@ -639,6 +673,16 @@ describe('tools that change the books', () => {
     });
     expect(posted.next).toMatch(/get_file with file_id "f{32}"/);
     expect(shapeAnswer({ outcome: 'needs_confirmation', warnings: [{ flag: 'allowZero', message: 'x' }] }, { fields: 'confirm' }).warnings[0].resend_with).toBe('confirm: ["allowZero"]');
+    // A tool whose confirm takes only some flags (the entry tools): any other is to change the request for.
+    const some = shapeAnswer({ operation: 'estimates.create', outcome: 'needs_confirmation', warnings: [{ flag: 'allowZero', message: 'x' }, { flag: 'allowDuplicateNumber', message: 'y' }] }, { confirm: ['allowDuplicateNumber'] });
+    expect(some.warnings).toEqual([
+      { flag: 'allowZero', message: 'x', instead: expect.stringMatching(/^This warning cannot be accepted with a flag\. Change the request/) },
+      { flag: 'allowDuplicateNumber', message: 'y', resend_with: 'confirm: ["allowDuplicateNumber"]' },
+    ]);
+    expect(some.next).toMatch(/what resend_with says/);
+    const none = shapeAnswer({ operation: 'time-entries.create', outcome: 'needs_confirmation', warnings: [{ flag: 'allowZero', message: 'x' }] }, { confirm: [] });
+    expect(none.warnings[0]).not.toHaveProperty('resend_with');
+    expect(none.next).toMatch(/^No flag accepts these warnings/);
     expect(shapeAnswer({ outcome: 'done' }).said).toBe('Done. Nothing was posted to the ledger.');
   });
 
@@ -763,6 +807,42 @@ describe('statements and reconciliation', () => {
         { bank_transaction_id: ID2, date: '2026-01-06', description: 'CHECK 1001', payee: 'City', amount: '-200.00', status: 'to_review', possible_matches: [{ journal_entry_id: ID, date: '2026-01-05', description: 'Check', number: '1001', amount: '-200.00', confidence: 'high' }] },
       ],
     });
+  });
+
+  it('get_bank_feed still lists the lines when the suggestions are refused or fail, and says why they are missing', async () => {
+    const line = { id: ID, date: '2026-01-05T00:00:00.000Z', description: 'OFFICE DEPOT', payee: null, amount: '-30.00', matched: false, excluded: false, matchedEntryId: null };
+    const clientWith = (act: () => unknown) => ({
+      async act() {
+        return act();
+      },
+      async get(p: string) {
+        if (p === '/api/bank-transactions') return [line];
+        if (p === '/api/bank-transactions/matches') return { matches: {} };
+        throw new Error(`unexpected ${p}`);
+      },
+    });
+    const plain = { bank_transaction_id: ID, date: '2026-01-05', description: 'OFFICE DEPOT', payee: null, amount: '-30.00', status: 'to_review' };
+    const refused = await call(clientWith(() => ({ outcome: 'refused', note: 'This agent may not read bank rules' })), 'get_bank_feed', { bank_account_id: ID });
+    expect(refused.isError).toBe(false);
+    expect(refused.data).toEqual({
+      count: 1,
+      lines: [plain],
+      suggestions: "No suggested accounts: This agent may not read bank rules. Choose each line's account from its description and list_accounts, or ask the person.",
+    });
+    // The door asks for a request_id this tool has no argument for (an Admin set the read to Ask).
+    const failed = await call(
+      clientWith(() => {
+        throw new ToolError('Give a request_id: any text of your own, unique to this change.');
+      }),
+      'get_bank_feed',
+      { bank_account_id: ID },
+    );
+    expect(failed.isError).toBe(false);
+    expect(failed.data.lines).toEqual([plain]);
+    expect(failed.data.suggestions).toMatch(/^No suggested accounts: Ironbooks did not give them this time\. Choose each line's account/);
+    expect(failed.text).not.toMatch(/request_id/);
+    const asked = await call(clientWith(() => ({ outcome: 'asked', requestId: ID2, status: 'pending' })), 'get_bank_feed', { bank_account_id: ID });
+    expect(asked.data.suggestions).toMatch(/your permissions do not let you read them on your own/);
   });
 
   it('get_reconciliation says whether it can be finished', async () => {

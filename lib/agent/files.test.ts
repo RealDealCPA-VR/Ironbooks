@@ -9,23 +9,50 @@
  *  - Another agent, or the same agent id in another company, never reaches the file.
  *  - File ids and names cannot be paths, device names, hidden-direction tricks or broken characters;
  *    an id of the wrong shape never reaches the disk.
- *  - One agent keeps at most 500 MB or 1000 files at once; other agents are not affected.
+ *  - One agent keeps at most 500 MB or 1000 files at once (the exported constants), refused with
+ *    words that say to wait or ask a person; other agents are not affected.
  *  - Old files and uploads are cleared (by age, or all), also lazily (when adding and when reading);
- *    clearing a missing folder is fine; a full clear at the same time as writes never fails them.
- *  - Where: beside the open company file; never in a folder that holds the books or lies inside
- *    them; a folder Ironbooks did not make is never cleared, nor used when it holds other things;
- *    the override is for test runs only.
- *  - allowedFolder: the folder itself or below, never beside or above (".."), case on Windows,
- *    links that lead outside, shares (refused, and accepted when an allowed folder names the share)
- *    and device paths.
+ *    clearing a missing folder is fine; a full clear at the same time as writes never fails them,
+ *    waits for a write already going, and never takes a file staged after it began (one gate).
+ *  - Where: beside the open company file; never in a folder that holds the books or Ironbooks' own
+ *    folder or lies inside the books, by the words or through a link; never on a share, by the
+ *    words or as the disk answers (a link to one, a mapped drive); every folder made is marked, and
+ *    a folder without the marker is never cleared, nor used when it holds other things; the
+ *    override is for test runs only.
+ *  - overlapsAppData: the staging folders, the books and the copies beside them, Ironbooks' own
+ *    local folder, the desktop app's settings folder under every name it has had (company-folder
+ *    mode's companies included), the backup, sandbox and connection-file folders the shell names,
+ *    inside or holding them, through links and in other spellings; fail closed for what is no full
+ *    path and for a share on this very computer in any spelling (by the words, nothing looked at,
+ *    or as the disk answers).
+ *  - allowedFolder: the folder itself or below, never beside or above (".."), case on Windows, a
+ *    look-alike name (the Kelvin sign) refused, never a whole drive, share or mounted volume, links
+ *    that lead outside, shares (refused before they are looked at, and accepted when an allowed
+ *    folder names the share), a share on this very computer (refused even when it answers) and
+ *    device paths.
+ *  - "Before the disk is looked at" is checked by watching every file-system call this module makes.
  */
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { STAGED_FILE_HOURS, UPLOAD_CHUNK_BYTES, UPLOAD_MAX_BYTES, type FileOwner } from './contract';
-import { AGENT_FILES_DIR_ENV, allowedFolder, clearStagedFiles, readStagedFile, stagedFileInfo, stagedFilesRoot, stageFile, uploadChunk } from './files';
+import {
+  AGENT_FILES_DIR_ENV,
+  AGENT_MAX_BYTES,
+  AGENT_MAX_FILES,
+  allowedFolder,
+  appDataPlaces,
+  clearStagedFiles,
+  isThisComputerShare,
+  overlapsAppData,
+  readStagedFile,
+  stagedFileInfo,
+  stagedFilesRoot,
+  stageFile,
+  uploadChunk,
+} from './files';
 import { ServiceError } from '@/lib/services/errors';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ib-agent-files-'));
@@ -43,7 +70,27 @@ const MB = 1024 * 1024;
 /** What marks a folder as Ironbooks' own staging folder (lib/agent/files.ts MARKER). */
 const MARKER = '.ironbooks-agent-files';
 
-const ENV_KEYS = [AGENT_FILES_DIR_ENV, 'BKA_COMPANY_STATE', 'BKA_DATA_DIR', 'BKA_COMPANY_FILE', 'NODE_ENV'] as const;
+const WIN = process.platform === 'win32';
+/** The Kelvin sign: upper case already, lower case "k", and a name of its own on an NTFS disk. */
+const KELVIN = 'K';
+
+const ENV_KEYS = [
+  AGENT_FILES_DIR_ENV,
+  'BKA_COMPANY_STATE',
+  'BKA_DATA_DIR',
+  'BKA_COMPANY_FILE',
+  'NODE_ENV',
+  'LOCALAPPDATA',
+  'XDG_STATE_HOME',
+  'APPDATA',
+  'XDG_CONFIG_HOME',
+  'IRONBOOKS_USER_DATA',
+  'BKA_BACKUP_DIR',
+  'BKA_SANDBOX_ROOT',
+  'BKA_SANDBOX_REAL_DIR',
+  'BKA_REAL_COMPANY_FILE',
+  'IRONBOOKS_AGENT_ENDPOINT_DIR',
+] as const;
 /** process.env with every name writable (Next types NODE_ENV as read-only). */
 const env = process.env as Record<string, string | undefined>;
 const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, env[k]])) as Record<(typeof ENV_KEYS)[number], string | undefined>;
@@ -90,6 +137,47 @@ async function refusal(p: Promise<unknown>): Promise<ServiceError> {
 }
 
 const b64 = (s: string | Buffer) => Buffer.from(s).toString('base64');
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** A path one of this test's places stands for (its folders, the books, a share, Ironbooks' own). */
+const OURS = (p: string) => p.includes(TMP) || p.includes('.bookkeeper-data') || /^[\\/]{2}/.test(p) || /ironbooks|agent-files/i.test(p);
+
+/**
+ * Watch every way lib/agent/files.ts looks at or changes the disk, the synchronous ones included:
+ * `paths()` lists what each call was about (calls through to the real disk).
+ */
+function watchDisk(): { paths: (which?: (p: string) => boolean) => string[]; restore: () => void } {
+  const asyncCalls = ['lstat', 'stat', 'readFile', 'readdir', 'open', 'realpath', 'readlink', 'mkdir', 'writeFile', 'rename', 'rm', 'rmdir'] as const;
+  const syncCalls = ['lstatSync', 'statSync', 'existsSync', 'readdirSync'] as const;
+  const spies: Array<{ mock: { calls: unknown[][] }; mockRestore: () => void }> = [
+    ...asyncCalls.map((m) => vi.spyOn(fsp, m as never) as never),
+    ...syncCalls.map((m) => vi.spyOn(fs, m as never) as never),
+    vi.spyOn(fs.realpathSync, 'native') as never,
+    vi.spyOn(fs.realpath, 'native') as never,
+  ];
+  return {
+    paths: (which = OURS) => spies.flatMap((s) => s.mock.calls.map((c) => String(c[0]))).filter(which),
+    restore: () => spies.forEach((s) => s.mockRestore()),
+  };
+}
+
+/** Spy on `obj[name]`: every call goes on to the real one, after `see` is shown what it is about. */
+function passThrough(obj: object, name: string, see: (p: unknown) => void): { mockRestore: () => void } {
+  const target = obj as Record<string, (...a: unknown[]) => unknown>;
+  const orig = target[name].bind(obj);
+  return vi.spyOn(target, name).mockImplementation((p: unknown, ...a: unknown[]) => {
+    see(p);
+    return orig(p, ...a);
+  });
+}
+
+/** A promise and the function that settles it. */
+function gate(): { wait: Promise<void>; open: () => void } {
+  let open!: () => void;
+  const wait = new Promise<void>((r) => (open = r));
+  return { wait, open };
+}
 
 beforeAll(() => {
   process.env[AGENT_FILES_DIR_ENV] = ROOT;
@@ -190,14 +278,7 @@ describe('path tricks', () => {
     ];
     // Every way this module looks at the disk is watched from here on, the lazy clear's included.
     lazyClearDue();
-    const looks = [
-      vi.spyOn(fsp, 'lstat'),
-      vi.spyOn(fsp, 'stat'),
-      vi.spyOn(fsp, 'readFile'),
-      vi.spyOn(fsp, 'readdir'),
-      vi.spyOn(fsp, 'open'),
-      vi.spyOn(fsp, 'realpath'),
-    ];
+    const disk = watchDisk();
     try {
       for (const id of tricks) {
         expect(await readStagedFile(me, id)).toBeNull();
@@ -209,15 +290,51 @@ describe('path tricks', () => {
       }
       // A good id from an owner that is no plain company and agent id is not looked for either.
       expect(await readStagedFile({ companyId: '..', agentId: AGENT }, file.fileId)).toBeNull();
-      for (const spy of looks) expect(spy).not.toHaveBeenCalled();
+      expect(await stagedFileInfo({ companyId: COMPANY, agentId: `${AGENT}/..` }, file.fileId)).toBeNull();
+      expect(disk.paths()).toEqual([]);
       // The watch works: a well-formed id is looked for.
       noLazyClear();
       expect((await readStagedFile(me, file.fileId))?.file.name).toBe('a.txt');
-      expect(looks[0]).toHaveBeenCalled();
+      expect(disk.paths().some((p) => p.endsWith(`${file.fileId}.bin`))).toBe(true);
     } finally {
-      for (const spy of looks) spy.mockRestore();
+      disk.restore();
       noLazyClear();
     }
+  });
+
+  it('an upload with a malformed id, a malformed part or no plain owner is refused before the disk is looked at', async () => {
+    const started = await uploadChunk(me, { name: 'u.txt', type: 'text/plain', chunkBase64: b64('u'), last: false });
+    lazyClearDue();
+    const disk = watchDisk();
+    try {
+      for (const bad of ['../x', started.uploadId.toUpperCase(), started.uploadId.slice(1), `${started.uploadId}.part`, 42, { id: 1 }]) {
+        const err = await refusal(uploadChunk(me, { uploadId: bad as unknown as string, name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: false }));
+        expect(err.message).toMatch(/no unfinished upload/);
+      }
+      // A part that is not base64, or too large, is refused before anything is looked at either.
+      await refusal(uploadChunk(me, { uploadId: started.uploadId, name: 'x', type: 'text/plain', chunkBase64: 'abc$', last: true }));
+      await refusal(uploadChunk(me, { name: 'x', type: 'text/plain', chunkBase64: 'A'.repeat(UPLOAD_CHUNK_BYTES * 3), last: true }));
+      await refusal(uploadChunk(me, null as never));
+      const owner = await refusal(uploadChunk({ companyId: '..', agentId: AGENT }, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: true }));
+      expect(owner.code).toBe('FORBIDDEN');
+      await refusal(stageFile({ companyId: COMPANY, agentId: '../../x' }, { name: 'x', type: 'text/plain', bytes: Buffer.from('x') }));
+      expect(disk.paths()).toEqual([]);
+    } finally {
+      disk.restore();
+      noLazyClear();
+    }
+    // The upload itself carries on.
+    const done = await uploadChunk(me, { uploadId: started.uploadId, name: 'u.txt', type: 'text/plain', chunkBase64: b64('p'), last: true });
+    expect(done.file?.size).toBe(2);
+  });
+
+  it('a .json changed by hand cannot pass on a name or type that is not clean', async () => {
+    const file = await stageFile(me, { name: 'plain.txt', type: 'text/plain', bytes: Buffer.from('x') });
+    const json = path.join(ownerFolder(me), `${file.fileId}.json`);
+    const meta = JSON.parse(fs.readFileSync(json, 'utf8'));
+    fs.writeFileSync(json, JSON.stringify({ ...meta, name: '..\\..\\evil\uD800‮.pdf', type: 'text/html\r\nX-Evil: 1' }));
+    expect(await stagedFileInfo(me, file.fileId)).toEqual({ fileId: file.fileId, name: 'evil.pdf', type: 'application/octet-stream', size: 1 });
+    expect((await readStagedFile(me, file.fileId))?.file.name).toBe('evil.pdf');
   });
 
   it('names lose path parts, control and direction marks, Windows-reserved characters and device names', async () => {
@@ -273,6 +390,16 @@ describe('path tricks', () => {
     expect(device.name).toHaveLength(120);
     expect(device.name.startsWith('_con.aaa')).toBe(true);
     expect(device.name.endsWith('.pdf')).toBe(true);
+    // In characters as well, and with halves of character pairs taken out before the count.
+    const wide = await stageFile(me, { name: `LPT1.${'\uD800😀'.repeat(200)}`, type: 'application/octet-stream', bytes: Buffer.from('x') });
+    expect(Array.from(wide.name)).toHaveLength(120);
+    expect(wide.name.startsWith('_LPT1.😀')).toBe(true);
+    expect(wide.name).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+    // Every name kept is at most 120 characters, whatever was sent.
+    for (const raw of [`${'x'.repeat(119)}.`, `aux${' '.repeat(5)}.${'b'.repeat(130)}.txt`, `${'é'.normalize('NFD').repeat(130)}.csv`]) {
+      const f = await stageFile(me, { name: raw, type: 'text/plain', bytes: Buffer.from('x') });
+      expect(Array.from(f.name).length, JSON.stringify(raw)).toBeLessThanOrEqual(120);
+    }
   });
 });
 
@@ -401,6 +528,11 @@ describe('limits per agent', () => {
     process.env[AGENT_FILES_DIR_ENV] = limitsRoot;
   });
 
+  it('the limits are the constants: 500 MB and 1000 files per agent', () => {
+    expect(AGENT_MAX_BYTES).toBe(MAX_BYTES);
+    expect(AGENT_MAX_FILES).toBe(MAX_FILES);
+  });
+
   it('one agent keeps at most 500 MB at once, uploads included; other agents are not affected; expired files stop counting', async () => {
     const owner: FileOwner = { companyId: COMPANY, agentId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' };
     const dir = path.join(limitsRoot, owner.companyId, owner.agentId);
@@ -413,6 +545,9 @@ describe('limits per agent', () => {
       const err = await refusal(uploadChunk(owner, { uploadId: up.uploadId, name: 'u.bin', type: 'application/octet-stream', chunkBase64: b64('123456'), last: false }));
       expect(err.code).toBe('VALIDATION');
       expect(err.message).toMatch(/500 MB/);
+      // Plain words that say what to do next: wait, or ask a person.
+      expect(err.message).toMatch(/wait for older ones to be cleared/);
+      expect(err.message).toMatch(/ask a person/);
       // The upload is not stopped by that: a smaller part still fits.
       expect(fs.existsSync(path.join(dir, `${up.uploadId}.part`))).toBe(true);
       const done = await uploadChunk(owner, { uploadId: up.uploadId, name: 'u.bin', type: 'application/octet-stream', chunkBase64: b64('12345'), last: true });
@@ -440,6 +575,7 @@ describe('limits per agent', () => {
     for (let i = 1; i < MAX_FILES; i++) fs.writeFileSync(path.join(dir, `${i.toString(16).padStart(32, '0')}.bin`), '');
     const err = await refusal(stageFile(owner, { name: 'one-more.txt', type: 'text/plain', bytes: Buffer.from('x') }));
     expect(err.message).toMatch(/1000 files/);
+    expect(err.message).toMatch(/wait .*or ask a person/);
     await refusal(uploadChunk(owner, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: true }));
     age(path.join(dir, `${first.fileId}.bin`), STAGED_FILE_HOURS + 1);
     expect((await stageFile(owner, { name: 'one-more.txt', type: 'text/plain', bytes: Buffer.from('x') })).size).toBe(1);
@@ -556,6 +692,111 @@ describe('clearing', () => {
     expect(fs.existsSync(clearRoot)).toBe(false);
   });
 
+  it('a full clear already going: files staged meanwhile wait for it, and are kept', async () => {
+    const before = await stageFile(me, { name: 'before.txt', type: 'text/plain', bytes: Buffer.from('before') });
+    // Hold the clear at its first look into the root.
+    const reached = gate();
+    const held = gate();
+    const readdir = fsp.readdir.bind(fsp) as (...a: unknown[]) => Promise<unknown>;
+    let holding = true;
+    const spy = vi.spyOn(fsp, 'readdir').mockImplementation((async (...a: unknown[]) => {
+      if (holding && String(a[0]) === clearRoot && (a[1] as { withFileTypes?: boolean } | undefined)?.withFileTypes) {
+        holding = false;
+        reached.open();
+        await held.wait;
+      }
+      return readdir(...a);
+    }) as never);
+    try {
+      const clearing = clearStagedFiles({ all: true });
+      await reached.wait;
+      const during = Promise.all([
+        stageFile(me, { name: 'during.txt', type: 'text/plain', bytes: Buffer.from('during') }),
+        stageFile(otherCompany, { name: 'other.txt', type: 'text/plain', bytes: Buffer.from('other') }),
+        uploadChunk(otherAgent, { name: 'whole.txt', type: 'text/plain', chunkBase64: b64('whole'), last: true }),
+      ]);
+      await sleep(50);
+      // Nothing new on the disk while the clear goes: the writes wait in the gate.
+      expect(fs.readdirSync(path.join(clearRoot, COMPANY, AGENT)).filter((n) => !n.startsWith(before.fileId) && n !== MARKER)).toEqual([]);
+      expect(fs.existsSync(path.join(clearRoot, OTHER_COMPANY))).toBe(false);
+      held.open();
+      expect(await clearing).toBe(1);
+      const [a, b, c] = await during;
+      expect(Buffer.from((await readStagedFile(me, a.fileId))!.bytes).toString()).toBe('during');
+      expect(Buffer.from((await readStagedFile(otherCompany, b.fileId))!.bytes).toString()).toBe('other');
+      expect(Buffer.from((await readStagedFile(otherAgent, c.file!.fileId))!.bytes).toString()).toBe('whole');
+      expect(await readStagedFile(me, before.fileId)).toBeNull();
+    } finally {
+      held.open();
+      spy.mockRestore();
+      await clearStagedFiles({ all: true });
+    }
+  });
+
+  it('a full clear asked for while a file is being written waits for the write, which never fails', async () => {
+    await stageFile(otherAgent, { name: 'first.txt', type: 'text/plain', bytes: Buffer.from('first') });
+    const reached = gate();
+    const held = gate();
+    const writeFile = fsp.writeFile.bind(fsp) as (...a: unknown[]) => Promise<void>;
+    let holding = true;
+    const spy = vi.spyOn(fsp, 'writeFile').mockImplementation((async (...a: unknown[]) => {
+      if (holding && String(a[0]).startsWith(path.join(clearRoot, COMPANY, AGENT)) && String(a[0]).endsWith('.tmp')) {
+        holding = false;
+        reached.open();
+        await held.wait;
+      }
+      return writeFile(...a);
+    }) as never);
+    try {
+      const staging = stageFile(me, { name: 'slow.txt', type: 'text/plain', bytes: Buffer.from('slow') });
+      await reached.wait;
+      let cleared = false;
+      const clearing = clearStagedFiles({ all: true }).then((n) => {
+        cleared = true;
+        return n;
+      });
+      await sleep(50);
+      expect(cleared).toBe(false);
+      held.open();
+      const file = await staging;
+      expect(file.size).toBe(4);
+      // The clear ran after the write: everything there was then, the new file included, went.
+      expect(await clearing).toBe(2);
+      expect(await readStagedFile(me, file.fileId)).toBeNull();
+      expect(fs.existsSync(clearRoot)).toBe(false);
+    } finally {
+      held.open();
+      spy.mockRestore();
+    }
+  });
+
+  it('every folder it makes is marked, and only marked folders are cleared or removed', async () => {
+    const f = await stageFile(me, { name: 'a.txt', type: 'text/plain', bytes: Buffer.from('a') });
+    for (const d of [clearRoot, path.join(clearRoot, COMPANY), ownerFolder(me).replace(ROOT, clearRoot)]) {
+      expect(fs.statSync(path.join(d, MARKER)).isFile(), d).toBe(true);
+    }
+    // Folders named like ids, or like the database's own, that this module did not make.
+    const strangers = [
+      path.join(clearRoot, 'pg_tblspc'),
+      path.join(clearRoot, OTHER_COMPANY, OTHER_AGENT),
+      path.join(clearRoot, COMPANY, 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'),
+    ];
+    for (const d of strangers) fs.mkdirSync(d, { recursive: true });
+    // An old file with a staged file's name, in a folder that is not marked, is not touched either.
+    const lookalike = path.join(clearRoot, OTHER_COMPANY, OTHER_AGENT, `${'e'.repeat(32)}.bin`);
+    fs.writeFileSync(lookalike, 'not ours');
+    age(lookalike, STAGED_FILE_HOURS + 5);
+    expect(await clearStagedFiles({ all: true })).toBe(1);
+    expect(await readStagedFile(me, f.fileId)).toBeNull();
+    for (const d of strangers) expect(fs.existsSync(d), d).toBe(true);
+    expect(fs.readFileSync(lookalike, 'utf8')).toBe('not ours');
+    // The marked folders that held nothing else went; the ones that hold strangers stay, still marked.
+    expect(fs.existsSync(ownerFolder(me).replace(ROOT, clearRoot))).toBe(false);
+    expect(fs.existsSync(path.join(clearRoot, COMPANY, MARKER))).toBe(true);
+    expect(fs.existsSync(path.join(clearRoot, MARKER))).toBe(true);
+    fs.rmSync(clearRoot, { recursive: true, force: true });
+  });
+
   it('a folder Ironbooks did not make is never cleared, and one that already holds things is not used', async () => {
     const foreign = path.join(TMP, 'foreign');
     for (const d of [path.join('Taxes', '2024'), 'pg_tblspc', path.join(COMPANY, AGENT)]) fs.mkdirSync(path.join(foreign, d), { recursive: true });
@@ -670,14 +911,376 @@ describe('where the files are kept', () => {
     }
   });
 
-  it.runIf(process.platform === 'win32')('a folder on a network share or a device path is refused (fail closed)', async () => {
-    for (const root of ['\\\\ironbooks-test.invalid\\share\\agent-files', `\\\\?\\${ROOT}`]) {
-      process.env[AGENT_FILES_DIR_ENV] = root;
-      const err = await refusal(stageFile(me, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') }));
-      expect(err.code).toBe('INTERNAL');
-      expect(await readStagedFile(me, 'a'.repeat(32))).toBeNull();
-      await expect(clearStagedFiles()).rejects.toBeInstanceOf(ServiceError);
+  it.runIf(process.platform === 'win32')('a folder on a network share or a device path is refused (fail closed), before it is looked at', async () => {
+    lazyClearDue();
+    const disk = watchDisk();
+    try {
+      for (const root of ['\\\\ironbooks-test.invalid\\share\\agent-files', '//ironbooks-test.invalid/share/agent-files', `\\\\?\\${ROOT}`, `\\\\.\\${ROOT}`]) {
+        process.env[AGENT_FILES_DIR_ENV] = root;
+        expect(stagedFilesRoot()).toBeNull();
+        const err = await refusal(stageFile(me, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') }));
+        expect(err.code).toBe('INTERNAL');
+        expect(err.message).toMatch(/another computer/);
+        expect(await readStagedFile(me, 'a'.repeat(32))).toBeNull();
+        await refusal(uploadChunk(me, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: true }));
+        await expect(clearStagedFiles()).rejects.toBeInstanceOf(ServiceError);
+      }
+      expect(disk.paths((p) => /^[\\/]{2}/.test(p))).toEqual([]);
+    } finally {
+      disk.restore();
+      noLazyClear();
     }
+  });
+
+  it.runIf(process.platform === 'win32')('a folder the disk answers as a share (a link to one, a mapped drive) is refused too, and the share is never looked at', async () => {
+    // The system answers a junction to a share, or a folder on a mapped drive, as \\server\share\…
+    const looksLocal = path.join(TMP, 'mapped-root');
+    fs.mkdirSync(looksLocal, { recursive: true });
+    const localReal = fs.realpathSync.native(looksLocal);
+    const nativeSync = fs.realpathSync.native;
+    const onShare: string[] = [];
+    const see = (p: unknown) => {
+      if (/^[\\/]{2}/.test(String(p))) onShare.push(String(p));
+    };
+    const spies = [
+      vi.spyOn(fs.realpathSync, 'native').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+        see(p);
+        const out = String(nativeSync(p, ...(rest as [])));
+        const inside = out === localReal || out.startsWith(localReal + path.sep);
+        return inside ? `\\\\ironbooks-test.invalid\\share\\mapped${out.slice(localReal.length)}` : out;
+      }) as never),
+      ...['lstatSync', 'statSync', 'existsSync', 'readdirSync'].map((m) => passThrough(fs, m, see)),
+      ...['lstat', 'stat', 'mkdir', 'writeFile', 'readdir', 'open', 'rename'].map((m) => passThrough(fsp, m, see)),
+    ];
+    try {
+      for (const root of [path.join(looksLocal, 'agent-files'), looksLocal]) {
+        process.env[AGENT_FILES_DIR_ENV] = root;
+        expect(stagedFilesRoot(), root).toBeNull();
+        const err = await refusal(stageFile(me, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') }));
+        expect(err.code).toBe('INTERNAL');
+        expect(err.message).toMatch(/another computer/);
+        await refusal(uploadChunk(me, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: true }));
+        await expect(clearStagedFiles()).rejects.toBeInstanceOf(ServiceError);
+      }
+      expect(onShare).toEqual([]);
+      // Nothing was made or marked in the folder that only looks local.
+      expect(fs.readdirSync(looksLocal)).toEqual([]);
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
+  });
+
+  it('the same refusals hold through a link, in another spelling, and for a folder that holds Ironbooks’ own local folder', async (ctx) => {
+    const real = path.join(TMP, 'linked-real');
+    const books = path.join(real, 'books');
+    const data = path.join(books, 'data');
+    fs.mkdirSync(path.join(data, 'pg_tblspc'), { recursive: true });
+    const alias = path.join(TMP, 'linked-alias');
+    try {
+      fs.symlinkSync(books, alias, WIN ? 'junction' : 'dir');
+    } catch {
+      ctx.skip();
+    }
+    try {
+      // The database folder named through the link; the staging folder holds it as the disk has it.
+      process.env.BKA_DATA_DIR = path.join(alias, 'data');
+      process.env[AGENT_FILES_DIR_ENV] = books;
+      expect(stagedFilesRoot()).toBeNull();
+      await refusal(stageFile(me, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') }));
+      // The other way round: the staging folder named through the link, inside the database folder.
+      process.env.BKA_DATA_DIR = data;
+      process.env[AGENT_FILES_DIR_ENV] = path.join(alias, 'data', 'agent-files');
+      expect(stagedFilesRoot()).toBeNull();
+      await refusal(uploadChunk(me, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: false }));
+      // A spelling that may be the same folder (another case) is refused as well.
+      process.env[AGENT_FILES_DIR_ENV] = books.toUpperCase();
+      expect(stagedFilesRoot()).toBeNull();
+      process.env[AGENT_FILES_DIR_ENV] = path.join(data.toUpperCase(), 'agent-files');
+      expect(stagedFilesRoot()).toBeNull();
+      // Ironbooks' own local folder (working copies, sandboxes, the app data staging folder).
+      if (WIN) process.env.LOCALAPPDATA = path.join(TMP, 'local');
+      else process.env.XDG_STATE_HOME = path.join(TMP, 'local');
+      if (process.platform !== 'darwin') {
+        process.env.BKA_DATA_DIR = path.join(TMP, 'elsewhere-data');
+        process.env[AGENT_FILES_DIR_ENV] = path.join(TMP, 'local');
+        expect(stagedFilesRoot()).toBeNull();
+        // Inside it is where staged files belong when no company file is open.
+        process.env[AGENT_FILES_DIR_ENV] = path.join(TMP, 'local', WIN ? 'Ironbooks' : 'ironbooks', 'agent-files');
+        expect(stagedFilesRoot()).toBe(path.join(TMP, 'local', WIN ? 'Ironbooks' : 'ironbooks', 'agent-files'));
+      }
+      // Nothing was made or marked anywhere, and the database's own empty folder is still there.
+      expect(fs.existsSync(path.join(books, MARKER))).toBe(false);
+      expect(fs.existsSync(path.join(data, 'agent-files'))).toBe(false);
+      expect(fs.existsSync(path.join(data, 'pg_tblspc'))).toBe(true);
+    } finally {
+      restoreEnv('BKA_DATA_DIR', 'LOCALAPPDATA', 'XDG_STATE_HOME');
+    }
+  });
+});
+
+describe('overlapsAppData (for the folder rules of other units)', () => {
+  const base = path.join(TMP, 'overlaps');
+  const local = path.join(base, 'local');
+  const staged = path.join(base, 'staged');
+  const working = path.join(base, 'Working');
+  const work = path.join(working, 'Acme-1a2b');
+  const data = path.join(work, 'data');
+  const filed = path.join(base, 'Books');
+  const companyFileAt = path.join(filed, 'Acme.ironbooks');
+  const elsewhere = path.join(TMP, 'overlaps-elsewhere');
+  const appLocal = () =>
+    WIN ? path.join(local, 'Ironbooks') : process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Application Support', 'Ironbooks') : path.join(local, 'ironbooks');
+
+  beforeAll(() => {
+    for (const d of [staged, data, path.join(working, 'Other-3c4d'), filed, path.join(elsewhere, 'Receipts')]) fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(companyFileAt, 'books');
+  });
+
+  beforeEach(() => {
+    process.env[AGENT_FILES_DIR_ENV] = staged;
+    process.env.BKA_DATA_DIR = data;
+    process.env.BKA_COMPANY_STATE = path.join(work, 'state.json');
+    process.env.BKA_COMPANY_FILE = companyFileAt;
+    if (WIN) process.env.LOCALAPPDATA = local;
+    else process.env.XDG_STATE_HOME = local;
+  });
+
+  afterAll(() => restoreEnv('BKA_DATA_DIR', 'BKA_COMPANY_STATE', 'BKA_COMPANY_FILE', 'LOCALAPPDATA', 'XDG_STATE_HOME'));
+
+  it('every staging folder, the books and Ironbooks’ own folder: the place itself, inside it, or holding it', () => {
+    expect(stagedFilesRoot()).toBe(staged);
+    expect(appDataPlaces()).toEqual(expect.arrayContaining([staged, data, work, working, companyFileAt, path.join(work, 'agent-files'), appLocal()]));
+    const refused = [
+      staged,
+      path.join(staged, COMPANY),
+      base, // holds all of them
+      data,
+      path.join(data, 'pg_tblspc'),
+      work,
+      path.join(work, 'agent-files'), // the open file's own staging folder (used when there is no override)
+      working, // the folder of every working folder
+      path.join(working, 'Other-3c4d'), // another company file's working folder, with its own staged files
+      filed, // holds the company file
+      companyFileAt,
+      appLocal(),
+      path.join(appLocal(), 'agent-files'), // the staging folder when no company file is open
+      path.join(appLocal(), 'Working', 'x'),
+    ];
+    for (const folder of refused) expect(overlapsAppData(folder), folder).toBe(true);
+    // Beside them is fine.
+    for (const folder of [elsewhere, path.join(elsewhere, 'Receipts'), path.join(base + '-beside'), path.join(filed + 'x')]) {
+      expect(overlapsAppData(folder), folder).toBe(false);
+    }
+    if (process.platform !== 'darwin') expect(overlapsAppData(path.join(local, 'Other'))).toBe(false);
+  });
+
+  it('through a link, and in a spelling that may be the same folder', (ctx) => {
+    expect(overlapsAppData(staged.toUpperCase())).toBe(true);
+    expect(overlapsAppData(path.join(data.toLowerCase(), 'x'))).toBe(true);
+    // A Kelvin sign where the folder has a "k": refused too, a refusal errs on the side of refusing.
+    expect(overlapsAppData(path.join(base, `Wor${KELVIN}ing`, 'Acme-1a2b'))).toBe(true);
+    expect(overlapsAppData(path.join(base, `Wor${KELVIN}ing-not`))).toBe(false);
+    const alias = path.join(elsewhere, 'link-to-staged');
+    try {
+      fs.symlinkSync(staged, alias, WIN ? 'junction' : 'dir');
+    } catch {
+      ctx.skip();
+    }
+    expect(overlapsAppData(alias)).toBe(true);
+    expect(overlapsAppData(path.join(alias, COMPANY, 'not-yet'))).toBe(true);
+    // A link that holds the books' folder.
+    const holder = path.join(elsewhere, 'link-to-working');
+    fs.symlinkSync(working, holder, WIN ? 'junction' : 'dir');
+    expect(overlapsAppData(holder)).toBe(true);
+  });
+
+  it('fails closed for what is no full path, and never looks at a share', () => {
+    for (const bad of ['', '   ', 'relative/folder', '..', 42, null, `${elsewhere}\u0000`, 'x'.repeat(2000)]) {
+      expect(overlapsAppData(bad as unknown as string), String(bad).slice(0, 20)).toBe(true);
+    }
+    if (WIN) {
+      expect(overlapsAppData(`\\\\?\\${elsewhere}`)).toBe(true);
+      expect(overlapsAppData(`\\\\.\\${elsewhere}`)).toBe(true);
+      const disk = watchDisk();
+      try {
+        expect(overlapsAppData('\\\\ironbooks-test.invalid\\share\\Receipts')).toBe(false);
+        expect(disk.paths((p) => /^[\\/]{2}/.test(p))).toEqual([]);
+      } finally {
+        disk.restore();
+      }
+    }
+  });
+
+  describe('the desktop app’s own folders, wherever the shell keeps them', () => {
+    // Outside `base`, so "beside them is fine" below means something.
+    const appData = path.join(TMP, 'overlaps-appdata');
+    const settingsParent = () =>
+      WIN ? path.join(appData, 'Roaming') : process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Application Support') : path.join(appData, 'config');
+    const settings = (name: string) => path.join(settingsParent(), name);
+    const shellNamed = {
+      BKA_BACKUP_DIR: path.join(TMP, 'overlaps-shell', 'backups-here'),
+      BKA_SANDBOX_ROOT: path.join(TMP, 'overlaps-shell', 'sandboxes-here'),
+      IRONBOOKS_AGENT_ENDPOINT_DIR: path.join(TMP, 'overlaps-shell', 'endpoints-here'),
+    } as const;
+    const realBooks = path.join(TMP, 'overlaps-real', 'Working', 'Real-9f9f', 'data');
+    const realFile = path.join(TMP, 'overlaps-realfile', 'Real.ironbooks');
+
+    beforeEach(() => {
+      if (WIN) process.env.APPDATA = path.join(appData, 'Roaming');
+      else process.env.XDG_CONFIG_HOME = path.join(appData, 'config');
+      // On Windows the settings folder must be covered without the shell naming it.
+      delete process.env.IRONBOOKS_USER_DATA;
+      for (const k of Object.keys(shellNamed) as Array<keyof typeof shellNamed>) delete process.env[k];
+      delete process.env.BKA_SANDBOX_REAL_DIR;
+      delete process.env.BKA_REAL_COMPANY_FILE;
+    });
+
+    afterAll(() =>
+      restoreEnv('APPDATA', 'XDG_CONFIG_HOME', 'IRONBOOKS_USER_DATA', 'BKA_BACKUP_DIR', 'BKA_SANDBOX_ROOT', 'IRONBOOKS_AGENT_ENDPOINT_DIR', 'BKA_SANDBOX_REAL_DIR', 'BKA_REAL_COMPANY_FILE'),
+    );
+
+    it('the settings folder under every name it has had: itself, its backups and companies, and the folder that holds them', () => {
+      const refused = [
+        settings('Ironbooks'),
+        path.join(settings('Ironbooks'), 'backups'), // the quit-time backups: whole copies of the books
+        path.join(settings('Ironbooks'), 'companies', 'Acme'),
+        path.join(settings('Ironbooks'), 'tls'),
+        settings('ironbooks'), // a development run's name
+        settings('BookKeeper AI'), // the names from before the rename
+        path.join(settings('BookKeeper AI'), 'backups'),
+        settings('bookkeeper-ai'),
+        path.join(os.homedir(), '.ironbooks', 'Working'),
+      ];
+      if (process.platform !== 'darwin') refused.push(settingsParent()); // holds them all (not the real ~/Library one on a Mac)
+      expect(appDataPlaces()).toEqual(expect.arrayContaining(['Ironbooks', 'ironbooks', 'BookKeeper AI', 'bookkeeper-ai'].map((n) => path.resolve(settings(n)))));
+      for (const folder of refused) expect(overlapsAppData(folder), folder).toBe(true);
+      // Beside them is fine.
+      if (process.platform !== 'darwin') {
+        for (const folder of [path.join(settingsParent(), 'Other'), path.join(settingsParent(), 'IronbooksExports'), `${settings('BookKeeper AI')} old`]) {
+          expect(overlapsAppData(folder), folder).toBe(false);
+        }
+      }
+    });
+
+    it('company-folder mode: every company folder under the settings folder, not only the open one', () => {
+      delete process.env.BKA_COMPANY_STATE;
+      delete process.env.BKA_COMPANY_FILE;
+      process.env.BKA_DATA_DIR = path.join(settings('Ironbooks'), 'companies', 'Acme');
+      expect(overlapsAppData(path.join(settings('Ironbooks'), 'companies', 'Other'))).toBe(true);
+      expect(overlapsAppData(path.join(settings('Ironbooks'), 'companies'))).toBe(true);
+      // A database folder of its own (the browser version): the backups and copies Ironbooks writes beside it.
+      const web = path.join(TMP, 'overlaps-web', '.bookkeeper-data', 'default');
+      process.env.BKA_DATA_DIR = web;
+      for (const n of ['backups', 'pre-op-backups', 'archives']) expect(overlapsAppData(path.join(path.dirname(web), n)), n).toBe(true);
+    });
+
+    it('the backup, sandbox and connection-file folders the shell names, the real books while a sandbox is open, and the archives beside the company file', () => {
+      for (const [k, v] of Object.entries(shellNamed)) process.env[k] = v;
+      process.env.BKA_SANDBOX_REAL_DIR = realBooks;
+      process.env.BKA_REAL_COMPANY_FILE = realFile;
+      expect(appDataPlaces()).toEqual(expect.arrayContaining([...Object.values(shellNamed), realBooks, realFile]));
+      const refused = [
+        ...Object.values(shellNamed),
+        path.join(shellNamed.BKA_BACKUP_DIR, 'Acme'),
+        path.join(shellNamed.BKA_SANDBOX_ROOT, 'sandbox-1', 'data'),
+        path.join(TMP, 'overlaps-shell'), // holds them
+        realBooks,
+        path.join(path.dirname(realBooks), 'backups'),
+        path.join(path.dirname(realBooks), 'pre-op-backups'),
+        path.dirname(realFile), // holds the real company file
+        path.join(path.dirname(realFile), 'archives'),
+        path.join(filed, 'archives'), // archive copies beside the open company file
+      ];
+      for (const folder of refused) expect(overlapsAppData(folder), folder).toBe(true);
+      // Beside them is fine, the company file's other folders too.
+      for (const folder of [path.join(TMP, 'overlaps-shell-other'), path.join(filed, 'Receipts'), path.join(TMP, 'overlaps-real', 'Elsewhere')]) {
+        expect(overlapsAppData(folder), folder).toBe(false);
+      }
+    });
+  });
+
+  describe.runIf(process.platform === 'win32')('a share on this very computer', () => {
+    const own = (): string | null => {
+      for (const list of Object.values(os.networkInterfaces())) {
+        for (const a of list ?? []) if (a.family === 'IPv4' && !a.internal) return a.address;
+      }
+      return null;
+    };
+    const hostName = os.hostname();
+    const here = [
+      '\\\\localhost\\c$\\Users\\someone\\AppData\\Local\\Ironbooks',
+      '//LOCALHOST/c$/Users/someone/AppData/Local',
+      '\\\\LocalHost.\\c$\\x',
+      '\\\\localhost',
+      '\\\\localhost@SSL\\DavWWWRoot\\x',
+      '\\\\wsl.localhost\\Ubuntu\\mnt\\c\\Users',
+      '\\\\wsl$\\Ubuntu\\mnt\\c\\Users',
+      '\\\\anything.localhost\\c$',
+      '\\\\\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54\\c$', // full-width letters
+      '\\\\127.0.0.1\\c$\\Users',
+      '\\\\127.1\\c$',
+      '\\\\127.255.10.3\\c$',
+      '\\\\0x7f.0.0.1\\c$',
+      '\\\\0177.0.0.1\\c$',
+      '\\\\2130706433\\c$',
+      '\\\\0x7f000001\\c$',
+      '\\\\0.0.0.0\\c$',
+      '\\\\::1\\c$',
+      '\\\\[::1]\\c$',
+      '\\\\0:0:0:0:0:0:0:1\\c$',
+      '\\\\0000::0001\\c$',
+      '\\\\0--1.ipv6-literal.net\\c$',
+      '\\\\--1.IPV6-LITERAL.NET\\c$',
+      '\\\\::ffff:127.0.0.1\\c$',
+      '\\\\[::ffff:7f00:1]\\c$',
+      `\\\\${hostName}\\c$\\Users`,
+      `\\\\${hostName.toLowerCase()}\\Shared`,
+      `\\\\${hostName.toUpperCase()}.corp.example\\Shared`,
+      ...(process.env.COMPUTERNAME ? [`\\\\${process.env.COMPUTERNAME}\\c$`] : []),
+      ...(own() ? [`\\\\${own()}\\c$`] : []),
+      '\\\\',
+    ];
+    const elsewhereShares = [
+      '\\\\ironbooks-test.invalid\\share\\Receipts',
+      '\\\\fileserver\\books',
+      '\\\\localhostx\\share',
+      '\\\\128.0.0.1\\share',
+      '\\\\203.0.113.7\\share', // a documentation address, never this computer's
+      '\\\\[2001:db8::1]\\share',
+      `\\\\${hostName}x-ironbooks-test\\share`,
+    ];
+
+    it('is refused in every spelling, by the words alone: nothing at all is looked at', () => {
+      const disk = watchDisk();
+      try {
+        for (const p of here) {
+          expect(isThisComputerShare(p), p).toBe(true);
+          expect(overlapsAppData(p), p).toBe(true);
+        }
+        expect(disk.paths(() => true)).toEqual([]);
+      } finally {
+        disk.restore();
+      }
+      for (const p of elsewhereShares) expect(isThisComputerShare(p), p).toBe(false);
+      // Not a share at all.
+      for (const p of [elsewhere, '\\\\?\\C:\\x', 'C:\\localhost\\c$', '/localhost/c$']) expect(isThisComputerShare(p), p).toBe(false);
+    });
+
+    it('a folder the disk answers as one (a drive mapped to this computer’s own share) is refused', () => {
+      const looksLocal = path.join(elsewhere, 'Receipts');
+      expect(overlapsAppData(looksLocal)).toBe(false);
+      const localReal = fs.realpathSync.native(looksLocal);
+      const nativeSync = fs.realpathSync.native;
+      const spy = vi.spyOn(fs.realpathSync, 'native').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+        const out = String(nativeSync(p, ...(rest as [])));
+        return out === localReal ? '\\\\localhost\\c$\\Receipts' : out;
+      }) as never);
+      try {
+        expect(overlapsAppData(looksLocal)).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 });
 
@@ -742,14 +1345,173 @@ describe('allowedFolder', () => {
     expect(await allowedFolder([allowed.toUpperCase()], sibling.toLowerCase())).toBeNull();
   });
 
+  it('a folder whose name only looks like the allowed one (a Kelvin sign for the "k") is another folder, and refused', async (ctx) => {
+    const plain = path.join(base, 'Ironbooks');
+    const lookalike = path.join(base, `Ironboo${KELVIN}s`);
+    fs.mkdirSync(path.join(plain, 'inside'), { recursive: true });
+    try {
+      fs.mkdirSync(path.join(lookalike, 'inside'), { recursive: true });
+    } catch {
+      ctx.skip();
+    }
+    // Where the disk folds the two names together (macOS), there is only one folder: nothing to prove.
+    if (fs.statSync(plain).ino === fs.statSync(lookalike).ino) ctx.skip();
+    expect(await allowedFolder([plain], path.join(lookalike, 'inside'))).toBeNull();
+    expect(await allowedFolder([plain], lookalike)).toBeNull();
+    expect(await allowedFolder([lookalike], path.join(plain, 'inside'))).toBeNull();
+    // Each is its own allowed folder.
+    expect(await allowedFolder([plain], path.join(plain, 'inside'))).toBe(real(path.join(plain, 'inside')));
+    expect(await allowedFolder([lookalike], path.join(lookalike, 'inside'))).toBe(real(path.join(lookalike, 'inside')));
+  });
+
+  it('never a whole drive or a volume mounted as a folder, even when it is in the allowed list', async () => {
+    // The company file at a drive's top (E:\Books.ironbooks) makes its folder the whole drive.
+    const top = path.parse(sub).root;
+    expect(await allowedFolder([top], sub)).toBeNull();
+    expect(await allowedFolder([top], top)).toBeNull();
+    expect(await allowedFolder([top, allowed], sub)).toBe(real(sub));
+    // A folder that is another volume (on another device than the folder it sits in).
+    const mounted = path.join(base, 'mounted');
+    fs.mkdirSync(path.join(mounted, 'inner'), { recursive: true });
+    const stat = fsp.stat.bind(fsp) as (...a: unknown[]) => Promise<fs.Stats>;
+    const mountedReal = real(mounted);
+    const spy = vi.spyOn(fsp, 'stat').mockImplementation((async (...a: unknown[]) => {
+      const st = await stat(...a);
+      // The mounted volume and everything on it: another device than the folder it sits in.
+      if (String(a[0]) !== mountedReal && !String(a[0]).startsWith(mountedReal + path.sep)) return st;
+      return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { dev: st.dev + 1 });
+    }) as never);
+    try {
+      expect(await allowedFolder([mounted], path.join(mounted, 'inner'))).toBeNull();
+      expect(await allowedFolder([mounted], mounted)).toBeNull();
+      // A folder inside it, allowed by itself, and the mount reached from an allowed folder above it, are fine.
+      expect(await allowedFolder([path.join(mounted, 'inner')], path.join(mounted, 'inner'))).toBe(real(path.join(mounted, 'inner')));
+      expect(await allowedFolder([base], path.join(mounted, 'inner'))).toBe(real(path.join(mounted, 'inner')));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  describe.runIf(process.platform === 'win32')('a share, as Windows reaches it (simulated)', () => {
+    // \\ironbooks-test.invalid\share is answered from a local folder, so the accepting side of the
+    // share rule is proved on every Windows computer; \\ironbooks-test.invalid\other must never be looked at.
+    const SHARE = '\\\\ironbooks-test.invalid\\share';
+    const OTHER = '\\\\ironbooks-test.invalid\\other';
+    /** This computer's own share, answered from the same local folder: it must be refused all the same. */
+    const HERE = '\\\\localhost\\share';
+    const mirror = path.join(TMP, 'share-mirror');
+    const onShare = (...parts: string[]) => [SHARE, ...parts].join('\\');
+    let mirrorReal = '';
+    let touched: string[] = [];
+    let spies: Array<{ mockRestore: () => void }> = [];
+
+    beforeAll(() => {
+      for (const d of [path.join(mirror, 'allowed', 'sub', 'deeper'), path.join(mirror, 'outside'), path.join(mirror, 'allowed-evil')]) fs.mkdirSync(d, { recursive: true });
+      mirrorReal = fs.realpathSync.native(mirror);
+    });
+
+    beforeEach(() => {
+      touched = [];
+      const fold = (p: string) => p.toUpperCase();
+      /** The local folder a path on the simulated share is, or null when it is on no simulated share. */
+      const local = (p: unknown): string | null => {
+        const s = String(p);
+        if (/^[\\/]{2}/.test(s)) touched.push(s);
+        for (const share of [SHARE, HERE]) if (fold(s.replace(/\//g, '\\')).startsWith(fold(share))) return mirror + s.slice(share.length);
+        return null;
+      };
+      const back = (p: string) => (p.startsWith(mirrorReal) ? SHARE + p.slice(mirrorReal.length) : p);
+      const missing = () => Object.assign(new Error('not there'), { code: 'ENOENT' });
+      const through = <K extends 'lstat' | 'stat' | 'readlink' | 'realpath'>(name: K, map: (out: unknown) => unknown) => {
+        const orig = (fsp[name] as (...a: unknown[]) => Promise<unknown>).bind(fsp);
+        return vi.spyOn(fsp, name).mockImplementation((async (p: unknown, ...a: unknown[]) => {
+          const l = local(p);
+          if (l === null && /^[\\/]{2}/.test(String(p))) throw missing();
+          return map(await orig(l ?? p, ...a));
+        }) as never);
+      };
+      const nativeOrig = fs.realpath.native;
+      spies = [
+        through('lstat', (o) => o),
+        through('stat', (o) => o),
+        through('readlink', (o) => back(String(o))),
+        through('realpath', (o) => back(String(o))),
+        vi.spyOn(fs.realpath, 'native').mockImplementation(((p: unknown, ...rest: unknown[]) => {
+          const cb = rest[rest.length - 1] as (err: Error | null, out?: string) => void;
+          const l = local(p);
+          if (l === null && /^[\\/]{2}/.test(String(p))) return cb(missing());
+          nativeOrig(l ?? (p as string), (err, out) => cb(err, err ? undefined : back(out)));
+        }) as never),
+      ];
+    });
+
+    afterEach(() => spies.forEach((s) => s.mockRestore()));
+
+    it('accepts a folder on a share an allowed folder itself names, answering it on the share', async () => {
+      expect(await allowedFolder([onShare('allowed')], onShare('allowed', 'sub'))).toBe(onShare('allowed', 'sub'));
+      expect(await allowedFolder([onShare('allowed')], onShare('allowed'))).toBe(onShare('allowed'));
+      expect(await allowedFolder([onShare('allowed')], `${onShare('allowed', 'sub', 'deeper')}\\..`)).toBe(onShare('allowed', 'sub'));
+      expect(await allowedFolder(['C:\\nowhere-ironbooks-test', onShare('allowed')], onShare('allowed', 'sub', 'deeper'))).toBe(onShare('allowed', 'sub', 'deeper'));
+      // The server and share are compared the way Windows compares names; forward slashes are the same path.
+      expect(await allowedFolder([onShare('allowed').toUpperCase()], onShare('allowed', 'sub'))).not.toBeNull();
+      expect(await allowedFolder([onShare('allowed')], onShare('allowed', 'sub').replace(/\\/g, '/'))).not.toBeNull();
+      expect(touched.length).toBeGreaterThan(0);
+      expect(touched.filter((p) => p.toUpperCase().startsWith(OTHER.toUpperCase()))).toEqual([]);
+    });
+
+    it('still never beside or above the allowed folder on the share, never the share itself, never another share', async () => {
+      expect(await allowedFolder([onShare('allowed')], onShare('outside'))).toBeNull();
+      expect(await allowedFolder([onShare('allowed')], onShare('allowed-evil'))).toBeNull();
+      expect(await allowedFolder([onShare('allowed')], `${onShare('allowed')}\\..\\allowed-evil`)).toBeNull();
+      expect(await allowedFolder([onShare('allowed')], onShare('allowed', 'missing'))).toBeNull();
+      // The whole share is never an agent's folder.
+      expect(await allowedFolder([SHARE], onShare('allowed'))).toBeNull();
+      expect(await allowedFolder([`${SHARE}\\`], onShare('allowed', 'sub'))).toBeNull();
+      // A share entry allows nothing off the share, a local entry nothing on it.
+      expect(await allowedFolder([onShare('allowed')], sub)).toBeNull();
+      expect(await allowedFolder([allowed], onShare('allowed', 'sub'))).toBeNull();
+      // Another share on the same server is never looked at, whatever is allowed on this one.
+      touched = [];
+      expect(await allowedFolder([onShare('allowed')], `${OTHER}\\allowed\\sub`)).toBeNull();
+      expect(await allowedFolder([onShare('allowed'), allowed], `${OTHER}\\allowed`)).toBeNull();
+      expect(touched).toEqual([]);
+    });
+
+    it('a local entry never makes the share looked at', async () => {
+      expect(await allowedFolder([allowed, sub], onShare('allowed', 'sub'))).toBeNull();
+      expect(touched).toEqual([]);
+    });
+
+    it('a share on this very computer is refused even when it answers, and never looked at', async () => {
+      const here = (...parts: string[]) => [HERE, ...parts].join('\\');
+      // The same folders the simulated share just allowed, reached through this computer's own share.
+      expect(await allowedFolder([here('allowed')], here('allowed', 'sub'))).toBeNull();
+      expect(await allowedFolder([here('allowed'), onShare('allowed')], here('allowed', 'sub'))).toBeNull();
+      expect(await allowedFolder([here('allowed')], onShare('allowed', 'sub'))).toBeNull();
+      expect(touched).toEqual([]);
+      // The other share still works beside it, and is the only one looked at.
+      expect(await allowedFolder([here('allowed'), onShare('allowed')], onShare('allowed', 'sub'))).toBe(onShare('allowed', 'sub'));
+      expect(touched.filter((p) => p.toUpperCase().startsWith(HERE.toUpperCase()))).toEqual([]);
+    });
+  });
+
   it.runIf(process.platform === 'win32')('refuses shares and device paths (before looking at them), and odd Windows paths', async () => {
-    expect(await allowedFolder([allowed], '\\\\ironbooks-test.invalid\\share\\folder')).toBeNull();
-    expect(await allowedFolder([allowed], '//ironbooks-test.invalid/share/folder')).toBeNull();
-    expect(await allowedFolder(['\\\\ironbooks-test.invalid\\other'], '\\\\ironbooks-test.invalid\\share\\folder')).toBeNull();
-    expect(await allowedFolder([allowed], `\\\\?\\${sub}`)).toBeNull();
-    expect(await allowedFolder([allowed], `\\\\.\\${sub}`)).toBeNull();
-    expect(await allowedFolder([`\\\\?\\${allowed}`], sub)).toBeNull();
-    expect(await allowedFolder([allowed], `\\??\\${sub}`)).toBeNull();
+    const disk = watchDisk();
+    try {
+      expect(await allowedFolder([allowed], '\\\\ironbooks-test.invalid\\share\\folder')).toBeNull();
+      expect(await allowedFolder([allowed], '//ironbooks-test.invalid/share/folder')).toBeNull();
+      expect(await allowedFolder(['\\\\ironbooks-test.invalid\\other'], '\\\\ironbooks-test.invalid\\share\\folder')).toBeNull();
+      // A server named with a Kelvin sign is another server than the one allowed.
+      expect(await allowedFolder([`\\\\ironbooks-test.invalid\\share\\folder`], `\\\\ironbooKs-test.invalid\\share\\folder`.replace('K', KELVIN))).toBeNull();
+      expect(await allowedFolder([allowed], `\\\\?\\${sub}`)).toBeNull();
+      expect(await allowedFolder([allowed], `\\\\.\\${sub}`)).toBeNull();
+      expect(await allowedFolder([`\\\\?\\${allowed}`], sub)).toBeNull();
+      expect(await allowedFolder([allowed], `\\??\\${sub}`)).toBeNull();
+      // Each is refused by its words: nothing at all was looked at, the local allowed folder included.
+      expect(disk.paths(() => true)).toEqual([]);
+    } finally {
+      disk.restore();
+    }
     // A path without a drive, or relative to a drive's current folder.
     expect(await allowedFolder([allowed], sub.slice(2))).toBeNull();
     expect(await allowedFolder([allowed], `${sub.slice(0, 2)}${sub.slice(3)}`)).toBeNull();
@@ -758,26 +1520,60 @@ describe('allowedFolder', () => {
     expect(await allowedFolder([allowed], `${sub}:stream`)).toBeNull();
   });
 
-  it.runIf(process.platform === 'win32')('accepts a folder on a share that an allowed folder itself names, and only below it', async (ctx) => {
-    // This computer's own drive as a share (\\localhost\c$), where the system offers one.
-    const onShare = (p: string) => `\\\\localhost\\${p.slice(0, 1).toLowerCase()}$${p.slice(2)}`;
-    let reachable = false;
+  it.runIf(process.platform === 'win32')('a share on this very computer is never an allowed folder nor one asked for, and is never looked at', async () => {
+    // This computer's own drive as a share: the app's own folders are there under another name.
+    const drive = (p: string) => `${p.slice(0, 1).toLowerCase()}$${p.slice(2)}`;
+    const servers = ['localhost', '127.0.0.1', '127.1', '[::1]', '0--1.ipv6-literal.net', os.hostname()];
+    const disk = watchDisk();
     try {
-      reachable = fs.statSync(onShare(allowed)).isDirectory();
-    } catch {
-      /* no such share here */
+      for (const server of servers) {
+        const onShare = (p: string) => `\\\\${server}\\${drive(p)}`;
+        expect(await allowedFolder([onShare(allowed)], onShare(sub)), server).toBeNull();
+        expect(await allowedFolder([onShare(allowed)], onShare(allowed)), server).toBeNull();
+        expect(await allowedFolder([allowed, onShare(allowed)], onShare(sub)), server).toBeNull();
+      }
+      expect(disk.paths((p) => /^[\\/]{2}/.test(p))).toEqual([]);
+      // Such an entry is left out; the others still count.
+      expect(await allowedFolder([`\\\\localhost\\${drive(allowed)}`, allowed], sub)).toBe(real(sub));
+      expect(await allowedFolder([`\\\\localhost\\${drive(allowed)}`], sub)).toBeNull();
+      expect(disk.paths((p) => /^[\\/]{2}/.test(p))).toEqual([]);
+    } finally {
+      disk.restore();
     }
-    if (!reachable) ctx.skip();
-    const got = await allowedFolder([onShare(allowed)], onShare(sub));
-    expect(got?.toLowerCase()).toBe(onShare(real(sub)).toLowerCase());
-    // The share's name is compared without case.
-    expect(await allowedFolder([onShare(allowed).toUpperCase()], onShare(sub))).not.toBeNull();
-    // Still never beside or above the allowed folder on that share.
-    expect(await allowedFolder([onShare(allowed)], onShare(outside))).toBeNull();
-    expect(await allowedFolder([onShare(allowed)], `${onShare(allowed)}\\..\\allowed-evil`)).toBeNull();
-    // A share entry allows nothing off the share, and a local entry nothing on it.
-    expect(await allowedFolder([onShare(allowed)], sub)).toBeNull();
-    expect(await allowedFolder([allowed], onShare(sub))).toBeNull();
+  });
+
+  it.runIf(process.platform === 'win32')('a folder the disk answers as a share on this very computer (a mapped drive) is refused, before that share is looked at', async () => {
+    const mapped = path.join(base, 'mapped-here');
+    fs.mkdirSync(path.join(mapped, 'inner'), { recursive: true });
+    const mappedReal = real(mapped);
+    const nativeOrig = fs.realpath.native;
+    const onShare: string[] = [];
+    const see = (p: unknown) => {
+      if (/^[\\/]{2}/.test(String(p))) onShare.push(String(p));
+    };
+    const spies = [
+      vi.spyOn(fs.realpath, 'native').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+        const cb = rest[rest.length - 1] as (err: Error | null, out?: string) => void;
+        see(p);
+        nativeOrig(p, (err, out) => {
+          if (err) return cb(err);
+          const inside = out === mappedReal || out.startsWith(mappedReal + path.sep);
+          cb(null, inside ? `\\\\localhost\\z$${out.slice(mappedReal.length)}` : out);
+        });
+      }) as never),
+      ...['lstat', 'stat', 'readlink', 'realpath'].map((m) => passThrough(fsp, m, see)),
+    ];
+    try {
+      expect(await allowedFolder([mapped], path.join(mapped, 'inner'))).toBeNull();
+      expect(await allowedFolder([allowed], path.join(mapped, 'inner'))).toBeNull();
+      // An allowed folder that turns out to be on it allows nothing either.
+      expect(await allowedFolder([mapped, allowed], sub)).toBe(real(sub));
+      expect(onShare).toEqual([]);
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
+    // Without the mapping the same folders are fine (the refusal above is the share's, not the folder's).
+    expect(await allowedFolder([mapped], path.join(mapped, 'inner'))).toBe(real(path.join(mapped, 'inner')));
   });
 
   it('refuses a link inside the allowed folder that leads outside', async (ctx) => {

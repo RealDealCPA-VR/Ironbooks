@@ -1,11 +1,39 @@
 /**
  * zod v3 -> JSON Schema (lib/agent/jsonSchema.ts): one case per zod kind the app's schemas use or
  * could use, plus the rules that hold across them (required fields, descriptions at every level,
- * recursion, never throwing).
+ * recursion, never throwing, patterns never stricter than the route), and the two checks the
+ * module also holds: is a schema valid draft 2020-12, and does a value meet one.
  */
+import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { JSON_SCHEMA_DRAFT, zodAcceptsMissing, zodToJsonSchema } from './jsonSchema';
+import {
+  JSON_SCHEMA_DRAFT,
+  jsonSchemaErrors,
+  jsonSchemaProblems,
+  patternWithFlags,
+  zodAcceptsMissing,
+  zodToJsonSchema,
+  type JsonSchema,
+} from './jsonSchema';
+
+/**
+ * ajv's draft 2020-12 validator, when it can be found (it comes in with electron-builder; it is not
+ * a dependency of the app). The tests that use it are skipped without it.
+ */
+function loadAjv(): (new (opts: Record<string, unknown>) => {
+  compile: (s: unknown) => ((v: unknown) => boolean) & { errors?: unknown };
+  validateSchema: (s: unknown) => boolean;
+  errors?: unknown;
+}) | null {
+  try {
+    const mod = createRequire(import.meta.url)('ajv/dist/2020') as { default?: unknown };
+    return (mod.default ?? mod) as never;
+  } catch {
+    return null;
+  }
+}
+const Ajv2020 = loadAjv();
 
 /** The schema without "$schema", for shorter expectations. */
 const conv = (s: unknown) => zodToJsonSchema(s, { $schema: false });
@@ -81,11 +109,10 @@ describe('zodToJsonSchema: each zod kind', () => {
     expect(conv(z.string().min(1).min(3).max(9).max(4))).toEqual({ type: 'string', minLength: 3, maxLength: 4 });
   });
 
-  it('string: email, url, uuid, datetime, date as formats', () => {
+  it('string: email, url, uuid, date as formats', () => {
     expect(conv(z.string().email())).toEqual({ type: 'string', format: 'email' });
     expect(conv(z.string().url())).toEqual({ type: 'string', format: 'uri' });
     expect(conv(z.string().uuid())).toEqual({ type: 'string', format: 'uuid' });
-    expect(conv(z.string().datetime())).toEqual({ type: 'string', format: 'date-time' });
     expect(conv(z.string().date())).toEqual({ type: 'string', format: 'date' });
     expect(conv(z.string().ip({ version: 'v4' }))).toEqual({ type: 'string', format: 'ipv4' });
     // A second format goes to allOf (one "format" per level).
@@ -105,11 +132,15 @@ describe('zodToJsonSchema: each zod kind', () => {
     expect(new RegExp((conv(z.string().includes('a-b.c')).pattern as string), 'u').test('xa-b.cx')).toBe(true);
   });
 
-  it('string: time and a datetime without an offset are patterns, never stricter than zod', () => {
-    // JSON Schema's "time" and "date-time" need an offset; these zod checks take a value without one.
+  it('string: time and every datetime are zod\'s own patterns, never stricter than zod', () => {
+    // JSON Schema's "time" and "date-time" need seconds and an offset; zod's checks take values
+    // without seconds, without an offset (local) and with "+0200" (offset): a format would refuse them.
     const cases: Array<[z.ZodString, string[], string[]]> = [
       [z.string().time(), ['13:45', '13:45:09', '13:45:09.123'], ['24:00', '13:45Z', '1:45']],
       [z.string().time({ precision: 3 }), ['13:45:09.123'], ['13:45', '13:45:09.12']],
+      [z.string().datetime(), ['2026-05-01T13:45:09Z', '2026-05-01T13:45Z', '2026-05-01T13:45:09.5Z'], ['2026-05-01T13:45:09', '2026-05-01T13:45:09+02:00']],
+      [z.string().datetime({ precision: 0 }), ['2026-05-01T13:45:09Z', '2026-05-01T13:45Z'], ['2026-05-01T13:45:09.5Z']],
+      [z.string().datetime({ offset: true }), ['2026-05-01T13:45:09Z', '2026-05-01T13:45:09+02:00', '2026-05-01T13:45-0530'], ['2026-05-01T13:45:09']],
       [z.string().datetime({ local: true }), ['2026-05-01T13:45:09', '2026-05-01T13:45:09Z', '2026-05-01T13:45'], ['2026-05-01T13:45:09+02:00', '2026-05-01']],
       [z.string().datetime({ local: true, offset: true }), ['2026-05-01T13:45:09', '2026-05-01T13:45:09+02:00'], ['2026-05-01 13:45:09']],
     ];
@@ -121,7 +152,28 @@ describe('zodToJsonSchema: each zod kind', () => {
         expect(s.safeParse(v).success, v).toBe(true);
         expect(re.test(v), `${out.pattern} on ${v}`).toBe(true);
       }
-      for (const v of bad) expect(re.test(v), `${out.pattern} on ${v}`).toBe(false);
+      for (const v of bad) {
+        expect(s.safeParse(v).success, v).toBe(false);
+        expect(re.test(v), `${out.pattern} on ${v}`).toBe(false);
+      }
+    }
+  });
+
+  it('string: the id and duration patterns take every case zod takes', () => {
+    // zod's ulid and nanoid tests are case-insensitive; its duration takes a sign and a fraction.
+    const cases: Array<[z.ZodString, string[]]> = [
+      [z.string().ulid(), ['01ARZ3NDEKTSV4RRFFQ69G5FAV', '01arz3ndektsv4rrffq69g5fav']],
+      [z.string().nanoid(), ['V1StGXR8_Z5jdHi6B-myT', 'v1stgxr8_z5jdhi6b-MYT']],
+      [z.string().cuid(), ['cjld2cjxh0000qzrmn831i7rn', 'Cjld2cjxh0000qzrmn831i7rn']],
+      [z.string().duration(), ['P3Y6M4DT12H30M5S', '-P1.5D', 'PT0.5S']],
+    ];
+    for (const [s, values] of cases) {
+      const out = conv(s);
+      expect(out.format).toBeUndefined();
+      for (const v of values) {
+        expect(s.safeParse(v).success, v).toBe(true);
+        expect(new RegExp(out.pattern as string, 'u').test(v), `${out.pattern} on ${v}`).toBe(true);
+      }
     }
   });
 
@@ -168,6 +220,193 @@ describe('zodToJsonSchema: each zod kind', () => {
     expect(odd.description).toMatch(/pattern that cannot be written here/);
   });
 
+  it('string: a pattern written from flags matches exactly what the regex matches', () => {
+    // Each regex against values it takes and values it does not: the pattern, read the way a
+    // validator reads it (unicode mode), must answer the same for every one.
+    const cases: Array<[RegExp, string[]]> = [
+      [/^[a-f0-9]+$/i, ['abc', 'ABC', 'aF09', 'g', 'G', '']],
+      [/^inv-\d+$/i, ['INV-12', 'inv-1', 'Inv-', 'xinv-1']],
+      [/^[^a-c]$/i, ['a', 'A', 'C', 'd', 'D', '-']],
+      [/^[A-z]$/i, ['[', '_', 'a', 'Z', '{', '@']],
+      [/^[Z-a]$/i, ['Z', 'z', 'a', 'A', '_', 'b', 'Y']],
+      [/^[a-z]+$/iu, ['abc', 'ABC', 'ſ', 'K', 'é']],
+      [/^s$/iu, ['s', 'S', 'ſ', 't']],
+      [/^k$/i, ['k', 'K', 'K']],
+      [/^[a-c-e]$/i, ['b', 'B', '-', 'e', 'E', 'd']],
+      [/^[\x41-\x43]$/i, ['a', 'C', 'd']],
+      [/^\x41b$/i, ['Ab', 'aB', 'ab', 'AB', 'ac']],
+      [/\bfoo\b/i, ['a foo b', 'FOO', 'foobar']],
+      [/^(?:ab|cd)+$/i, ['ABcd', 'abCD', 'ac']],
+      [/^[\d.]+$/i, ['1.2', 'a']],
+      [new RegExp('a.b', 's'), ['a\nb', 'axb', 'ab']],
+      [/^x$/m, ['x', 'a\nx', 'x\nb', 'ax']],
+      [/^a$/im, ['A', 'b\nA', 'ab']],
+      // Written without u: what unicode mode refuses is rewritten (\- outside a class, a lone brace).
+      [new RegExp('^a\\-b{x}c]$'), ['a-b{x}c]', 'a-bc']],
+      [new RegExp('^[_\\-.]+$'), ['_-.', 'a']],
+      [new RegExp('^\\d{2,}$'), ['12', '1']],
+    ];
+    for (const [regex, values] of cases) {
+      const p = patternWithFlags(regex);
+      expect(p, String(regex)).not.toBeNull();
+      const re = new RegExp(p!, 'u');
+      for (const v of values) expect(re.test(v), `${p} on ${JSON.stringify(v)} (${regex})`).toBe(regex.test(v));
+    }
+    // s and k under iu take the two letters outside ASCII that fold to them, written out.
+    expect(patternWithFlags(/^s$/iu)).toBe('^[sS\\u017f]$');
+    expect(patternWithFlags(/^[a-z]$/iu)).toBe('^[a-zA-Z\\u017f\\u212a]$');
+  });
+
+  it('string: a flag that cannot be written exactly leaves the pattern out, and the description says so', () => {
+    // A letter outside ASCII under i, a back-reference under i, \w, \b and \p{…} under iu, a
+    // \u{…} without u (it means "uuu" there), an unfinished class.
+    const unwritable = [
+      new RegExp('^café$', 'i'),
+      new RegExp('^(a)\\1$', 'i'),
+      new RegExp('^\\w+$', 'iu'),
+      new RegExp('\\bx', 'iu'),
+      new RegExp('^\\p{Lu}$', 'iu'),
+      new RegExp('^[\\u00c0-\\u00ff]$', 'i'),
+      new RegExp('^\\u{3}$'),
+    ];
+    for (const regex of unwritable) {
+      expect(patternWithFlags(regex), String(regex)).toBeNull();
+      const out = conv(z.string().max(9).regex(regex));
+      expect(out.pattern, String(regex)).toBeUndefined();
+      expect(out.maxLength).toBe(9);
+      expect(out.description).toBe('This text must also match a pattern that cannot be written here. The app checks it when the operation runs.');
+    }
+    // The same in a field with its own words: the note comes after them, and stays through wrappers.
+    const field = z.string().regex(new RegExp('^café$', 'i')).describe('Name on the card');
+    expect(conv(field).description).toBe('Name on the card. This text must also match a pattern that cannot be written here. The app checks it when the operation runs.');
+    const wrapped = conv(z.object({ name: field.optional().describe('Name on the card, if any.') }));
+    expect((wrapped.properties as Record<string, JsonSchema>).name.description).toBe(
+      'Name on the card, if any. This text must also match a pattern that cannot be written here. The app checks it when the operation runs.',
+    );
+    // Without the i flag the same letters are written as they are; a non-ASCII range without case is fine under i.
+    expect(patternWithFlags(new RegExp('^café$'))).toBe('^café$');
+    expect(patternWithFlags(new RegExp('^[\\u2000-\\u206f]$', 'i'))).toBe('^[\\u2000-\\u206f]$');
+  });
+
+  /** An emoji: one character to a validator, two UTF-16 units to a regex without u. */
+  const EMOJI = '\u{1F600}';
+
+  it('string: without u, a pattern that could refuse an emoji the route takes is left out', () => {
+    // Each regex (no u) takes the text, and the same source read in unicode mode, as a validator
+    // reads a pattern, refuses it: written as it is, the pattern would be stricter than the route.
+    const stricter: Array<[RegExp, string]> = [
+      [/^.{2}$/, EMOJI],
+      [/^..$/, EMOJI],
+      [/^.+.$/, EMOJI],
+      [/^[^a]{2,}$/, EMOJI],
+      [/^\S{3}$/, `a${EMOJI}`],
+      [/^(?:x?.){2}$/, EMOJI],
+      [/^[\x00-￿]+$/, EMOJI],
+      // A lookaround or \B where a match can start or end inside an emoji.
+      [new RegExp('(?<!a)[^a]'), `a${EMOJI}`],
+      [/\B\S$/, `x${EMOJI}`],
+    ];
+    for (const [regex, text] of stricter) {
+      expect(regex.test(text), `${regex} takes it`).toBe(true);
+      expect(new RegExp(regex.source, 'u').test(text), `${regex} read in unicode mode`).toBe(false);
+      expect(patternWithFlags(regex), String(regex)).toBeNull();
+      const out = conv(z.string().regex(regex));
+      expect(out.pattern, String(regex)).toBeUndefined();
+      expect(out.description).toMatch(/pattern that cannot be written here/);
+    }
+    // Left out to be safe, where the rule cannot be sure: the wide atom in a lookaround, a
+    // back-reference beside it, two quantifiers around it with a limit of 2 or more.
+    for (const regex of [new RegExp('^(?=.)a$'), /^(.)a\1$/, /^(?:.{0,3})+$/, /^[^@]+@[^@]+$/]) {
+      expect(patternWithFlags(regex), String(regex)).toBeNull();
+    }
+    // With u the source already counts as the validator does: written as it is.
+    expect(patternWithFlags(new RegExp('^.{2}$', 'u'))).toBe('^.{2}$');
+  });
+
+  it('string: without u, one wide atom that cannot split an emoji is still written, and takes all the route takes', () => {
+    const written: Array<[RegExp, string]> = [
+      // The app's own: a login without spaces.
+      [/^\S+$/, '^\\S+$'],
+      [/^.{0,3}$/, '^.{0,3}$'],
+      [/^a.?b$/, '^a.?b$'],
+      [/^(?:x?.)+$/, '^(?:x?.)+$'],
+      [/^[^@]+@example\.com$/, '^[^@]+@example\\.com$'],
+      [/x.y/, 'x.y'],
+      [new RegExp('^inv-\\d+(?!x)\\D$', 'i'), '^[iI][nN][vV]-\\d+(?![xX])\\D$'],
+    ];
+    const texts = ['', 'a', 'ab', 'axb', 'x y', EMOJI, EMOJI + EMOJI, `a${EMOJI}`, `a${EMOJI}b`, `x${EMOJI}y`, `${EMOJI}@example.com`, `inv-1${EMOJI}`, 'INV-12!'];
+    for (const [regex, pattern] of written) {
+      expect(patternWithFlags(regex), String(regex)).toBe(pattern);
+      const re = new RegExp(pattern, 'u');
+      for (const t of texts) if (regex.test(t)) expect(re.test(t), `${pattern} on ${JSON.stringify(t)} (${regex})`).toBe(true);
+    }
+  });
+
+  it('string: a pattern written from a regex without u never refuses text the regex takes (fuzz)', () => {
+    // Small random regexes from the parts that differ between UTF-16 units and characters (wide
+    // atoms, quantifiers, lookarounds, \B, anchors, |), against every short text of letters,
+    // spaces, digits and an emoji. A written pattern must take every text its regex takes.
+    let seed = 20261121;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    const pick = <T,>(list: readonly T[]): T => list[rand(list.length)];
+    const ATOMS = ['.', 'a', 'x', '[^a]', '\\S', '\\D', '\\W', '[ax]', '\\d', '[\\s\\S]', '[a\\S]'];
+    const QUANTIFIERS = ['', '', '', '?', '*', '+', '{2}', '{0,2}', '{1,2}', '{2,}', '{1,}', '*?', '{0,1}'];
+    const AROUND = ['(?!a)', '(?=x)', '(?<!a)', '(?<=a)', '\\b', '\\B'];
+    const sequence = (depth: number): string => {
+      let s = '';
+      for (let i = 0, n = 1 + rand(3); i < n; i++) {
+        const r = rand(10);
+        if (r < 6 || depth > 1) s += pick(ATOMS) + pick(QUANTIFIERS);
+        else if (r < 8) s += `(?:${sequence(depth + 1)})${pick(QUANTIFIERS)}`;
+        else s += pick(AROUND);
+      }
+      return s;
+    };
+    const letters = ['a', 'x', ' ', '1', EMOJI];
+    const texts = [''];
+    for (let len = 1; len <= 3; len++) {
+      for (const t of texts.filter((x) => [...x].length === len - 1)) for (const l of letters) texts.push(t + l);
+    }
+    const wrong: string[] = [];
+    let checked = 0;
+    for (let i = 0; i < 2500; i++) {
+      let src = sequence(0);
+      if (rand(3) === 0) src = `${src}|${sequence(0)}`;
+      if (rand(2) === 0) src = `^${src}`;
+      if (rand(2) === 0) src = `${src}$`;
+      const flags = pick(['', '', 'i', 's', 'm']);
+      let regex: RegExp;
+      try {
+        regex = new RegExp(src, flags);
+      } catch {
+        continue;
+      }
+      const p = patternWithFlags(regex);
+      if (p === null) continue;
+      checked++;
+      const re = new RegExp(p, 'u');
+      for (const t of texts) if (regex.test(t) && !re.test(t)) wrong.push(`/${src}/${flags} as ${p} refuses ${JSON.stringify(t)}`);
+    }
+    expect(wrong.slice(0, 10)).toEqual([]);
+    // Not empty: most of the random regexes are still written.
+    expect(checked).toBeGreaterThan(500);
+  });
+
+  it('string: after toLowerCase or toUpperCase a pattern takes either case (zod tests the changed text)', () => {
+    const lower = z.string().toLowerCase().regex(/^[a-z]+$/);
+    const p = conv(lower).pattern as string;
+    expect(lower.safeParse('ABC').success).toBe(true);
+    expect(new RegExp(p, 'u').test('ABC')).toBe(true);
+    const starts = z.string().toUpperCase().startsWith('INV-');
+    expect(starts.safeParse('inv-1').success).toBe(true);
+    expect(new RegExp(conv(starts).pattern as string, 'u').test('inv-1')).toBe(true);
+    // Before the change, the case still counts.
+    expect(conv(z.string().regex(/^[a-z]+$/).toLowerCase()).pattern).toBe('^[a-z]+$');
+  });
+
   it('string: transforms that do not limit the value add nothing', () => {
     expect(conv(z.string().trim().toLowerCase())).toEqual({ type: 'string' });
   });
@@ -179,6 +418,10 @@ describe('zodToJsonSchema: each zod kind', () => {
     expect(conv(z.number().positive())).toEqual({ type: 'number', exclusiveMinimum: 0 });
     expect(conv(z.number().lt(10))).toEqual({ type: 'number', exclusiveMaximum: 10 });
     expect(conv(z.number().int().nonnegative().multipleOf(5))).toEqual({ type: 'integer', minimum: 0, multipleOf: 5 });
+    // A fractional step in words: 19.99 / 0.01 is not a whole number in binary, so a validator
+    // would refuse an amount zod takes.
+    expect(z.number().multipleOf(0.01).safeParse(19.99).success).toBe(true);
+    expect(conv(z.number().multipleOf(0.01).min(0))).toEqual({ type: 'number', minimum: 0, description: 'This number must be a multiple of 0.01.' });
     expect(conv(z.coerce.number().int().min(1))).toEqual({ type: 'integer', minimum: 1 });
   });
 
@@ -375,9 +618,17 @@ describe('zodToJsonSchema: each zod kind', () => {
     });
   });
 
-  it('date: text in date-time form', () => {
+  it('date: text in date-time form; a coerced date also takes a date alone, so no format', () => {
     expect(conv(z.date())).toEqual({ type: 'string', format: 'date-time' });
-    expect(conv(z.coerce.date())).toEqual({ type: 'string', format: 'date-time' });
+    expect(z.coerce.date().safeParse('2026-05-01').success).toBe(true);
+    expect(conv(z.coerce.date())).toEqual({
+      type: 'string',
+      description: 'A date such as 2026-05-01, or a date and time such as 2026-05-01T13:45:00Z.',
+    });
+    expect(conv(z.coerce.date().describe('When it was paid'))).toEqual({
+      type: 'string',
+      description: 'When it was paid. A date such as 2026-05-01, or a date and time such as 2026-05-01T13:45:00Z.',
+    });
   });
 
   it('any and unknown: anything', () => {
@@ -498,5 +749,185 @@ describe('zodToJsonSchema: descriptions', () => {
     expect(conv(z.number().default(3).describe('How many'))).toEqual({ type: 'number', default: 3, description: 'How many' });
     expect(conv(z.lazy(() => z.boolean()).describe('Lazy flag'))).toEqual({ type: 'boolean', description: 'Lazy flag' });
     expect(conv(z.string().describe('inner').optional().describe('outer'))).toEqual({ type: 'string', description: 'outer' });
+  });
+
+  it('leaves no marker of its own behind: the output is plain JSON data', () => {
+    const out = zodToJsonSchema(z.object({ a: z.string().regex(new RegExp('é', 'i')), b: z.coerce.date() }));
+    const symbols = (v: unknown): number =>
+      v && typeof v === 'object' ? Object.getOwnPropertySymbols(v).length + Object.values(v).reduce((n: number, c) => n + symbols(c), 0) : 0;
+    expect(symbols(out)).toBe(0);
+    expect(JSON.parse(JSON.stringify(out))).toEqual(out);
+  });
+});
+
+/** One schema with every kind the converter writes, and values zod takes for it. */
+const EVERYTHING = (() => {
+  type Tree = { name: string; kids?: Tree[] };
+  const tree: z.ZodType<Tree> = z.lazy(() => z.object({ name: z.string(), kids: z.array(tree).optional() }));
+  enum Level {
+    Low,
+    High,
+  }
+  return z
+    .object({
+      id: z.string().uuid(),
+      code: z.string().regex(/^[a-z]{2}-\d+$/i).max(20),
+      when: z.string().datetime({ offset: true }).optional(),
+      at: z.string().time().optional(),
+      day: z.string().date().optional(),
+      mail: z.string().email().nullish(),
+      site: z.string().url().optional(),
+      amount: z.number().positive().multipleOf(0.01),
+      qty: z.number().int().min(1).max(500).default(1),
+      big: z.bigint().optional(),
+      kind: z.enum(['a', 'b']),
+      level: z.nativeEnum(Level).optional(),
+      on: z.literal(true).optional(),
+      pair: z.tuple([z.string(), z.number()]).optional(),
+      none: z.tuple([]).optional(),
+      tags: z.set(z.string()).max(3).optional(),
+      map: z.record(z.enum(['x', 'y']), z.number()).optional(),
+      lines: z.array(z.object({ memo: z.string().max(5).optional(), n: z.number() }).strict()).min(1),
+      pick: z.discriminatedUnion('t', [z.object({ t: z.literal('one') }), z.object({ t: z.literal('two'), v: z.number() })]).optional(),
+      both: z.intersection(z.object({ p: z.string() }), z.object({ q: z.number().optional() })).optional(),
+      either: z.union([z.string().min(1), z.number()]).nullable().optional(),
+      tree: tree.optional(),
+      anything: z.unknown(),
+      ip: z.string().ip().optional(),
+    })
+    .passthrough();
+})();
+
+const GOOD_VALUES: unknown[] = [
+  { id: '0b6c2f8e-5f7a-4b1e-9c3d-2a1b4c5d6e7f', code: 'AB-12', amount: 12.5, kind: 'a', lines: [{ n: 1 }] },
+  {
+    id: '0B6C2F8E-5F7A-4B1E-9C3D-2A1B4C5D6E7F',
+    code: 'ab-1',
+    when: '2026-05-01T13:45+02:00',
+    at: '13:45',
+    day: '2026-02-28',
+    mail: null,
+    site: 'https://example.com/x',
+    amount: 0.01,
+    qty: 500,
+    kind: 'b',
+    level: 1,
+    on: true,
+    pair: ['x', 2],
+    none: [],
+    map: { x: 1 },
+    lines: [{ memo: 'hi', n: 2 }],
+    pick: { t: 'two', v: 3 },
+    both: { p: 'p', q: 1 },
+    either: 'z',
+    tree: { name: 'root', kids: [{ name: 'leaf' }] },
+    anything: [1, 'two'],
+    ip: '10.0.0.1',
+    extra: 'kept',
+  },
+];
+
+const BAD_VALUES: unknown[] = [
+  { id: 'x', code: 'AB-12', amount: 1, kind: 'a', lines: [{ n: 1 }] },
+  { id: '0b6c2f8e-5f7a-4b1e-9c3d-2a1b4c5d6e7f', code: 'A-12', amount: 1, kind: 'a', lines: [{ n: 1 }] },
+  { id: '0b6c2f8e-5f7a-4b1e-9c3d-2a1b4c5d6e7f', code: 'AB-12', amount: -1, kind: 'a', lines: [{ n: 1 }] },
+  { id: '0b6c2f8e-5f7a-4b1e-9c3d-2a1b4c5d6e7f', code: 'AB-12', amount: 1, kind: 'c', lines: [{ n: 1 }] },
+  { id: '0b6c2f8e-5f7a-4b1e-9c3d-2a1b4c5d6e7f', code: 'AB-12', amount: 1, kind: 'a', lines: [] },
+  { id: '0b6c2f8e-5f7a-4b1e-9c3d-2a1b4c5d6e7f', code: 'AB-12', amount: 1, kind: 'a', lines: [{ n: 1, other: 1 }] },
+  { id: '0b6c2f8e-5f7a-4b1e-9c3d-2a1b4c5d6e7f', code: 'AB-12', amount: 1, kind: 'a', lines: [{ n: 1 }], pick: { t: 'two' } },
+  { id: '0b6c2f8e-5f7a-4b1e-9c3d-2a1b4c5d6e7f', code: 'AB-12', amount: 1, kind: 'a', lines: [{ n: 1 }], tree: { kids: [] } },
+  { code: 'AB-12', amount: 1, kind: 'a', lines: [{ n: 1 }] },
+];
+
+describe('jsonSchemaProblems: a valid draft 2020-12 schema', () => {
+  it('finds nothing wrong with what the converter writes, for every kind at once', () => {
+    const out = zodToJsonSchema(EVERYTHING);
+    expect(jsonSchemaProblems(out)).toEqual([]);
+    // Each kind on its own too, including the odd ones (a tuple with no items, a never).
+    for (const s of [z.tuple([]), z.never(), z.undefined(), z.nan(), z.string().regex(new RegExp('é', 'i')), z.coerce.date()]) {
+      expect(jsonSchemaProblems(zodToJsonSchema(s)), String(s._def.typeName)).toEqual([]);
+    }
+  });
+
+  it('names each mistake by where it is', () => {
+    const cases: Array<[unknown, RegExp]> = [
+      [{ type: 'text' }, /^\$\.type: must be one of/],
+      [{ type: ['string', 'string'] }, /^\$\.type:/],
+      [{ minLength: -1 }, /^\$\.minLength: must be a whole number/],
+      [{ maxItems: 1.5 }, /^\$\.maxItems:/],
+      [{ pattern: '[a' }, /^\$\.pattern: "\[a" is not a valid regular expression/],
+      [{ pattern: '\\-' }, /^\$\.pattern:/], // fine without u, refused in unicode mode
+      [{ $ref: '#/$defs/Nope' }, /^\$\.\$ref: "#\/\$defs\/Nope" does not lead/],
+      [{ anyOf: [] }, /^\$\.anyOf: must be a list of at least one schema/],
+      [{ prefixItems: [] }, /^\$\.prefixItems:/],
+      [{ enum: [] }, /^\$\.enum: an empty list/],
+      [{ enum: ['a', 'a'] }, /^\$\.enum: lists a value twice/],
+      [{ required: ['a', 'a'] }, /^\$\.required:/],
+      [{ minLength: 5, maxLength: 2 }, /^\$: minLength is above maxLength/],
+      [{ multipleOf: 0 }, /^\$\.multipleOf: must be a number above 0/],
+      [{ formatt: 'date' }, /^\$\.formatt: not a keyword of JSON Schema draft 2020-12/],
+      [{ toString: 'x' }, /^\$\.toString: not a keyword/],
+      [{ properties: { a: 5 } }, /^\$\.properties\.a: a schema must be an object/],
+      [{ properties: { a: { $schema: JSON_SCHEMA_DRAFT } } }, /^\$\.properties\.a\.\$schema: \$schema belongs on the root only/],
+      [{ items: { type: 'string', default: Infinity } }, /not JSON/],
+      [{ default: undefined }, /not JSON/],
+    ];
+    for (const [schema, problem] of cases) {
+      const found = jsonSchemaProblems(schema);
+      expect(found.length, JSON.stringify(schema)).toBeGreaterThan(0);
+      expect(found.some((p) => problem.test(p)), `${JSON.stringify(schema)}: ${found.join(' | ')}`).toBe(true);
+    }
+    // A boolean schema and the empty schema are schemas.
+    expect(jsonSchemaProblems(true)).toEqual([]);
+    expect(jsonSchemaProblems({})).toEqual([]);
+    expect(jsonSchemaProblems({ $defs: { A: { type: 'string' } }, $ref: '#/$defs/A' })).toEqual([]);
+  });
+
+  it.skipIf(!Ajv2020)('agrees with ajv (draft 2020-12, strict): the schema compiles and checks values as zod does', () => {
+    // ajv-formats is not installed: the formats the schema uses, roughly, so ajv checks them too.
+    const formats = {
+      uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      date: /^\d{4}-\d{2}-\d{2}$/,
+      email: /^[^\s@]+@[^\s@]+$/,
+      uri: /^[a-z][a-z0-9+.-]*:/i,
+      ipv4: /^\d{1,3}(\.\d{1,3}){3}$/,
+      ipv6: /:/,
+      int64: true,
+    };
+    const ajv = new Ajv2020!({ strict: true, formats, allowUnionTypes: true, logger: false });
+    const out = zodToJsonSchema(EVERYTHING);
+    expect(ajv.validateSchema(out), JSON.stringify(ajv.errors)).toBe(true);
+    const check = ajv.compile(out);
+    for (const v of GOOD_VALUES) {
+      expect(EVERYTHING.safeParse(v).success, JSON.stringify(v)).toBe(true);
+      expect(check(v), `${JSON.stringify(v)}: ${JSON.stringify(check.errors)}`).toBe(true);
+    }
+    for (const v of BAD_VALUES) {
+      expect(EVERYTHING.safeParse(v).success, JSON.stringify(v)).toBe(false);
+      expect(check(v), JSON.stringify(v)).toBe(false);
+    }
+  });
+});
+
+describe('jsonSchemaErrors: does a value meet a schema', () => {
+  const schema = zodToJsonSchema(EVERYTHING);
+
+  it('takes what zod takes, and refuses what zod refuses (for these values)', () => {
+    for (const v of GOOD_VALUES) expect(jsonSchemaErrors(schema, v), JSON.stringify(v)).toEqual([]);
+    for (const v of BAD_VALUES) expect(jsonSchemaErrors(schema, v).length, JSON.stringify(v)).toBeGreaterThan(0);
+  });
+
+  it('says what is wrong and where', () => {
+    expect(jsonSchemaErrors(schema, BAD_VALUES[0])).toEqual(['$.id: must be in uuid form']);
+    expect(jsonSchemaErrors(schema, BAD_VALUES[8])).toEqual(['$: must have id']);
+    expect(jsonSchemaErrors(schema, BAD_VALUES[5])).toEqual(['$.lines[0]: must not have other']);
+    expect(jsonSchemaErrors({ type: 'object' }, undefined)).toEqual(['$: must be object, and is missing']);
+    expect(jsonSchemaErrors({ type: 'integer' }, 1.5)).toEqual(['$: must be integer']);
+    expect(jsonSchemaErrors({ type: 'number', minimum: 0 }, 3)).toEqual([]);
+    expect(jsonSchemaErrors({ type: 'string', format: 'date' }, '2026-02-30')).toEqual(['$: must be in date form']);
+    expect(jsonSchemaErrors({ type: 'string', format: 'date' }, '2026-02-30', { formats: false })).toEqual([]);
+    expect(jsonSchemaErrors({ $ref: '#/$defs/Gone' }, 1)).toEqual(['$: the schema refers to "#/$defs/Gone", which is not in it']);
+    expect(jsonSchemaErrors({ oneOf: [{ type: 'number' }, { type: 'integer' }] }, 2)).toEqual(['$: must match exactly one of 2 options; it matches 2']);
+    expect(jsonSchemaErrors(false, 1)).toEqual(['$: no value is allowed here']);
   });
 });

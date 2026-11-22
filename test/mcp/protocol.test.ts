@@ -3,7 +3,7 @@
  */
 import { PassThrough } from 'node:stream';
 import { describe, expect, it } from 'vitest';
-import { PROTOCOL_VERSIONS, ToolContent, ToolError, argumentProblem, createServer, serve } from '../../mcp/protocol.mjs';
+import { MAX_MESSAGE_CHARS, PROTOCOL_VERSIONS, ToolContent, ToolError, argumentProblem, createServer, idFromHead, serve } from '../../mcp/protocol.mjs';
 import { IronbooksError } from '../../mcp/client.mjs';
 import { SERVER_INFO } from '../../mcp/ironbooks-mcp.mjs';
 import { INSTRUCTIONS, TOOLS } from '../../mcp/tools.mjs';
@@ -182,6 +182,130 @@ describe('over a stream', () => {
     expect(out).toHaveLength(1);
     expect(out[0].jsonrpc).toBe('2.0');
   });
+
+  it('a long line (a large upload) arriving in many small chunks is read once, whole, and quickly', async () => {
+    const seen: Msg[] = [];
+    const tools = [{ name: 'take', description: 'Takes text.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } }, handler: async (a: Msg) => (seen.push(a), { length: a.text.length }) }];
+    const s = createServer({ tools, client: {}, serverInfo: { name: 't', version: '0' } });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let out = '';
+    output.on('data', (d) => (out += d.toString('utf8')));
+    const done = serve(s, { input, output });
+    // 24 million characters in chunks of 16 KB: searched for line ends only once each, never again.
+    const text = 'QUJD'.repeat(6_000_000);
+    const line = `${JSON.stringify(call(7, 'take', { text }))}\n${JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'ping' })}\n`;
+    const t = Date.now();
+    for (let i = 0; i < line.length; i += 16_384) input.write(line.slice(i, i + 16_384));
+    input.end();
+    await done;
+    expect(Date.now() - t).toBeLessThan(10_000);
+    const answers = out.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(answers.map((m) => m.id).sort()).toEqual([7, 8]);
+    expect(JSON.parse(answers.find((m) => m.id === 7).result.content[0].text)).toEqual({ length: text.length });
+    expect(seen).toHaveLength(1);
+  }, 30_000);
+
+  it('a message longer than any tool takes is not read into memory: it gets an error, and the next line still works', async () => {
+    const { s, seen } = server();
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let out = '';
+    output.on('data', (d) => (out += d.toString('utf8')));
+    const done = serve(s, { input, output }, { maxMessageChars: 1_000 });
+    const big = JSON.stringify(call(1, 'echo', { text: 'y'.repeat(2_000) }));
+    for (let i = 0; i < big.length; i += 300) input.write(big.slice(i, i + 300));
+    input.write(`\n${JSON.stringify(call(2, 'echo', { text: 'hi' }))}\n`);
+    // Too long again at the very end, with no line end after it.
+    input.write('z'.repeat(1_500));
+    input.end();
+    await done;
+    const answers = out.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const tooLarge = (id: unknown) => ({ jsonrpc: '2.0', id, error: { code: -32600, message: 'Message too large: at most 1000 characters.' } });
+    // The first refusal comes before anything else; the tool's answer and the last refusal in either order.
+    expect(answers).toHaveLength(3);
+    // Answered under the call's own id, read from the start of the line, so the client's call gets
+    // its error instead of waiting for its own time limit.
+    expect(answers[0]).toEqual(tooLarge(1));
+    // A line whose start names no id: answered with id null.
+    expect(answers.filter((m) => m.id === null)).toEqual([tooLarge(null)]);
+    expect(answers.find((m) => m.id === 2)).toEqual({ jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: JSON.stringify({ said: 'hi', by: 'client' }) }], isError: false } });
+    expect(seen).toEqual([{ text: 'hi' }]);
+    // The shipped limit is well past the largest upload (test/mcp/files.test.ts holds the two together).
+    expect(MAX_MESSAGE_CHARS).toBeGreaterThan(80_000_000);
+  });
+
+  it('a message too long is answered under its id, even a string id, and only a top-level one', async () => {
+    const { s } = server();
+    const input = new PassThrough();
+    const output = new PassThrough();
+    let out = '';
+    output.on('data', (d) => (out += d.toString('utf8')));
+    const done = serve(s, { input, output }, { maxMessageChars: 1_000 });
+    // The id after "method", with spaces, in one chunk past the limit; a string id; an id only inside params.
+    input.write(`  { "jsonrpc" : "2.0", "method": "tools/call", "id" : 41, "params": { "text": "${'y'.repeat(2_000)}" } }\n`);
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'call-"7"', method: 'tools/call', params: { text: 'y'.repeat(2_000) } })}\n`);
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', params: { id: 99, text: 'y'.repeat(2_000) }, id: 5 })}\n`);
+    input.end();
+    await done;
+    const ids = out.split('\n').filter(Boolean).map((l) => JSON.parse(l)).map((m) => (expect(m.error.code).toBe(-32600), m.id));
+    // The last one's own id comes after the long params: not in the start of the line, so null, never params' 99.
+    expect(ids).toEqual([41, 'call-"7"', null]);
+  });
+
+  it('reads the id from the start of a line as JSON does, or gives null', () => {
+    expect(idFromHead('{"jsonrpc":"2.0","id":3,"method":"x","params":{"a":"')).toBe(3);
+    expect(idFromHead('{"jsonrpc":"2.0","id":"a\\"b","method":"x"')).toBe('a"b');
+    expect(idFromHead('{"jsonrpc":"2.0","method":"x","id":-2.5e1,')).toBe(-25);
+    // An "id" in a nested object, an "id" that is a value, or text that looks like a key inside a string.
+    expect(idFromHead('{"params":{"id":7},"jsonrpc":"2.0","method":"x","params2":"')).toBeNull();
+    expect(idFromHead('{"name":"id","method":"x","params":"')).toBeNull();
+    expect(idFromHead('{"note":"\\",\\"id\\":8,","method":"x"')).toBeNull();
+    // Cut off: a number at the very end may be longer, a string not closed.
+    expect(idFromHead('{"jsonrpc":"2.0","id":12')).toBeNull();
+    expect(idFromHead('{"jsonrpc":"2.0","id":"abc')).toBeNull();
+    // Not one message, or an id JSON-RPC does not allow.
+    expect(idFromHead('[{"id":1}]')).toBeNull();
+    expect(idFromHead('{"id":null,"method":"x"')).toBeNull();
+    expect(idFromHead('{"id":{"a":1},"method":"x"')).toBeNull();
+    expect(idFromHead('zz{"id":1,')).toBeNull();
+    expect(idFromHead('')).toBeNull();
+  });
+});
+
+describe('arguments refused before the handler runs', () => {
+  it('are told to the tool that asks to hear of them, and the answer is the same', async () => {
+    const heard: Array<[unknown, string]> = [];
+    const tools = [
+      {
+        name: 'careful',
+        description: 'Logs refusals.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string', maxLength: 5 } }, required: ['path'], additionalProperties: false },
+        refused: (a: unknown, problem: string) => heard.push([a, problem]),
+        handler: async () => 'ran',
+      },
+      {
+        name: 'throws',
+        description: 'Its hook fails.',
+        inputSchema: { type: 'object', properties: { n: { type: 'integer' } }, additionalProperties: false },
+        refused: () => {
+          throw new Error('cannot log');
+        },
+        handler: async () => 'ran',
+      },
+    ];
+    const s = createServer({ tools, client: {}, serverInfo: { name: 't', version: '0' } });
+    const answer = async (name: string, args: Msg) => ((await s.handle(call(1, name, args))) as Msg).result;
+    expect(await answer('careful', { path: 'abcdefgh' })).toEqual({ content: [{ type: 'text', text: '"path" is too long.' }], isError: true });
+    expect(await answer('careful', { path: 5 })).toMatchObject({ isError: true });
+    expect(await answer('careful', { path: 'ok' })).toEqual({ content: [{ type: 'text', text: 'ran' }], isError: false });
+    expect(heard).toEqual([
+      [{ path: 'abcdefgh' }, '"path" is too long.'],
+      [{ path: 5 }, '"path" must be text.'],
+    ]);
+    // A hook that fails changes nothing about the answer.
+    expect(await answer('throws', { n: 'x' })).toEqual({ content: [{ type: 'text', text: '"n" must be a whole number.' }], isError: true });
+  });
 });
 
 describe('maps, alternatives and rich answers', () => {
@@ -315,6 +439,9 @@ describe('resources, prompts and notifications', () => {
 describe('the shipped server', () => {
   /** The generic door and files (mcp/operations-tools.mjs, files-tools.mjs): their own rules below. */
   const GENERIC = new Set([...OPERATION_TOOLS, ...FILE_TOOLS].map((t: Msg) => t.name));
+  /** A named tool whose name starts with one of these changes something (convert_estimate, adjust_inventory …). */
+  const CHANGING_NAME =
+    /^(enter|add|edit|void|deactivate|pay|write|make|transfer|receive|import|categorize|match|unmatch|exclude|start|mark|update|finish|cancel|undo|convert|adjust)_/;
 
   it('names itself and describes its tools for an agent', () => {
     expect(SERVER_INFO.name).toBe('ironbooks');
@@ -338,7 +465,7 @@ describe('the shipped server', () => {
       if (GENERIC.has(t.name)) continue;
       // A named tool whose name says it changes something is marked as one, takes a dry run and a
       // request id; a tool that only looks takes neither. Nothing offers to delete.
-      const changing = /^(enter|add|edit|void|deactivate|pay|write|make|transfer|receive|import|categorize|match|unmatch|exclude|start|mark|update|finish|cancel|undo)_/.test(t.name);
+      const changing = CHANGING_NAME.test(t.name);
       expect(t.changes === true, t.name).toBe(changing);
       expect('dry_run' in t.inputSchema.properties, t.name).toBe(changing);
       expect('request_id' in t.inputSchema.properties, t.name).toBe(changing);
@@ -379,8 +506,12 @@ describe('the shipped server', () => {
     expect(hint('run_operation')).toMatchObject({ readOnlyHint: false, destructiveHint: true });
     expect(hint('wait_for_decision')).toMatchObject({ readOnlyHint: true });
     expect(hint('save_file')).toMatchObject({ readOnlyHint: false, destructiveHint: false });
+    // Every named tool that may change something says so, and only those (the list grows as named
+    // tools are added, so it is held to the rule rather than to a count).
     const named = listed.filter((t) => !GENERIC.has(t.name));
-    expect(named.filter((t) => !t.annotations.readOnlyHint).length).toBe(30);
+    const changes = named.filter((t) => !t.annotations.readOnlyHint).map((t) => t.name);
+    expect(changes).toEqual(named.map((t) => t.name).filter((n) => CHANGING_NAME.test(n)));
+    expect(changes.length).toBeGreaterThanOrEqual(30);
     expect(listed.filter((t) => GENERIC.has(t.name) && !t.annotations.readOnlyHint).map((t) => t.name).sort()).toEqual(
       ['ask_for_permission', 'attach_local_file', 'cancel_request', 'run_operation', 'save_file', 'upload_file'],
     );

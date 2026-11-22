@@ -223,11 +223,14 @@ describe('2.8: developer switches stay out of the installed app', () => {
 
   // The variables only the shell sets. A scratch server sets fewer of them than the company
   // server; one it does not set must arrive unset, not as a value planted in the PC's environment.
+  // The agent ones (electron/agentShell.js, lib/agent/files.ts): where approved desktop requests
+  // go and this launch's key for them, the shell's Documents, and where staged files are kept.
   const SHELL_ONLY = [
     'BKA_FILE_KNOWN_HERE', 'BKA_DEVICE_VAULT', 'BKA_PROXY_SECRET', 'BKA_LAUNCH_PASS', 'BKA_INTERNAL_TOKEN',
     'BKA_SANDBOX_DIR', 'BKA_SANDBOX_REAL_DIR', 'BKA_COMPANY_SEALED', 'BKA_COMPANY_FILE', 'BKA_COMPANY_STATE',
     'BKA_COMPANY_LOCK', 'BKA_COMPANY_LOCK_TOKEN', 'BKA_OFFLINE', 'BKA_SANDBOX', 'BKA_SANDBOX_ROOT',
     'BKA_REAL_COMPANY_FILE', 'BKA_MIGRATIONS_DIR', 'BKA_BACKUP_DIR', 'BKA_BACKUP_INTERVAL_HOURS',
+    'BKA_AGENT_SHELL', 'BKA_AGENT_SHELL_KEY', 'BKA_AGENT_DOCUMENTS', 'BKA_AGENT_FILES_DIR',
   ];
   /** The names a server's env object in main.js sets itself (`NAME:` keys after the inherited part). */
   const setByShell = (sig: string) => {
@@ -255,6 +258,10 @@ describe('2.8: developer switches stay out of the installed app', () => {
       expect(scratch.has(k), `scratch server sets ${k}`).toBe(true);
     }
     expect(scratch.has('BKA_FILE_KNOWN_HERE')).toBe(false); // the gap this closes
+    // No agent works in a scratch server: it says so for each agent name rather than inheriting one.
+    for (const k of ['BKA_AGENT_SHELL', 'BKA_AGENT_SHELL_KEY', 'BKA_AGENT_DOCUMENTS', 'BKA_AGENT_FILES_DIR']) {
+      expect(scratch.has(k), `scratch server sets ${k}`).toBe(true);
+    }
     // The documented overrides main.js does read are not in the list (they would be dropped).
     const readByMain = new Set([...main.matchAll(/process\.env\.(BKA_[A-Z_]+)/g)].map((m) => m[1]));
     expect(readByMain.has('BKA_DATA_DIR')).toBe(true);

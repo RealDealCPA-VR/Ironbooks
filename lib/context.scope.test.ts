@@ -376,24 +376,27 @@ describe('opening a scope', () => {
     expect(inServiceScope()).toBe(false);
   });
 
-  it('needs a path middleware could have stamped: no "." or ".." parts, no empty parts, no backslash', async () => {
+  it('needs a path middleware could have stamped: no "." or ".." parts, no empty parts, no backslash, no encoded slash', async () => {
     const fn = vi.fn(async () => 'ran');
     // The route map skips empty parts and takes ".." for an id; a parsed URL never holds these.
     const dots = ['/api/customers/../users', '/api/./customers', '/api/customers/%2e%2E/users', '/api/customers/.%2e', '/api/customers/%2E'];
     const empty = ['/api//customers', '/api/customers/', '/'];
     const raw = ['/api/customers\\..\\users', '/api/customers/a b', '/api/customers/a\u0000', '/api/customers/a\u007f'];
+    // Whatever decodes the path once would read these as two parts: another route than the handler's.
+    const encoded = ['/api/customers/a%2Fb', '/api/customers/a%2fb', '/api/customers/a%5Cb', '/api/customers/a%5c..%5cusers', '/api/customers%2F..%2Fusers'];
     for (const p of dots) await expect(runWithServiceContext(ctxA, { path: p, method: 'GET' }, fn), p).rejects.toThrow('without "." or ".." parts');
     for (const p of empty) await expect(runWithServiceContext(ctxA, { path: p, method: 'GET' }, fn), p).rejects.toThrow('without empty parts');
     for (const p of raw) await expect(runWithServiceContext(ctxA, { path: p, method: 'GET' }, fn), p).rejects.toThrow('without backslashes');
+    for (const p of encoded) await expect(runWithServiceContext(ctxA, { path: p, method: 'GET' }, fn), p).rejects.toThrow('without encoded slashes or backslashes');
     expect(fn).not.toHaveBeenCalled();
     expect(inServiceScope()).toBe(false);
-    // An encoded "/" or "\" inside a value (how lib/agent/bridge.ts buildPath writes one) stays in
-    // its one segment, as in a real request's pathname: let through, and judged as that route.
-    const stamped = await runWithServiceContext(ctxA, { path: '/api/customers/a%2Fb%5Cc', method: 'GET' }, async () => {
+    // Other encoded characters stay inside their one part, as in a real request's pathname: an
+    // encoded "%" ("%25", which is not a slash) and a space are let through and judged as that route.
+    const stamped = await runWithServiceContext(ctxA, { path: '/api/customers/a%252Fb%20c', method: 'GET' }, async () => {
       expect((await getServerContext()).companyId).toBe(ctxA.companyId);
       return (await currentRequestInfo())?.path;
     });
-    expect(stamped).toBe('/api/customers/a%2Fb%5Cc');
+    expect(stamped).toBe('/api/customers/a%252Fb%20c');
   });
 
   it("needs the agent's access, role and the agent itself: never a context read as trusted", async () => {
@@ -719,9 +722,22 @@ describe('the scope ends when its work settles', () => {
     resetReads();
     let late!: Promise<Record<string, unknown>>;
     let during!: string | null;
-    const opened = { ...OPTS, headers: { [CLOSING_PASSWORD_HEADER]: 'typed by the approver', accept: 'application/json' } };
+    let duringArchive!: Array<string | null>;
+    const archive = ['x-ironbooks-login', 'x-ironbooks-password', 'x-ironbooks-recovery-key'];
+    const opened = {
+      ...OPTS,
+      headers: {
+        [CLOSING_PASSWORD_HEADER]: 'typed by the approver',
+        'x-ironbooks-login': 'dana@books.test',
+        'x-ironbooks-password': 'c2VjcmV0LXR5cGVk',
+        'x-ironbooks-recovery-key': 'RK-1234-5678',
+        accept: 'application/json',
+      },
+    };
     await runWithServiceContext(ctxA, opened, async () => {
       during = (await requestHeaders()).get(CLOSING_PASSWORD_HEADER);
+      const now = await requestHeaders();
+      duringArchive = archive.map((n) => now.get(n));
       late = new Promise((resolve) => {
         setTimeout(async () => {
           const hh = await requestHeaders();
@@ -736,14 +752,16 @@ describe('the scope ends when its work settles', () => {
             method: hh.get(ROUTE_METHOD_HEADER),
             info: await currentRequestInfo(),
             remote: (await getRequestOrigin()).remote,
-            // ...but the closing-date password was for the request, which is over.
+            // ...but every secret the approver typed was for the request, which is over.
             password: hh.get(CLOSING_PASSWORD_HEADER),
+            archive: archive.map((n) => hh.get(n)),
             accept: hh.get('accept'),
           });
         }, 20);
       });
     });
     expect(during).toBe('typed by the approver');
+    expect(duringArchive).toEqual(['dana@books.test', 'c2VjcmV0LXR5cGVk', 'RK-1234-5678']);
     expect(await late).toEqual({
       inScope: true,
       ctx: SERVICE_SCOPE_ENDED_MESSAGE,
@@ -755,6 +773,7 @@ describe('the scope ends when its work settles', () => {
       info: { path: OPTS.path, method: OPTS.method },
       remote: true,
       password: null,
+      archive: [null, null, null],
       accept: 'application/json',
     });
     expectNoReads();
@@ -889,6 +908,35 @@ describe('requestHeaders()', () => {
     expect(hh.get(CLOSING_PASSWORD_HEADER)).toBe('pw');
     expect(h.reads.headers).toBe(1);
   });
+
+  it("carries a backup's or a copy's user name, password and recovery key when the bridge gives them, and only then", async () => {
+    // The request around it is a person's carrying their own: none of it shows through.
+    request('POST', '/api/backups/restore', {
+      user: ownerId,
+      headers: { 'x-ironbooks-login': 'person', 'x-ironbooks-password': 'cGVyc29u', 'x-ironbooks-recovery-key': 'RK-PERSON' },
+    });
+    resetReads();
+    const names = ['x-ironbooks-login', 'x-ironbooks-password', 'x-ironbooks-recovery-key'];
+    const read = async () => {
+      const hh = await requestHeaders();
+      return names.map((n) => hh.get(n));
+    };
+    expect(await runWithServiceContext(ctxA, { path: '/api/backups/restore', method: 'POST' }, read)).toEqual([null, null, null]);
+    const given = { 'X-Ironbooks-Login': 'dana@books.test', 'x-ironbooks-password': 'ZGFuYS1wdw', 'x-ironbooks-recovery-key': 'RK-1111' };
+    expect(await runWithServiceContext(ctxA, { path: '/api/backups/restore', method: 'POST', headers: given }, read)).toEqual([
+      'dana@books.test',
+      'ZGFuYS1wdw',
+      'RK-1111',
+    ]);
+    expectNoReads();
+  });
+
+  it('the secrets a scope may carry are exactly the ones lib/agent/guards.ts applySecrets hands back', async () => {
+    const { SECRET_HEADERS } = await import('@/lib/agent/guards');
+    expect([...serviceScopeModule.SERVICE_SCOPE_SECRET_HEADERS].sort()).toEqual([...SECRET_HEADERS].sort());
+    for (const name of serviceScopeModule.SERVICE_SCOPE_SECRET_HEADERS) expect(serviceScopeModule.SERVICE_SCOPE_HEADERS).toContain(name);
+    expect(contextModule.SERVICE_SCOPE_SECRET_HEADERS).toBe(serviceScopeModule.SERVICE_SCOPE_SECRET_HEADERS);
+  });
 });
 
 describe('the request helpers inside a scope', () => {
@@ -999,5 +1047,60 @@ describe("people's requests behave as before", () => {
     expect(err.details).toMatchObject({ agent: true });
     request('POST', '/api/auth/2fa/setup', { user: ownerId, headers: { authorization: 'Bearer not-a-token' } });
     await refusedWith(getSessionGate(), 'Authentication required.');
+  });
+});
+
+describe('the closing-date password limiter (lib/closingPasswordLimiter.ts), shared by every way in', () => {
+  const resetLimiter = () => {
+    (globalThis as unknown as { __bkaLoginLimiter?: unknown }).__bkaLoginLimiter = undefined;
+  };
+  beforeEach(resetLimiter);
+  afterAll(resetLimiter);
+
+  it("wrong guesses lock it; a locked one refuses before the password is looked at, also for the person's own x-closing-password", async () => {
+    const { limitClosingPasswordGuess } = await import('@/lib/closingPasswordLimiter');
+    const [company] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, companyId));
+    const original = company.settings;
+    const { hashPassword } = await import('@/lib/auth');
+    await db
+      .update(companies)
+      .set({ settings: { ...((original ?? {}) as Record<string, unknown>), closingDatePasswordHash: await hashPassword('right-pw-9') } })
+      .where(eq(companies.id, companyId));
+    try {
+      request('GET', '/api/accounts', { user: ownerId });
+      const who = { companyId, userId: ownerId };
+      const verify = vi.fn(async () => false);
+      let lockedAt = -1;
+      for (let i = 0; i < 10 && lockedAt < 0; i++) {
+        try {
+          expect(await limitClosingPasswordGuess(who, verify)).toBe(false);
+        } catch (err) {
+          lockedAt = i;
+          // (A copy of the module: the "one store" test above reloads them, so compare by shape.)
+          expect(err).toMatchObject({ name: expect.any(String), code: 'FORBIDDEN', details: { rateLimited: true } });
+          expect((err as ServiceError).message).toMatch(/^Too many wrong closing-date passwords\. Try again in /);
+        }
+      }
+      expect(lockedAt).toBeGreaterThan(1);
+      expect(verify).toHaveBeenCalledTimes(lockedAt);
+      // Locked: the right password is not even looked at, and the person's own save is refused too.
+      const right = vi.fn(async () => true);
+      await expect(limitClosingPasswordGuess(who, right)).rejects.toMatchObject({ details: { rateLimited: true } });
+      expect(right).not.toHaveBeenCalled();
+      request('GET', '/api/accounts', { user: ownerId, headers: { [CLOSING_PASSWORD_HEADER]: 'right-pw-9' } });
+      await expect(getServerContext()).rejects.toMatchObject({ code: 'FORBIDDEN', details: { rateLimited: true } });
+      // Another person in the same company is not locked out by these guesses.
+      expect(await limitClosingPasswordGuess({ companyId, userId: 'someone-else' }, async () => true)).toBe(true);
+    } finally {
+      await db.update(companies).set({ settings: original }).where(eq(companies.id, companyId));
+    }
+  });
+
+  it("a right password goes through and the person's own save gets the override, as before", async () => {
+    const { limitClosingPasswordGuess } = await import('@/lib/closingPasswordLimiter');
+    request('GET', '/api/accounts', { user: ownerId });
+    expect(await limitClosingPasswordGuess({ companyId, userId: ownerId }, async () => true)).toBe(true);
+    request('GET', '/api/accounts', { user: ownerId, headers: { [CLOSING_PASSWORD_HEADER]: 'anything' } });
+    expect((await getServerContext()).closingDateOverride).toBe(true);
   });
 });

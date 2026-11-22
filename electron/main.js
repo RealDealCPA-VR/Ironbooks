@@ -1877,6 +1877,9 @@ function spawnScratch(...args) {
 async function startNextServer() {
   if (isDev) return 'http://localhost:3000';
 
+  // Opening: agents' staged files a crash left in this computer's app data folder (kept there while
+  // a company folder is open) go before the server can hand any out (companySession.js).
+  companySession.clearAppDataAgentFiles();
   const serverEntry = path.join(process.resourcesPath, 'app', 'server.js'); // .next/standalone/server.js
   const dataDir = activeCompanyDir();
   const sandboxRecord = sandboxRecordFor(dataDir);
@@ -1943,6 +1946,9 @@ async function startNextServer() {
         // Documents as this shell knows it (OneDrive can move it): files.save checks the same
         // Documents\Ironbooks folders agents may use as the shell does.
         BKA_AGENT_DOCUMENTS: agentShellDocuments(),
+        // Agents' staged files stay in the open file's working copy (lib/agent/files.ts): never a
+        // folder planted in this computer's environment.
+        BKA_AGENT_FILES_DIR: '',
         ELECTRON_RUN_AS_NODE: '1',
         // Local-only: no Next.js telemetry (it is build/CLI-time, but make sure).
         NEXT_TELEMETRY_DISABLED: '1',
@@ -2572,6 +2578,7 @@ async function startScratchServer(dataDir) {
           BKA_AGENT_SHELL: '',
           BKA_AGENT_SHELL_KEY: '',
           BKA_AGENT_DOCUMENTS: '',
+          BKA_AGENT_FILES_DIR: '',
           ELECTRON_RUN_AS_NODE: '1',
           NEXT_TELEMETRY_DISABLED: '1',
         },
@@ -4446,25 +4453,46 @@ function agentShellEnv() {
 
 app.on('will-quit', () => {
   if (agentShellEndpoint) agentShellEndpoint.close().catch(() => {});
+  // The company file closes with the app: agents' staged files (statements, report PDFs) go with
+  // it (electron/companySession.js clearAgentFiles; opening a file clears any a crash left). With a
+  // company folder open they were kept in this computer's app data folder instead: those go too.
+  if (openFile && openFile.workDir) companySession.clearAgentFiles(openFile.workDir);
+  else if (!remoteHostOrigin) companySession.clearAppDataAgentFiles();
 });
 
-// The desktop notice when an agent asks while the window is not in front (lib/desktop/agentNotice.ts,
-// plan 7.2): title and body only; clicking it brings the window forward on the approval center.
-// Never while the app runs hidden for an agent.
-ipcMain.handle('agent:notice', (e, notice) => {
+/**
+ * What the title bar's count says right now (AgentRequestCount), asked by this process with the
+ * window's own sign-in: null when it cannot be told (no window, client mode, no answer in time).
+ */
+async function agentRequestCountForNotice() {
+  if (!serverUrl || remoteHostOrigin || !mainWindow || mainWindow.isDestroyed()) return null;
+  try {
+    const ses = mainWindow.webContents.session;
+    if (!ses || typeof ses.fetch !== 'function') return null;
+    const countUrl = new URL('/api/agent-requests/count', serverUrl).toString();
+    const res = await Promise.race([
+      ses.fetch(countUrl, { credentials: 'include', cache: 'no-store', redirect: 'error' }),
+      new Promise((resolve) => setTimeout(() => resolve(null), 10_000)),
+    ]);
+    return res && res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+// The desktop notice when an agent asks while the window is not in front: minimized, in the tray
+// or behind others (lib/desktop/agentNotice.ts, plan 7.2). The page only says when; the words come
+// from this app's own server (the newest request's agent and the summary the server built, never
+// the agent's own words), so no text of the page reaches the notice. Clicking it brings the window
+// forward on the approval center. Never while the app runs hidden for an agent.
+ipcMain.handle('agent:notice', async (e, ask) => {
   if (!fromLocalApp(e) || agentServiceHidden) return false;
+  const count = await agentRequestCountForNotice();
   return agentShell.showNotice({
     Notification: require('electron').Notification,
     win: mainWindow,
-    notice,
-    open: (route) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        if (mainWindow.isMinimized()) mainWindow.restore();
-        mainWindow.show();
-        mainWindow.focus();
-      }
-      navigate(route);
-    },
+    notice: agentShell.noticeFromCount(count, ask && typeof ask === 'object' ? ask.href : null),
+    open: (route) => agentShell.showWindowOn(mainWindow, route, navigate),
   });
 });
 

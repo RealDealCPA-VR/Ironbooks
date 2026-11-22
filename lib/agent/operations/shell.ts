@@ -290,10 +290,20 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: 'Open the company file hosted at {host}',
     why:
-      'File > Open company on host: this computer becomes a client of another computer\'s company file. Ironbooks contacts that ' +
-      `address first to check it answers. ${RESTART_NOTE} From then on this computer has no books of its own open, so agents ` +
-      'connect to the host computer instead.',
-    input: { host: { type: 'string', required: true, describe: 'The host\'s address, as its Company > Multi-user page shows it.' } },
+      'File > Open company on host. What joining really does: Ironbooks saves and closes the company file open on this computer, ' +
+      'restarts, and from then on the Ironbooks window shows the pages the program at that address serves instead of its own, ' +
+      'and people sign in there with their user names and passwords. So approve only the address of another computer you know ' +
+      'hosts your company file (its Company > Multi-user page shows it). Ironbooks contacts the address first to check it ' +
+      "answers, and refuses this computer's own addresses and names and the virtual machines or containers it runs (such as WSL " +
+      'or Docker). Your connection ends with the restart, and this computer ' +
+      'then has no books of its own open: agents connect to the host computer instead.',
+    input: {
+      host: {
+        type: 'string',
+        required: true,
+        describe: "Another computer's address, as its Company > Multi-user page shows it (this office network or Tailscale); never this computer's own.",
+      },
+    },
     questions: [],
     needsSecret: [],
     fileAdmin: true,

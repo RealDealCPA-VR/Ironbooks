@@ -32,6 +32,7 @@ import {
   SERVICE_SCOPE_CHANGED_MESSAGE,
   SERVICE_SCOPE_ENDED_MESSAGE,
   SERVICE_SCOPE_HEADERS,
+  SERVICE_SCOPE_SECRET_HEADERS,
   currentServiceScope,
   inServiceScope,
   outsideServiceScope,
@@ -46,7 +47,7 @@ import { assertPasswordChangeNotRequired } from '@/lib/services/passwordPolicy';
 import { PASSWORD_CHANGE_REQUIRED_MESSAGE } from '@/lib/passwordPolicy';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { isLoopbackHostHeader } from '@/lib/net/loopbackHost';
-import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
+import { limitClosingPasswordGuess } from '@/lib/closingPasswordLimiter';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { ensureSandboxEnvSynced } from '@/lib/services/sandboxState';
 
@@ -96,6 +97,7 @@ export {
   SERVICE_SCOPE_CHANGED_MESSAGE,
   SERVICE_SCOPE_ENDED_MESSAGE,
   SERVICE_SCOPE_HEADERS,
+  SERVICE_SCOPE_SECRET_HEADERS,
   inServiceScope,
   outsideServiceScope,
   requestHeaders,
@@ -164,9 +166,10 @@ async function selectedCompanyCookie(): Promise<string | undefined> {
  * closing-date password hash. A valid password (or any explicit attempt when no password is
  * configured) unlocks postings dated on/before the closing date for THIS request only.
  *
- * Guesses are rate-limited like sign-in (per person, per address and globally — review round 5):
- * this was the one password with no attempt limit, so a user with the closed-period right but not
- * the password (an Accountant, an External Accountant) could try passwords until one worked.
+ * Guesses are rate-limited like sign-in (per person in this company and globally — review round
+ * 5), with the same limiter and keys as the other ways in (lib/closingPasswordLimiter.ts): this
+ * was the one password with no attempt limit, so a user with the closed-period right but not the
+ * password (an Accountant, an External Accountant) could try passwords until one worked.
  */
 async function resolveClosingDateOverride(db: DB, companyId: string, userId?: string | null): Promise<boolean> {
   let supplied: string | null = null;
@@ -177,31 +180,7 @@ async function resolveClosingDateOverride(db: DB, companyId: string, userId?: st
     return false;
   }
   if (supplied === null) return false;
-  const origin = await getRequestOrigin();
-  const limiter = loginLimiter();
-  // Only signed-in people can guess, so the person (in this company) is the key, plus the global
-  // cap — not the address: everyone working on this computer shares 'local', and one person's
-  // wrong guesses must not lock the others out.
-  const keys = attemptKeys('closing-password', `${companyId}:${userId ?? ''}`, origin.addr).filter((k) => !k.includes(':addr:'));
-  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
-  const gate = limiter.begin(keys, Date.now(), weights);
-  if (!gate.allowed) {
-    const { retryAfter } = tooManyAttempts(gate.retryAfterMs);
-    const secs = Number(retryAfter);
-    throw new ServiceError(
-      'FORBIDDEN',
-      `Too many wrong closing-date passwords. Try again in ${secs < 90 ? `${secs} seconds` : `${Math.ceil(secs / 60)} minutes`}.`,
-      { rateLimited: true, retryAfterSeconds: secs },
-    );
-  }
-  try {
-    const ok = await verifyClosingDatePassword(db, companyId, supplied);
-    if (ok) limiter.recordSuccess(keys.slice(0, -1));
-    else limiter.recordFailure(keys, Date.now(), weights);
-    return ok;
-  } finally {
-    gate.release();
-  }
+  return limitClosingPasswordGuess({ companyId, userId }, () => verifyClosingDatePassword(db, companyId, supplied));
 }
 
 /**

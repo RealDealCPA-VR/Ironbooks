@@ -5,10 +5,24 @@
  *    "Agent requests" entry (components/AgentRequestsBadge.tsx), shown only above 0; the entry
  *    itself only while the company has an agent (lib/nav.ts, components/AppShell.tsx);
  *  - one poll of GET /api/agent-requests/count for the window: about every 20 seconds while it is
- *    on screen, none while it is hidden, and a failed poll keeps the last answer without a word;
+ *    on screen, every 90 seconds while it is hidden (only so the notice can still be raised), and a
+ *    failed poll keeps the last answer without a word;
  *  - the desktop notice, once per rise and only when the window is not in front, in the app's own
- *    words (never the agent's);
- *  - Pause all agents (components/PauseAllAgents.tsx): asks first, then POST /api/agents/pause-all.
+ *    words (never the agent's), minimized or not;
+ *  - Pause all agents (components/PauseAllAgents.tsx): asks first, then POST /api/agents/pause-all;
+ *    nothing at all for a person the count route says may not use it;
+ *  - the command bar (components/CommandPalette.tsx) and "Agent requests" while the company has no
+ *    agent: it says where an agent is connected, never "Turn it on in Preferences", and the
+ *    server's "go to …" never resolves to that page (lib/nav.ts searchPages);
+ *  - the page help of the approval center and of the Agents tab (lib/pageHelp.ts), checked in the
+ *    part the help screens show (`what` and `first`), and on screen in the F1 window and the
+ *    "What is this page?" bubble;
+ *  - Scheduled Reports (app/reports/schedules/page.tsx): a schedule an agent set up waits for a
+ *    person, says so, and offers Confirm recipients; the reason shown is to be the current one, as
+ *    the server's listing says it (`waitingForAPerson`), not as the page remembers it. Today's
+ *    server sends no such field and keeps a stored agent message through a later internet hold
+ *    (lib/services/memorizedReports.ts, HANDOFF), so the page falls back on the stored message:
+ *    the real-browser half checks both what it shows today and with the server's answer.
  *
  * The poll's timing and its rules run here with a fake window and fake timers; what is on screen
  * runs in a real browser engine (test/dom/agentChrome.dom.tsx, through test/domHarness.ts).
@@ -17,6 +31,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  AGENT_REQUESTS_HIDDEN_POLL_MS,
   AGENT_REQUESTS_HREF,
   AGENT_REQUESTS_POLL_MS,
   agentRequestNotice,
@@ -26,10 +41,20 @@ import {
   type AgentCountEnv,
   type AgentNotice,
 } from '@/components/AgentRequestsBadge';
-import { navGroups, searchPages, simpleNavGroups, visibleNavGroups } from '@/lib/nav';
-import { pageHelpFor } from '@/lib/pageHelp';
+import { AGENT_ONLY_PATHS, hiddenPageNotice, navGroups, searchPages, simpleNavGroups, visibleNavGroups } from '@/lib/nav';
+import { PAGE_HELP, TAB_HELP, pageHelpFor, type PageHelpEntry } from '@/lib/pageHelp';
 import type { AgentRequestCount } from '@/lib/agent/contract';
+import type { ServiceContext } from '@/lib/services/_base';
 import { expectAllPassed, runDomFile } from './domHarness';
+
+// How many agents the company has, for server code that counts them (lib/services/agents.ts
+// agentCount): the command bar tests below run without a database. lib/services/commandBar.ts does
+// not count them yet (HANDOFF), so only the expected-to-fail test below would reach this.
+const agentsHere = vi.hoisted(() => ({ count: 0 }));
+vi.mock('@/lib/services/agents', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/services/agents')>()),
+  agentCount: async () => agentsHere.count,
+}));
 
 const read = (f: string) => fs.readFileSync(path.resolve(process.cwd(), f), 'utf8');
 
@@ -91,7 +116,7 @@ describe('the count poll', () => {
     vi.useRealTimers();
   });
 
-  it('asks at once, then about every 20 seconds while the window is on screen; none while hidden; at once when it shows again', async () => {
+  it('asks at once, then about every 20 seconds while the window is on screen; every 90 while hidden; at once when it shows again', async () => {
     const { w, store } = fakeWindow();
     w.answer = counted({ pending: 1 });
     expect(w.loads).toBe(0); // nothing until something on screen wants the number
@@ -100,42 +125,89 @@ describe('the count poll', () => {
     expect(w.loads).toBe(1);
     expect(store.get()?.pending).toBe(1);
     expect(AGENT_REQUESTS_POLL_MS).toBe(20_000);
+    expect(AGENT_REQUESTS_HIDDEN_POLL_MS).toBe(90_000);
 
     await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS - 1);
     expect(w.loads).toBe(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(w.loads).toBe(2);
 
+    // Hidden: not at the usual 20 seconds, only the slow ask for the notice, 90 seconds on.
     w.hide();
-    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS * 5);
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_HIDDEN_POLL_MS - 1);
+    expect(w.loads).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(w.loads).toBe(3);
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_HIDDEN_POLL_MS * 2);
+    expect(w.loads).toBe(5);
+    w.show();
+    await flush();
+    expect(w.loads).toBe(6);
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS);
+    expect(w.loads).toBe(7); // and back to every 20 seconds: the visible poll is unchanged
+
+    // A second reader shares the same poll; the last one leaving stops it, hidden or not.
+    const stop2 = store.subscribe(() => {});
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS);
+    expect(w.loads).toBe(8);
+    stop();
+    stop2();
+    expect(w.on).toBeNull();
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_HIDDEN_POLL_MS * 3);
+    expect(w.loads).toBe(8);
+    w.visible = false;
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_HIDDEN_POLL_MS * 3);
+    expect(w.loads).toBe(8);
+    expect(store.get()?.pending).toBe(1); // the last answer is kept for the next reader
+  });
+
+  it('a window that starts hidden takes where it starts at once, then asks every 90 seconds until it shows', async () => {
+    const { w, store } = fakeWindow();
+    w.visible = false;
+    store.subscribe(() => {});
+    await flush();
+    expect(w.loads).toBe(1);
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS * 4);
+    expect(w.loads).toBe(1);
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_HIDDEN_POLL_MS - AGENT_REQUESTS_POLL_MS * 4);
     expect(w.loads).toBe(2);
     w.show();
     await flush();
     expect(w.loads).toBe(3);
     await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS);
     expect(w.loads).toBe(4);
-
-    // A second reader shares the same poll; the last one leaving stops it.
-    const stop2 = store.subscribe(() => {});
-    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS);
-    expect(w.loads).toBe(5);
-    stop();
-    stop2();
-    expect(w.on).toBeNull();
-    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS * 3);
-    expect(w.loads).toBe(5);
-    expect(store.get()?.pending).toBe(1); // the last answer is kept for the next reader
   });
 
-  it('a window that starts hidden waits until it shows', async () => {
+  it('a hidden window raises the notice from its slow poll, once per rise', async () => {
     const { w, store } = fakeWindow();
     w.visible = false;
+    w.focused = false; // minimized: never in front
+    w.answer = counted({ pending: 1, newest: newest('h1', 'Month-end helper', 'Enter a bill from Acme Supply for $120.00') });
     store.subscribe(() => {});
-    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS * 2);
-    expect(w.loads).toBe(0);
+    await flush();
+    expect(w.notices).toEqual([]); // where it starts, not news
+
+    w.answer = counted({ pending: 2, newest: newest('h2', 'Month-end helper', 'Pay 2 bills from Checking for $300.00') });
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_HIDDEN_POLL_MS);
+    expect(w.notices).toEqual([
+      { title: 'Month-end helper asks for your approval', body: 'Pay 2 bills from Checking for $300.00. Click to review it.', href: '/agent-requests' },
+    ]);
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_HIDDEN_POLL_MS * 2);
+    expect(w.notices).toHaveLength(1); // the same number again says nothing
+
+    // Hidden while a poll is on its way: that poll lands, then the slow interval follows.
     w.show();
     await flush();
-    expect(w.loads).toBe(1);
+    const before = w.loads;
+    w.on!.changed(); // a poll starts…
+    w.hide(); // …and the window is minimized before it lands
+    await flush();
+    expect(w.loads).toBe(before + 1);
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_POLL_MS * 2);
+    expect(w.loads).toBe(before + 1);
+    await vi.advanceTimersByTimeAsync(AGENT_REQUESTS_HIDDEN_POLL_MS - AGENT_REQUESTS_POLL_MS * 2);
+    expect(w.loads).toBe(before + 2);
+    expect(w.notices).toHaveLength(1);
   });
 
   it('"the requests changed" asks at once, and the next poll is 20 seconds after it', async () => {
@@ -316,6 +388,9 @@ describe('the "Agent requests" menu entry', () => {
     expect(searchPages('agent requests')[0]?.href).toBe(AGENT_REQUESTS_HREF);
     expect(searchPages('approve')[0]?.href).toBe(AGENT_REQUESTS_HREF);
     expect(searchPages('agent requests', { hiddenPaths: new Set([AGENT_REQUESTS_HREF]) }).map((r) => r.href)).not.toContain(AGENT_REQUESTS_HREF);
+    expect(searchPages('agent requests', { hasAgents: false }).map((r) => r.href)).not.toContain(AGENT_REQUESTS_HREF);
+    expect(searchPages('agent requests', { hasAgents: true })[0]?.href).toBe(AGENT_REQUESTS_HREF);
+    expect([...AGENT_ONLY_PATHS]).toEqual([AGENT_REQUESTS_HREF]);
   });
 
   it('the sidebar hides it unless the poll says the company has an agent, and draws the count on it', () => {
@@ -336,6 +411,150 @@ describe('the "Agent requests" menu entry', () => {
   });
 });
 
+describe('the command bar and a hidden "Agent requests"', () => {
+  it('says where an agent is connected, never "Turn it on in Preferences"', () => {
+    expect(hiddenPageNotice(AGENT_REQUESTS_HREF)).toEqual({
+      heading: 'Agent requests are not shown yet',
+      body: 'Agent requests appear once an agent is connected (Users & Roles > Agents).',
+    });
+    expect(hiddenPageNotice(`${AGENT_REQUESTS_HREF}?status=pending`).body).not.toMatch(/Preferences/);
+    // Every other hidden page is a feature switched off in Preferences, as before.
+    expect(hiddenPageNotice('/estimates')).toEqual({ heading: 'That feature is turned off', body: 'Turn it on in Preferences to use it.' });
+    const palette = read('components/CommandPalette.tsx');
+    expect(palette).not.toContain("'Turn it on in Preferences to use it.'"); // one wording, in lib/nav.ts
+    expect(palette.match(/\.\.\.hiddenPageNotice\(/g)).toHaveLength(3); // prefilled form, server's page, go to agent requests
+    expect(read('components/AppShell.tsx')).toContain('<CommandPalette permissions={me?.permissions} hiddenPaths={hiddenPaths} hasAgents={hasAgents} />');
+  });
+
+  it('a strict "go to" match never lands on it unless the caller knows the company has an agent', () => {
+    for (const words of ['agent requests', 'Agent requests', 'approve', 'agents']) {
+      expect(searchPages(words, { limit: 1, strict: true }).map((r) => r.href), words).not.toContain(AGENT_REQUESTS_HREF);
+      expect(searchPages(words, { limit: 1, strict: true, hasAgents: false }).map((r) => r.href), words).not.toContain(AGENT_REQUESTS_HREF);
+    }
+    expect(searchPages('agent requests', { limit: 1, strict: true, hasAgents: true })[0]?.href).toBe(AGENT_REQUESTS_HREF);
+    // Other pages are found as before.
+    expect(searchPages('invoices', { limit: 1, strict: true })[0]?.href).toBe('/invoices');
+    expect(searchPages('needs attention', { limit: 1, strict: true })[0]?.href).toBe('/attention');
+  });
+
+  it('the server command bar does not resolve "go to agent requests" to the page while the company has no agent', async () => {
+    const { executeIntent } = await import('@/lib/services/commandBar');
+    const ctx = { access: null, companyId: 'co1' } as unknown as ServiceContext; // full access: nothing else stops it
+    const when = new Date('2026-11-20T12:00:00Z');
+    agentsHere.count = 0;
+    const out = await executeIntent(ctx, { kind: 'navigate', target: 'agent requests' }, {}, when);
+    expect(out.type).toBe('unknown');
+    expect(JSON.stringify(out)).not.toContain(AGENT_REQUESTS_HREF);
+    const invoices = await executeIntent(ctx, { kind: 'navigate', target: 'invoices' }, {}, when);
+    expect(invoices).toMatchObject({ type: 'navigate', href: '/invoices' });
+  }, 60_000);
+
+  // Expected to fail today: lib/services/commandBar.ts executeNavigate calls searchPages strictly
+  // without `hasAgents`, so with an agent connected the server answers "I couldn't find a page…"
+  // (HANDOFF: pass `hasAgents: (await agentCount(ctx.db, ctx.companyId)) > 0`). Once it does, this
+  // reports "expected to fail": turn it into a plain `it`.
+  it.fails('with an agent, the server command bar opens Agent requests', async () => {
+    const { executeIntent } = await import('@/lib/services/commandBar');
+    const ctx = { access: null, companyId: 'co1' } as unknown as ServiceContext;
+    agentsHere.count = 1;
+    try {
+      const withAgent = await executeIntent(ctx, { kind: 'navigate', target: 'agent requests' }, {}, new Date('2026-11-20T12:00:00Z'));
+      expect(withAgent).toMatchObject({ type: 'navigate', href: AGENT_REQUESTS_HREF });
+    } finally {
+      agentsHere.count = 0;
+    }
+  }, 60_000);
+});
+
+describe('page help for the agent screens', () => {
+  // What the help screens show: the "What is this page?" bubble (components/Help.tsx) and the F1
+  // window (components/ShortcutsHelp.tsx) read `what` and `first` only, so what a person must know
+  // is checked there. `more` only adds detail (no screen shows it yet).
+  const shown = (h: PageHelpEntry) => `${h.what} First: ${h.first}`;
+  const all = (h: PageHelpEntry) => [h.what, h.first, ...(h.more ?? [])].join(' ');
+  /** Pause all agents shows only to whoever may use it (canPauseAll, today an Admin): no point says otherwise. */
+  const pauseAllForAdmins = (h: PageHelpEntry) => {
+    for (const m of [h.what, h.first, ...(h.more ?? [])]) if (/pause all/i.test(m)) expect(m, m).toMatch(/an Admin can/i);
+  };
+
+  it('the approval center says, where it is shown: on its own vs asks, approve once or standing permission, pausing one or all, and the record', () => {
+    const h = pageHelpFor(AGENT_REQUESTS_HREF)!;
+    expect(h).toBe(PAGE_HELP[AGENT_REQUESTS_HREF]);
+    const text = shown(h);
+    expect(text).toMatch(/On its own an agent does only what its settings allow/);
+    // Only what it must ask for comes here, not "the rest": work set to Never is refused unasked.
+    expect(text).toMatch(/what it must ask for waits here, showing the change/);
+    expect(text).not.toMatch(/the rest waits here/);
+    expect(all(h)).toContain('Work set to Never in its settings is refused without asking');
+    expect(text).toContain('Approve once');
+    expect(text).toContain('Approve similar… (standing permission)');
+    expect(text).toContain('Deny');
+    // Every approver reads this, but the Agents tab shows to Admins only (app/users/page.tsx) and
+    // Pause all agents to whoever may use it: pausing, one or all, and Revoke are an Admin's.
+    expect(text).toContain('An Admin can pause one agent (Users & Roles > Agents) or all');
+    for (const m of [h.what, h.first, ...(h.more ?? [])]) if (m.includes('Users & Roles > Agents')) expect(m, m).toMatch(/an Admin can/i);
+    expect(text).toContain('The Audit Trail and Agent Activity report keep the record');
+    pauseAllForAdmins(h);
+    // The extra detail names the report's place and the control.
+    expect(all(h)).toContain('Reports > Accountant & Taxes > Agent Activity');
+    expect(all(h)).toContain('or every agent at once with Pause all agents at the top of the window');
+  });
+
+  it('the Agents tab: its own help, asked for as /users/agents, with the essentials in the part a bubble shows', () => {
+    const h = pageHelpFor('/users/agents')!;
+    expect(h).toBe(TAB_HELP['/users/agents']);
+    expect(h.title).toBe('Agents');
+    expect(pageHelpFor('/users')?.title).toBe('Users & Roles'); // the page's own help is unchanged
+    const text = shown(h);
+    for (const w of ['Allow (does it alone)', 'Ask (waits in Agent requests', 'approves once', 'standing permission', 'or Never', 'Pause this agent stops it', 'an Admin can pause all', 'The Audit Trail and Agent Activity report keep the record']) {
+      expect(text, w).toContain(w);
+    }
+    pauseAllForAdmins(h);
+    // The extra detail: the presets, who may loosen, Revoke.
+    for (const w of ['Read only', 'Ask for every change', 'Trusted bookkeeper', 'Full, with asks', 'Revoke']) expect(all(h), w).toContain(w);
+    expect(all(h)).toMatch(/Only an Admin can let an agent do more/); // loosening needs an Admin (plan 4.4)
+    // The tab shows to Admins only: no point offers it to "anyone who manages users".
+    expect(all(h)).not.toMatch(/anyone who manages users/i);
+  });
+
+  it('is plain and short: two sentences, a first step, and a few short points', () => {
+    for (const h of [PAGE_HELP[AGENT_REQUESTS_HREF], ...Object.values(TAB_HELP)]) {
+      expect(h.what.length).toBeLessThanOrEqual(200);
+      expect((h.what.match(/[.!?](\s|$)/g) ?? []).length).toBeLessThanOrEqual(2);
+      expect(h.first.length).toBeLessThanOrEqual(130);
+      expect(h.more?.length ?? 0).toBeLessThanOrEqual(6);
+      for (const m of h.more ?? []) expect(m.length, m).toBeLessThanOrEqual(200);
+      // No jargon a person would not use, and no blame.
+      expect(all(h)).not.toMatch(/\b(token|grant|policy|risk class|operation|API|MCP)\b/i);
+    }
+  });
+});
+
+describe('Scheduled Reports: a schedule an agent set up', () => {
+  const page = read('app/reports/schedules/page.tsx');
+
+  it('reads the hold from the message the timer stores, as the service writes it', async () => {
+    const start = /const AGENT_HOLD_START = '([^']+)';/.exec(page)?.[1];
+    expect(start).toBeTruthy();
+    const { AGENT_SCHEDULE_HELD_MESSAGE, SCHEDULE_HELD_MESSAGE } = await import('@/lib/services/memorizedReports');
+    expect(AGENT_SCHEDULE_HELD_MESSAGE.startsWith(start!)).toBe(true);
+    expect(SCHEDULE_HELD_MESSAGE.startsWith(start!)).toBe(false); // the internet hold is another reason
+  }, 60_000);
+
+  it('whether it waits is the server’s answer each time the list loads, not what the page remembers', () => {
+    expect(page).toContain("if (typeof s.waitingForAPerson === 'boolean') return s.waitingForAPerson;");
+    expect(page).not.toMatch(/setConfirmed|confirmedOver/);
+    // The toast after a save promises nothing about the next run.
+    expect(page).not.toMatch(/runs at its next due time/);
+  });
+
+  it('only the recipients Save sends what lets it run; Pause and Resume send isActive alone', () => {
+    expect(page).toMatch(/api\.patch\(`\/api\/report-schedules\/\$\{id\}`, \{ emailTo: mailEdit\.value\.trim\(\) \|\| null \}\)/);
+    expect(page).toMatch(/api\.patch\(`\/api\/report-schedules\/\$\{s\.id\}`, \{ isActive: !s\.isActive \}\)/);
+    expect(page.match(/api\.patch\(/g)).toHaveLength(2);
+  });
+});
+
 describe('on screen (a real browser engine)', () => {
   it('badge, menu entry, notice and Pause all agents', async () => {
     expectAllPassed(await runDomFile('test/dom/agentChrome.dom.tsx'), [
@@ -347,6 +566,18 @@ describe('on screen (a real browser engine)', () => {
       'a refusal is said in its own words, and the confirmation stays',
       'a confirmation the poll took away does not open again by itself',
       'Pause all agents shows only to a person who may use it, and nothing polls on the sign-in page',
+      'a minimized window still raises the notice',
+      'the command bar: "go to agent requests" with no agent says where to connect one',
+      'the command bar: with an agent, "go to agent requests" opens it',
+      'the command bar: a server answer leading to a hidden Agent requests says why',
+      'page help: F1 on Agent requests says how to pause agents and where the record is',
+      'page help: the "What is this page?" bubble on Agent requests says the same',
+      'page help: the Agents tab’s help entry, in a Help bubble, says what a person needs',
+      'Scheduled Reports: an agent’s schedule waits for you, and only Confirm recipients lets it run',
+      'Scheduled Reports: with the server’s answer, a changed hold reason shows the current one',
+      'Scheduled Reports: after a reload, or for another person, the server’s answer decides',
+      'Scheduled Reports: a listing without the server’s answer errs towards waiting and promises nothing',
+      'Scheduled Reports: with today’s server, a confirmed agent hold still shows until the schedule runs',
     ]);
-  }, 180_000);
+  }, 240_000);
 });

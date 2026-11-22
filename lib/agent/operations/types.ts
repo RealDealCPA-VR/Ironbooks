@@ -342,6 +342,12 @@ export interface ApprovalNeeds {
   grantAdminOnly?: boolean;
   /** Secrets the approver types on the card. */
   secrets: SecretKind[];
+  /**
+   * (wave 4) Those of `secrets` the route itself treats as optional (the sign-in of another company
+   * file for a restore: a backup made in this same file needs none). The card offers the box and
+   * lets the person approve with it empty; the run goes ahead without that secret.
+   */
+  optionalSecrets?: SecretKind[];
   /** Two different people must approve. */
   twoPerson: boolean;
   /** Whether the approver may give standing permission while approving. */

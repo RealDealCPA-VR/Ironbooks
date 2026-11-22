@@ -21,6 +21,9 @@
  *    loader of that schema. describe_operation turns them into JSON Schema
  *    (lib/agent/operations/schemas.ts); written out so the bundler includes each one.
  *
+ * Only a schema the route file imports can be named (and so loaded); a handler that parses its body
+ * with a schema written inside the route file is listed by inlineBodySchemas() and warned about.
+ *
  * What it reports are HINTS read from the source. The hand-written classification
  * (lib/agent/operations/classes/*.ts) has the last word: it can name a body schema, a body kind or
  * an output kind the reader could not see. test/agentRegistry.test.ts runs this in --check mode, so
@@ -167,6 +170,8 @@ function analyzeFile(fileAbs) {
 
   /** local name -> { module, name } for every named import. */
   const imports = new Map();
+  /** Names of the file's own top-level constants (a zod schema written inside the route is one). */
+  const locals = new Set();
   /** top-level function name -> function node (declarations and `const f = () => …`). */
   const functions = new Map();
   /** exported name -> local name it points at (or the function node itself). */
@@ -188,6 +193,7 @@ function analyzeFile(fileAbs) {
     } else if (ts.isVariableStatement(st)) {
       for (const d of st.declarationList.declarations) {
         if (!ts.isIdentifier(d.name) || !d.initializer) continue;
+        locals.add(d.name.text);
         const init = unwrap(d.initializer);
         if (isFunctionLike(init)) functions.set(d.name.text, init);
         if (isExported(st)) {
@@ -263,6 +269,8 @@ function analyzeFile(fileAbs) {
     const bodyVars = new Set();
     const queryVars = new Set();
     const parses = []; // { ref, arg }
+    /** Parses with a schema the route file defines itself: { name, arg }. */
+    const inlineParses = [];
     let text = '';
 
     for (const fn of fns) {
@@ -289,8 +297,10 @@ function analyzeFile(fileAbs) {
             const imp = imports.get(callee.expression.text);
             const mod = imp ? moduleRef(imp.module, fileAbs) : null;
             // Only schemas imported from this app: a schema written inside the route file cannot be
-            // imported by anyone else, and JSON.parse is not a schema.
+            // imported by anyone else, and JSON.parse is not a schema. One written inside the file
+            // is noted, so it can be moved to lib/validation (inlineBodySchemas below).
             if (imp && mod) parses.push({ ref: `${mod}#${imp.name}`, arg: n.arguments[0] });
+            else if (!imp && locals.has(callee.expression.text)) inlineParses.push({ name: callee.expression.text, arg: n.arguments[0] });
           }
         }
         if (ts.isNewExpression(n) && ts.isIdentifier(n.expression) && /^(Next)?Response$/.test(n.expression.text)) {
@@ -312,13 +322,18 @@ function analyzeFile(fileAbs) {
 
     const bodySchemas = [];
     const querySchemas = [];
+    const isBodyArg = (arg) => {
+      const a = unwrap(arg);
+      return !!readKind(arg) || (ts.isIdentifier(a) && bodyVars.has(a.text));
+    };
     for (const { ref, arg } of parses) {
       const a = unwrap(arg);
-      const isBody = !!readKind(arg) || (ts.isIdentifier(a) && bodyVars.has(a.text));
+      const isBody = isBodyArg(arg);
       const isQuery = !isBody && ((ts.isIdentifier(a) && queryVars.has(a.text)) || queryLike(arg.getText(sf)));
       if (isBody && !bodySchemas.includes(ref)) bodySchemas.push(ref);
       if (isQuery && !querySchemas.includes(ref)) querySchemas.push(ref);
     }
+    const inlineBody = [...new Set(inlineParses.filter(({ arg }) => isBodyArg(arg)).map(({ name }) => name))];
 
     // A raw Response with a body is not JSON. Which kind it is comes from the content types the
     // handler names: only PDF is "pdf"; NDJSON or server-sent events without a download name is a
@@ -350,6 +365,8 @@ function analyzeFile(fileAbs) {
       output,
       serverContext,
       sessionGate,
+      // Not written to routes.generated.ts: read by inlineBodySchemas() and the warning in main().
+      ...(inlineBody.length ? { inlineBodySchemas: inlineBody } : {}),
     };
   }
 
@@ -577,6 +594,22 @@ export function renderSchemas(refs) {
   return lines.join('\n');
 }
 
+/**
+ * Handlers that parse their body with a zod schema written inside the route file
+ * ("POST app/api/x/route.ts: bodySchema"). The registry cannot export such a schema, so
+ * describe_operation shows no body for the operation: move it to lib/validation and import it.
+ * test/agentSchemas.described.test.ts keeps this list empty.
+ */
+export function inlineBodySchemas(routes = collect()) {
+  const out = [];
+  for (const r of routes) {
+    for (const m of METHODS) {
+      for (const name of r.methods[m]?.inlineBodySchemas ?? []) out.push(`${m} ${r.file}: ${name}`);
+    }
+  }
+  return out;
+}
+
 export function generate() {
   const routes = collect();
   const schemas = schemaRefs(routes);
@@ -617,6 +650,13 @@ function main(argv) {
     console.warn(
       `agent-registry: these exports are not operations (only ${METHODS.join(' ')} are). They are listed as ` +
         `otherMethods, and test/agentRegistry.test.ts refuses each one it does not allow:\n  ${other.join('\n  ')}`,
+    );
+  }
+  const inline = inlineBodySchemas(routes);
+  if (inline.length) {
+    console.warn(
+      'agent-registry: these handlers parse their body with a zod schema written inside the route file, so agents ' +
+        `see no body for them. Move each schema to lib/validation and import it:\n  ${inline.join('\n  ')}`,
     );
   }
   const stale = Object.entries(files)

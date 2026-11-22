@@ -6,14 +6,18 @@
  *
  * The app is a recording stand-in, as in tools.test.ts: the verbs are still stubs on the server
  * side, so these tests hold the connector to the contract (lib/agent/contract.ts AgentVerbs).
+ *
+ * The JSON Schema checks use ajv, which is not a dependency of Ironbooks: today it is installed only
+ * because electron-builder brings it. It is loaded when it can be found, and those cases are
+ * skipped, saying why, when it cannot.
  */
-import Ajv2020 from 'ajv/dist/2020';
+import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
 import { argumentProblem, createServer } from '../../mcp/protocol.mjs';
-import { IronbooksError } from '../../mcp/client.mjs';
+import { IronbooksError, WAITS_BUSY_CODE, WAITS_BUSY_MESSAGE } from '../../mcp/client.mjs';
 import { createIronbooksServer } from '../../mcp/ironbooks-mcp.mjs';
 import { TOOLS } from '../../mcp/tools.mjs';
-import { AREAS, MAX_RESULT_CHARS, OPERATION_TOOLS, REQUEST_STATUSES, RISK_CLASSES, WAIT_MAX_SECONDS, cutToFit } from '../../mcp/operations-tools.mjs';
+import { AREAS, MAX_RESULT_CHARS, OPERATION_TOOLS, REQUEST_STATUSES, RISK_CLASSES, WAIT_MAX_SECONDS, cutToFit, holdToLimit, shapeRequest } from '../../mcp/operations-tools.mjs';
 import { FILE_TOOLS, STAGED_FILE_HOURS, UPLOAD_CHUNK_BYTES, UPLOAD_MAX_BYTES } from '../../mcp/files-tools.mjs';
 import {
   ADMIN_GIVES_STANDING,
@@ -31,6 +35,36 @@ import * as types from '@/lib/agent/operations/types';
 import { AREA_KEYS } from '@/lib/permissions/model';
 
 type Any = Record<string, any>;
+
+/** The little of ajv these tests use (no types from the package: it may not be installed). */
+interface Validator {
+  (data: unknown): boolean;
+  errors?: unknown;
+}
+interface AjvLike {
+  addKeyword(def: { keyword: string; schemaType: string }): unknown;
+  compile(schema: unknown): Validator;
+}
+type AjvClass = new (opts: { strict: boolean; allErrors: boolean }) => AjvLike;
+
+/**
+ * A package's default export, or null when it cannot be found here. Loaded at run time, so a
+ * package that is not installed never breaks the whole file at import.
+ */
+function loadOptional<T>(id: string): T | null {
+  try {
+    const m = createRequire(import.meta.url)(id);
+    return (m?.default ?? m) as T;
+  } catch {
+    return null;
+  }
+}
+/** ajv's JSON Schema 2020-12 validator (not a declared dependency). */
+const Ajv2020 = loadOptional<AjvClass>('ajv/dist/2020');
+const AJV_MISSING =
+  'skipped: ajv is not installed here. It is not a dependency of Ironbooks (it arrives only through electron-builder), so the JSON Schema checks run only where it can be found.';
+if (!Ajv2020) console.warn(`test/mcp/operations.test.ts: JSON Schema checks ${AJV_MISSING}`);
+
 const ID = '11111111-2222-4333-8444-555555555555';
 const ID2 = '99999999-2222-4333-8444-555555555555';
 const FILE = 'ab'.repeat(16);
@@ -132,7 +166,7 @@ describe('the connector and the app agree', () => {
     expect(ask.description).toContain(STANDING_TEXT);
     expect(GUIDE_TEXT).toContain(STANDING_TEXT);
     expect(STANDING_TEXT).toBe(
-      'Standing permission can be given for prepare, enter and change (until the end of the day at most); bulk (the same, and each request still within the most records one request may change); outside and print (at most 30 minutes; for outside, only an Admin can give it). It is never given for read_sensitive (protected data), remove (deleting), period (closed-period work), settings, admin (users and security), file (the company file) and secret (passwords and keys): each of those is asked one request at a time, so do not ask ahead for them.',
+      'Standing permission can be given for prepare, enter and change (until the end of the day at most); bulk (the same, and each request still within the most records one request may change); outside and print (at most 30 minutes; for outside, only an Admin can give it). It is never given for read_sensitive (protected data), remove (deleting), period (closed-period work), settings, admin (users and security), file (the company file) and secret (passwords and keys): each of those is asked one request at a time, so do not ask ahead for them. Nor does standing permission ever cover a request dated on or before the closing date (that is closed-period work, whatever the operation), one with reveal, or one sent with a confirm flag: each of those asks a person.',
     );
     expect(ask.inputSchema.properties.minutes.description).toBe('How long it should last, in minutes. The person may shorten it. It ends at the end of the day at the latest; outside and print at most 30.');
   });
@@ -299,6 +333,8 @@ describe('run_operation', () => {
     expect(r.data.result.rows.length).toBeLessThan(20_000);
     expect(r.data.result.rows[0]).toEqual({ id: 0, memo: 'x'.repeat(40) });
     expect(r.data.result_cut_short).toMatch(/Narrow the request/);
+    expect(r.data.cut_short).toEqual({ result: r.data.result_cut_short });
+    expect(r.data.cut_short.result).toMatch(/^The result was too long to show in full: its longest lists were cut\./);
     expect(cutToFit({ a: [1, 2] })).toBeNull();
     expect(cutToFit({ text: 'y'.repeat(300) }, 100)).toEqual({ value: null });
   });
@@ -311,16 +347,68 @@ describe('run_operation', () => {
     const r = await call(client, 'run_operation', { operation: 'x.batch', request_id: 'b-1', reason: 'Month end.' });
     expect(r.text.length).toBeLessThan(MAX_RESULT_CHARS + 5_000);
     expect(r.data.route_preview.rows.length).toBeLessThan(20_000);
+    expect(r.data.route_preview.rows[0]).toEqual(rows[0]);
+    // The short list fits its share and is kept whole.
     expect(r.data).toMatchObject({ outcome: 'asked', request_id: ID, would_also: ['Emails 3 statements'] });
     expect(r.data.next).toMatch(/wait_for_decision/);
-    expect(r.data.result_cut_short).toMatch(/longest lists were cut/);
+    // It says which part was cut, and how to see the rest.
+    expect(Object.keys(r.data.cut_short)).toEqual(['route_preview']);
+    expect(r.data.cut_short.route_preview).toMatch(/^The operation's own preview \(route_preview\) was too long to show in full: its longest lists were cut\. A person sees all of it on the approval card\. To see it all yourself, dry run a smaller request/);
+    expect(r.data).not.toHaveProperty('result_cut_short');
     // One text too long to cut: that part is left out, and the answer says which.
     const huge = fake({ act: () => ({ operation: 'x.report', outcome: 'read', result: 'z'.repeat(MAX_RESULT_CHARS + 10), note: 'Kept.' }) });
     const left = await call(huge.client, 'run_operation', { operation: 'x.report' });
     expect(left.text.length).toBeLessThan(MAX_RESULT_CHARS);
     expect(left.data).toMatchObject({ outcome: 'read', note: 'Kept.', left_out: ['result'] });
     expect(left.data).not.toHaveProperty('result');
-    expect(left.data.result_cut_short).toMatch(/too long to show/);
+    expect(left.data.result_cut_short).toMatch(/^The result was too long to show at all, so it was left out\. Narrow the request/);
+  });
+
+  it('a long list of what it would also send is cut like the result: it says how many are shown of how many', async () => {
+    const effects = Array.from({ length: 6_000 }, (_, i) => ({ kind: 'email', summary: `Email to customer${i}@example.com: Statement for March (1 attachment) ${'.'.repeat(30)}` }));
+    const rows = Array.from({ length: 20_000 }, (_, i) => ({ id: i, memo: 'x'.repeat(40) }));
+    const { client } = fake({ act: () => ({ operation: 'statements.email', outcome: 'dry_run', preview: { routePreview: { rows }, effects }, result: { rows } }) });
+    const r = await call(client, 'run_operation', { operation: 'statements.email', dry_run: true });
+    expect(r.text.length).toBeLessThan(MAX_RESULT_CHARS + 5_000);
+    expect(r.data.would_also.length).toBeLessThan(6_000);
+    expect(r.data.would_also[0]).toBe(effects[0].summary);
+    // A dry run waits for nobody: there is no approval card to point to.
+    expect(r.data.cut_short.would_also).toBe(
+      `The list of what it would also do outside the books (would_also) was too long to show in full: only the first ${r.data.would_also.length} of 6000 are shown. Nothing was sent. To see each one, dry run a smaller batch.`,
+    );
+    expect(r.data.cut_short.route_preview).toMatch(/Nothing was kept\. To see all of it, dry run a smaller request/);
+    expect(JSON.stringify(r.data.cut_short)).not.toMatch(/approval card/);
+    // Every long part was cut to a fair share; none took all the room.
+    expect(Object.keys(r.data.cut_short).sort()).toEqual(['result', 'route_preview', 'would_also']);
+    // (Halving a list can leave a part at half its share, a sixth of the room: never near nothing.)
+    for (const part of ['result', 'route_preview', 'would_also']) expect(JSON.stringify(r.data[part]).length, part).toBeGreaterThan(MAX_RESULT_CHARS / 10);
+    expect(r.data.outcome).toBe('dry_run');
+    // An answer that fits is left as it is.
+    expect(holdToLimit({ outcome: 'read', result: [1, 2, 3] })).toEqual({ outcome: 'read', result: [1, 2, 3] });
+  });
+
+  it('a change that was carried out is never cut with advice that would send it again', async () => {
+    const rows = Array.from({ length: 20_000 }, (_, i) => ({ id: i, memo: 'x'.repeat(40) }));
+    for (const outcome of ['posted', 'done']) {
+      const { client } = fake({ act: () => ({ operation: 'bills.batch', outcome, result: { rows }, preview: { routePreview: { rows } } }) });
+      const r = await call(client, 'run_operation', { operation: 'bills.batch', body: {}, request_id: `b-${outcome}` });
+      expect(r.text.length, outcome).toBeLessThan(MAX_RESULT_CHARS + 5_000);
+      for (const part of ['result', 'route_preview']) {
+        expect(r.data.cut_short[part], `${outcome} ${part}`).toMatch(/It was carried out once, in full: do not send it again\. To see the rest, read what it made with a narrower read/);
+        expect(r.data.cut_short[part], `${outcome} ${part}`).not.toMatch(/Narrow the request|dry run|approval card/);
+      }
+    }
+    // Waiting for a person: the card shows the rest. Not carried out: a smaller request does.
+    const card = holdToLimit({ outcome: 'asked', next: 'wait', route_preview: { rows } }, 50_000);
+    expect((card.cut_short as Any).route_preview).toMatch(/A person sees all of it on the approval card/);
+    const read = holdToLimit({ outcome: 'read', result: { rows } }, 50_000);
+    expect((read.cut_short as Any).result).toMatch(/Narrow the request \(dates, a filter, a limit in the query\) to see everything\.$/);
+    // A request read later: approved and done is carried out; one that failed was not, and sending it again shows nothing.
+    const executed = shapeRequest({ ...REQUEST, result: { rows } }, { full: true }) as Any;
+    expect(executed.cut_short.result).toMatch(/^The result was too long to show in full: its longest lists were cut\. It was carried out once, in full: do not send it again\./);
+    const failed = shapeRequest({ ...REQUEST, status: 'failed', error: 'No.', result: { rows } }, { full: true }) as Any;
+    expect(failed.cut_short.result).toMatch(/Do not send the request again to see the rest: read the error/);
+    expect(failed.cut_short.result).not.toMatch(/carried out once/);
   });
 
   it('checks what it can before anything is sent', async () => {
@@ -405,18 +493,192 @@ describe('waiting for a decision', () => {
     const r = await call(answering(first).client, 'wait_for_decision', { request_id: ID }, sent);
     expect(r.data).toMatchObject({
       decision: 'pending',
-      said: 'Approved by Dana Lee. A second person must also approve it before anything is done.',
+      said: 'One person approved it (Dana Lee); a second person must also approve it before anything is done.',
       first_approved_by: 'Dana Lee',
       first_approved_at: '2026-11-20T10:05:00.000Z',
     });
+    expect(r.data.said).toMatch(/one person approved it/i);
+    expect(r.data.said).toMatch(/a second person must also approve/);
     // Not shown as decided while a second person has still to approve.
     expect(r.data).not.toHaveProperty('decided_by');
     expect(r.data).not.toHaveProperty('decided_at');
     expect(r.data.next).toMatch(/Call wait_for_decision again/);
     expect(sent).toEqual([]);
+    // The list says the same.
+    const listed = await call(fake({ act: () => ({ requests: [first] }) }).client, 'list_my_requests');
+    expect(listed.data.requests[0]).toMatchObject({ decision: 'pending', said: r.data.said, first_approved_by: 'Dana Lee' });
+    expect(listed.data.requests[0]).not.toHaveProperty('decided_by');
     // Once both have: decided by the first, second approver named.
     const both = await call(answering({ ...REQUEST, secondApproverName: 'Sam Roe' }).client, 'wait_for_decision', { request_id: ID });
     expect(both.data).toMatchObject({ decision: 'approved', decided_by: 'Dana Lee', second_approver: 'Sam Roe' });
+  });
+
+  it('a stale request: the books changed, a person must decide again on the new preview, and it is not news yet', async () => {
+    // Going stale sets every approval aside (lib/services/agentRequests.ts backToWaiting clears
+    // decidedBy), so a stale request with no name on it waits for a person to decide again.
+    const stale = { ...REQUEST, status: 'pending', result: null, decidedAt: null, decidedByName: null, stale: true };
+    const sent: Any[] = [];
+    const r = await call(answering(stale).client, 'wait_for_decision', { request_id: ID }, sent);
+    expect(r.data).toMatchObject({ decision: 'pending', stale: true });
+    expect(r.data.said).toBe('The books changed after a person was shown what this would do, so Ironbooks made a new preview. Nothing was done: a person must look at the new preview and decide again.');
+    expect(r.data).not.toHaveProperty('first_approved_by');
+    expect(r.data.next).toMatch(/Do not send the request again/);
+    expect(sent).toEqual([]);
+    // Not stale: no mark at all.
+    expect(shapeRequest({ ...REQUEST, status: 'pending', stale: false, decidedByName: null })).not.toHaveProperty('stale');
+  });
+
+  it('a stale request one person approved again: the first of two approvals of the NEW preview, so a second person must also approve', async () => {
+    // The stale mark stays on (it counts the rounds), and the name is set again only by a first of
+    // two approvals of the new preview (agentRequests.ts approve, firstOfTwo).
+    const stale = { ...REQUEST, status: 'pending', result: null, decidedByName: 'Dana Lee', decidedAt: '2026-11-20T10:09:00.000Z', stale: true };
+    const sent: Any[] = [];
+    const r = await call(answering(stale).client, 'wait_for_decision', { request_id: ID }, sent);
+    expect(r.data).toMatchObject({ decision: 'pending', stale: true, first_approved_by: 'Dana Lee', first_approved_at: '2026-11-20T10:09:00.000Z' });
+    expect(r.data.said).toBe(
+      'The books changed after a person was shown what this would do, so Ironbooks made a new preview. One person approved the new preview (Dana Lee); a second person must also approve it before anything is done.',
+    );
+    expect(r.data.said).toMatch(/one person approved/i);
+    expect(r.data.said).toMatch(/a second person must also approve/);
+    // Not "decide again": the agent must not tell its person to approve once more.
+    expect(r.data.said).not.toMatch(/decide again/);
+    expect(r.data).not.toHaveProperty('decided_by');
+    expect(r.data.next).toMatch(/Do not send the request again/);
+    expect(sent).toEqual([]);
+    // The list says the same.
+    const listed = await call(fake({ act: () => ({ requests: [stale] }) }).client, 'list_my_requests');
+    expect(listed.data.requests[0]).toMatchObject({ decision: 'pending', stale: true, said: r.data.said, first_approved_by: 'Dana Lee' });
+  });
+
+  it('the standing permission actually given is what the agent reads, not what it asked for', async () => {
+    const asked = { constraints: { entityIds: [ID, ID2], maxAmount: '900.00' }, minutes: 240 };
+    const given = { minutes: 60, constraints: { entityIds: [ID], maxAmount: '500.00', maxUses: 5 }, expiresAt: '2026-11-20T11:05:00.000Z' };
+    const grantRequest = { ...REQUEST, kind: 'grant', status: 'executed', result: null, grantId: ID2, grantAsked: asked, grant: given };
+    const r = await call(answering(grantRequest).client, 'wait_for_decision', { request_id: ID });
+    expect(r.data).toMatchObject({
+      kind: 'standing permission',
+      decision: 'approved',
+      standing_permission: ID2,
+      limits_given: { entity_ids: [ID], max_amount: '500.00', max_uses: 5 },
+      minutes_given: 60,
+      standing_permission_ends_at: '2026-11-20T11:05:00.000Z',
+    });
+    expect(r.data.said).toBe('Approved by Dana Lee: you have standing permission for estimates.create until 2026-11-20T11:05:00.000Z, within the limits you were given (limits_given).');
+    expect(r.data.next).toMatch(/go by limits_given, not by what you asked/);
+    // What was asked is not shown once the given limits are known: the agent cannot take it for its own.
+    expect(r.data).not.toHaveProperty('limits_you_asked');
+    expect(r.data).not.toHaveProperty('minutes_you_asked');
+    expect(r.text).not.toContain('900.00');
+    expect(r.text).not.toContain(ID2 + '"]'); // the second customer asked for is not in the limits
+    // The list shows the same.
+    const listed = await call(fake({ act: () => ({ requests: [grantRequest] }) }).client, 'list_my_requests');
+    expect(listed.data.requests[0]).toMatchObject({ limits_given: r.data.limits_given, minutes_given: 60 });
+    expect(listed.data.requests[0]).not.toHaveProperty('limits_you_asked');
+    // Given with no limits of its own: said so, not left out.
+    const open = await call(answering({ ...grantRequest, grant: { ...given, constraints: {} } }).client, 'wait_for_decision', { request_id: ID });
+    expect(open.data.limits_given).toMatch(/^none beyond the operation itself/);
+    // While it waits, what was asked is shown, labelled as asked.
+    const waiting = await call(answering({ ...grantRequest, status: 'pending', grantId: null, grant: null, decidedByName: null }).client, 'wait_for_decision', { request_id: ID });
+    expect(waiting.data).toMatchObject({ limits_you_asked: { entity_ids: [ID, ID2], max_amount: '900.00' }, minutes_you_asked: 240 });
+    expect(waiting.data).not.toHaveProperty('limits_given');
+  });
+
+  it('a request approved with "approve similar": the standing permission given with it, or why none was', async () => {
+    const given = { minutes: 30, constraints: { maxAmount: '500.00' }, expiresAt: '2026-11-20T10:35:00.000Z' };
+    const r = await call(answering({ ...REQUEST, grantId: ID2, grant: given }).client, 'wait_for_decision', { request_id: ID });
+    expect(r.data.said).toBe('Approved by Dana Lee, and done. The person also gave you standing permission for more of the same until 2026-11-20T10:35:00.000Z, within limits_given.');
+    expect(r.data).toMatchObject({ standing_permission: ID2, limits_given: { max_amount: '500.00' }, minutes_given: 30 });
+    const refused = await call(answering({ ...REQUEST, grantError: 'Standing permission for this can last at most 30 minutes from now.' }).client, 'wait_for_decision', { request_id: ID });
+    expect(refused.data.said).toMatch(/^Approved by Dana Lee, and done\. The person also wanted to give you standing permission for more of the same, but it was not given/);
+    expect(refused.data.standing_permission_not_given).toBe('Standing permission for this can last at most 30 minutes from now.');
+    expect(refused.data).not.toHaveProperty('standing_permission');
+  });
+
+  it('a run that posted to the books says so, with the entries it made', async () => {
+    const r = await call(answering({ ...REQUEST, posted: true, entryIds: [ID2] }).client, 'wait_for_decision', { request_id: ID });
+    expect(r.data).toMatchObject({ said: 'Approved by Dana Lee, and posted to the books.', entry_ids: [ID2] });
+    // The list stays short: no entry ids.
+    const listed = await call(fake({ act: () => ({ requests: [{ ...REQUEST, posted: true, entryIds: [ID2] }] }) }).client, 'list_my_requests');
+    expect(listed.data.requests[0].said).toBe('Approved by Dana Lee, and posted to the books.');
+    expect(listed.data.requests[0]).not.toHaveProperty('entry_ids');
+  });
+
+  it('a very long result of an approved run is cut, and says so', async () => {
+    const rows = Array.from({ length: 20_000 }, (_, i) => ({ id: i, memo: 'x'.repeat(40) }));
+    const r = await call(answering({ ...REQUEST, result: { rows } }).client, 'wait_for_decision', { request_id: ID });
+    expect(r.text.length).toBeLessThan(MAX_RESULT_CHARS + 5_000);
+    expect(r.data.result.rows.length).toBeLessThan(20_000);
+    expect(r.data).toMatchObject({ decision: 'approved', said: 'Approved by Dana Lee, and done.' });
+    // How to see the rest of a run that is done: never by sending it again.
+    expect(r.data.cut_short.result).toBe(
+      'The result was too long to show in full: its longest lists were cut. It was carried out once, in full: do not send it again. To see the rest, read what it made with a narrower read (find_operations finds one).',
+    );
+    expect(r.data.next).toMatch(/Do not send it again/);
+  });
+
+  it('when Ironbooks holds as many waits as it allows (429), the request is read now and the agent is told to check later', async () => {
+    const pending = { ...REQUEST, status: 'pending', result: null, decidedAt: null, decidedByName: null };
+    const asked: Any[] = [];
+    const busy = fake({
+      get: (_p, q) => {
+        asked.push(q);
+        return q.wait > 0 ? new IronbooksError('You are already waiting on 4 requests at once.', { status: 429, code: 'RATE_LIMITED', retryAfter: 5 }) : { request: pending };
+      },
+    });
+    const sent: Any[] = [];
+    const r = await call(busy.client, 'wait_for_decision', { request_id: ID }, sent);
+    expect(r.isError, r.text).toBe(false);
+    expect(asked).toEqual([{ wait: WAIT_MAX_SECONDS }, { wait: 0 }]);
+    expect(busy.got[1].opts).toEqual({ wait: false });
+    expect(r.data).toMatchObject({ request_id: ID, decision: 'pending', said: 'A person has not decided yet.', check_again_after_seconds: 5 });
+    expect(r.data.next).toBe(
+      'Ironbooks is already holding as many waits for you as it allows, so this one was read now, without waiting. Check this request later: call wait_for_decision for it again in 5 seconds or more, or carry on with other work first. Do not send the request again: it is already waiting.',
+    );
+    expect(sent).toEqual([]);
+    // Decided meanwhile: the read now gives the decision, announced as usual.
+    const decided = fake({ get: (_p, q) => (q.wait > 0 ? new IronbooksError('Busy.', { status: 429, code: 'RATE_LIMITED' }) : { request: REQUEST }) });
+    const told: Any[] = [];
+    const d = await call(decided.client, 'wait_for_decision', { request_id: ID }, told);
+    expect(d.data).toMatchObject({ decision: 'approved', said: 'Approved by Dana Lee, and done.' });
+    expect(d.data).not.toHaveProperty('check_again_after_seconds');
+    expect(d.data.next).toBe('It is done. Do not send it again.');
+    expect(told.map((m) => m.method)).toEqual(['notifications/message']);
+    // A 429 on a read without waiting is passed on as it is (Ironbooks never limits those).
+    const plain = await call(fake({ get: () => new IronbooksError('Busy.', { status: 429 }) }).client, 'wait_for_decision', { request_id: ID, timeout_seconds: 0 });
+    expect(plain).toMatchObject({ isError: true, text: 'Busy.' });
+  });
+
+  it('when this connector already holds its waits open, a third is read now, with advice to check it later', async () => {
+    const pending = { ...REQUEST, status: 'pending', result: null, decidedAt: null, decidedByName: null };
+    const busy = fake({ get: (_p, _q, o) => (o.wait ? new IronbooksError(WAITS_BUSY_MESSAGE, { code: WAITS_BUSY_CODE }) : { request: pending }) });
+    const r = await call(busy.client, 'wait_for_decision', { request_id: ID });
+    expect(r.isError, r.text).toBe(false);
+    expect(r.data.next).toBe(
+      'You are already waiting on other requests here, so this one was read now, without waiting. Check this request later: call wait_for_decision for it again once one of your other waits has come back, or carry on with other work first. Do not send the request again: it is already waiting.',
+    );
+    expect(r.data).not.toHaveProperty('check_again_after_seconds');
+  });
+
+  it('tells the connector about requests that restart Ironbooks, so it is not started again while one may be under way', async () => {
+    const noted: Any[] = [];
+    const update = { ...REQUEST, operation: 'shell.update.install', class: 'settings', status: 'pending', result: null, decidedByName: null };
+    const base = fake({
+      act: (r) => (r.verb === 'run_operation' ? { operation: 'shell.update.install', outcome: 'asked', requestId: ID, status: 'pending' } : r.verb === 'list_my_requests' ? { requests: [update] } : { request: { ...update, status: 'cancelled' } }),
+      get: () => ({ request: { ...update, status: 'executed' } }),
+    });
+    const client = { ...base.client, noteRequest: (r: Any) => noted.push({ id: r.id, operation: r.operation, status: r.status }) };
+    await call(client, 'run_operation', { operation: 'shell.update.install', request_id: 'update-1', reason: 'The person asked for the update.' });
+    await call(client, 'list_my_requests');
+    await call(client, 'wait_for_decision', { request_id: ID });
+    await call(client, 'cancel_request', { request_id: ID });
+    expect(noted).toEqual([
+      { id: ID, operation: 'shell.update.install', status: 'pending' },
+      { id: ID, operation: 'shell.update.install', status: 'pending' },
+      { id: ID, operation: 'shell.update.install', status: 'executed' },
+      { id: ID, operation: 'shell.update.install', status: 'cancelled' },
+    ]);
+    // A client without the hook (the tests' stand-ins, older callers) is fine.
+    expect((await call(base.client, 'wait_for_decision', { request_id: ID })).isError).toBe(false);
   });
 
   it('standing permission that is approved but not made yet is still going: it may yet fail', async () => {
@@ -637,13 +899,44 @@ describe('the guide', () => {
     // Every one of the 14 classes, with what it means.
     for (const c of types.RISK_CLASSES) expect(GUIDE_TEXT).toContain(`- ${c}: ${CLASS_MEANINGS[c as keyof typeof CLASS_MEANINGS]}`);
   });
+
+  it('says what standing permission an agent can get: a short window for sends and prints (D5), never for closed-period work', () => {
+    // Outside and print: a person approves each, or gives a window of at most 30 minutes; for sends only an Admin.
+    expect(GUIDE_TEXT).toContain('- outside: Sends something off this computer: an email, an e-file, a call to an AI service. A person approves each send, unless an Admin gave you standing permission for a batch (at most 30 minutes).');
+    expect(GUIDE_TEXT).toContain('- print: Prints on a real printer. A person approves each print, unless they gave you standing permission (at most 30 minutes).');
+    expect(GUIDE_TEXT).not.toMatch(/outside[^\n]*Always asks a person/);
+    expect(GUIDE_TEXT).toContain('outside and print (at most 30 minutes; for outside, only an Admin can give it)');
+    // Closed-period work: the class, and any request dated on or before the closing date.
+    expect(GUIDE_TEXT).toMatch(/It is never given for [^.]*period \(closed-period work\)/);
+    expect(GUIDE_TEXT).toContain('Nor does standing permission ever cover a request dated on or before the closing date');
+    expect(GUIDE_TEXT).toMatch(/Go by what you were given, never by what you asked for/);
+  });
+
+  it('says what a stale request is, and that the person decides again', () => {
+    expect(GUIDE_TEXT).toMatch(/A pending request can be marked stale: the books changed after a person was shown what it would do/);
+    expect(GUIDE_TEXT).toMatch(/Nothing was done\. The person must look at the new preview and decide again; any approval given before counts for nothing\./);
+    expect(GUIDE_TEXT).toMatch(/do not send the request again/);
+    // Two people and a stale request: one approval of the new preview, and a second still to come.
+    expect(GUIDE_TEXT).toMatch(/That holds for a stale request too: once one person approves the new preview, the answer still says stale, names that person \(first_approved_by\), and says a second person must also approve it\./);
+    // And what a wait that cannot be held open means.
+    expect(GUIDE_TEXT).toMatch(/says to check it later/);
+  });
 });
 
-describe('every input schema is real JSON Schema, and says what the tool itself accepts', () => {
-  const ajv = new Ajv2020({ strict: true, allErrors: true });
+describe('a package that is not installed', () => {
+  it('is found missing at run time, so its cases are skipped instead of the whole file failing at import', () => {
+    expect(loadOptional('ironbooks-no-such-package/dist/2020')).toBeNull();
+    // ajv itself is found wherever electron-builder brought it; either way the describe below says what it does.
+    expect(Ajv2020 === null || typeof Ajv2020 === 'function').toBe(true);
+  });
+});
+
+describe.skipIf(!Ajv2020)(`every input schema is real JSON Schema, and says what the tool itself accepts${Ajv2020 ? '' : ` (${AJV_MISSING})`}`, () => {
+  // Only built when ajv was found (the describe is skipped otherwise, and its body still runs to collect the cases).
+  const ajv = Ajv2020 ? new Ajv2020({ strict: true, allErrors: true }) : (null as unknown as AjvLike);
   // The two words the tools add for their own messages.
-  ajv.addKeyword({ keyword: 'patternHint', schemaType: 'string' });
-  ajv.addKeyword({ keyword: 'anyOfHint', schemaType: 'string' });
+  ajv?.addKeyword({ keyword: 'patternHint', schemaType: 'string' });
+  ajv?.addKeyword({ keyword: 'anyOfHint', schemaType: 'string' });
 
   it('every tool\'s schema compiles under JSON Schema 2020-12, strictly', () => {
     for (const t of TOOLS as Any[]) {
@@ -692,7 +985,10 @@ describe('every input schema is real JSON Schema, and says what the tool itself 
       }
     }
   });
+});
 
+// Needs no JSON Schema validator: it runs whether ajv is there or not.
+describe('the new tools\' schemas and handlers agree', () => {
   it('every property the new tools declare is one their handler reads', async () => {
     // Fill every declared property with a valid value and check each one shows up in what is sent.
     const { client, acted } = fake({

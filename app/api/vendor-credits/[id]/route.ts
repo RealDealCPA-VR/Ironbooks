@@ -18,8 +18,8 @@ import {
   updateVendorCredit,
 } from '@/lib/services/vendorCredits';
 import { routeError, serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
-import { zodErrorBody } from '@/lib/validation/helpers';
-import { createVendorCreditSchema } from '@/lib/validation/vendorCredits';
+import { bodyValidationError, zodErrorBody } from '@/lib/validation/helpers';
+import { createVendorCreditSchema, vendorCreditActionSchema } from '@/lib/validation/vendorCredits';
 import { ServiceError } from '@/lib/services/_base';
 
 function errorResponse(err: unknown) {
@@ -32,6 +32,16 @@ function errorResponse(err: unknown) {
 }
 
 type RouteContext = { params: Promise<{ id: string }> };
+
+/**
+ * The POST body as agents read it described (lib/validation/vendorCredits.ts
+ * vendorCreditActionSchema). Called once the checks of the action answered, so it refuses only a
+ * value the service could not have used.
+ */
+function checkActionBody(body: unknown): void {
+  const checked = vendorCreditActionSchema.safeParse(body);
+  if (!checked.success) throw bodyValidationError(checked.error);
+}
 
 /**
  * Reads an optional date from the request body. Missing means "today" (null); anything that is
@@ -80,6 +90,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       if (!body.amount) {
         return NextResponse.json({ error: 'amount is required', code: 'VALIDATION' }, { status: 400 });
       }
+      checkActionBody(body);
       const result = await refundVendorCredit(ctx, {
         vendorCreditId: id,
         bankAccountId: body.bankAccountId,
@@ -104,6 +115,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json({ error: 'amount is required', code: 'VALIDATION' }, { status: 400 });
     }
 
+    checkActionBody(body);
     const fn = body.action === 'apply' ? applyToBill : unapplyFromBill;
     const result = await fn(ctx, {
       vendorCreditId: id,

@@ -5,9 +5,10 @@
  *  - nothing listed or returned afterwards contains the token or the digest;
  *  - a token finds its agent until the agent is removed, and never on another computer's key;
  *  - only an Admin makes or removes agents, and both are audited with the Admin as the one who
- *    did it; anyone who may see Users & Roles lists them; an agent, or work inside an agent's
- *    bridged run, does none of it. An agent may hold any role, Admin included (D1): the role is
- *    its ceiling;
+ *    did it; removing one also takes back the standing permission it still holds; anyone who may
+ *    see Users & Roles > Users lists them, each with how many adjustments it has; an agent, or
+ *    work inside an agent's bridged run, does none of it. An agent may hold any role, Admin
+ *    included (D1): the role is its ceiling;
  *  - a new agent asks for every change unless the Admin chose otherwise (D2), and the older mode
  *    follows its preset;
  *  - an agent's access is its roles' access through the agent limits (clampForAgent);
@@ -35,7 +36,7 @@ vi.mock('@/lib/serviceScope', async (importOriginal) => ({
 }));
 
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { agents, auditLogs, companies, users } from '@/lib/db/schema';
+import { agentGrants, agentPolicies, agents, auditLogs, companies, users } from '@/lib/db/schema';
 import { builtinRole, fullAccess, unionRoles, type RoleDefinition } from '@/lib/permissions/model';
 import { canActivity } from '@/lib/permissions/model';
 import { clampForAgent } from '@/lib/permissions/agentAccess';
@@ -68,6 +69,15 @@ let admin: ServiceContext;
 let bookkeeper: ServiceContext;
 let manager: ServiceContext;
 let adminId: string;
+/** May see Users & Roles > Users, and change nothing there. */
+const usersViewRole: RoleDefinition = {
+  key: 'users_viewer',
+  name: 'Users viewer',
+  description: 'test',
+  builtin: false,
+  permissions: { 'users.users': ['view'] },
+  flags: {},
+};
 
 async function expectError(p: Promise<unknown>, code: string, message?: RegExp) {
   try {
@@ -213,6 +223,68 @@ describe('making an agent', () => {
     await revokeAgent(admin, agentId);
     expect(await db.select().from(auditLogs).where(eq(auditLogs.entityId, agentId))).toHaveLength(2);
   });
+
+  it('removing it takes back the standing permission it still holds, each audited', async () => {
+    const made = await createAgent(admin, { name: 'Granted helper', roleKeys: ['bookkeeper'] });
+    const other = await createAgent(admin, { name: 'Other helper', roleKeys: ['bookkeeper'] });
+    const companyId = admin.companyId;
+    const hour = 60 * 60 * 1000;
+    const grant = async (agent: string, over: Partial<typeof agentGrants.$inferInsert> = {}) =>
+      (
+        await db
+          .insert(agentGrants)
+          .values({ companyId, agentId: agent, operation: 'invoices.create', class: 'enter', givenBy: adminId, expiresAt: new Date(Date.now() + hour), ...over })
+          .returning()
+      )[0];
+    const standing = await grant(made.agent.id);
+    const usedUp = await grant(made.agent.id, { constraints: { maxUses: 1 }, uses: 1 });
+    const expired = await grant(made.agent.id, { expiresAt: new Date(Date.now() - hour) });
+    const earlierBy = new Date(Date.now() - 1000);
+    const alreadyBack = await grant(made.agent.id, { revokedAt: earlierBy, revokedBy: other.agent.id });
+    const othersOwn = await grant(other.agent.id);
+
+    await revokeAgent(admin, made.agent.id);
+    const byId = async (id: string) => (await db.select().from(agentGrants).where(eq(agentGrants.id, id)))[0];
+    // Every grant that still stood is taken back now, by the Admin who removed the agent.
+    for (const g of [standing, usedUp]) {
+      const after = await byId(g.id);
+      expect(after.revokedAt).toBeInstanceOf(Date);
+      expect(after.revokedBy).toBe(adminId);
+      const [audit] = await db.select().from(auditLogs).where(eq(auditLogs.entityId, g.id));
+      expect(audit).toMatchObject({ action: 'update', entityType: 'agent_grant', userId: adminId, agentId: null });
+      expect(audit.newValues).toMatchObject({ agentId: made.agent.id, operation: 'invoices.create', revoked: true, reason: 'agent removed' });
+    }
+    // An expired one stays as it ended; one already taken back keeps who took it back; another agent's stands.
+    expect((await byId(expired.id)).revokedAt).toBeNull();
+    expect(await byId(alreadyBack.id)).toMatchObject({ revokedAt: earlierBy, revokedBy: other.agent.id });
+    expect((await byId(othersOwn.id)).revokedAt).toBeNull();
+    const [agentAudit] = await db.select().from(auditLogs).where(eq(auditLogs.entityId, made.agent.id)).then((r) => r.filter((a) => a.action === 'update'));
+    expect(agentAudit.newValues).toMatchObject({ revoked: true, grantsTakenBack: 2 });
+
+    // Removing again finds nothing more to take back.
+    await revokeAgent(admin, made.agent.id);
+    expect(await db.select().from(auditLogs).where(eq(auditLogs.entityId, standing.id))).toHaveLength(1);
+    await revokeAgent(admin, other.agent.id);
+    expect((await byId(othersOwn.id)).revokedBy).toBe(adminId);
+  });
+
+  it('lists how many adjustments each agent has on top of its preset', async () => {
+    const adjusted = await createAgent(admin, { name: 'Adjusted', roleKeys: ['bookkeeper'] });
+    const plain = await createAgent(admin, { name: 'Plain', roleKeys: ['bookkeeper'] });
+    expect(adjusted.agent.overrideCount).toBe(0);
+    const companyId = admin.companyId;
+    await db.insert(agentPolicies).values([
+      { companyId, agentId: adjusted.agent.id, class: 'enter', area: null, setting: 'never' },
+      { companyId, agentId: adjusted.agent.id, class: 'enter', area: 'banking', setting: 'ask' },
+    ]);
+    const listed = await listAgents(admin);
+    expect(listed.find((a) => a.id === adjusted.agent.id)?.overrideCount).toBe(2);
+    expect(listed.find((a) => a.id === plain.agent.id)?.overrideCount).toBe(0);
+    expect(listed.every((a) => Number.isInteger(a.overrideCount))).toBe(true);
+    // The view a removal answers says it too.
+    expect((await revokeAgent(admin, adjusted.agent.id)).overrideCount).toBe(2);
+    await revokeAgent(admin, plain.agent.id);
+  });
 });
 
 describe('who may make agents, and what an agent may be', () => {
@@ -228,6 +300,10 @@ describe('who may make agents, and what an agent may be', () => {
     await expectError(revokeAgent(manager, made.agent.id), 'FORBIDDEN', /Admin/);
     // A person whose context was built without access is checked from the company file.
     expect((await listAgents({ db, companyId: admin.companyId, userId: adminId })).length).toBeGreaterThan(0);
+    // Seeing Users & Roles > Users is enough to list, as it is to open an agent's page.
+    const viewer: ServiceContext = { ...bookkeeper, access: unionRoles([builtinRole('bookkeeper')!, usersViewRole]) };
+    expect((await listAgents(viewer)).map((a) => a.id)).toContain(made.agent.id);
+    await expectError(createAgent(viewer, { name: 'Viewer made', roleKeys: ['view_only'] }), 'FORBIDDEN', /Admin/);
     // An agent cannot manage agents either, even with an Admin's access handed to it.
     const asAgent: ServiceContext = { ...admin, userId: null, agent: { id: made.agent.id, name: 'To remove', mode: 'post' } };
     await expectError(createAgent(asAgent, { name: 'Child', roleKeys: ['view_only'], mode: 'read_only' }), 'FORBIDDEN');
@@ -249,9 +325,16 @@ describe('who may make agents, and what an agent may be', () => {
     expect(boss.agent).toMatchObject({ roleKeys: ['admin'], roleNames: ['Admin'], preset: 'ask_every_change', mode: 'propose' });
     const both = await createAgent(admin, { name: 'Boss two', roleKeys: ['bookkeeper', 'admin'], mode: 'read_only' });
     expect(both.agent.roleNames).toEqual(['Bookkeeper', 'Admin']);
-    // Its access goes through the agent limits like any other role's.
+    // Its access goes through the agent limits like any other role's: the Admin role's own access
+    // is everything, so its ceiling is the limits applied to everything.
     const access = await agentAccess(db, { companyId: admin.companyId, roleKeys: ['admin'] });
     expect(access).toEqual(clampForAgent(fullAccess()));
+    // By value: an Admin ceiling, Users & Roles kept (its work is the admin class, which a person
+    // approves), and the books themselves.
+    expect(access.isAdmin).toBe(true);
+    expect(access.roleKeys).toEqual(['admin']);
+    expect(canActivity(access, 'users.users', 'modify')).toBe(true);
+    expect(canActivity(access, 'banking.registers', 'view_balance')).toBe(true);
     await revokeAgent(admin, boss.agent.id);
     await revokeAgent(admin, both.agent.id);
 

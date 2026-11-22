@@ -4,22 +4,16 @@
  * PUT /api/doc-numbers            — set / clear a starting number: { docType, startingNumber }.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getServerContext } from '@/lib/context';
 import { routeError } from '@/lib/routeErrors';
 import {
-  DOC_TYPES,
   getDocNumberSettings,
   isDocType,
   nextDocNumber,
   setStartingDocNumber,
 } from '@/lib/services/docNumbers';
 import { zodErrorBody } from '@/lib/validation/helpers';
-
-const putSchema = z.object({
-  docType: z.enum(DOC_TYPES),
-  startingNumber: z.string().trim().max(50).nullable(),
-});
+import { docNumberSettingSchema } from '@/lib/validation/docNumbers';
 
 export async function GET(req: NextRequest) {
   try {
@@ -41,7 +35,7 @@ export async function PUT(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const body = await req.json().catch(() => ({}));
-    const parsed = putSchema.safeParse(body);
+    const parsed = docNumberSettingSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const setting = await setStartingDocNumber(
       ctx,

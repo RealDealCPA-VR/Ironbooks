@@ -175,22 +175,22 @@ export function amountOf(operation: Pick<Operation, 'amountField'>, input: Opera
  * The amount as the one-line summary shows it to a person (describe.ts). amountOf is null as soon
  * as either side cannot be read, which is right for the policy (it then treats the request as over
  * every limit) but would leave the approval card without a figure: an agent could hide the total by
- * writing junk in a body field the route ignores. So: amountOf when it has one; otherwise the larger
- * of the amounts that can be read (the route's answer usually holds the real one); 'unreadable' when
- * an amount is there and none of it can be read; null when there is no amount at all.
+ * writing junk in a body field the route ignores. So:
+ *  - amountOf when it has one;
+ *  - otherwise the route's answer's figure, when that can be read (the body's is the junk: what the
+ *    route did beats what the agent wrote);
+ *  - otherwise 'unreadable': the answer's figure is junk (the body's figure is then one the route
+ *    did not use, so it never shows), or no figure can be read at all, or none was given. The card
+ *    then says the amount is not known, as the policy reads it;
+ *  - null only when the operation names no amount.
  */
 export function amountShown(operation: Pick<Operation, 'amountField'>, input: OperationInput, answer?: unknown): string | 'unreadable' | null {
   const field = operation.amountField;
   if (typeof field !== 'string' || field === '') return null;
   const strict = amountOf(operation, input, answer);
   if (strict !== null) return strict;
-  const readings = [answer === undefined ? NONE : amountIn(answer, field), amountIn(input?.body, field)];
-  let best: Decimal | null = null;
-  for (const r of readings) {
-    if (r.kind === 'ok' && (best === null || r.value.abs().greaterThan(best.abs()))) best = r.value;
-  }
-  if (best !== null) return decimalText(best);
-  return readings.some((r) => r.kind === 'bad') ? 'unreadable' : null;
+  const done = answer === undefined ? NONE : amountIn(answer, field);
+  return done.kind === 'ok' ? decimalText(done.value) : 'unreadable';
 }
 
 // ---------------------------------------------------------------------------

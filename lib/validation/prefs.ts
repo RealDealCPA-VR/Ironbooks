@@ -3,7 +3,7 @@
  * to-dos, leads, letters/labels/envelopes, Doc Center attachments, calendar.
  */
 import { z } from 'zod';
-import { zUuid } from './helpers';
+import { describeShape, zUuid } from './helpers';
 import { FORM_TYPES, MAX_FAVORITES, isFavoritePath } from '@/lib/preferences';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -125,10 +125,10 @@ export const updateTodoSchema = z.object(todoBase).partial();
 
 // ---- Leads ----
 const contactSchema = z.object({
-  name: z.string().trim().min(1).max(255),
-  title: z.string().max(100).optional(),
-  email: z.string().max(255).optional(),
-  phone: z.string().max(50).optional(),
+  name: z.string().trim().min(1).max(255).describe('Name of the contact person.'),
+  title: z.string().max(100).optional().describe('Job title of the contact; leave out for none.'),
+  email: z.string().max(255).optional().describe('Email address of the contact; leave out for none.'),
+  phone: z.string().max(50).optional().describe('Phone number of the contact; leave out for none.'),
 });
 const leadBase = {
   name: z.string().trim().min(1, 'A lead needs a name.').max(255),
@@ -142,18 +142,72 @@ const leadBase = {
   notes: z.string().max(10000).nullish(),
   isActive: z.boolean().optional(),
 };
-export const createLeadSchema = z.object(leadBase);
-export const updateLeadSchema = z.object(leadBase).partial();
-export const convertLeadSchema = z.object({ displayName: z.string().trim().max(255).optional() });
+// The edit takes the same fields, each optional; updateLead (lib/services/leads.ts) keeps every
+// field left out, and null or blank text clears one. Both are built from leadBase itself
+// (describeShape), so a field added to it reaches both and must be described there.
+export const createLeadSchema = z.object(
+  describeShape(leadBase, {
+    name: 'Name of the lead (a person or a business), at most 255 characters.',
+    companyName: "The lead's company name; leave out for none. On converting, it becomes the customer name.",
+    status: 'hot, warm or cold; leave out for warm.',
+    email: 'Email address of the lead; leave out for none.',
+    phone: 'Phone number of the lead (at most 50 characters); leave out for none.',
+    website: 'Website of the lead; leave out for none.',
+    address: 'Address as named text lines such as line1, line2, city, state, zip and country; leave out for none.',
+    contacts: 'Contact people at the lead, at most 50; leave out for none.',
+    notes: 'Notes about the lead (at most 10,000 characters); leave out for none.',
+    isActive: 'False adds the lead as inactive; leave out for active.',
+  }),
+);
+export const updateLeadSchema = z
+  .object(
+    describeShape(leadBase, {
+      name: 'New name of the lead; leave out to keep the name.',
+      companyName: "The lead's company name; leave out to keep it, or send null to clear it.",
+      status: 'hot, warm or cold; leave out to keep it.',
+      email: 'Email address of the lead; leave out to keep it, or send null or "" to clear it.',
+      phone: 'Phone number of the lead; leave out to keep it, or send null to clear it.',
+      website: 'Website of the lead; leave out to keep it, or send null to clear it.',
+      address: 'Address as named text lines such as line1, city, state and zip, replacing the saved one; leave out to keep it, or send null to clear it.',
+      contacts: 'All contact people of the lead, replacing the saved ones; leave out to keep them, or send null to remove them all.',
+      notes: 'Notes about the lead, replacing the saved ones; leave out to keep them, or send null to clear them.',
+      isActive: 'False makes the lead inactive; true makes it active again. Leave out to keep it.',
+    }),
+  )
+  .partial();
+export const convertLeadSchema = z.object({
+  displayName: z
+    .string()
+    .trim()
+    .max(255)
+    .optional()
+    .describe("Name of the new customer; leave out for the lead's company name, or its name when it has none."),
+});
 
 // ---- Letters ----
 const recipientType = z.enum(['customer', 'vendor', 'employee', 'lead']);
 export const letterTemplateSchema = z.object({
-  category: z.enum(['collection', 'customer', 'vendor', 'employee', 'lead', 'other']),
-  name: z.string().trim().min(1).max(100),
-  body: z.string().min(1).max(20000),
+  category: z
+    .enum(['collection', 'customer', 'vendor', 'employee', 'lead', 'other'])
+    .describe('Which letters list the template is under: collection, customer, vendor, employee, lead or other.'),
+  name: z.string().trim().min(1).max(100).describe('Name of the template, such as "Friendly reminder" (at most 100 characters).'),
+  body: z
+    .string()
+    .min(1)
+    .max(20000)
+    .describe(
+      'Text of the letter, with merge fields filled per recipient, such as {{date}}, {{recipient.name}}, {{recipient.address}}, {{balance}}, {{overdueBalance}}, {{invoiceList}}, {{company.name}} and {{signer}}.',
+    ),
 });
-export const updateLetterTemplateSchema = letterTemplateSchema.partial();
+export const updateLetterTemplateSchema = z
+  .object(
+    describeShape(letterTemplateSchema.shape, {
+      category: 'Which letters list the template is under; leave out to keep it.',
+      name: 'New name of the template; leave out to keep the name.',
+      body: 'Text of the letter with its merge fields, replacing the saved text; leave out to keep it.',
+    }),
+  )
+  .partial();
 export const prepareLettersSchema = z
   .object({
     recipientType,
@@ -176,18 +230,28 @@ export const envelopesSchema = z.object({
 });
 
 // ---- Doc Center ----
+/** The record kinds a document can be filed to (FILING_TABLES in lib/services/attachments.ts). */
+const FILING_KINDS =
+  'invoice, bill, expense, journal_entry, customer, vendor, employee, paycheck, estimate, sales_receipt, sales_order, ' +
+  'purchase_order, credit_memo, vendor_credit, payment_received, bill_payment, item, lead, form_template or deposit';
+const zEntityType = z.string().regex(/^[a-z][a-z0-9_]{0,99}$/, 'entityType is not valid');
+
 export const uploadAttachmentSchema = z.object({
-  entityType: z.string().regex(/^[a-z][a-z0-9_]{0,99}$/, 'entityType is not valid').nullish(),
-  entityId: zUuid.nullish(),
-  filename: z.string().trim().min(1, 'filename is required').max(255),
-  mimeType: z.string().max(100).optional(),
-  base64: z.string().min(1, 'file content is required'),
-  description: z.string().max(1000).nullish(),
+  entityType: zEntityType
+    .nullish()
+    .describe(`Kind of record the document is filed to, such as ${FILING_KINDS}; send it with entityId, or leave both out to put the document in the Doc Center inbox.`),
+  entityId: zUuid.nullish().describe('Id of that record; send it with entityType.'),
+  filename: z.string().trim().min(1, 'filename is required').max(255).describe('File name with its extension, such as "receipt-0412.pdf".'),
+  mimeType: z.string().max(100).optional().describe('Content type of the file, such as "application/pdf"; leave out for none.'),
+  base64: z.string().min(1, 'file content is required').describe("The file's bytes as base64 text, at most 25 MB before encoding."),
+  description: z.string().max(1000).nullish().describe('Description shown with the document; leave out for none.'),
 });
 export const updateAttachmentSchema = z.object({
-  entityType: z.string().regex(/^[a-z][a-z0-9_]{0,99}$/, 'entityType is not valid').nullish(),
-  entityId: zUuid.nullish(),
-  description: z.string().max(1000).nullish(),
+  entityType: zEntityType
+    .nullish()
+    .describe(`Kind of record to file the document to, such as ${FILING_KINDS}; send it with entityId. Send both as null to move it back to the inbox, or leave both out to keep where it is filed.`),
+  entityId: zUuid.nullish().describe('Id of that record; send it with entityType.'),
+  description: z.string().max(1000).nullish().describe('Description shown with the document; leave out to keep it, or send null to clear it.'),
 });
 
 // ---- Calendar ----

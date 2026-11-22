@@ -15,7 +15,9 @@
  *  - liveGrants: what the agent's door hands the policy engine. A removed or paused agent, or a
  *    company whose Integrated Applications switch is off, has none. Nor does a grant whose giver
  *    has left the company, been deactivated, or may no longer do the work themselves (for outside
- *    sends: is no longer an Admin), since approving never widens anything (plan 4.5).
+ *    sends: is no longer an Admin), since approving never widens anything (plan 4.5). The Agents
+ *    tab's live list (listGrants with `live`) shows exactly these.
+ *  - Nothing running inside an agent's bridged run reads, lists, gives, uses or takes back a grant.
  *  - useGrant: counts one use in the run's own transaction with ONE update that checks everything
  *    again, so a run that rolls back gives the use back, and two runs racing for the last use cannot
  *    both have it.
@@ -123,6 +125,20 @@ function assertOwnAgent(ctx: ServiceContext, agentId: unknown): void {
     throw new ServiceError('FORBIDDEN', 'An agent can only see its own standing permission.');
   }
 }
+
+/**
+ * Grants are read and used by the agent's door and the bridge, before and after a handler runs,
+ * never from inside one: work running inside an agent's bridged run (lib/serviceScope.ts) neither
+ * reads, lists nor uses a grant, whatever context it was handed (plan 4.6, D9).
+ */
+function refuseInsideAgentWork(message: string): void {
+  if (inServiceScope()) throw new ServiceError('FORBIDDEN', message);
+}
+
+const INSIDE_READ =
+  "Standing permission is not looked up from inside an agent's work. A person sees it in Users & Roles > Agents.";
+const INSIDE_USE =
+  "Standing permission is counted by Ironbooks itself when it runs a request, never from inside the work. Send the request again to ask a person.";
 
 // ---------------------------------------------------------------------------
 // The company's day and its pause switch
@@ -474,6 +490,7 @@ async function giverStillMay(ctx: ServiceContext, row: GrantRow, givers: Map<str
  * agents), and its giver still able to give it (giverStillMay).
  */
 export const liveGrants: LiveGrants = async (ctx, agentId, now = new Date()) => {
+  refuseInsideAgentWork(INSIDE_READ);
   assertOwnAgent(ctx, agentId);
   if (!isUuid(agentId)) return [];
   // A time that cannot be read cannot show a grant is unexpired (fail closed).
@@ -615,9 +632,11 @@ const GRANT_GONE =
  * unexpired, not used up, its agent is neither removed nor paused, nor every agent of the company,
  * and the person who gave it is still an active member. When the run's context names an agent, the
  * grant must be that agent's. (The giver's role was checked when liveGrants handed the grant to the
- * engine, moments before, in the same request.)
+ * engine, moments before, in the same request.) The bridge counts the use before the handler runs,
+ * outside its service scope; nothing inside the scope may count one.
  */
 export const useGrant: UseGrant = async (tx, grantId) => {
+  refuseInsideAgentWork(INSIDE_USE);
   if (!isUuid(grantId)) throw new ServiceError('FORBIDDEN', GRANT_GONE);
   const now = new Date();
   const c = agentGrants.constraints;
@@ -714,13 +733,17 @@ export const revokeGrant: RevokeGrant = async (ctx, grantId) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Grants with the names a screen shows, newest first. `live`: only those still standing (unrevoked,
- * unexpired, not used up, agent not removed); a paused agent's grants are listed, so a person can
- * take them back before turning the agent on again. For the same reason so are grants whose giver
- * may not give them just now (liveGrants leaves those out): they would stand again if the person
- * were turned back on the same day. An agent's context lists only its own.
+ * Grants with the names a screen shows, newest first. An agent's context lists only its own.
+ *
+ * `live`: only those in effect right now, the same ones liveGrants hands the policy engine:
+ * unrevoked, unexpired, not used up, the agent neither removed nor paused (nor every agent of the
+ * company, Integrated Applications off), and the giver still able to give it (giverStillMay). So a
+ * screen never shows as standing a grant the next request could not run under. Without `live`
+ * every grant is listed, those that stand again once an agent or a person is turned back on
+ * included, so a person can still find them and take them back.
  */
 export const listGrants: ListGrants = async (ctx, opts = {}) => {
+  refuseInsideAgentWork(INSIDE_READ);
   let agentId = opts?.agentId;
   if (ctx.agent) {
     assertOwnAgent(ctx, agentId ?? ctx.agent.id);
@@ -729,6 +752,7 @@ export const listGrants: ListGrants = async (ctx, opts = {}) => {
   if (agentId !== undefined && !isUuid(agentId)) throw notFound('Agent');
   const live = opts?.live === true;
   const now = new Date();
+  if (live && (await companyState(ctx)).agentsBlocked) return [];
 
   const conditions: SQL[] = [eq(agentGrants.companyId, ctx.companyId)];
   if (agentId !== undefined) conditions.push(eq(agentGrants.agentId, agentId));
@@ -739,6 +763,7 @@ export const listGrants: ListGrants = async (ctx, opts = {}) => {
       grant: agentGrants,
       agentName: agents.name,
       agentRevokedAt: agents.revokedAt,
+      agentPausedAt: agents.pausedAt,
       // Only the name: nothing else of a person's row ever leaves here.
       givenByName: users.name,
     })
@@ -748,18 +773,23 @@ export const listGrants: ListGrants = async (ctx, opts = {}) => {
     .where(and(...conditions))
     .orderBy(desc(agentGrants.createdAt));
 
-  return rows
-    .filter((r) => !live || (r.agentName !== null && !r.agentRevokedAt && notUsedUp(r.grant)))
-    .map((r): AgentGrantView => {
-      const grant = toGrant(r.grant);
-      return {
-        ...grant,
-        agentName: r.agentName ?? 'An agent that was removed',
-        operationLabel: operationLabel(r.grant.operation),
-        class: storedClass(r.grant),
-        givenByName: r.givenByName ?? 'A person no longer in this file',
-        createdAt: r.grant.createdAt.toISOString(),
-        maxUses: typeof grant.constraints.maxUses === 'number' ? grant.constraints.maxUses : null,
-      };
+  const givers = new Map<string, ResolvedAccess>();
+  const out: AgentGrantView[] = [];
+  for (const r of rows) {
+    if (live) {
+      if (r.agentName === null || r.agentRevokedAt || isPaused(r.agentPausedAt) || !notUsedUp(r.grant)) continue;
+      if (!(await giverStillMay(ctx, r.grant, givers))) continue;
+    }
+    const grant = toGrant(r.grant);
+    out.push({
+      ...grant,
+      agentName: r.agentName ?? 'An agent that was removed',
+      operationLabel: operationLabel(r.grant.operation),
+      class: storedClass(r.grant),
+      givenByName: r.givenByName ?? 'A person no longer in this file',
+      createdAt: r.grant.createdAt.toISOString(),
+      maxUses: typeof grant.constraints.maxUses === 'number' ? grant.constraints.maxUses : null,
     });
+  }
+  return out;
 };

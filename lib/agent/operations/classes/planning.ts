@@ -47,32 +47,40 @@ export const PLANNING_CLASSES: ClassificationMap = {
 
   // Pay Sales Tax and the Sales Tax Payment checks it writes.
   'GET /api/sales-tax/pay': { class: 'read', id: 'sales-tax.due', describe: 'Show the sales tax due to each agency' },
-  // A check's memo defaults to "Acct # <the agency vendor's account number>" in full, which the
-  // vendor screens mask; sensitiveFields keeps it out of previews, stored requests and logs.
+  // A Sales Tax Payment check stores the memo "Acct # <the agency vendor's full account number>"
+  // when none is typed: the check prints it, and the agency applies the payment by it. Every check
+  // answer masks it for a caller without "view full account numbers" (liabilityPayments.ts
+  // checkMemoFor), and the payment's journal line no longer carries it. So these keep their class
+  // and carry `reveal`: an unmasked memo is a separate, approved request. sensitiveFields still keeps
+  // the memo out of previews, stored requests and logs.
   'POST /api/sales-tax/pay': {
     class: 'enter',
     id: 'sales-tax.payments.create',
     describe: 'Pay {total} of sales tax to the agencies picked, from account {paymentAccountId} on {date}',
-    why: 'Writes one Sales Tax Payment check per agency picked, in one transaction, and adds and links a vendor for an agency that has none yet. Kept as entry, not bulk: it is one payment run on one screen (plan section 8: enter (pay)). The amount is the answer\'s total (the sum of payments[].amount), so until the preview has run it counts as over any limit.',
+    why: 'Writes one Sales Tax Payment check per agency picked, in one transaction, and adds and links a vendor for an agency that has none yet. Kept as entry, not bulk: it is one payment run on one screen (plan section 8: enter (pay)). The amount is the answer\'s total (the sum of payments[].amount), so until the preview has run it counts as over any limit. The checks in the answer have their memo masked.',
     confirmFlags: ['allowDuplicateNumber'],
     amountField: 'total',
+    reveal: 'account_numbers',
     sensitiveFields: ['checks.*.memo'],
   },
   'GET /api/sales-tax/payments': {
     class: 'read',
     describe: 'List sales tax payment checks',
+    reveal: 'account_numbers',
     sensitiveFields: ['items.*.memo'],
   },
   'GET /api/sales-tax/payments/[id]': {
     class: 'read',
     describe: 'Show sales tax payment check {id}',
+    reveal: 'account_numbers',
     sensitiveFields: ['memo'],
   },
   'POST /api/sales-tax/payments/[id]': {
     class: 'change',
     describe: 'Void sales tax payment check {id}',
-    why: 'Voiding is the only thing this POST does: the check stays, marked void, the tax is owed again and the bank gets the money back.',
+    why: 'Voiding is the only thing this POST does: the check stays, marked void, the tax is owed again and the bank gets the money back. The answer is the voided check, its amount as it was and its memo masked.',
     amountField: 'amount',
+    reveal: 'account_numbers',
     sensitiveFields: ['memo'],
   },
 
@@ -82,7 +90,7 @@ export const PLANNING_CLASSES: ClassificationMap = {
   'GET /api/budgets/[id]': { class: 'read', describe: 'Show budget {id} with its amounts' },
   'PATCH /api/budgets/[id]': {
     class: 'change',
-    describe: 'Set budget {id}, account {accountId}, month {month} to {amount}',
+    describe: 'Set the amount of budget {id} for account {accountId} in month {month} to {amount}',
   },
   'GET /api/budgets/[id]/vs-actual': { class: 'read', describe: 'Compare budget {id} with the actual amounts' },
   'POST /api/budgets/[id]/adjust': {
@@ -114,7 +122,7 @@ export const PLANNING_CLASSES: ClassificationMap = {
 
   // Mileage log.
   'GET /api/mileage': { class: 'read', describe: 'List mileage trips or the mileage summary' },
-  'POST /api/mileage': { class: 'enter', describe: 'Log a trip of {miles} miles' },
+  'POST /api/mileage': { class: 'enter', describe: 'Log a mileage trip ({miles} miles)' },
   'DELETE /api/mileage/[id]': { class: 'remove', describe: 'Delete mileage trip {id}' },
 
   // Fixed assets and their monthly depreciation.
@@ -150,7 +158,7 @@ export const PLANNING_CLASSES: ClassificationMap = {
   },
   'DELETE /api/loans/[id]/payments': {
     class: 'change',
-    describe: 'Void payment {paymentId} of loan {id}',
+    describe: 'Void a payment of loan {id} (payment {paymentId})',
     why: 'Voids the payment\'s check or bill (and its exchange gain or loss entry) rather than deleting it: the records stay on the books, marked void. The amount is the answer\'s total (the loan payment voided).',
     amountField: 'total',
   },

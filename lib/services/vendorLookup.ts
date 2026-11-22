@@ -10,15 +10,24 @@
  *    numbers) removed. Never amounts, dates, accounts, customers or anything else.
  *  - Every request goes through policyFetch (purpose 'vendor-lookup'), so Offline mode, the
  *    machine-wide ceiling and the outbound activity log all apply.
+ *  - And through the effects outbox (lib/ai/outbound.ts outboundCall, plan 5.4), like every AI
+ *    call: in an agent's preview of a prefill or bank-category suggestion nothing is sent. The
+ *    preview stops with "This would contact {host} for …" (EffectNotRunInPreview, passed on to the
+ *    caller, never turned into "nothing known") so the approval card can say where the payee's
+ *    name would go. In an agent's real run the lookup is made and recorded for the audit trail.
  *  - Answers (including "no results") are cached per company + name for a day (at most 500
  *    names, least recently used forgotten first); a failure
  *    (blocked, unreachable, timeout) is just "nothing known" and is retried next time.
  *
  * The returned summary is untrusted web text: callers pass it to the AI as reference data only.
  */
+import { hostOf, isNotRunInPreview, outboundCall } from '@/lib/ai/outbound';
 import { policyFetch } from '@/lib/net/guard';
 import type { ServiceContext } from './_base';
 import { getNetworkPolicy } from './networkPolicy';
+
+/** What the lookup sends, for "Contact {host} for {purpose}" (never the name itself). */
+export const VENDOR_LOOKUP_PURPOSE = "sending a vendor's name to look up what kind of business it is";
 
 export interface VendorFacts {
   /** The cleaned name that was searched. */
@@ -106,13 +115,16 @@ export async function lookupVendor(
     url.searchParams.set('format', 'json');
     url.searchParams.set('categories', 'general');
     url.searchParams.set('safesearch', '1');
-    const res = await policyFetch(
-      url,
-      { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(8000) },
-      { purpose: 'vendor-lookup', ctx, fetchImpl: opts.fetchImpl },
-    );
-    if (res.ok) {
-      const data = (await res.json()) as { results?: Array<{ title?: unknown; url?: unknown; content?: unknown }> };
+    // The answer is read inside the call, so the outbox records how the whole lookup went.
+    const data = await outboundCall(VENDOR_LOOKUP_PURPOSE, hostOf(policy.vendorLookupUrl, 'the vendor lookup server'), async () => {
+      const res = await policyFetch(
+        url,
+        { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(8000) },
+        { purpose: 'vendor-lookup', ctx, fetchImpl: opts.fetchImpl },
+      );
+      return res.ok ? ((await res.json()) as { results?: Array<{ title?: unknown; url?: unknown; content?: unknown }> }) : null;
+    });
+    if (data) {
       const results = (Array.isArray(data?.results) ? data.results : [])
         .map((r) => ({
           title: typeof r.title === 'string' ? r.title.trim() : '',
@@ -138,7 +150,9 @@ export async function lookupVendor(
         };
       }
     }
-  } catch {
+  } catch (err) {
+    // A preview stops here: the caller must not carry on as if the lookup found nothing.
+    if (isNotRunInPreview(err)) throw err;
     return null; // blocked, unreachable, timed out or not JSON: nothing known, try again next time
   }
   cache.delete(key);

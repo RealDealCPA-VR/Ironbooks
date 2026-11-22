@@ -1,18 +1,29 @@
 /**
  * Agent full access, records (plan §7.3 and §12):
  *
- *  - writeAudit stores what an agent's change ran under (ServiceContext.approval) on the audit row
- *    (approved_by / agent_request_id / agent_grant_id) and on the transaction log record; a
- *    person's own change is recorded exactly as before;
+ *  - writeAudit stores what an agent's change ran under (ServiceContext.approval: set by the route
+ *    bridge on an agent's run, and by the approval center on a person's decision) on the audit row
+ *    (approved_by / agent_request_id / agent_grant_id) and on the transaction log record; any
+ *    other change by a person is recorded exactly as before;
  *  - the audit trail and the transaction log name the agent and how its change was allowed:
  *    "<Agent> (agent)", "..., approved by <person>", "..., under permission from <person> until
  *    <time>", or "..., under standing permission" when the grant is no longer on file, and
- *    "a removed user" for a giver no longer on file; a run under one grant words it once;
+ *    "..., under standing permission from a removed user until <time>" for a giver no longer on
+ *    file; a run under one grant words it once per database transaction (savepoints included);
  *  - the new record fields are inside the log's hash: changing one breaks the chain;
+ *  - an entry's snapshot shows the account number in memo text ("Acct # …") masked to a person
+ *    without "view full account numbers";
+ *  - the records of agents' requests and standing permission are for people who manage users; their
+ *    note, message and limits only for one who may also view the work they were about, in the
+ *    audit trail and in a transaction-log record (logRecordDataFor);
+ *  - an agent's read of the audit trail leaves out Users & Roles and File Utilities and never sees
+ *    the whole log, whatever its role;
  *  - the Agent Activity report lists every permission request whatever its status, is empty-safe,
- *    keeps to its dates and company, words a waiting request as the approval center does (expired
- *    past its time, waiting for a second person), hides what a request was about from a person who
- *    may not view that area, and is refused to an agent.
+ *    keeps to its dates and company, reads each status through the approval center's own
+ *    shownStatus (expired past its time) and says "being carried out" and "waiting for a second
+ *    person" in the center's own words, marks a first-of-two approver before and after the request
+ *    is settled, hides what a request was about from a person who may not view that area, and is
+ *    refused to an agent.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
@@ -20,12 +31,23 @@ import fs from 'node:fs';
 import { eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { agentGrants, agentPermissionRequests, agents, auditLogs, companies, users } from '@/lib/db/schema';
-import { builtinRole, can, canActivity, unionRoles } from '@/lib/permissions/model';
+import { builtinRole, can, canActivity, unionRoles, type EffectiveAccess } from '@/lib/permissions/model';
 import { allOperations } from '@/lib/agent/operations/registry';
 import { REQUEST_STATUSES, type RequestStatus } from '@/lib/agent/operations/types';
 import { CATALOG_BY_KEY, REPORT_FAMILIES, listedReports } from '@/lib/reports/catalog';
-import { writeAudit, type ServiceContext } from './_base';
-import { getAuditLog, listAuditLogs, REQUEST_STATUS_WORDS } from './auditTrail';
+import { inTransaction, writeAudit, type ServiceContext } from './_base';
+import { STATUS_LABELS, statusLabel } from '@/app/agent-requests/words';
+import {
+  FIRST_OF_TWO,
+  WAITING_FOR_SECOND_PERSON,
+  auditReaderFor,
+  getAuditLog,
+  listAuditLogs,
+  logRecordDataFor,
+  REQUEST_STATUS_WORDS,
+} from './auditTrail';
+import { auditEntityRef, auditValuesFor, canSeeAuditEntry } from './auditVisibility';
+import { expireRequests, shownStatus } from './agentRequests';
 import { readAllTransactionLog, transactionLogPath, verifyTransactionLog, queryTransactionLog } from './transactionLog';
 import { isStandardReport, runStandardReport } from './reportRegistry';
 
@@ -225,19 +247,19 @@ describe('the audit trail and the transaction log name the agent and how it was 
 describe('standing permission, worded', () => {
   const update = (entityId: string, displayName: string) => ({ action: 'update' as const, entityType: 'customer', entityId, newValues: { displayName } });
 
-  it('a grant whose giver was removed: "under permission from a removed user until <time>"', async () => {
+  it('a grant whose giver was removed: "under standing permission from a removed user until <time>"', async () => {
     const [grant] = await db
       .insert(agentGrants)
       .values({ companyId: owner.companyId, agentId, operation: 'customers.update', class: 'change', givenBy: '55555555-0000-4000-8000-000000000001', expiresAt: new Date('2026-11-20T18:00:00.000Z') })
       .returning();
     const entityId = '11111111-0000-4000-8000-000000000010';
     await writeAudit(asAgent({ approval: { approvedBy: null, requestId: null, grantId: grant.id } }), update(entityId, 'Giver gone'));
-    const words = 'Ledger bot (agent), under permission from a removed user until 2026-11-20 18:00';
+    const words = 'Ledger bot (agent), under standing permission from a removed user until 2026-11-20 18:00';
     expect((await trailName(entityId))?.actorName).toBe(words);
     expect(logRecord(entityId)?.userName).toBe(words);
   });
 
-  it('a run under one grant words it once, not once a record; a company change words it again', async () => {
+  it('a run under one grant words it once per transaction, savepoints included; the next transaction words it afresh', async () => {
     const [grant] = await db
       .insert(agentGrants)
       .values({ companyId: owner.companyId, agentId, operation: 'customers.update', class: 'change', givenBy: people.giver, expiresAt: new Date('2026-11-21T09:00:00.000Z') })
@@ -245,20 +267,240 @@ describe('standing permission, worded', () => {
     const run = asAgent({ approval: { approvedBy: null, requestId: null, grantId: grant.id } });
     const e = (n: number) => `11111111-0000-4000-8000-00000000010${n}`;
     const until = (t: string) => `Ledger bot (agent), under permission from Gina Giver until 2026-11-21 ${t}`;
+    const moveEnd = (tx: ServiceContext, iso: string) => tx.db.update(agentGrants).set({ expiresAt: new Date(iso) }).where(eq(agentGrants.id, grant.id));
 
-    await writeAudit(run, update(e(1), 'First'));
-    // Changed behind the app's back: the run goes on with the words it already has (no new lookup).
-    await db.update(agentGrants).set({ expiresAt: new Date('2026-11-21T10:00:00.000Z') }).where(eq(agentGrants.id, grant.id));
-    await writeAudit(run, update(e(2), 'Second'));
+    await inTransaction(run, async (tx) => {
+      await writeAudit(tx, update(e(1), 'First'));
+      // Changed behind the app's back inside the run: the rest of it keeps the words it already
+      // has, which shows it did not look the grant up again for the next record.
+      await moveEnd(tx, '2026-11-21T10:00:00.000Z');
+      await writeAudit(tx, update(e(2), 'Second'));
+      // A service's own inTransaction inside the run is a savepoint of the same transaction.
+      await inTransaction(tx, async (inner) => writeAudit(inner, update(e(3), 'Third')));
+    });
     expect(logRecord(e(1))?.userName).toBe(until('09:00'));
     expect(logRecord(e(2))?.userName).toBe(until('09:00'));
+    expect(logRecord(e(3))?.userName).toBe(until('09:00'));
 
-    // A change to the company (its Preferences hold the time zone) words it afresh.
-    await writeAudit(owner, { action: 'update', entityType: 'company', entityId: owner.companyId, newValues: { name: 'Agent Audit Co' } });
-    await writeAudit(run, update(e(3), 'Third'));
-    expect(logRecord(e(3))?.userName).toBe(until('10:00'));
+    // The next transaction looks the grant up again: nothing is older than the run that uses it.
+    await inTransaction(run, async (tx) => writeAudit(tx, update(e(4), 'Fourth')));
+    expect(logRecord(e(4))?.userName).toBe(until('10:00'));
+    // So does a write outside any transaction (it is one of its own).
+    await moveEnd(owner, '2026-11-21T11:00:00.000Z');
+    await writeAudit(run, update(e(5), 'Fifth'));
+    expect(logRecord(e(5))?.userName).toBe(until('11:00'));
+
+    // A change to the company (its Preferences hold the time zone) inside the run words it afresh.
+    await inTransaction(run, async (tx) => {
+      await writeAudit(tx, update(e(6), 'Sixth'));
+      await moveEnd(tx, '2026-11-21T12:00:00.000Z');
+      await writeAudit({ ...tx, agent: undefined, approval: undefined, userId: people.owner }, { action: 'update', entityType: 'company', entityId: owner.companyId, newValues: { name: 'Agent Audit Co' } });
+      await writeAudit(tx, update(e(7), 'Seventh'));
+    });
+    expect(logRecord(e(6))?.userName).toBe(until('11:00'));
+    expect(logRecord(e(7))?.userName).toBe(until('12:00'));
     // The audit trail always reads the grant as it is now.
-    expect((await trailName(e(1)))?.actorName).toBe(until('10:00'));
+    expect((await trailName(e(1)))?.actorName).toBe(until('12:00'));
+  });
+
+  it('a rolled-back run leaves no words behind for the next one', async () => {
+    const [grant] = await db
+      .insert(agentGrants)
+      .values({ companyId: owner.companyId, agentId, operation: 'customers.update', class: 'change', givenBy: people.giver, expiresAt: new Date('2026-11-22T09:00:00.000Z') })
+      .returning();
+    const run = asAgent({ approval: { approvedBy: null, requestId: null, grantId: grant.id } });
+    const entityId = '11111111-0000-4000-8000-000000000201';
+    await expect(
+      inTransaction(run, async (tx) => {
+        await writeAudit(tx, update(entityId, 'Rolled back'));
+        throw new Error('dry run');
+      }),
+    ).rejects.toThrow('dry run');
+    expect(logRecord(entityId)).toBeUndefined();
+    await db.update(agentGrants).set({ expiresAt: new Date('2026-11-22T10:00:00.000Z') }).where(eq(agentGrants.id, grant.id));
+    await inTransaction(run, async (tx) => writeAudit(tx, update(entityId, 'Kept')));
+    expect(logRecord(entityId)?.userName).toBe('Ledger bot (agent), under permission from Gina Giver until 2026-11-22 10:00');
+  });
+});
+
+describe('an entry\'s snapshot as a person may see it', () => {
+  const bookkeeperAccess = (): EffectiveAccess => unionRoles([builtinRole('bookkeeper')!]);
+  const FULL = 'Acct # 000123456789';
+  const MASKED = 'Acct # ••••6789';
+
+  it('masks the account number in a check\'s memo for a person without "view full account numbers"', async () => {
+    const checkId = '66666666-0000-4000-8000-000000000001';
+    // As liabilityPayments.ts insertPaymentCheck writes it: the whole stored row.
+    await writeAudit(owner, {
+      action: 'create',
+      entityType: 'payment_check',
+      entityId: checkId,
+      newValues: { id: checkId, kind: 'sales_tax', payeeName: 'State Tax Board', memo: FULL, amount: '120.00', accountNumber: '000123456789' },
+    });
+    const [row] = await db.select().from(auditLogs).where(eq(auditLogs.entityId, checkId));
+    const access = bookkeeperAccess();
+    expect(access.flags.fullAccountNumbers).toBe(false);
+    expect(canSeeAuditEntry(access, 'payment_check', null, row.newValues)).toBe(true);
+
+    const masked = await getAuditLog({ ...owner, role: 'accountant', access }, row.id);
+    expect(masked.newValues).toMatchObject({ memo: MASKED, accountNumber: '••••6789', payeeName: 'State Tax Board', amount: '120.00' });
+    expect(JSON.stringify(masked)).not.toContain('000123456789');
+    // The transaction log's record of the same change, by the same rule (logRecordDataFor).
+    const logged = logRecordDataFor(access, logRecord(checkId)!);
+    expect(logged).toMatchObject({ new: { memo: MASKED, accountNumber: '••••6789' } });
+    expect(JSON.stringify(logged)).not.toContain('000123456789');
+
+    // With the right, and for a trusted context, the memo is as stored.
+    const withRight: EffectiveAccess = { ...access, flags: { ...access.flags, fullAccountNumbers: true } };
+    expect((await getAuditLog({ ...owner, role: 'accountant', access: withRight }, row.id)).newValues).toMatchObject({ memo: FULL });
+    expect((await getAuditLog(owner, row.id)).newValues).toMatchObject({ memo: FULL });
+  });
+
+  it('masks it on journal lines too (older Sales Tax Payment entries), and leaves text the mask wrote as it is', () => {
+    const access = bookkeeperAccess();
+    const entry = { description: 'Pay Sales Tax — State Tax Board', lines: [{ memo: FULL, debit: '120.00' }, { memo: 'Paid in full', credit: '120.00' }] };
+    expect(auditValuesFor(access, entry)).toEqual({ ...entry, lines: [{ memo: MASKED, debit: '120.00' }, { memo: 'Paid in full', credit: '120.00' }] });
+    // Already masked (a check's answer that found its way into a snapshot): unchanged.
+    expect(auditValuesFor(access, { memo: MASKED })).toEqual({ memo: MASKED });
+    expect(auditValuesFor(access, auditValuesFor(access, { memo: FULL }))).toEqual({ memo: MASKED });
+    // A "*" or "•" in a typed memo does not make the rest safe to show.
+    expect(auditValuesFor(access, { memo: 'acct # *1234-5678*' })).toEqual({ memo: 'acct # ••••678*' });
+    // Only memo text: a name that happens to read like a label is left as stored.
+    expect(auditValuesFor(access, { displayName: 'Acct # 42 Holdings' })).toEqual({ displayName: 'Acct # 42 Holdings' });
+    // The input is never changed.
+    expect(entry.lines[0].memo).toBe(FULL);
+    // Credential material is gone for everyone, trusted contexts included; they see the rest as stored.
+    expect(auditValuesFor(undefined, { memo: FULL, passwordHash: 'x' })).toEqual({ memo: FULL });
+  });
+});
+
+describe('records of agents\' requests and standing permission', () => {
+  it('belong to Users & Roles > Users, like the agent: not Admin-only by accident, never for a Bookkeeper', async () => {
+    for (const kind of ['agent_permission_request', 'agent_grant']) expect(auditEntityRef(kind), kind).toBe('users.users');
+    expect(auditEntityRef('agent')).toBe('users.users');
+
+    const manager = unionRoles([
+      { key: 'user-manager', name: 'User manager', description: '', builtin: false, permissions: { users: ['view'], reports_financial: ['view'] }, flags: {} },
+    ]);
+    expect(manager.isAdmin).toBe(false);
+    const bookkeeper = unionRoles([builtinRole('bookkeeper')!]);
+    for (const kind of ['agent_permission_request', 'agent_grant']) {
+      expect(canSeeAuditEntry(manager, kind, null, { status: 'denied' }), kind).toBe(true);
+      expect(canSeeAuditEntry(bookkeeper, kind, null, { status: 'denied' }), kind).toBe(false);
+    }
+
+    const requestId = '77777777-0000-4000-8000-000000000001';
+    await writeAudit({ ...owner, approval: { approvedBy: null, requestId, grantId: null } }, {
+      action: 'update',
+      entityType: 'agent_permission_request',
+      entityId: requestId,
+      oldValues: { status: 'pending' },
+      newValues: { status: 'denied', operation: 'customers.update', agentId },
+    });
+    const managerRows = await listAuditLogs({ ...owner, role: 'accountant', access: manager }, { entityType: 'agent_permission_request' });
+    expect(managerRows.rows.map((r) => r.entityId)).toContain(requestId);
+    expect((await listAuditLogs({ ...owner, role: 'accountant', access: bookkeeper }, { entityType: 'agent_permission_request' })).total).toBe(0);
+  });
+
+  it('show the note, the message and the limits only to someone who may view the work they were about', async () => {
+    const payroll = allOperations().find((o) => o.area === 'payroll' && o.method !== 'GET')!;
+    const customers = allOperations().find((o) => o.area === 'customers' && o.method !== 'GET')!;
+    const NOTE = 'Dana Lee is on leave, pay her next week';
+    const ERROR = "Dana Lee's paycheck for this period is already posted.";
+    const LIMITS = { maxAmount: '2500.00', entityIds: ['88888888-0000-4000-8000-000000000001'] };
+    const e = { payroll: '77777777-0000-4000-8000-000000000002', grant: '77777777-0000-4000-8000-000000000003', customer: '77777777-0000-4000-8000-000000000004', unknown: '77777777-0000-4000-8000-000000000005' };
+    const decided = (entityId: string, newValues: Record<string, unknown>) =>
+      writeAudit({ ...owner, approval: { approvedBy: null, requestId: entityId, grantId: null } }, { action: 'update', entityType: 'agent_permission_request', entityId, oldValues: { status: 'pending' }, newValues });
+    // As agentRequests.ts auditDecision writes them.
+    await decided(e.payroll, { operation: payroll.id, agentId, status: 'failed', approvedBy: people.approver, error: ERROR, grantNotGiven: 'Standing permission was not given for Dana Lee.', note: NOTE });
+    await decided(e.customer, { operation: customers.id, agentId, status: 'denied', deniedBy: people.approver, note: 'Use the other customer' });
+    // A record that names no operation (fail closed: Admins only).
+    await decided(e.unknown, { status: 'denied', note: 'Not this one' });
+    // As agentGrants.ts writes a new grant.
+    await writeAudit(owner, {
+      action: 'create',
+      entityType: 'agent_grant',
+      entityId: e.grant,
+      newValues: { agentId, agentName: AGENT.name, operation: payroll.id, class: 'enter', constraints: LIMITS, minutes: 60, expiresAt: '2026-11-20T18:00:00.000Z', requestId: e.payroll },
+    });
+
+    const manager = unionRoles([
+      { key: 'user-manager', name: 'User manager', description: '', builtin: false, permissions: { users: ['view'], customers: ['view'], reports_financial: ['view'] }, flags: {} },
+    ]);
+    const payrollManager = unionRoles([
+      {
+        key: 'payroll-user-manager',
+        name: 'Payroll and user manager',
+        description: '',
+        builtin: false,
+        permissions: { users: ['view'], customers: ['view'], payroll: ['view'], reports_financial: ['view'] },
+        flags: {},
+      },
+    ]);
+    const admin = unionRoles([builtinRole('admin')!]);
+    const values = async (access: EffectiveAccess | undefined, entityId: string) =>
+      (await getAuditLog(access ? { ...owner, role: 'accountant', access } : owner, (await auditRow(entityId)).id)).newValues;
+    const HIDDEN = 'Details hidden. An Admin, or someone who may view Employees & Payroll, can see them.';
+
+    // Managing agents shows that the payroll request was made and how it ended, not its details.
+    expect(await values(manager, e.payroll)).toEqual({ operation: payroll.id, agentId, status: 'failed', approvedBy: people.approver, error: HIDDEN, grantNotGiven: HIDDEN, note: HIDDEN });
+    expect(JSON.stringify(await getAuditLog({ ...owner, role: 'accountant', access: manager }, (await auditRow(e.payroll)).id))).not.toContain('Dana Lee');
+    expect(await values(manager, e.grant)).toMatchObject({ operation: payroll.id, class: 'enter', minutes: 60, constraints: HIDDEN });
+    // A request whose work they may view: shown.
+    expect(await values(manager, e.customer)).toMatchObject({ note: 'Use the other customer' });
+    // No operation on record: only an Admin sees its details.
+    expect(await values(manager, e.unknown)).toEqual({ status: 'denied', note: 'Details hidden. An Admin can see them.' });
+    // With the payroll right, as an Admin and in a trusted context: as stored.
+    for (const access of [payrollManager, admin, undefined]) {
+      expect(await values(access, e.payroll)).toMatchObject({ note: NOTE, error: ERROR });
+      expect(await values(access, e.grant)).toMatchObject({ constraints: LIMITS });
+    }
+    expect(await values(admin, e.unknown)).toMatchObject({ note: 'Not this one' });
+
+    // The same rule for the transaction log's record of it.
+    const rec = logRecord(e.payroll)!;
+    expect(logRecordDataFor(manager, rec)).toEqual({ old: { status: 'pending' }, new: expect.objectContaining({ note: HIDDEN, error: HIDDEN, operation: payroll.id }) });
+    expect(logRecordDataFor(payrollManager, rec)).toMatchObject({ new: { note: NOTE, error: ERROR } });
+    expect(logRecordDataFor(manager, logRecord(e.grant)!)).toMatchObject({ new: { constraints: HIDDEN } });
+    expect((rec.data as { new: { note: string } }).new.note).toBe(NOTE); // the record itself is never changed
+  });
+});
+
+describe('an agent reading the audit trail', () => {
+  const agentOf = { id: '44444444-0000-4000-8000-000000000002', ...AGENT };
+
+  it('never sees the entries of Users & Roles or File Utilities, nor the whole log, whatever its role', async () => {
+    const admin = unionRoles([builtinRole('admin')!]);
+    expect(admin.isAdmin).toBe(true);
+    const reader = auditReaderFor({ access: admin, agent: agentOf })!;
+    expect(reader.isAdmin).toBe(false);
+    for (const kind of ['user', 'role', 'agent', 'agent_permission_request', 'agent_grant', 'company_restore', 'sandbox']) {
+      expect(canSeeAuditEntry(reader, kind, null, null), kind).toBe(false);
+    }
+    expect(canSeeAuditEntry(reader, 'customer', null, null)).toBe(true);
+    // A person with the same role reads them all.
+    expect(auditReaderFor({ access: admin })).toBe(admin);
+    // A context without an access (a test's) is not the whole log for an agent either.
+    const bare = auditReaderFor({ agent: agentOf })!;
+    expect(bare.isAdmin).toBe(false);
+    expect(canSeeAuditEntry(bare, 'agent_permission_request', null, null)).toBe(false);
+    expect(bare.flags.fullAccountNumbers).toBe(false);
+
+    // A run through the door keeps its role's Users area (lib/agent/operate.ts ownRunAccess): the
+    // audit trail leaves it out anyway, so an agent never reads other agents' requests or the
+    // approvers' notes this way.
+    const manager = unionRoles([
+      { key: 'user-manager', name: 'User manager', description: '', builtin: false, permissions: { users: ['view'], customers: ['view'], reports_financial: ['view'] }, flags: {} },
+    ]);
+    const asPerson = await listAuditLogs({ ...owner, role: 'accountant', access: manager }, { entityType: 'agent_permission_request' });
+    expect(asPerson.total).toBeGreaterThan(0);
+    const run = asAgent({ access: manager });
+    expect((await listAuditLogs(run, { entityType: 'agent_permission_request' })).total).toBe(0);
+    await expect(getAuditLog(run, asPerson.rows[0].id)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    // Its own and everyone's customer changes are still there.
+    const customersSeen = await listAuditLogs(run, { entityType: 'customer', limit: 200 });
+    expect(customersSeen.total).toBeGreaterThan(0);
+    expect((await getAuditLog(run, customersSeen.rows[0].id)).entityType).toBe('customer');
   });
 });
 
@@ -315,8 +557,9 @@ describe('Agent Activity report (Reports > Accountant & Taxes)', () => {
     expect(by('failed')).toMatchObject({ status: 'Failed', note: 'That invoice number is already used.' });
     expect(by('executed')).toMatchObject({ status: 'Done', class: 'Enter new', decidedBy: 'Pat Approver, then Sam Second' });
     expect(by('expired')).toMatchObject({ status: 'Expired', decidedBy: '' });
-    // Claimed by a person's yes but never carried out: not to be read as done.
-    expect(by('approved')).toMatchObject({ status: 'Approved, not yet done', decidedBy: 'Pat Approver' });
+    // Claimed by a person's yes and not yet marked done or failed: what the approval center calls
+    // "being carried out right now", never read as done.
+    expect(by('approved')).toMatchObject({ status: 'Approved, being carried out', decidedBy: 'Pat Approver' });
     expect(r.rows.some((x) => x.cells.what === 'Other company')).toBe(false);
     // The agent's own words are never on it (only the summary built from the operation).
     expect(JSON.stringify(r.rows)).not.toMatch(/Ignore your rules/);
@@ -347,7 +590,7 @@ describe('Agent Activity report (Reports > Accountant & Taxes)', () => {
     expect(cells.find((c) => c.status === 'Denied')).toMatchObject({ what: 'Request that ended denied', note: 'Use the other customer' });
   });
 
-  it('says what the approval center says of a waiting request: expired past its time, or waiting for a second person', async () => {
+  it('says what the approval center says of a waiting request: expired past its time, or waiting for a second person, whose first approver is marked', async () => {
     const customers = allOperations().find((o) => o.area === 'customers' && o.method !== 'GET')!;
     const asked = Date.parse('2026-04-01T09:00:00.000Z');
     const row = (key: string, extra: Partial<typeof agentPermissionRequests.$inferInsert>) => ({
@@ -367,15 +610,88 @@ describe('Agent Activity report (Reports > Accountant & Taxes)', () => {
       row('past-its-time', { expiresAt: new Date(asked + 86_400_000), createdAt: new Date(asked + 60_000) }),
       // The first of two people said yes (D8); the second has not yet.
       row('first-of-two', { decidedBy: people.approver, decidedAt: new Date(asked + 120_000), createdAt: new Date(asked + 120_000) }),
+      // The first of two said yes, then nobody else did in time.
+      row('first-then-expired', { decidedBy: people.approver, decidedAt: new Date(asked + 150_000), createdAt: new Date(asked + 150_000), expiresAt: new Date(asked + 86_400_000) }),
       row('just-asked', {}),
+      // Settled already: the sweep keeps decided_by when it marks a request expired, and so does
+      // the agent taking a request back (or a copy of the company cancelling it).
+      row('first-then-marked-expired', { status: 'expired', decidedBy: people.approver, decidedAt: new Date(asked + 180_000), createdAt: new Date(asked + 180_000), expiresAt: new Date(asked + 86_400_000) }),
+      row('first-then-taken-back', { status: 'cancelled', decidedBy: people.approver, decidedAt: new Date(asked + 210_000), createdAt: new Date(asked + 210_000) }),
+      // Copied from an older proposal, which never takes two approvals: a person there is the one
+      // who decided the proposal under Ask AI, not a first of two.
+      row('copied-decided', { status: 'cancelled', operation: 'action:enter_journal_entry', proposalId: '99999999-0000-4000-8000-000000000001', decidedBy: people.approver, decidedAt: new Date(asked + 240_000), createdAt: new Date(asked + 240_000) }),
     ]);
-    const r = await runStandardReport(owner, 'agent-activity', { from: '2026-04-01', to: '2026-04-01' });
-    const status = (key: string) => r.rows.find((x) => x.cells.what === `Waiting ${key}`)!.cells.status;
-    expect(r.rows).toHaveLength(3);
-    expect(status('past-its-time')).toBe('Expired');
-    expect(status('first-of-two')).toBe('Waiting for a second person');
-    expect(status('just-asked')).toBe('Waiting for approval');
-    expect(r.rows.find((x) => x.cells.what === 'Waiting first-of-two')!.cells.decidedBy).toBe('Pat Approver');
+    const report = async () => {
+      const r = await runStandardReport(owner, 'agent-activity', { from: '2026-04-01', to: '2026-04-01' });
+      expect(r.rows).toHaveLength(7);
+      return (key: string) => r.rows.find((x) => x.cells.what === `Waiting ${key}`)!.cells;
+    };
+    const cells = await report();
+    expect(cells('past-its-time')).toMatchObject({ status: 'Expired', decidedBy: '' });
+    expect(cells('first-of-two')).toMatchObject({ status: WAITING_FOR_SECOND_PERSON, decidedBy: `Pat Approver ${FIRST_OF_TWO}` });
+    expect(cells('first-of-two').decidedBy).toBe('Pat Approver (first of two)');
+    expect(cells('first-then-expired')).toMatchObject({ status: 'Expired', decidedBy: 'Pat Approver (first of two)' });
+    expect(cells('just-asked')).toMatchObject({ status: 'Waiting for approval', decidedBy: '' });
+    expect(cells('first-then-marked-expired')).toMatchObject({ status: 'Expired', decidedBy: 'Pat Approver (first of two)' });
+    expect(cells('first-then-taken-back')).toMatchObject({ status: 'Cancelled', decidedBy: 'Pat Approver (first of two)' });
+    expect(cells('copied-decided')).toMatchObject({ status: 'Cancelled', decidedBy: 'Pat Approver' });
+
+    // The approval center's own sweep marks the two past their time expired: the report reads the
+    // same before and after it.
+    expect(await expireRequests(owner)).toBeGreaterThanOrEqual(2);
+    const [swept] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.requestKey, 'first-then-expired'));
+    expect(swept).toMatchObject({ status: 'expired', decidedBy: people.approver, secondApprover: null });
+    const after = await report();
+    for (const key of ['past-its-time', 'first-of-two', 'first-then-expired', 'just-asked', 'first-then-marked-expired', 'first-then-taken-back', 'copied-decided']) {
+      expect(after(key), key).toEqual(cells(key));
+    }
+  });
+
+  it('reads every request through the approval center\'s own shownStatus', async () => {
+    const stored = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.companyId, owner.companyId));
+    const r = await runStandardReport(owner, 'agent-activity', {});
+    expect(r.rows).toHaveLength(stored.length);
+    const now = new Date();
+    for (const s of stored) {
+      const shown = shownStatus(s, now);
+      const words = shown === 'pending' && s.decidedBy ? WAITING_FOR_SECOND_PERSON : REQUEST_STATUS_WORDS[shown];
+      expect(r.rows.find((x) => x.id === `aa:${s.id}`)!.cells.status, s.requestKey).toBe(words);
+    }
+  });
+
+  it('says "being carried out" and "waiting for a second person" in the approval center\'s own words', async () => {
+    // Claimed by a person's yes just now (the sweep above marked the older one failed: its run
+    // could not still be going).
+    const customers = allOperations().find((o) => o.area === 'customers' && o.method !== 'GET')!;
+    await db.insert(agentPermissionRequests).values({
+      companyId: owner.companyId,
+      agentId,
+      requestKey: 'being-carried-out',
+      operation: customers.id,
+      class: 'change',
+      summary: 'Being carried out',
+      status: 'approved',
+      decidedBy: people.approver,
+      decidedAt: new Date(),
+      expiresAt: new Date(Date.now() + 86_400_000),
+    });
+    const stored = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.companyId, owner.companyId));
+    const r = await runStandardReport(owner, 'agent-activity', {});
+    const now = new Date();
+    const center = (s: (typeof stored)[number]) => statusLabel({ status: shownStatus(s, now), decidedByName: s.decidedBy ? 'Pat Approver' : null });
+    const reportWords = (s: (typeof stored)[number]) => r.rows.find((x) => x.id === `aa:${s.id}`)!.cells.status;
+    const carriedOut = stored.filter((s) => s.status === 'approved');
+    const secondPerson = stored.filter((s) => shownStatus(s, now) === 'pending' && s.decidedBy);
+    expect(carriedOut.length && secondPerson.length).toBeTruthy();
+    for (const s of [...carriedOut, ...secondPerson]) expect(reportWords(s), s.requestKey).toBe(center(s));
+    // Expired, denied and done read the same in both too.
+    for (const s of stored.filter((x) => ['expired', 'denied', 'executed'].includes(shownStatus(x, now)))) {
+      expect(reportWords(s), s.requestKey).toBe(center(s));
+    }
+    // They differ on purpose only for these: a report row says what it waits for, "Failed" is the
+    // audit's word, and a cancellation may not be the agent's own (a copy of the company).
+    const differ = (Object.keys(REQUEST_STATUS_WORDS) as RequestStatus[]).filter((k) => REQUEST_STATUS_WORDS[k] !== STATUS_LABELS[k]);
+    expect(differ.sort()).toEqual(['cancelled', 'failed', 'pending']);
   });
 
   it('is refused to an agent, which reads its own requests another way', async () => {

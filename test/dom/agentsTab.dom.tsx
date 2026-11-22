@@ -5,12 +5,23 @@
 //
 // The agent's detail page (app/users/agents/, plan 7.1): the policy grid with its locked cells,
 // per-area overrides, limits, a save that sends only what changed, standing permissions with
-// Revoke, the activity with its links, and Pause / Resume.
+// Revoke, the activity with its links, and Pause / Resume. Only an Admin lets an agent do more by
+// itself (plan 4.4): anyone else who manages agents may only tighten or pause.
+//
+// The audit trail (app/audit-trail/page.tsx) opens the entry its address names (?id=), so the
+// Activity tab's links land on the row.
 import * as React from 'react';
 import AgentsTab from '@/app/users/AgentsTab';
+import AuditTrailPage from '@/app/audit-trail/page';
 import { Toaster } from '@/components/ui';
 import { PRESET_DEFAULTS } from '@/lib/agent/policy';
-import { $, $$, button, check, click, domTest, equal, focus, mount, reply, runDomTests, stubFetch, textOf, typeText, unmount, until, type FetchCall } from './kit';
+import { $, $$, button, check, click, domTest, equal, focus, mount, reply, runDomTests, stubFetch, textOf, typeText, unmount, until, type FetchAnswer, type FetchCall } from './kit';
+
+/** Who is signed in at this window (GET /api/auth/me). */
+const ADMIN_ME = { id: 'u1', name: 'Pat Owner', isAdmin: true };
+const MANAGER_ME = { id: 'u2', name: 'Sam Manager', isAdmin: false };
+/** stubFetch, signed in as an Admin unless the routes say otherwise. */
+const stub = (routes: Record<string, FetchAnswer>) => stubFetch({ 'GET /api/auth/me': ADMIN_ME, ...routes });
 
 const ROLES = [
   { key: 'admin', name: 'Admin', description: 'Everything.', builtin: true },
@@ -31,7 +42,7 @@ const page = () => (
 const dialog = () => $('[role="dialog"]');
 
 domTest('the list shows each agent, its role and last use, and never a token', async () => {
-  stubFetch({ 'GET /api/agents': { agents: [READER, GONE], hostOnly: false, connection: CONNECTION } });
+  stub({ 'GET /api/agents': { agents: [READER, GONE], hostOnly: false, connection: CONNECTION } });
   await mount(page());
   await until(() => textOf().includes('Month-end helper'), 'the agents');
   const text = textOf();
@@ -50,7 +61,7 @@ domTest('the list shows each agent, its role and last use, and never a token', a
 // preset ("Ask for every change" unless another is chosen) instead of the older mode.
 domTest('New agent: name, roles (Admin with a warning) and the chosen preset are sent, and the token is shown once', async () => {
   let made = false;
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': () => ({ agents: made ? [READER] : [], hostOnly: false, connection: CONNECTION }),
     'POST /api/agents': () => {
       made = true;
@@ -116,7 +127,7 @@ domTest('working while nobody is signed in is off unless ticked, and says what i
   const NIGHT = { ...READER, id: 'a2', name: 'Night closer', mode: 'post', unattended: true };
   const STARTS = { ...CONNECTION, env: { ...CONNECTION.env, IRONBOOKS_AGENT_START: '1' } };
   let made = false;
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': () => ({ agents: made ? [READER, NIGHT] : [READER], hostOnly: false, connection: CONNECTION }),
     'POST /api/agents': () => {
       made = true;
@@ -156,7 +167,7 @@ domTest('working while nobody is signed in is off unless ticked, and says what i
 
 domTest('a company file with passwords: the switch is not offered, and the tab says why', async () => {
   const NIGHT = { ...READER, id: 'a2', name: 'Night closer', mode: 'post', unattended: true };
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': { agents: [NIGHT], hostOnly: false, connection: CONNECTION, unattendedPossible: false },
     'POST /api/agents': reply(201, { agent: READER, token: TOKEN, connection: CONNECTION }),
   });
@@ -178,7 +189,7 @@ domTest('a company file with passwords: the switch is not offered, and the tab s
 });
 
 domTest('a refusal from the server is said in its own words, and the dialog stays', async () => {
-  stubFetch({
+  stub({
     'GET /api/agents': { agents: [], hostOnly: false, connection: CONNECTION },
     'POST /api/agents': reply(409, { error: 'There is already an agent named "Twin".', code: 'CONFLICT' }),
   });
@@ -196,7 +207,7 @@ domTest('a refusal from the server is said in its own words, and the dialog stay
 
 domTest('Remove asks first, then takes the access away', async () => {
   let removed = false;
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': () => ({ agents: [removed ? { ...READER, status: 'revoked' } : READER], hostOnly: false, connection: CONNECTION }),
     'DELETE /api/agents/a1': () => {
       removed = true;
@@ -215,7 +226,7 @@ domTest('Remove asks first, then takes the access away', async () => {
 });
 
 domTest('on another computer the tab only lists', async () => {
-  stubFetch({ 'GET /api/agents': { agents: [READER], hostOnly: true, connection: null } });
+  stub({ 'GET /api/agents': { agents: [READER], hostOnly: true, connection: null } });
   await mount(page());
   await until(() => textOf().includes('Month-end helper'), 'the agents');
   check(textOf().includes('This can only be changed on the computer that holds the company file.'), 'it says where agents are made');
@@ -290,7 +301,7 @@ async function openDetail(calls?: FetchCall[]) {
 }
 
 domTest('the agent detail: the grid shows locked cells with their reason, and they cannot be changed', async () => {
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION },
     'GET /api/agents/a1': detailOf(),
   });
@@ -329,7 +340,7 @@ domTest('the agent detail: the grid shows locked cells with their reason, and th
 
 domTest('saving sends only what changed, in the policy shape', async () => {
   let saved: Override[] = [];
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION },
     'GET /api/agents/a1': () => detailOf({ overrides: saved }),
     'PATCH /api/agents/a1': (c: FetchCall) => {
@@ -341,11 +352,13 @@ domTest('saving sends only what changed, in the policy shape', async () => {
   await openDetail(calls);
   check(button('Save changes')?.disabled, 'Save waits for a change');
 
-  // Everywhere: Enter new to Allow; Change to Allow and back to Ask (the preset's own: no change).
+  // Everywhere: Enter new to Allow; Change to Allow and back to Ask. Changed on purpose (wave 3):
+  // the preset's own Ask, clicked, is kept as chosen, so a later looser preset cannot move it.
   await click(cell('everywhere', 'enter', 'allow'), 'Enter new: Allow');
   await click(cell('everywhere', 'change', 'allow'), 'Change or void: Allow');
   await click(cell('everywhere', 'change', 'ask'), 'Change or void: Ask');
-  check(textOf().includes('Changed from the preset'), 'the changed row is marked');
+  check(textOf($('[data-own="enter"]')) === 'Changed from the preset', 'the changed row is marked');
+  check(textOf($('[data-own="change"]')) === 'Kept as chosen', "the preset's own setting, clicked, is kept as chosen");
   check(!button('Save changes')?.disabled, 'Save is ready');
 
   // Payroll: Enter new is Never there.
@@ -375,6 +388,7 @@ domTest('saving sends only what changed, in the policy shape', async () => {
       overrides: [
         { class: 'enter', area: null, setting: 'allow' },
         { class: 'enter', area: 'payroll', setting: 'never' },
+        { class: 'change', area: null, setting: 'ask' },
       ],
       bulkCap: 50,
     }),
@@ -393,25 +407,28 @@ domTest('saving sends only what changed, in the policy shape', async () => {
   await unmount();
 });
 
-domTest('standing permissions: Revoke takes one back at once', async () => {
+/** AgentGrantView (lib/agent/contract.ts): given by Pat Owner, ending later today. */
+const GRANT = {
+  id: 'g1',
+  agentId: 'a1',
+  operation: 'invoices.create',
+  constraints: { maxAmount: '500.00', maxUses: 10 },
+  givenBy: 'u1',
+  expiresAt: new Date(Date.now() + 6 * 3600_000).toISOString(),
+  revokedAt: null,
+  uses: 2,
+  agentName: 'Month-end helper',
+  operationLabel: 'Enter an invoice',
+  class: 'enter',
+  givenByName: 'Pat Owner',
+  createdAt: new Date(Date.now() - 3600_000).toISOString(),
+  maxUses: 10,
+};
+
+// Changed on purpose (wave 3): Revoke asks once before it takes the permission back.
+domTest('standing permissions: who gave it, what it is held to and until when; Revoke asks once, then takes it back', async () => {
   let revoked = false;
-  const GRANT = {
-    id: 'g1',
-    agentId: 'a1',
-    operation: 'invoices.create',
-    constraints: { maxAmount: '500.00', maxUses: 10 },
-    givenBy: 'u1',
-    expiresAt: '2026-11-20T23:59:00.000Z',
-    revokedAt: null,
-    uses: 2,
-    agentName: 'Month-end helper',
-    operationLabel: 'Enter an invoice',
-    class: 'enter',
-    givenByName: 'Pat Owner',
-    createdAt: '2026-11-20T09:00:00.000Z',
-    maxUses: 10,
-  };
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION },
     'GET /api/agents/a1': detailOf(),
     'GET /api/agents/a1/grants': () => ({ grants: revoked ? [] : [GRANT] }),
@@ -422,18 +439,45 @@ domTest('standing permissions: Revoke takes one back at once', async () => {
   });
   await openDetail(calls);
   await click(button('Standing permissions'), 'Standing permissions');
-  await until(() => textOf().includes('Enter an invoice'), 'the standing permission');
-  const text = textOf();
-  check(text.includes('Pat Owner') && text.includes('up to 500.00') && text.includes('2 of 10'), `who gave it, what holds it, how often used: ${text}`);
-  await click(button('Revoke'), 'Revoke');
+  const row = await until(() => $('tr[data-grant="g1"]'), 'the standing permission');
+  const text = textOf(row);
+  check(text.includes('Enter an invoice') && text.includes('Pat Owner'), `what it covers and who gave it: ${text}`);
+  check(text.includes('up to 500.00') && text.includes('2 of 10'), `what holds it and how often it was used: ${text}`);
+  check(text.includes(new Date(GRANT.expiresAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })), `until when: ${text}`);
+  equal(row.dataset.grantState, 'live', 'it is in effect');
+  check(text.includes('In effect'), 'and says so');
+  check(!$('[data-grants-paused]'), 'no note that it is not in effect');
+
+  await click(button('Revoke', row), 'Revoke');
+  const confirm = await until(dialog, 'the question');
+  check(textOf(confirm).includes('Month-end helper will ask a person again before "Enter an invoice"'), `it says what happens: ${textOf(confirm)}`);
+  equal(calls.filter((c) => c.method === 'DELETE').length, 0, 'nothing is taken back before the answer');
+  await click(button('Revoke', confirm), 'Revoke in the question');
   await until(() => textOf().includes('No standing permissions.'), 'the list without it');
+  check(!dialog(), 'asked once');
   equal(calls.filter((c) => c.method === 'DELETE').map((c) => c.path).join(','), '/api/agent-grants/g1', 'the grant route, once');
+  await unmount();
+});
+
+domTest('a standing permission is marked as not in effect while the agent is paused', async () => {
+  stub({
+    'GET /api/agents': { agents: [{ ...READER, pausedAt: '2026-11-19T10:00:00.000Z' }], hostOnly: false, connection: CONNECTION },
+    'GET /api/agents/a1': detailOf({ paused: true }),
+    'GET /api/agents/a1/grants': { grants: [GRANT] },
+  });
+  await openDetail();
+  await click(button('Standing permissions'), 'Standing permissions');
+  const row = await until(() => $('tr[data-grant="g1"]'), 'the standing permission');
+  equal(row.dataset.grantState, 'not_in_effect', 'it is not in effect');
+  check(textOf(row).includes('Not in effect') && textOf(row).includes('while this agent is paused'), `the row says why: ${textOf(row)}`);
+  check(textOf($('[data-grants-paused]')).includes('Not in effect while this agent is paused'), 'and so does the section');
+  check(button('Revoke', row), 'it can still be taken back');
   await unmount();
 });
 
 domTest('Pause and Resume call the pause route, and Remove asks first', async () => {
   let removed = false;
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': () => ({ agents: [removed ? { ...READER, status: 'revoked' } : READER], hostOnly: false, connection: CONNECTION }),
     'GET /api/agents/a1': detailOf(),
     'POST /api/agents/a1/pause': (c: FetchCall) => detailOf({ paused: (c.body as { paused: boolean }).paused }),
@@ -462,7 +506,7 @@ domTest('Pause and Resume call the pause route, and Remove asks first', async ()
 });
 
 domTest('activity: what it ran and asked, with links to the approval center and the audit trail', async () => {
-  stubFetch({
+  stub({
     'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION },
     'GET /api/agents/a1': detailOf(),
     'GET /api/agents/a1/activity': {
@@ -479,34 +523,41 @@ domTest('activity: what it ran and asked, with links to the approval center and 
   check(text.includes('Added invoice') && text.includes('Pat Owner') && text.includes('Waiting') && text.includes('Done'), `each row with its outcome: ${text}`);
   check($('a[href="/agent-requests?id=r1"]'), 'a request links to the approval center');
   check($('a[href="/audit-trail?id=au1"]'), 'an operation links to the audit trail');
-  // Named for what it opens today: the approval center does not filter by agent yet (review).
-  equal(textOf($('a[href="/agent-requests?agentId=a1"]')), 'Approval center', 'and the approval center is one click away');
+  // Changed on purpose (review): the approval center reads agentId and starts with this agent's
+  // requests, so the link is named for that.
+  equal(textOf($('a[href="/agent-requests?agentId=a1"]')), 'Its requests in the approval center', "and the agent's requests in the approval center are one click away");
   await unmount();
 });
 
+// Changed on purpose (wave 3): GET /api/agents answers { agents, allPaused } (contract §11), so the
+// list says it from its own answer and never asks the count route; "(adjusted: N)" is the form.
 domTest('the list marks an adjusted preset, and every agent as paused while Integrated Applications is off', async () => {
-  // The list route does not say yet, so the count route does.
-  stubFetch({
-    'GET /api/agents': { agents: [{ ...READER, preset: 'read_only', overrideCount: 2 }], hostOnly: false, connection: CONNECTION },
-    'GET /api/agent-requests/count': { pending: 0, newest: null, agents: 1, allPaused: true, canPauseAll: true },
+  const COUNT = { pending: 0, newest: null, agents: 1, allPaused: true, canPauseAll: true };
+  let calls = stub({
+    'GET /api/agents': { agents: [{ ...READER, preset: 'read_only', overrideCount: 2 }, GONE], hostOnly: false, connection: CONNECTION, allPaused: true },
+    'GET /api/agent-requests/count': COUNT,
   });
   await mount(page());
   await until(() => textOf().includes('Month-end helper'), 'the agents');
   await until(() => $('[data-all-paused]'), 'the note that every agent is paused');
   const text = textOf();
-  check(text.includes('Read only (adjusted: 2 changes)'), `the preset says it was adjusted: ${text}`);
+  equal(textOf($('[data-preset-of="a1"]')), 'Read only (adjusted: 2)', 'the preset says it was adjusted');
+  check($('[data-preset-of="a1"]')?.getAttribute('title')?.startsWith('2 kinds of work are set for this agent itself'), 'and what that means');
   check(text.includes('Every agent is paused') && text.includes('Integrated Applications'), 'the note says why');
   check(text.includes('Paused') && text.includes('All agents') && !text.includes('Active'), `the agent is shown paused: ${text}`);
+  check(text.includes('Removed'), 'a removed agent stays removed');
+  equal(calls.filter((c) => c.path === '/api/agent-requests/count').length, 0, 'the count route is not asked');
   await unmount();
 
-  // The list route's own answer wins, and then the count is not asked.
-  const calls = stubFetch({
+  // Applications allowed: the agent is active, and still nothing asks the count route.
+  calls = stub({
     'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION, allPaused: false },
-    'GET /api/agent-requests/count': { pending: 0, newest: null, agents: 1, allPaused: true, canPauseAll: true },
+    'GET /api/agent-requests/count': COUNT,
   });
   await mount(page());
   await until(() => textOf().includes('Active'), 'the agent shown active');
   check(!$('[data-all-paused]'), 'no note');
+  equal(textOf($('[data-preset-of="a1"]')), 'Read only', 'a preset without changes is named as it is');
   equal(calls.filter((c) => c.path === '/api/agent-requests/count').length, 0, 'the count route is not asked');
   await unmount();
 });
@@ -516,7 +567,7 @@ domTest('picking a stricter preset says which changes still let the agent do mor
     { class: 'enter', area: null, setting: 'allow' },
     { class: 'bulk', area: null, setting: 'never' },
   ];
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION },
     'GET /api/agents/a1': detailOf({ overrides: OVERRIDES }),
     'PATCH /api/agents/a1': (c: FetchCall) => {
@@ -525,8 +576,13 @@ domTest('picking a stricter preset says which changes still let the agent do mor
     },
   });
   await openDetail(calls);
-  check(textOf($('[data-preset-summary]')).includes('Ask for every change (adjusted: 2 changes)'), 'the header says the preset was adjusted');
+  check(textOf($('[data-preset-summary]')).includes('Ask for every change (adjusted: 2)'), 'the header says the preset was adjusted');
   check(!$('[data-looser-note]'), 'no note before another preset is picked');
+  // The preset's line describes it as it comes; the note under it says what this agent's own add.
+  const adjusted = textOf($('[data-preset-adjusted]'));
+  check(adjusted.includes('That is the preset as it comes. This agent has 2 settings of its own'), `the preset's line is put right: ${adjusted}`);
+  check(adjusted.includes('One of them lets it do more by itself than the preset says: Enter new: Allow.'), 'and names what lets it do more');
+  check($('[data-preset-adjusted]')?.closest('label')?.querySelector<HTMLInputElement>('input')?.value === 'ask_every_change', 'under the chosen preset');
 
   await click($('input[name="ag-detail-preset"][value="read_only"]'), 'Read only');
   const note = await until(() => $('[data-looser-note]'), 'the note');
@@ -534,6 +590,7 @@ domTest('picking a stricter preset says which changes still let the agent do mor
   check(said.includes('"Read only" is chosen') && said.includes('Enter new: Allow'), `it names the looser change: ${said}`);
   check(!said.includes('Change many at once'), 'and only that one');
   check(cell('everywhere', 'enter', 'allow')?.checked, 'the grid still shows it');
+  check($('[data-preset-adjusted]')?.closest('label')?.querySelector<HTMLInputElement>('input')?.value === 'read_only', "the note follows the chosen preset, so Read only's line is never taken as the whole truth");
 
   await click(button('Take it away', note), 'Take it away');
   await until(() => !$('[data-looser-note]'), 'the note to go');
@@ -545,12 +602,12 @@ domTest('picking a stricter preset says which changes still let the agent do mor
     JSON.stringify({ preset: 'read_only', overrides: [{ class: 'bulk', area: null, setting: 'never' }] }),
     'the stricter preset, without the looser change',
   );
-  await until(() => textOf($('[data-preset-summary]')).includes('Read only (adjusted: 1 change)'), 'the header after the save');
+  await until(() => textOf($('[data-preset-summary]')).includes('Read only (adjusted: 1)'), 'the header after the save');
   await unmount();
 });
 
 domTest('an Allow the engine never gives stays locked even when the server list leaves it out', async () => {
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION },
     'GET /api/agents/a1': detailOf({ locked: [] }),
   });
@@ -567,7 +624,7 @@ domTest('an Allow the engine never gives stays locked even when the server list 
 });
 
 domTest('an area keeps the setting chosen for it, even the one it already follows', async () => {
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION },
     'GET /api/agents/a1': detailOf(),
     'PATCH /api/agents/a1': (c: FetchCall) => detailOf({ overrides: (c.body as { overrides?: Override[] }).overrides ?? [] }),
@@ -608,7 +665,7 @@ domTest('an area keeps the setting chosen for it, even the one it already follow
 });
 
 domTest('a folder typed but not added is added by Save, and the cap that applies is shown', async () => {
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION },
     'GET /api/agents/a1': detailOf(),
     'PATCH /api/agents/a1': () => detailOf({ bulkCap: 75 }),
@@ -633,7 +690,7 @@ domTest('a folder typed but not added is added by Save, and the cap that applies
 });
 
 domTest('on another computer the detail only shows the policy, and the agent can still be paused', async () => {
-  const calls = stubFetch({
+  const calls = stub({
     'GET /api/agents': { agents: [READER], hostOnly: true, connection: null },
     'GET /api/agents/a1': detailOf(),
     'POST /api/agents/a1/pause': detailOf({ paused: true }),
@@ -646,6 +703,302 @@ domTest('on another computer the detail only shows the policy, and the agent can
   await click(button(/Pause this agent/), 'Pause this agent');
   await until(() => calls.some((c) => c.method === 'POST' && c.path === '/api/agents/a1/pause'), 'the pause');
   await unmount();
+});
+
+domTest('a click on the setting a cell already follows keeps it as chosen, everywhere too', async () => {
+  const calls = stub({
+    'GET /api/agents': { agents: [READER], hostOnly: false, connection: CONNECTION },
+    'GET /api/agents/a1': detailOf(),
+    'PATCH /api/agents/a1': (c: FetchCall) => detailOf({ overrides: (c.body as { overrides?: Override[] }).overrides ?? [] }),
+  });
+  await openDetail(calls);
+  const row = () => $('[data-policy-grid="everywhere"] tr[data-class="enter"]');
+  check(cell('everywhere', 'enter', 'ask')?.checked && !$('[data-own="enter"]'), "Enter new follows the preset's Ask");
+  // Ask is already on (from the preset): clicking it keeps it as this agent's own.
+  await click(cell('everywhere', 'enter', 'ask'), 'Enter new: Ask');
+  await until(() => textOf(row()).includes('Kept as chosen'), 'Ask kept as chosen');
+  check(button('As the preset', row() ?? document), 'and it can follow the preset again');
+  await click(button('Save changes'), 'Save changes');
+  await until(() => calls.some((c) => c.method === 'PATCH'), 'the save');
+  equal(JSON.stringify(calls.find((c) => c.method === 'PATCH')?.body), JSON.stringify({ overrides: [{ class: 'enter', area: null, setting: 'ask' }] }), 'saved as its own row');
+  await until(() => textOf($('[data-preset-summary]')).includes('(adjusted: 1)'), 'the header counts it');
+  // Review (wave 3): and says that it changes nothing today, so "(adjusted)" is not read as more.
+  const title = $('[data-preset-summary]')?.getAttribute('title') ?? '';
+  check(title.includes('It only keeps the setting it would have anyway') && title.includes('just what the preset says'), `the header's title says so: ${title}`);
+  check(textOf($('[data-preset-adjusted]')).includes('It only keeps the setting it would have anyway'), 'and so does the note under the preset');
+  await unmount();
+});
+
+const REFUSAL = 'Only an Admin can change the settings of an agent that has more access than you. You can still pause it.';
+
+domTest('a person who is not an Admin can make an agent stricter or pause it, and never let it do more', async () => {
+  const calls = stubFetch({
+    'GET /api/auth/me': MANAGER_ME,
+    'GET /api/agents': { agents: [{ ...READER, preset: 'ask_every_change', overrideCount: 1 }], hostOnly: false, connection: CONNECTION, allPaused: false },
+    'GET /api/agents/a1': detailOf({ overrides: [{ class: 'enter', area: null, setting: 'never' }], bulkCap: 100 }),
+    'PATCH /api/agents/a1': reply(403, { error: REFUSAL, code: 'FORBIDDEN' }),
+    'POST /api/agents/a1/pause': (c: FetchCall) =>
+      detailOf({ overrides: [{ class: 'enter', area: null, setting: 'never' }], bulkCap: 100, paused: (c.body as { paused: boolean }).paused }),
+  });
+  await mount(page());
+  await until(() => textOf().includes('Month-end helper'), 'the agents');
+  check(!button(/New agent/), 'no New agent');
+  equal($$('button[title="Remove this agent\'s access"]').length, 0, 'no Remove');
+  check(textOf($('[data-not-admin]')).includes('Only an Admin can make or remove an agent.'), 'the list says why');
+
+  await click($('button[aria-label="Open Month-end helper"]'), 'Open');
+  await until(() => cell('everywhere', 'read', 'allow'), 'the grid');
+  check(textOf($('[data-not-admin]')).includes('Only an Admin can let it do more by itself'), 'the page says what this person may do');
+  check(!$('[data-agent-detail] button[title="Remove this agent\'s access"]'), 'no Remove on the detail page');
+
+  // Presets: the looser ones are off and say why; a stricter one can be picked.
+  const preset = (p: string) => $<HTMLInputElement>(`input[name="ag-detail-preset"][value="${p}"]`);
+  check(preset('trusted_bookkeeper')?.disabled && preset('full_with_asks')?.disabled, 'a looser preset cannot be picked');
+  check(textOf(preset('trusted_bookkeeper')?.closest('label') ?? null).includes('Only an Admin can let an agent do more by itself.'), 'and it says why');
+  check(!preset('read_only')?.disabled && !preset('ask_every_change')?.disabled, 'a stricter preset, or the same, can');
+
+  // The grid: nothing that lets the agent do more; everything stricter.
+  const grid = $('[data-policy-grid="everywhere"]') ?? document;
+  check(cell('everywhere', 'change', 'allow')?.disabled && cell('everywhere', 'change', 'allow')?.dataset.adminOnly === 'true', 'Change or void cannot become Allow');
+  check(cell('everywhere', 'enter', 'ask')?.disabled && cell('everywhere', 'enter', 'allow')?.disabled, 'Enter new cannot go back up from Never');
+  check(cell('everywhere', 'change', 'allow')?.closest('label')?.getAttribute('title') === 'Only an Admin can let an agent do more by itself.', 'the cell says why');
+  check(!cell('everywhere', 'change', 'never')?.disabled && !cell('everywhere', 'prepare', 'ask')?.disabled, 'a stricter choice is open');
+  equal($$('input[data-locked="true"]', grid).length, NEVER_ALLOW.length, 'the locked cells are still the locked ones');
+  check(button('As the preset')?.disabled, '"As the preset" on the stricter row would loosen it');
+  check(button('Use the preset as it is')?.disabled, 'and so would using the preset as it is');
+
+  await click(cell('everywhere', 'change', 'never'), 'Change or void: Never');
+  check(cell('everywhere', 'change', 'never')?.checked, 'made stricter');
+  check(!cell('everywhere', 'change', 'ask')?.disabled, 'and it can be put back as it was saved');
+
+  // Limits: lowering is open, raising is held and says why.
+  await click(button('Limits'), 'Limits');
+  const cap = await until(() => $<HTMLInputElement>('#ag-bulk-cap'), 'the cap');
+  await focus(cap, 'the cap');
+  cap.select();
+  await typeText('500');
+  await until(() => $('[data-admin-only="bulkCap"]'), 'the note that only an Admin raises it');
+  const held = textOf(await until(() => $('[data-loosen-blocked]'), 'the note by Save'));
+  check(held.includes('up to 500 records in one request instead of 100') && held.includes('Put it back to save the rest'), `it says what is held: ${held}`);
+  check(button('Save changes')?.disabled, 'Save is held');
+  cap.select();
+  await typeText('50');
+  await until(() => !$('[data-admin-only="bulkCap"]') && !$('[data-loosen-blocked]'), 'the notes to go');
+  check(!button('Save changes')?.disabled, 'Save is ready');
+  check($<HTMLInputElement>('#ag-folder')?.disabled && button(/Add folder/)?.disabled, 'no folder can be added');
+  check(textOf($('[data-admin-only="folders"]')).includes('Only an Admin can give an agent another folder.'), 'and it says why');
+  check(button('Remove C:\\Receipts'), 'a folder can still be taken off');
+  const notify = $$<HTMLInputElement>('input[type="checkbox"]').find((c) => textOf(c.closest('label')).startsWith('Email the Admin')) ?? null;
+  check(notify?.disabled && notify.dataset.adminOnly === 'true', 'the email notice cannot be turned on');
+  check(textOf(notify?.closest('label') ?? null).includes('Only an Admin can turn the email notice on'), 'and it says why');
+
+  // The server refuses (this agent has more access than the person): said in its own words.
+  await click(button('Save changes'), 'Save changes');
+  const refusal = await until(() => $('[data-save-error]'), 'the refusal');
+  equal(textOf(refusal), REFUSAL, 'the refusal in its own words');
+  equal(
+    JSON.stringify(calls.find((c) => c.method === 'PATCH')?.body),
+    JSON.stringify({ overrides: [{ class: 'enter', area: null, setting: 'never' }, { class: 'change', area: null, setting: 'never' }], bulkCap: 50 }),
+    'only the tightening was sent',
+  );
+
+  // Pausing is open.
+  await click(button(/Pause this agent/), 'Pause this agent');
+  await until(() => button(/Resume/), 'Resume');
+  await unmount();
+});
+
+// Review (wave 3): the server turns back on an agent that holds the Admin role only for an Admin,
+// so nobody else is offered Resume for one; the page says why.
+domTest('a person who is not an Admin is not offered Resume for an agent with the Admin role', async () => {
+  const PAUSED_ADMIN_AGENT = { ...detailOf({ paused: true }), roleKeys: ['admin'], roleNames: ['Admin'] };
+  const LISTED = { ...READER, roleNames: ['Admin'], pausedAt: '2026-11-19T10:00:00.000Z' };
+  let calls = stubFetch({
+    'GET /api/auth/me': MANAGER_ME,
+    'GET /api/agents': { agents: [LISTED], hostOnly: false, connection: CONNECTION, allPaused: false },
+    'GET /api/agents/a1': PAUSED_ADMIN_AGENT,
+    'POST /api/agents/a1/pause': detailOf(),
+  });
+  await openDetail();
+  const resume = await until(() => button(/Resume/), 'Resume');
+  check(resume.disabled, 'Resume is off');
+  equal(resume.getAttribute('title'), 'Only an Admin can turn back on an agent that holds the Admin role.', 'and says why');
+  equal(textOf($('[data-resume-blocked]')), 'Only an Admin can turn back on an agent that holds the Admin role.', 'so does the page');
+  await click(resume, 'Resume');
+  equal(calls.filter((c) => c.method === 'POST').length, 0, 'nothing was sent');
+  await unmount();
+
+  // An Admin may turn it back on.
+  calls = stub({
+    'GET /api/agents': { agents: [LISTED], hostOnly: false, connection: CONNECTION, allPaused: false },
+    'GET /api/agents/a1': PAUSED_ADMIN_AGENT,
+    'POST /api/agents/a1/pause': { ...detailOf(), roleKeys: ['admin'], roleNames: ['Admin'] },
+  });
+  await openDetail();
+  const forAdmin = await until(() => button(/Resume/), 'Resume');
+  check(!forAdmin.disabled && !$('[data-resume-blocked]'), 'an Admin is offered Resume');
+  await click(forAdmin, 'Resume');
+  await until(() => calls.some((c) => c.method === 'POST' && c.path === '/api/agents/a1/pause'), 'the pause route');
+  await unmount();
+});
+
+// Review (wave 3): Users & Roles knows whether the person is an Admin; it can say so, and the tab
+// then does not ask GET /api/auth/me a second time.
+function AnsweredLater() {
+  const [admin, setAdmin] = React.useState<boolean | null>(null);
+  return (
+    <div>
+      <Toaster />
+      <button type="button" onClick={() => setAdmin(false)}>
+        The page knows now
+      </button>
+      <AgentsTab roles={ROLES} viewerIsAdmin={admin} />
+    </div>
+  );
+}
+
+domTest('the page can say whether the person is an Admin, and the tab then does not ask again', async () => {
+  const LIST = { agents: [READER], hostOnly: false, connection: CONNECTION, allPaused: false };
+  const asked = (calls: FetchCall[]) => calls.filter((c) => c.path === '/api/auth/me').length;
+
+  // An Admin, as the page says.
+  let calls = stubFetch({ 'GET /api/agents': LIST });
+  await mount(
+    <div>
+      <Toaster />
+      <AgentsTab roles={ROLES} viewerIsAdmin />
+    </div>,
+  );
+  await until(() => textOf().includes('Month-end helper'), 'the agents');
+  check(button(/New agent/) && !$('[data-not-admin]'), 'New agent is offered, and no note for someone else');
+  equal(asked(calls), 0, 'the tab did not ask who is signed in');
+  await unmount();
+
+  // Not an Admin, as the page says: its word is taken, even where the server would say Admin.
+  calls = stub({ 'GET /api/agents': LIST });
+  await mount(
+    <div>
+      <Toaster />
+      <AgentsTab roles={ROLES} viewerIsAdmin={false} />
+    </div>,
+  );
+  await until(() => $('[data-not-admin]'), 'the note for someone who is not an Admin');
+  check(!button(/New agent/), 'no New agent');
+  equal(asked(calls), 0, 'the tab did not ask who is signed in');
+  await unmount();
+
+  // Still asking (null): the tab waits for the page, and shows nothing it might have to take back.
+  calls = stub({ 'GET /api/agents': LIST });
+  await mount(<AnsweredLater />);
+  await until(() => calls.some((c) => c.path === '/api/agents'), 'the list asked for');
+  check(!textOf().includes('Month-end helper') && !button(/New agent/), 'nothing shown before the page knows');
+  await click(button('The page knows now'), 'the page answering');
+  await until(() => $('[data-not-admin]') && textOf().includes('Month-end helper'), 'the list for someone who is not an Admin');
+  check(!button(/New agent/), 'no New agent');
+  equal(asked(calls), 0, 'the tab did not ask who is signed in');
+  await unmount();
+
+  // Left out: the tab asks itself, once.
+  calls = stub({ 'GET /api/agents': LIST });
+  await mount(page());
+  await until(() => button(/New agent/), 'New agent for the Admin');
+  equal(asked(calls), 1, 'the tab asked once');
+  await unmount();
+});
+
+// ---------------------------------------------------------------------------
+// The audit trail: the Activity tab's links land on the entry (?id=)
+// ---------------------------------------------------------------------------
+
+const AUDIT_ROW = {
+  id: 'au1',
+  action: 'create',
+  entityType: 'invoice',
+  entityId: 'inv1',
+  actorName: 'Month-end helper (agent)',
+  actorId: null,
+  createdAt: '2026-11-20T09:00:00.000Z',
+};
+const OTHER_ROW = { ...AUDIT_ROW, id: 'au2', actorName: 'Pat Owner', createdAt: '2026-11-20T10:00:00.000Z' };
+
+domTest('the audit trail opens the entry its address names, expanded and scrolled to', async () => {
+  const scrolled: Element[] = [];
+  const realScroll = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = function (this: Element) {
+    scrolled.push(this);
+  };
+  try {
+    window.history.replaceState(null, '', '?id=au1');
+    const calls = stubFetch({
+      'GET /api/audit-trail': { rows: [OTHER_ROW, AUDIT_ROW], total: 2 },
+      'GET /api/audit-trail/au1': { ...AUDIT_ROW, oldValues: null, newValues: { invoiceNumber: '1042', total: '250.00' } },
+    });
+    await mount(<AuditTrailPage />);
+    const focused = await until(() => $('[data-audit-focus="au1"]'), 'the entry at the top');
+    check(textOf(focused).includes('The entry you opened') && textOf(focused).includes('Month-end helper (agent)'), `it shows the entry: ${textOf(focused)}`);
+    await until(() => textOf(focused).includes('"invoiceNumber": "1042"'), 'opened, with what it recorded');
+    check(scrolled.includes(focused), 'scrolled to');
+    await until(() => $$('tr[data-audit-row="au2"]').length === 1, 'the whole trail below');
+    equal($$('tr[data-audit-row="au1"][data-focused="true"]').length, 2, 'the entry is marked at the top and in the trail');
+    equal($$('tr[data-focused]').length, 2, 'and nothing else is');
+    equal(calls.filter((c) => c.path === '/api/audit-trail/au1').length, 1, 'the entry was asked for once');
+
+    await click(button('Close', focused), 'Close');
+    await until(() => !$('[data-audit-focus]'), 'the entry at the top to go');
+    check(!window.location.search.includes('id='), 'the address no longer names it');
+    await unmount();
+  } finally {
+    Element.prototype.scrollIntoView = realScroll;
+    window.history.replaceState(null, '', window.location.pathname);
+  }
+});
+
+domTest('an audit trail entry that cannot be found is said once, and the whole trail is shown; another failure is said as it is, with Try again', async () => {
+  try {
+    window.history.replaceState(null, '', '?id=gone');
+    stubFetch({
+      'GET /api/audit-trail': { rows: [AUDIT_ROW], total: 1 },
+      'GET /api/audit-trail/gone': reply(404, { error: 'Audit log entry not found.', code: 'NOT_FOUND' }),
+    });
+    await mount(<AuditTrailPage />);
+    const note = await until(() => $('[data-audit-focus="gone"]'), 'the note');
+    check(textOf(note).includes("That entry is not in this company's audit trail"), `it says so: ${textOf(note)}`);
+    await until(() => $('tr[data-audit-row="au1"]'), 'the trail below');
+    check(!$('tr[data-focused]'), 'nothing is marked');
+    await unmount();
+
+    // Review (wave 3): any other failure is not "not found": it is said as it is, with Try again,
+    // and no row of the trail is marked until the entry itself has loaded.
+    window.history.replaceState(null, '', '?id=au1');
+    let failing = true;
+    const tries = stubFetch({
+      'GET /api/audit-trail': { rows: [AUDIT_ROW], total: 1 },
+      'GET /api/audit-trail/au1': () => (failing ? reply(500, { error: 'The company file is busy. Try again in a moment.' }) : { ...AUDIT_ROW, oldValues: null, newValues: { total: '250.00' } }),
+    });
+    await mount(<AuditTrailPage />);
+    const failed = await until(() => $('[data-audit-focus="au1"]'), 'the note');
+    check(textOf(failed).includes('The company file is busy. Try again in a moment.'), `the error in its own words: ${textOf(failed)}`);
+    check(!textOf(failed).includes('not in this company'), 'not said to be missing');
+    await until(() => $('tr[data-audit-row="au1"]'), 'the trail below');
+    check(!$('tr[data-focused]'), 'nothing is marked before the entry loaded');
+    failing = false;
+    await click(button('Try again', failed), 'Try again');
+    await until(() => textOf($('[data-audit-focus="au1"]')).includes('The entry you opened'), 'the entry, on the second try');
+    await until(() => $$('tr[data-focused="true"]').length === 2, 'marked at the top and in the trail');
+    equal(tries.filter((c) => c.path === '/api/audit-trail/au1').length, 2, 'asked twice');
+    await unmount();
+
+    // No id: the page is as it always was.
+    window.history.replaceState(null, '', window.location.pathname);
+    const calls = stubFetch({ 'GET /api/audit-trail': { rows: [AUDIT_ROW], total: 1 } });
+    await mount(<AuditTrailPage />);
+    await until(() => $('tr[data-audit-row="au1"]'), 'the trail');
+    check(!$('[data-audit-focus]') && !$('tr[data-focused]'), 'nothing extra');
+    equal(calls.filter((c) => c.path.startsWith('/api/audit-trail/')).length, 0, 'no entry was asked for');
+    await unmount();
+  } finally {
+    window.history.replaceState(null, '', window.location.pathname);
+  }
 });
 
 void runDomTests();

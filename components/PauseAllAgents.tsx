@@ -4,8 +4,10 @@
  * Integrated Applications switch of the company (AgentRequestCount.allPaused), made one click
  * away: while it is on, every agent is refused everything until a person resumes them.
  *
- * Shown whenever the company has an agent and this person may use the switch (canPauseAll, from
- * the same poll as the request badge: components/AgentRequestsBadge.tsx). One click and a short
+ * Shown whenever the company has an agent and the count route says this person may use the switch
+ * (canPauseAll, from the same poll as the request badge: components/AgentRequestsBadge.tsx; the
+ * route asks the same check the switch itself makes). Anyone else sees nothing here, not even the
+ * paused note: no greyed-out button and no Resume that cannot work. One click and a short
  * confirmation; paused, it reads "Agents are paused" with Resume, which asks too (resuming hands
  * the agents their access back). POST /api/agents/pause-all { paused }. The server decides who
  * may: a refusal is shown in its own words in the confirmation, which stays open.

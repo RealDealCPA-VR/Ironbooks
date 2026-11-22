@@ -49,8 +49,8 @@
  * mail server; this module knows nothing of the company's mail settings. Services do not call it:
  * they call sendMail(opts, ctx) in lib/services/email.ts, which builds the message from the
  * company's settings and calls this. Where the plan writes effects.email({ to, cc, subject, ... }),
- * read sendMail. Known gap: the test email (sendTestEmail in lib/services/emailSettings.ts) still
- * uses its own transport and does not come through here yet.
+ * read sendMail. The test email (sendTestEmail in lib/services/emailSettings.ts) comes through here
+ * too.
  *
  * A preview shows what is really sent. Recipients are read with nodemailer's own address parser.
  * Inside a scope an email is refused when nodemailer would deliver it to anyone but its To, Cc and
@@ -61,14 +61,33 @@
  * full values stay in the detail.
  *
  * Folders. effects.writeFile does not know who asks, so it does not check which folders an agent
- * may save in: the bridge checks that against the folders the Admin allows before the operation
- * runs (plan 5.5). This module only refuses names that would be saved under another name, or not
- * at all, so the file saved is the file previewed.
+ * may save in: the bridge checks every file the work asked for against the folders the Admin
+ * allows, inside the collection, before anything is committed (plan 5.5). This module only refuses
+ * names that would be saved under another name, or not at all, so the file saved is the file
+ * previewed.
+ *
+ * A check made during the work is only as good as the folder still being that folder when the file
+ * is written, after the commit. So the caller pins a queued file to the real folder it approved
+ * (pinFile: links resolved, inside an allowed folder). At release a pinned file is written into
+ * exactly that folder, never through the path the work named, and only after looking again: the
+ * part of the folder that exists must still resolve to itself before anything is made in it, and
+ * the whole folder again once it is made. A link or junction made inside an allowed folder while
+ * the work was committing, pointing somewhere else, fails that look, and the file is not saved
+ * (reported as failed), nor any folder made where the link leads. The temporary file the save
+ * writes first is created new, never opened through something already there.
+ *
+ * A caller that checks the folders itself opens its scope with { pinFiles: true } (the bridge
+ * does). In such a scope writeFile does not look at the disk at all: the folder the work named may
+ * be on someone's network share, and merely looking at it there offers that share the person's
+ * Windows sign-in. pinFile looks, once the caller knows the folder is one it allows (whether a file
+ * is replaced, whether a folder is in the way). And release writes only pinned files: a file the
+ * caller never pinned (asked for while its check was already running, say) is reported as failed
+ * and never written.
  *
  * Pure Node: no database or Next imports, so the bridge, the services and the tests can all use it.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { promises as fsp } from 'node:fs';
+import fs, { promises as fsp } from 'node:fs';
 import path from 'node:path';
 import addressparser from 'nodemailer/lib/addressparser';
 import type Mail from 'nodemailer/lib/mailer';
@@ -268,6 +287,16 @@ interface Entry {
   ran: boolean;
   /** How that call went; null while it is still running. */
   outcome: { status: 'sent' | 'failed'; error: string | null } | null;
+  /** A file save: where the caller pinned it (pinFile), read by its run at release. */
+  file: FileTarget | null;
+}
+
+/** Where a queued file goes: the real folder the caller approved, once pinned. */
+interface FileTarget {
+  pinned: string | null;
+  /** The file's name and size, for the summary pinFile writes again once it has looked. */
+  name: string;
+  size: number;
 }
 
 interface Scope {
@@ -275,6 +304,18 @@ interface Scope {
   entries: Entry[];
   /** False once fn has finished: an effect asked for after that is refused. */
   open: boolean;
+  /** The caller checks and pins every file (EffectsOptions.pinFiles). */
+  pinFiles: boolean;
+}
+
+/** How a scope runs, besides its mode. */
+export interface EffectsOptions {
+  /**
+   * The caller checks every file save's folder itself and pins it (pinFile). writeFile then never
+   * looks at the disk, pinFile looks once the folder is approved, and release writes a file only
+   * when it was pinned: one that never was is reported failed (FILE_NOT_CHECKED) and not saved.
+   */
+  pinFiles?: boolean;
 }
 
 interface EffectsState {
@@ -341,13 +382,13 @@ function isObject(v: unknown): v is object {
  * If fn throws, the same error is thrown here and nothing is ever released; effectsOfFailedRun(err)
  * says what fn had asked for.
  */
-export async function runWithEffects<T>(mode: EffectsMode, fn: () => T | Promise<T>): Promise<EffectsRun<T>> {
+export async function runWithEffects<T>(mode: EffectsMode, fn: () => T | Promise<T>, options: EffectsOptions = {}): Promise<EffectsRun<T>> {
   if (mode !== 'capture' && mode !== 'defer') throw new Error(`Unknown effects mode "${String(mode)}".`);
   const outer = state().scope.getStore();
   if (outer?.open) {
     throw new Error('Effects are already being collected for this work, so another collection cannot start inside it.');
   }
-  const scope: Scope = { mode, entries: [], open: true };
+  const scope: Scope = { mode, entries: [], open: true, pinFiles: options?.pinFiles === true };
   let value: T;
   try {
     value = await state().scope.run(scope, fn);
@@ -712,16 +753,25 @@ async function whatIsAt(full: string): Promise<'file' | 'folder' | null> {
 
 /**
  * Save so a reader never sees half a file: a temporary file next to it, then renamed over the old
- * one. A failed write leaves the previous file as it was and no temporary file behind.
+ * one. A failed write leaves the previous file as it was and no temporary file behind. The
+ * temporary file is always created new ('wx'): something already there under its name (a link
+ * planted in the folder) is never written through, and the save fails instead.
  */
 async function writeNow(dir: string, full: string, bytes: Uint8Array | string): Promise<void> {
   await fsp.mkdir(dir, { recursive: true });
-  const tmp = `${full}.${process.pid}.${Date.now().toString(36)}.tmp`;
+  const tmp = `${full}.${process.pid}.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.tmp`;
+  const removeTmp = () => fsp.rm(tmp, { force: true }).catch(() => undefined);
   try {
-    await fsp.writeFile(tmp, bytes);
+    await fsp.writeFile(tmp, bytes, { flag: 'wx' });
+  } catch (err) {
+    // Only a temporary file this save made is removed, never one that was already there.
+    if ((err as { code?: unknown } | null)?.code !== 'EEXIST') await removeTmp();
+    throw err;
+  }
+  try {
     await fsp.rename(tmp, full);
   } catch (err) {
-    await fsp.rm(tmp, { force: true }).catch(() => undefined);
+    await removeTmp();
     throw err;
   }
 }
@@ -752,13 +802,136 @@ function checkCall(call: NetworkCall): NetworkCall {
   return { host, purpose };
 }
 
-function record(scope: Scope, what: string, preview: EffectPreview, run: (() => Promise<unknown>) | null, ran = false): Entry {
+function record(
+  scope: Scope,
+  what: string,
+  preview: EffectPreview,
+  run: (() => Promise<unknown>) | null,
+  ran = false,
+  file: FileTarget | null = null,
+): Entry {
   // Asked again here: writeFile looks at the disk first, and the work may have finished meanwhile.
   if (!scope.open) throw refusedLate(what);
   const defer = scope.mode === 'defer';
-  const entry: Entry = { preview, run: defer ? run : null, ran: defer && ran, outcome: null };
+  const entry: Entry = { preview, run: defer ? run : null, ran: defer && ran, outcome: null, file };
   scope.entries.push(entry);
   return entry;
+}
+
+// ---------------------------------------------------------------------------
+// Pinned files: written only into the folder the caller approved
+// ---------------------------------------------------------------------------
+
+const WIN = process.platform === 'win32';
+
+/** The release report's words for a pinned file whose folder changed after it was approved. */
+export const PINNED_FOLDER_CHANGED =
+  'The folder changed after this was approved (a link or shortcut in it now leads somewhere else), so the file was not saved there. Ask for it to be saved again.';
+
+/** The release report's words for a file a { pinFiles } scope's caller never checked (and pinned). */
+export const FILE_NOT_CHECKED =
+  'This file was asked for after its folder could be checked, so it was not saved. Ask for it to be saved again.';
+
+/** Two folder paths name the same place, as the system writes them (any case on Windows). */
+function samePath(a: string, b: string): boolean {
+  const norm = (p: string) => {
+    const r = path.resolve(p);
+    return WIN ? r.toLowerCase() : r;
+  };
+  return norm(a) === norm(b);
+}
+
+/** The folder with every link resolved: the system's own answer first, the plain one where it fails. */
+function realFolder(dir: string): Promise<string> {
+  return new Promise((resolve, reject) =>
+    fs.realpath.native(dir, (err, out) => {
+      if (!err) return resolve(out);
+      fsp.realpath(dir).then(resolve, reject);
+    }),
+  );
+}
+
+/** Throws PINNED_FOLDER_CHANGED unless `dir` exists and resolves to itself (no link in the way). */
+async function assertStillItself(dir: string): Promise<void> {
+  let real: string;
+  try {
+    real = await realFolder(dir);
+  } catch {
+    throw new Error(PINNED_FOLDER_CHANGED);
+  }
+  if (!samePath(real, dir)) throw new Error(PINNED_FOLDER_CHANGED);
+}
+
+/**
+ * The nearest part of `dir` that exists (itself, or a parent), looked at with lstat so a link
+ * there is found, not followed. Every part looked at is inside the folder the caller approved.
+ */
+async function nearestExisting(dir: string): Promise<string> {
+  let at = path.resolve(dir);
+  for (;;) {
+    try {
+      await fsp.lstat(at);
+      return at;
+    } catch (err) {
+      if ((err as { code?: unknown } | null)?.code !== 'ENOENT') throw new Error(PINNED_FOLDER_CHANGED);
+    }
+    const up = path.dirname(at);
+    if (up === at) throw new Error(PINNED_FOLDER_CHANGED);
+    at = up;
+  }
+}
+
+/**
+ * Write a pinned file: into `dir` (the real folder the caller approved, made when it is new), and
+ * only while that folder still resolves to itself, so a link made inside it since the check
+ * cannot lead the write somewhere else. The part that exists is looked at BEFORE any folder is
+ * made, so a link planted at a name still to be made gets no folder made where it leads.
+ */
+async function writePinned(dir: string, name: string, bytes: Uint8Array | string): Promise<void> {
+  await assertStillItself(await nearestExisting(dir));
+  await fsp.mkdir(dir, { recursive: true });
+  await assertStillItself(dir);
+  const full = path.join(dir, name);
+  if ((await whatIsAt(full)) === 'folder') throw new Error(`There is now a folder called "${oneLine(name, 80, 'middle')}" there, so the file was not saved.`);
+  await writeNow(dir, full, bytes);
+}
+
+/** The refusal of a file name a folder already uses (writeFile, and pinFile in a { pinFiles } scope). */
+function folderInTheWay(name: string, dir: string): ServiceError {
+  return new ServiceError(
+    'VALIDATION',
+    `There is a folder called "${oneLine(name, 80, 'middle')}" in ${oneLine(dir, 120, 'middle')}, so the file cannot be saved under that name.`,
+  );
+}
+
+/**
+ * Pin a file the work asked to save (its effect, as currentEffects() gave it) to `realDir`: the
+ * real folder the caller approved for it, with every link resolved. At release the file is written
+ * into exactly that folder, after checking once more that it still resolves to itself (see
+ * "Folders" in the header). Only inside the open scope the file was asked for in, and only once
+ * per file (pinning it again to the same folder changes nothing; to another folder throws).
+ *
+ * Then it looks at the file's place in that folder (approved, so it may be looked at): the preview
+ * says when the save replaces a file there, and a folder of that name throws the same VALIDATION
+ * error writeFile gives a person. In a { pinFiles } scope this is the first look at the disk.
+ */
+export async function pinFile(effect: EffectPreview, realDir: string): Promise<void> {
+  const s = state().scope.getStore();
+  if (!s?.open) throw new Error('A file can only be pinned while the work that asked for it is running.');
+  const entry = s.entries.find((e) => e.preview === effect);
+  if (!entry || !entry.file) throw new Error('That is not a file this work asked to save.');
+  if (typeof realDir !== 'string' || !path.isAbsolute(realDir)) throw new Error('A file can only be pinned to a full folder path.');
+  const dir = path.resolve(realDir);
+  if (entry.file.pinned !== null && !samePath(entry.file.pinned, dir)) throw new Error('This file is already pinned to another folder.');
+  entry.file.pinned = dir;
+  const there = await whatIsAt(path.join(dir, entry.file.name));
+  if (there === 'folder') throw folderInTheWay(entry.file.name, String(effect.detail.dir ?? dir));
+  const replaces = there === 'file';
+  if (effect.detail.replaces !== replaces) {
+    const fresh = filePreview({ dir: String(effect.detail.dir ?? dir), name: entry.file.name, path: String(effect.detail.path ?? ''), size: entry.file.size, replaces });
+    effect.summary = fresh.summary;
+    effect.detail.replaces = replaces;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -795,18 +968,15 @@ export const effects = {
 
   /**
    * Save a file in a folder. Same three behaviours as email. The preview says when it replaces a
-   * file already there. Which folders an agent may use is the bridge's check, not this one's.
+   * file already there. Which folders an agent may use is the bridge's check, not this one's. In a
+   * { pinFiles } scope the disk is not looked at here (see "Folders" in the header): `replaces` is
+   * false until pinFile has looked, and only the preview is brought up to date then.
    */
   async writeFile(file: FileToWrite): Promise<WriteFileResult> {
     const scope = activeScope('Saving a file');
     const f = checkFile(file);
-    const there = await whatIsAt(f.full);
-    if (there === 'folder') {
-      throw new ServiceError(
-        'VALIDATION',
-        `There is a folder called "${oneLine(f.name, 80, 'middle')}" in ${oneLine(f.dir, 120, 'middle')}, so the file cannot be saved under that name.`,
-      );
-    }
+    const there = scope?.pinFiles ? null : await whatIsAt(f.full);
+    if (there === 'folder') throw folderInTheWay(f.name, f.dir);
     const replaces = there === 'file';
     const effect = filePreview({ dir: f.dir, name: f.name, path: f.full, size: f.size, replaces });
     const bytes = file.bytes;
@@ -814,7 +984,17 @@ export const effects = {
       await writeNow(f.dir, f.full, bytes);
       return { written: true, status: 'done', path: f.full, size: f.size, replaces, effect };
     }
-    record(scope, 'Saving a file', effect, () => writeNow(f.dir, f.full, bytes));
+    // Pinned (pinFile): only into the approved folder. Unpinned: where the work said, except in a
+    // { pinFiles } scope, where a file its caller never checked is not saved at all.
+    const target: FileTarget = { pinned: null, name: f.name, size: f.size };
+    const pinFiles = scope.pinFiles;
+    const run = () =>
+      target.pinned !== null
+        ? writePinned(target.pinned, f.name, bytes)
+        : pinFiles
+          ? Promise.reject(new Error(FILE_NOT_CHECKED))
+          : writeNow(f.dir, f.full, bytes);
+    record(scope, 'Saving a file', effect, run, false, target);
     return { written: false, status: scope.mode === 'capture' ? 'previewed' : 'queued', path: f.full, size: f.size, replaces, effect };
   },
 

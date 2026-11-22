@@ -5,31 +5,72 @@
 import { z } from 'zod';
 import { zDate, zDecimal, zDecimalPositive, zMoney, zUuid } from './helpers';
 
+// POST /api/loans and PUT /api/loans/:id (lib/services/loans.ts createLoan / updateLoan). An edit
+// saves the loan's terms as sent: a field left out goes back to its default, except the last six
+// (balloonAmount to nextPaymentDate), which keep the saved value, and exchangeRate.
 export const loanSchema = z.object({
-  name: z.string().trim().min(1, 'Give the loan a name.').max(255),
-  lenderVendorId: zUuid.nullish(),
-  liabilityAccountId: zUuid,
-  interestAccountId: zUuid,
-  escrowAccountId: zUuid.nullish(),
-  paymentAccountId: zUuid.nullish(),
-  originalAmount: zMoney,
-  annualRate: zDecimal,
-  termMonths: z.coerce.number().int().min(1).max(600),
-  paymentsPerYear: z.coerce.number().int().optional(),
-  originDate: zDate,
-  firstPaymentDate: zDate,
-  escrowAmount: zMoney.nullish(),
-  notes: z.string().nullish(),
+  name: z.string().trim().min(1, 'Give the loan a name.').max(255).describe('Name of the loan in the Loan Manager, such as "Truck loan".'),
+  lenderVendorId: zUuid
+    .nullish()
+    .describe('Id of the lender (vendor list), who the payments go to; leave out for none. The loan is in the lender\'s currency.'),
+  liabilityAccountId: zUuid.describe('Id of the liability account (chart of accounts) the loan balance is kept in, such as Notes Payable.'),
+  interestAccountId: zUuid.describe('Id of the expense account (chart of accounts) the interest of each payment posts to.'),
+  escrowAccountId: zUuid
+    .nullish()
+    .describe('Id of the account (chart of accounts) the escrow part of each payment posts to; needed when escrowAmount is above zero, else leave out.'),
+  paymentAccountId: zUuid
+    .nullish()
+    .describe('Id of the bank account (chart of accounts) payment checks are written from by default; leave out for none.'),
+  originalAmount: zMoney.describe('Amount borrowed, as decimal text above zero such as "25000.00".'),
+  annualRate: zDecimal.describe('Annual interest rate in percent, as decimal text such as "6.5" for 6.5%; 0 to 100.'),
+  termMonths: z.coerce.number().int().min(1).max(600).describe('Length of the loan in months, 1 to 600.'),
+  paymentsPerYear: z.coerce
+    .number()
+    .int()
+    .optional()
+    .describe('Payments a year: 1, 2, 4, 12, 24, 26 or 52; leave out for 12 (monthly).'),
+  originDate: zDate.describe('Date the loan was taken out, YYYY-MM-DD.'),
+  firstPaymentDate: zDate.describe('Due date of the first payment, YYYY-MM-DD.'),
+  escrowAmount: zMoney.nullish().describe('Escrow added to every payment, as decimal text such as "200.00"; leave out for none.'),
+  notes: z.string().nullish().describe('Notes about the loan; leave out for none.'),
   // p1 fx: loan currency (default: the lender's) and the rate it was booked at
-  currency: z.string().max(3).nullish(),
-  exchangeRate: zDecimalPositive.nullish(),
+  currency: z
+    .string()
+    .max(3)
+    .nullish()
+    .describe("3-letter currency code such as \"EUR\"; leave out for the lender's currency, which it must match."),
+  exchangeRate: zDecimalPositive
+    .nullish()
+    .describe(
+      "Foreign-currency loans only: home-currency units per 1 unit of the loan currency, as decimal text such as \"1.10\"; on a new loan leave it out for the currency list's rate, and on an edit leaving it out keeps the saved rate.",
+    ),
   // purchbank F1: balloon, compounding, the lender's payment amount, a loan already in progress
-  balloonAmount: zMoney.nullish(),
-  compounding: z.enum(['monthly', 'exact_days']).nullish(),
-  dayCount: z.coerce.number().int().nullish(),
-  paymentAmount: zMoney.nullish(),
-  nextPaymentNumber: z.coerce.number().int().min(1).nullish(),
-  nextPaymentDate: zDate.nullish(),
+  balloonAmount: zMoney
+    .nullish()
+    .describe('Balloon paid with the last payment, as decimal text below the loan amount; leave out for none. On an edit, leave out to keep it, or send null to clear it.'),
+  compounding: z
+    .enum(['monthly', 'exact_days'])
+    .nullish()
+    .describe('monthly (per payment period, the default) or exact_days (interest by the days between payments); on an edit, leave out to keep it.'),
+  dayCount: z.coerce
+    .number()
+    .int()
+    .nullish()
+    .describe('With exact_days: days in the interest year, 365 (the default) or 360; on an edit, leave out to keep it.'),
+  paymentAmount: zMoney
+    .nullish()
+    .describe(
+      "The lender's payment (principal and interest), as decimal text above the first period's interest; leave out to work it out from the terms. On an edit, leave out to keep it, or send null to clear it.",
+    ),
+  nextPaymentNumber: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .nullish()
+    .describe('A loan already in progress: number of the next payment the Loan Manager tracks; leave out for 1. On an edit, leave out to keep it.'),
+  nextPaymentDate: zDate
+    .nullish()
+    .describe('A loan already in progress: due date of that next payment, YYYY-MM-DD; leave out to work it out from firstPaymentDate. On an edit, leave out to keep it.'),
 });
 
 /** POST /api/loans/:id/what-if — QB Loan Manager "What If Scenarios" (nothing is saved). */
@@ -183,9 +224,14 @@ export const checkPrintSettingsSchema = z.object({
   layout: z.unknown().optional(),
 });
 
+/** POST /api/banking/account-currency (lib/services/currencies.ts setAccountCurrency). */
 export const accountCurrencySchema = z.object({
-  accountId: zUuid,
-  currency: z.string().max(3).nullish(),
+  accountId: zUuid.describe('Id of a bank or credit card account (chart of accounts) with no transactions yet.'),
+  currency: z
+    .string()
+    .max(3)
+    .nullish()
+    .describe('3-letter code of a currency in the currency list, such as "EUR"; leave out or null for the home currency.'),
 });
 
 export const updateTransferBodySchema = z.object({

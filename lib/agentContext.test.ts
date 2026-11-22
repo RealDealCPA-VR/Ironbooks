@@ -16,7 +16,8 @@
  *    settings stay closed to it;
  *  - its own request reaches only the door (POST /api/agent/actions), its own reads, and GETs the
  *    registry classes as plain reads open to agents; every other method and every GET classed
- *    file, outside, read_sensitive, person_only, hard_floor or left unclassified is refused;
+ *    admin, file, outside or read_sensitive, person_only, hard_floor or left unclassified is
+ *    refused (the reads of Users & Roles are class admin, the backup history class file);
  *  - not through the multi-user proxy, not from a browser, not before a person signed in, not in a
  *    practice copy, not in single-user mode, not while paused;
  *  - an agent may hold the Admin role (D1), but its own requests never reach Users & Roles or the
@@ -103,7 +104,13 @@ import {
   agentUseDoorMessage,
 } from '@/lib/agentContext';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
-import { AGENT_ACTION_ROUTE, AGENT_DOOR_ONLY_AREAS, AGENT_OWN_ROUTES } from '@/lib/permissions/agentAccess';
+import {
+  AGENT_ACTION_ROUTE,
+  AGENT_DOOR_ONLY_AREAS,
+  AGENT_OWN_ROUTES,
+  agentRouteAllowed,
+  type AgentRouteLookup,
+} from '@/lib/permissions/agentAccess';
 import { builtinRole, fullAccess, unionRoles, withoutAreas } from '@/lib/permissions/model';
 import { canSeeAuditEntry, seesWholeLog } from '@/lib/services/auditVisibility';
 import { DEFAULT_PRESET } from '@/lib/agent/policy';
@@ -372,20 +379,25 @@ describe('after a person signed in', () => {
       ['/api/company', 'read', 'agent'],
       ['/api/audit-trail', 'read', 'agent'],
       ['/api/backup', 'file', 'agent'],
+      ['/api/backups', 'file', 'agent'],
+      ['/api/report-schedules', 'file', 'agent'],
+      ['/api/users', 'admin', 'agent'],
+      ['/api/roles', 'admin', 'agent'],
       ['/api/network-policy', 'outside', 'agent'],
       ['/api/bank-transactions/suggestions', 'outside', 'agent'],
-      ['/api/payroll/state-wage-worksheet', 'read_sensitive', 'agent'],
+      // A filed document as it is (a scanned W-9, a bank statement): masking cannot reach inside it.
+      ['/api/attachments/[id]', 'read_sensitive', 'agent'],
       ['/api/reports/1099-xml', 'read_sensitive', 'agent'],
       ['/api/auth/me', 'read', 'person_only'],
       ['/api/handshake', 'read', 'person_only'],
-      ['/api/agents', 'read', 'hard_floor'],
+      ['/api/agents', 'admin', 'hard_floor'],
       ['/api/agent-requests', 'read', 'hard_floor'],
     ];
     for (const [routePath, cls, availability] of cases) {
       // The registry still files each one where this test expects it.
       const op = operationForRoute('GET', routePath);
       expect(op, routePath).toMatchObject({ classified: true, class: cls, availability });
-      request('GET', routePath, { token });
+      request('GET', concrete(routePath), { token });
       if (cls === 'read' && availability === 'agent') expect((await getServerContext()).agent?.id, routePath).toBe(agentId);
       else if (availability === 'agent') await refusedWith(getServerContext(), agentUseDoorMessage(op!.id));
       else await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
@@ -401,6 +413,27 @@ describe('after a person signed in', () => {
     }
     request('GET', '/api/accounts', { token });
     expect((await getServerContext()).agent?.id).toBe(agentId);
+  });
+
+  it('hands the rule the registry lookup lib/net/agentOrigin.test.ts checks it with', () => {
+    // agentOrigin.test.ts proves agentRouteAllowed with its own copy of this lookup. That proof is
+    // worth something only if the way in passes the same one (and passes one at all: without it
+    // only the door and the agent's own reads pass), so the two must agree on every route.
+    const lookup: AgentRouteLookup = (p) => operationForPath('GET', p)?.operation ?? null;
+    let directReads = 0;
+    for (const op of allOperations()) {
+      if (op.kind !== 'route') continue;
+      const p = concrete(op.route);
+      for (const method of ['GET', 'HEAD', op.method]) {
+        const viaWayIn = agentRequestAllowed(p, method);
+        expect(viaWayIn, `${method} ${op.route}`).toBe(agentRouteAllowed(p, method, lookup));
+        if (viaWayIn && method === 'GET' && op.method === 'GET' && !AGENT_OWN_ROUTES.includes(op.route)) directReads++;
+      }
+    }
+    // Not vacuous: plain reads do pass, which they could not without a lookup.
+    expect(directReads).toBeGreaterThan(50);
+    expect(agentRouteAllowed('/api/accounts', 'GET', null)).toBe(false);
+    expect(agentRequestAllowed('/api/accounts', 'GET')).toBe(true);
   });
 
   it('nothing that is not a mapped API route, and nothing without the stamp', async () => {
@@ -526,20 +559,20 @@ describe('after a person signed in', () => {
       expect(ctx.role).toBe('viewer');
       expect(isReadOnlyDb(ctx.db)).toBe(true);
       expect(ctx.access!.flags).toEqual({ sensitivePayroll: false, fullAccountNumbers: false, closedPeriod: false });
-      // Users & Roles (and File Utilities): even the GETs the registry classes 'read' are refused
-      // here and named as door operations. Behind the door they are judged by that class, so today
-      // they run without asking (a known gap, pinned in lib/permissions/agentAccess.test.ts and
-      // handed to the registry's owner); this test proves only the direct refusal.
-      for (const routePath of [
-        '/api/users',
-        `/api/users/${ownerId}`,
-        '/api/users/password-policy',
-        '/api/users/permissions-report',
-        '/api/roles',
-        `/api/roles/${ID}`,
-        '/api/backups',
-      ]) {
-        expect(operationForPath('GET', routePath)?.operation.class, routePath).toBe('read');
+      // Users & Roles and File Utilities: their reads are refused here and named as door operations.
+      // Behind the door they are classed admin (Users & Roles) or file (the backup history), so an
+      // Admin is asked every time (plan 4.2; lib/permissions/agentAccess.test.ts proves the policy
+      // side). Here: the direct refusal, and the class that makes the door ask.
+      for (const [routePath, cls] of [
+        ['/api/users', 'admin'],
+        [`/api/users/${ownerId}`, 'admin'],
+        ['/api/users/password-policy', 'admin'],
+        ['/api/users/permissions-report', 'admin'],
+        ['/api/roles', 'admin'],
+        [`/api/roles/${ID}`, 'admin'],
+        ['/api/backups', 'file'],
+      ] as const) {
+        expect(operationForPath('GET', routePath)?.operation.class, routePath).toBe(cls);
         request('GET', routePath, { token: boss.token });
         await refusedWith(getServerContext(), /^Ask for this through run_operation/);
       }
@@ -780,7 +813,9 @@ describe('making agents is for an Admin at the computer that holds the file', ()
       request('GET', '/api/agents', { user: ownerId, sid, headers: extra });
       const list = await (await agentsGET(new NextRequest('http://localhost:45123/api/agents', { headers: extra }))).json();
       expect(list.hostOnly).toBe(true);
-      expect(list.connection).toBeNull();
+      // No connector settings (paths of the host computer) from afar: the list either says none or,
+      // as app/api/agents/route.ts now has it, never carries them at all.
+      expect(list.connection ?? null).toBeNull();
     }
     request('GET', '/api/accounts', { token });
     expect((await getServerContext()).agent?.id).toBe(agentId);

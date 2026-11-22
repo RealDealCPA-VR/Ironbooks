@@ -21,9 +21,15 @@
  *
  * Hidden entries are left out of the rows AND the counts, the filters' lists and the exports, so
  * the only trace of them is that the log's own record count (integrity check) is larger.
+ *
+ * An entry a person may read is shown through auditValuesFor: no credential material, SSNs and
+ * account numbers masked by field name for their roles, and the account number in memo text
+ * ("Acct # 000123456789", the memo a check gets when it is left blank) masked too.
  */
 import { and, eq, inArray, or, sql, type SQL } from 'drizzle-orm';
 import { auditLogs } from '@/lib/db/schema';
+import { maskAccountsInText } from '@/lib/agent/guards';
+import { maskSensitive, stripSecrets } from '@/lib/permissions/mask';
 import { canRef, refArea, type AccessRef, type Area, type EffectiveAccess } from '@/lib/permissions/model';
 import { RECORD_ACTIVITY, recordActivity } from '@/lib/permissions/recordActivities';
 
@@ -141,7 +147,15 @@ export const AUDIT_ENTITY_REFS: Record<string, AccessRef> = {
   user_company: 'users.users',
   user_session: 'users.users',
   user_preferences: 'users.users',
+  // Agents, what they asked a person to approve and the standing permission people gave them
+  // (agent full access): managed on Users & Roles > Users, like the agent itself. A decision's
+  // record names the operation and the agent, never the input or a secret, but can hold the
+  // person's note, the app's message and a grant's limits: the audit trail shows those only to
+  // someone who may also view the operation's work (auditTrail.ts auditEntryValuesFor), and
+  // never any of these records to an agent (auditReaderFor).
   agent: 'users.users',
+  agent_permission_request: 'users.users',
+  agent_grant: 'users.users',
   role: 'users.roles',
   password_policy: 'users.password_rules',
   company_file: 'users.file_password',
@@ -343,4 +357,51 @@ export function auditVisibilitySql(access: EffectiveAccess | null | undefined): 
     );
   }
   return parts.length ? or(...parts) : sql`false`;
+}
+
+/**
+ * Keys holding memo text: a check's memo, a journal line's memo (every memo column in the schema
+ * is named `memo`; "lineMemo" and the like are covered too).
+ */
+const MEMO_KEY = /memo$/i;
+
+function isPlainRecord(v: unknown): v is Record<string, unknown> {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+/** A copy of `v` with the account number in every memo text masked (maskAccountsInText). */
+function maskMemoText(v: unknown, key: string | null): unknown {
+  if (typeof v === 'string') return key !== null && MEMO_KEY.test(key) ? maskAccountsInText(v) : v;
+  if (Array.isArray(v)) return v.map((x) => maskMemoText(x, key));
+  if (!isPlainRecord(v)) return v; // Date, Decimal …: as they are
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(v)) out[k] = maskMemoText(val, k);
+  return out;
+}
+
+/**
+ * An entry's before / after snapshot as this reader may see it: the audit trail's entry
+ * (auditTrail.ts getAuditLog, through auditEntryValuesFor). The transaction log's records carry
+ * the same snapshots; auditTrail.ts logRecordDataFor is this rule for them, but GET
+ * /api/transaction-log does not use it yet (it masks by field name only, maskForContext), so the
+ * memo text below is still shown there in full. Its CSV export has no snapshots.
+ *  - Credential material is never in it, whoever asks (stripSecrets; trusted contexts too).
+ *  - For a person, SSNs and account numbers are masked by field name for their roles
+ *    (maskSensitive), as every other answer is.
+ *  - Without "view full account numbers", so is the number in memo text. A check whose memo is
+ *    left blank stores the payee's full account number there ("Acct # 000123456789", written by
+ *    liabilityPayments.ts and printQueue.ts) and its audit row keeps that text; older Sales Tax
+ *    Payment entries carry it on a journal line's memo. It reads "Acct # ••••6789", as the check's
+ *    own answers show it (liabilityPayments.ts checkMemoFor). Text the mask itself wrote comes back
+ *    unchanged (maskAccountsInText keeps "••••6789" as it is), and a typed memo with an account
+ *    label is masked after the label too, which errs on the safe side.
+ * Trusted contexts (no `access`: system jobs, tests) see the rest as stored.
+ */
+export function auditValuesFor<T>(access: EffectiveAccess | null | undefined, value: T): T {
+  const clean = stripSecrets(value);
+  if (!access) return clean;
+  const masked = maskSensitive(clean, access);
+  return access.flags.fullAccountNumbers ? masked : (maskMemoText(masked, null) as T);
 }

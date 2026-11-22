@@ -11,29 +11,19 @@
  * inside the service (like /api/search), so a role only gets pages/actions/answers it may use.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getServerContext } from '@/lib/context';
 import { routeError, invalidJsonBody, readJsonObject } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
-import { commandIntentSchema, resolveHintsSchema } from '@/lib/commands/intent';
+import { commandBarSchema } from '@/lib/validation/commandBar';
 import { runCommand } from '@/lib/services/commandBar';
 import { AiError } from '@/lib/ai/types';
-
-const bodySchema = z
-  .object({
-    text: z.string().max(500).optional(),
-    intent: commandIntentSchema.optional(),
-    hints: resolveHintsSchema.optional(),
-    allowAi: z.boolean().optional(),
-  })
-  .refine((b) => !!b.text?.trim() || !!b.intent, { message: 'Type what you want to do.', path: ['text'] });
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const body = await readJsonObject(req);
     if (!body) return invalidJsonBody();
-    const parsed = bodySchema.safeParse(body);
+    const parsed = commandBarSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     return NextResponse.json(await runCommand(ctx, parsed.data));
   } catch (err) {

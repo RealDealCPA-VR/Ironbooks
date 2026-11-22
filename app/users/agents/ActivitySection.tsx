@@ -2,7 +2,8 @@
 /**
  * What an agent ran and asked for (plan 7.1): its last 200 operations and requests, newest first
  * (GET /api/agents/[id]/activity), each linked to the approval center or the audit trail. A
- * request's own link opens that request (the approval center reads `id`).
+ * request's own link opens that request (the approval center reads `id`); an operation's opens its
+ * entry in the audit trail (that page reads `id`).
  */
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
@@ -17,8 +18,8 @@ function errMsg(e: unknown) {
 
 /**
  * The approval center (app/agent-requests), for one agent or one request. That page opens one
- * request from `id`; it does not read `agentId` yet (it is asked for in this unit's handoff), so the
- * link is named for what it opens today, "Approval center", and filters once the page reads it.
+ * request from `id`, and starts with only one agent's requests from `agentId`, so the link at the
+ * top is named for what it opens: this agent's requests.
  */
 export function approvalCenterHref(q: { agentId?: string; requestId?: string }): string {
   const p = new URLSearchParams();
@@ -29,9 +30,8 @@ export function approvalCenterHref(q: { agentId?: string; requestId?: string }):
 }
 
 /**
- * The audit trail (app/audit-trail). It reads no address parameters yet (asked for in this unit's
- * handoff), so `id` does not take the reader to the row today: the links say "Audit trail", not
- * "this entry", and land on the row once the page reads it.
+ * The audit trail (app/audit-trail). With `id` the page opens that entry at the top, scrolled to
+ * and expanded, above the whole trail.
  */
 export function auditTrailHref(auditId?: string | null): string {
   return auditId ? `/audit-trail?id=${encodeURIComponent(auditId)}` : '/audit-trail';
@@ -61,7 +61,7 @@ export default function ActivitySection({ agentId }: { agentId: string }) {
         <p className="text-sm text-navy/60">{ACTIVITY_INTRO}</p>
         <span className="flex gap-3 text-sm">
           <Link href={approvalCenterHref({ agentId })} className="text-electric hover:underline">
-            Approval center
+            Its requests in the approval center
           </Link>
           <Link href={auditTrailHref()} className="text-electric hover:underline">
             Audit trail

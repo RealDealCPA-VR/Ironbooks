@@ -1,13 +1,17 @@
 /**
  * Agent full access: a desktop notice when an agent asks and the window is not in front (plan §7.2).
  *
- * The desktop shell's preload (electron/preload.js) puts `agentNotice` on window.bookkeeper; the
- * main process shows the notice only while the Ironbooks window is not focused, and clicking it
- * brings the window forward on the approval center (electron/agentShell.js showNotice). In a
- * browser, or an older desktop app without it, this does nothing.
+ * The desktop shell's preload (electron/preload.js) puts `agentNotice` on window.bookkeeper. The
+ * notice is raised by the main process on this call: it shows it only while the Ironbooks window is
+ * not focused (minimized, in the tray or behind other windows counts as not focused), and clicking
+ * it brings the window forward on the approval center (electron/agentShell.js showNotice,
+ * showWindowOn). In a browser, or an older desktop app without it, this does nothing.
  *
- * Title and body only, in plain words, built by the caller from the request's summary: never the
- * agent's own words (its reason), which the approval center shows labelled as the agent's.
+ * What the notice says: the desktop app takes only `href` from this call and words the notice
+ * itself from the app's own server (GET /api/agent-requests/count: the newest request's agent name
+ * and the summary the server built from the operation), so no text of the page, and never the
+ * agent's own words (its reason), reaches it. The caller still passes its title and body, in plain
+ * words built from that same summary, for a bridge that shows them as given (a test's).
  */
 
 interface DesktopBridge {

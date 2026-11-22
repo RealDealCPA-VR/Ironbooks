@@ -11,16 +11,25 @@
 //    (BKA_AGENT_SHELL, BKA_AGENT_SHELL_KEY), the same way it hands over BKA_INTERNAL_TOKEN.
 //  - When a person approves such a request in their own window, the server makes an approval
 //    ticket: an HMAC with that key over the request id, the operation, a hash of the input, the
-//    approver and an expiry two minutes ahead (lib/agent/shellTicket.ts). It sends ONE JSON line:
-//    { ticket, operation, input, answers, secrets, folders, file? }.
-//  - Here, before anything runs: the ticket must be good for exactly this operation and input and
-//    must not have been seen before (a replay is refused); the input must be what the operation
-//    takes; every path in it must be inside a folder agents may use (the open company file's
-//    folder, Documents\Ironbooks and its Agent Outbox, plus the folders the Admin added for the
-//    agent, which the line carries from the policy). Anything unexpected is refused: fail closed.
-//    A path is a file strictly inside such a folder (never the folder itself), checked as the disk
-//    has it (links followed, names exactly as the disk spells them); the company file a flow will
-//    write (".ironbooks" added) is checked too, and must not be there yet.
+//    approver, an expiry two minutes ahead, and a hash of everything else the shell acts on: the
+//    approver's answers, the folders the Admin allowed, the file that comes with it and which
+//    secrets were typed (lib/agent/shellTicket.ts). It sends ONE JSON line:
+//    { ticket, operation, input, answers, folders, sealed? }. `sealed` holds what must stay private
+//    (the approver's passwords, a print job's PDF): AES-256-GCM with a key derived from the launch
+//    key, tied to the ticket, so whoever might sit between the server and the shell reads nothing of
+//    it and cannot swap it.
+//  - Here, before anything runs: the ticket must be good for exactly this operation, input,
+//    answers, folders and file, and must not have been seen before (a ticket is used once, and a
+//    replay is refused); the input must be what the operation takes; every path in it must be
+//    inside a folder agents may use (the open company file's folder, Documents\Ironbooks and its
+//    Agent Outbox, plus the folders the Admin added for the agent, which the line carries from the
+//    policy). A drive or share root (a USB stick's E:\, a mapped drive's Q:\, \\server\share) is
+//    never such a folder: a company file kept there leaves only the Documents folders. Anything
+//    unexpected is refused: fail closed. A path is a file strictly inside such a folder (never the
+//    folder itself), checked as the disk has it (links followed, names exactly as the disk spells
+//    them); the company file a flow will write (".ironbooks" added) is checked too, and must not be
+//    there yet. A host an agent asks to join must not be this computer itself, nor a virtual
+//    machine or container it runs (joinProblem).
 //  - Then the operation runs the same flow the File menu runs (electron/main.js), inside a SCRIPT:
 //    every native dialog the flow would show takes its answer from the request instead of opening.
 //    A dialog's options are read as Electron reads them (window first, or none). File pickers get
@@ -30,7 +39,27 @@
 //    Nothing ever waits on screen. The script follows the flow's own async work (AsyncLocalStorage)
 //    and ends with it: a dialog shown by anything else, at any other moment, goes to the person
 //    exactly as before.
-//  - One JSON line goes back: { ok, result, error, restarting }. Never a secret, never the ticket.
+//  - One JSON line goes back: { ok, result, error, restarting, mac }. Never a secret, never the
+//    ticket. `mac` is an HMAC with the launch key over the answer and the ticket's MAC: the server
+//    never takes an answer that does not check out for "done".
+//
+// The endpoint itself (openEndpoint):
+//  - Windows: a named pipe with 128 random bits in its name. Node (libuv) creates its first
+//    instance with FILE_FLAG_FIRST_PIPE_INSTANCE, so listening fails (EADDRINUSE) when anything
+//    already holds the name: no second server can take it, and this one never shares it. The pipe
+//    gets Windows' default security for a named pipe: full control for this Windows account, SYSTEM
+//    and Administrators, read-only for other accounts. Read-only is no way in: every connection is
+//    its own pipe instance, so another account reads nothing of anyone else's requests, cannot write
+//    one, and cannot make an instance of its own. Node offers no way to set a narrower list, so a
+//    program running as this same Windows account could make a second instance with native code;
+//    against that the ticket's MAC (nothing it changes is carried out), the sealed part (it reads no
+//    password or PDF) and the signed answer (it cannot make the server believe a result) hold. That
+//    part can only be checked in the running app (test/agentShell.test.ts checks what Node does).
+//    What read-only access still allows: another account that finds the name (pipe names can be
+//    listed) can open connections that send nothing and so hold the endpoint's few connections
+//    (MAX_CONNECTIONS); approvals then fail as "not answering", and nothing runs. A connection that
+//    stays silent is closed after FIRST_BYTE_MS, so such a program has to keep reconnecting.
+//  - Elsewhere: a Unix socket in a folder only this account can open (mkdtemp, 0700), itself 0600.
 //
 // Plain Node, no Electron import: the ticket check, the replay memory, the path check, the
 // scripted dialogs and the endpoint itself are driven by test/agentShell.test.ts with fake flows.
@@ -39,11 +68,13 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const dns = require('node:dns');
 const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { AsyncLocalStorage } = require('node:async_hooks');
+const hostingCore = require('./hostingCore');
 
 /** Where the endpoint listens, and this launch's ticket key, in the company server's environment. */
 const ENDPOINT_ENV = 'BKA_AGENT_SHELL';
@@ -58,17 +89,30 @@ const OUTBOX_NAME = 'Agent Outbox';
  * address over 2 MB; 1.5 MB in base64 stays under that. A larger PDF a person prints themselves.
  */
 const MAX_PRINT_BYTES = 1_500_000;
-/** A request line: the input plus, for printing, that PDF in base64 (2 MB at most) and room for the rest. */
-const MAX_LINE_BYTES = 2.5 * 1024 * 1024;
+/**
+ * A request line: the input plus, for printing, that PDF sealed (base64 inside the sealed JSON,
+ * base64 again on the line: about 2.7 MB for the largest) and room for the rest.
+ */
+const MAX_LINE_BYTES = 4 * 1024 * 1024;
 /**
  * How long a connection has, from the moment it is accepted, to send its whole line (the server
  * writes it at once). Counted from the start, not from the last byte: a program that trickles a
  * byte at a time cannot hold the endpoint's few connections for long.
  */
 const READ_TIMEOUT_MS = 10_000;
+/**
+ * How long a connection may stay silent before it is closed. The server writes its line the moment
+ * it connects, so a connection that sends nothing is something else holding one of the endpoint's
+ * few connections (another Windows account may connect read-only): it lets go of it quickly.
+ */
+const FIRST_BYTE_MS = 2_000;
+/** Connections the endpoint holds at once; more are closed as they arrive. */
+const MAX_CONNECTIONS = 8;
 const MAX_COPIES = 100;
 
-const TICKET_LABEL = 'ironbooks-shell-ticket/1';
+const TICKET_LABEL = 'ironbooks-shell-ticket/2';
+const ANSWER_LABEL = 'ironbooks-shell-answer/1';
+const SEAL_INFO = 'ironbooks-shell-private/1';
 const HEX64 = /^[0-9a-f]{64}$/;
 const FILE_ID = /^[0-9a-f]{32}$/;
 const CLOCK_SLACK_MS = 60_000;
@@ -109,13 +153,74 @@ function stableJson(value) {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`;
 }
 
-function inputHash(input) {
-  return crypto.createHash('sha256').update(stableJson(input === undefined ? null : input), 'utf8').digest('hex');
+function sha256Hex(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
 }
 
-function ticketMac(key, t) {
-  const message = JSON.stringify([TICKET_LABEL, t.requestId, t.operation, t.inputHash, t.approverId, t.expiresAt]);
+function inputHash(input) {
+  return sha256Hex(Buffer.from(stableJson(input === undefined ? null : input), 'utf8'));
+}
+
+/** The file of a request as the ticket covers it: name, type and a sha256 of the bytes (shellFileRef). */
+function fileRef(file) {
+  if (!file || typeof file !== 'object') return null;
+  const bytes = Buffer.from(typeof file.base64 === 'string' ? file.base64 : '', 'base64');
+  return { name: String(file.name ?? ''), type: String(file.type ?? ''), sha256: sha256Hex(bytes) };
+}
+
+/** sha256 of everything else the shell acts on, with the same defaults as shellBoundHash. */
+function boundHash(bound) {
+  const b = bound && typeof bound === 'object' ? bound : {};
+  const kinds = Array.isArray(b.secrets) ? b.secrets.map((k) => String(k)).sort() : [];
+  const text = stableJson({ answers: b.answers ?? {}, folders: b.folders ?? [], file: b.file ?? null, secrets: kinds });
+  return sha256Hex(Buffer.from(text, 'utf8'));
+}
+
+function ticketMac(key, t, bound) {
+  const message = JSON.stringify([TICKET_LABEL, t.requestId, t.operation, t.inputHash, t.approverId, t.expiresAt, boundHash(bound)]);
   return crypto.createHmac('sha256', key).update(message, 'utf8').digest('hex');
+}
+
+function sealKey(key) {
+  return Buffer.from(crypto.hkdfSync('sha256', Buffer.from(key, 'utf8'), Buffer.alloc(0), SEAL_INFO, 32));
+}
+
+/** Seal what must stay private for this ticket (lib/agent/shellTicket.ts sealShellPrivate). */
+function sealPrivate(key, mac, priv) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', sealKey(key), iv);
+  cipher.setAAD(Buffer.from(mac, 'utf8'));
+  const data = Buffer.concat([cipher.update(JSON.stringify(priv), 'utf8'), cipher.final()]);
+  return { iv: iv.toString('hex'), data: data.toString('base64'), tag: cipher.getAuthTag().toString('hex') };
+}
+
+/** What was sealed for this ticket with this key, or null (openShellPrivate). */
+function openPrivate(key, mac, sealed) {
+  if (!sealed || typeof sealed !== 'object' || typeof key !== 'string' || !key) return null;
+  if (typeof sealed.iv !== 'string' || !/^[0-9a-f]{24}$/.test(sealed.iv) || typeof sealed.tag !== 'string' || !/^[0-9a-f]{32}$/.test(sealed.tag)) return null;
+  if (typeof sealed.data !== 'string') return null;
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', sealKey(key), Buffer.from(sealed.iv, 'hex'));
+    decipher.setAAD(Buffer.from(String(mac), 'utf8'));
+    decipher.setAuthTag(Buffer.from(sealed.tag, 'hex'));
+    const text = Buffer.concat([decipher.update(Buffer.from(sealed.data, 'base64')), decipher.final()]).toString('utf8');
+    const v = JSON.parse(text);
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The HMAC of an answer to the request whose ticket has `mac` (shellAnswerMac). */
+function answerMac(key, mac, answer) {
+  const text = stableJson({ ok: answer.ok, result: answer.result, error: answer.error, restarting: answer.restarting });
+  return crypto.createHmac('sha256', String(key || '')).update(JSON.stringify([ANSWER_LABEL, String(mac), text]), 'utf8').digest('hex');
+}
+
+/** The answer as it goes on the line: its JSON form, with its HMAC. */
+function signAnswer(key, mac, answer) {
+  const sent = JSON.parse(JSON.stringify({ ok: answer.ok, result: answer.result, error: answer.error, restarting: answer.restarting }));
+  return { ...sent, mac: answerMac(key, mac, sent) };
 }
 
 function readableTicket(t) {
@@ -143,19 +248,22 @@ function sameHex(a, b) {
   return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y);
 }
 
+const NO_KEY =
+  'This Ironbooks has no key for approval tickets, so it cannot carry out approved requests. Restart Ironbooks, then have the agent ask again.';
+const UNREADABLE_TICKET = 'The approval ticket could not be read, so nothing was done. The agent can ask again.';
+const NOT_OURS =
+  'The approval ticket was not made by this Ironbooks for exactly what came with it, so nothing was done. Requests are approved in the Ironbooks window; the agent can ask again.';
+
 /**
- * Null when `ticket` is good for exactly this operation and input, otherwise why not. A request
- * that fails is final (plan 7.2): the way on is a new request, so the messages say "ask again".
+ * Null when `ticket` is good for exactly this operation, input and `bound` (answers, folders,
+ * file, secret kinds), otherwise why not. A request that fails is final (plan 7.2): the way on is a
+ * new request, so the messages say "ask again".
  */
-function ticketProblem(key, ticket, operation, input, now = Date.now()) {
-  if (typeof key !== 'string' || !key) {
-    return 'This Ironbooks has no key for approval tickets, so it cannot carry out approved requests. Restart Ironbooks, then have the agent ask again.';
-  }
-  if (!readableTicket(ticket)) return 'The approval ticket could not be read, so nothing was done. The agent can ask again.';
+function ticketProblem(key, ticket, operation, input, now = Date.now(), bound = null) {
+  if (typeof key !== 'string' || !key) return NO_KEY;
+  if (!readableTicket(ticket)) return UNREADABLE_TICKET;
   // The MAC first: until it checks out, nothing else in the ticket can be believed.
-  if (!sameHex(ticketMac(key, ticket), ticket.mac)) {
-    return 'The approval ticket was not made by this Ironbooks, so nothing was done. Requests are approved in the Ironbooks window; the agent can ask again.';
-  }
+  if (!sameHex(ticketMac(key, ticket, bound), ticket.mac)) return NOT_OURS;
   if (now > ticket.expiresAt) return 'The approval ran out before Ironbooks got to it, so nothing was done. The agent can ask again.';
   if (ticket.expiresAt - now > TICKET_SECONDS * 1000 + CLOCK_SLACK_MS) return 'The approval ticket could not be read, so nothing was done. The agent can ask again.';
   if (ticket.operation !== operation) return 'The approval ticket is for another request, so nothing was done. The agent can ask again.';
@@ -198,13 +306,34 @@ const DEVICE_PATH = /^(?:[\\/]{2}[?.](?:[\\/]|$)|\\\?\?\\)/;
 const DEVICE_NAME = /^(con|prn|aux|nul|conin\$|conout\$|clock\$|com[0-9¹²³]|lpt[0-9¹²³]) *(\.|$)/iu;
 const PATH_MAX = 1024;
 
-/** The folders agents may use without the Admin naming them. */
-function defaultFolders({ companyFile, documents } = {}) {
+/**
+ * `p` is the top of a drive or a share: "E:\" (a USB stick, a mapped drive letter, C:\ itself),
+ * "\\server\share", or "/". Such a folder is never one agents may use: it would hand them the whole
+ * drive or share.
+ */
+function driveOrShareRoot(p, platform = process.platform) {
+  if (typeof p !== 'string' || !p) return false;
+  const P = platform === 'win32' ? path.win32 : path.posix;
+  const resolved = P.resolve(p);
+  return resolved === P.parse(resolved).root;
+}
+
+/**
+ * The folders agents may use without the Admin naming them: the open company file's folder, and
+ * Documents\Ironbooks with its Agent Outbox. A company file at the top of a drive or share (a USB
+ * stick's E:\Books.ironbooks, a mapped Q:\, \\office\books\Books.ironbooks) adds no folder of its
+ * own: only the Documents ones apply.
+ */
+function defaultFolders({ companyFile, documents, platform = process.platform } = {}) {
+  const P = platform === 'win32' ? path.win32 : path.posix;
   const out = [];
-  if (typeof companyFile === 'string' && companyFile) out.push(path.dirname(companyFile));
+  if (typeof companyFile === 'string' && companyFile) {
+    const dir = P.dirname(P.resolve(companyFile));
+    if (!driveOrShareRoot(dir, platform)) out.push(dir);
+  }
   if (typeof documents === 'string' && documents) {
-    out.push(path.join(documents, 'Ironbooks'));
-    out.push(path.join(documents, 'Ironbooks', OUTBOX_NAME));
+    out.push(P.join(documents, 'Ironbooks'));
+    out.push(P.join(documents, 'Ironbooks', OUTBOX_NAME));
   }
   return out;
 }
@@ -314,7 +443,10 @@ function pathProblem(raw, allowed, { platform = process.platform, fs: fsx = REAL
     const start = platform === 'win32' ? 'with the drive (C:\\…)' : 'with /';
     return `"${shown}" is not a full path to a place on this computer. Give the whole path, starting ${start}.`;
   }
-  const bases = (Array.isArray(allowed) ? allowed : []).map((a) => cleanPath(a, platform)).filter(Boolean);
+  // The top of a drive or a share is never a folder agents may use, whoever named it.
+  const bases = (Array.isArray(allowed) ? allowed : [])
+    .map((a) => cleanPath(a, platform))
+    .filter((b) => b && !driveOrShareRoot(b, platform));
   const outside =
     `"${shown}" is not in a folder agents may use on this computer. Use the company file's folder, Documents\\Ironbooks, ` +
     "or a folder the Admin added in the agent's settings, and name a file inside it.";
@@ -324,7 +456,8 @@ function pathProblem(raw, allowed, { platform = process.platform, fs: fsx = REAL
   const real = onDisk(want, platform, fsx);
   if (real && candidates.some((b) => {
     const base = onDisk(b, platform, fsx);
-    return base && insideFolder(real, base, platform, { exact: true });
+    // A folder that is a link to the top of a drive or share is refused like the top itself.
+    return base && !driveOrShareRoot(base, platform) && insideFolder(real, base, platform, { exact: true });
   })) {
     return null;
   }
@@ -347,13 +480,224 @@ function pathTaken(p) {
 }
 
 // ---------------------------------------------------------------------------
+// The host an agent asks to join (shell.hosting.connect)
+// ---------------------------------------------------------------------------
+
+/** How long a look-up of the host's name may take before the join is refused. */
+const LOOKUP_MS = 5000;
+
+const REAL_NETWORK = {
+  interfaces: () => os.networkInterfaces(),
+  hostname: () => os.hostname(),
+  lookup: (name) => dns.promises.lookup(name, { all: true, verbatim: true }),
+};
+
+/** An address as compared here: lower case, no brackets, no zone ("%eth0"), IPv4 as itself. */
+function plainAddress(a) {
+  return hostingCore.unmapAddress(String(a || '').replace(/^\[|\]$/g, '').replace(/%.*$/, '')).replace(/\.$/, '');
+}
+
+/** Every address of this computer (every network adapter, its own loopback too), and the "any" addresses. */
+function ownAddresses(interfaces) {
+  const out = new Set(['0.0.0.0', '::']);
+  let list = {};
+  try {
+    list = interfaces() || {};
+  } catch {
+    list = {};
+  }
+  for (const entries of Object.values(list)) {
+    for (const e of Array.isArray(entries) ? entries : []) if (e && e.address) out.add(plainAddress(e.address));
+  }
+  return out;
+}
+
+function isIpAddress(host) {
+  return hostingCore.parseIPv4(host) !== null || host.includes(':');
+}
+
+/**
+ * The adapters this computer has for virtual machines and containers it runs: WSL and Hyper-V's
+ * switches ("vEthernet (WSL)", "vEthernet (Default Switch)"), Docker, VirtualBox, VMware,
+ * Parallels, libvirt and LXC. What answers on their networks runs on this computer (an agent
+ * inside WSL, say), behind an address of its own. Known by the adapter's name, or by the maker
+ * part of its hardware address when the name says nothing (a Hyper-V switch someone named).
+ */
+const VIRTUAL_ADAPTER_NAME = /^(?:vEthernet\b|VirtualBox\b|VMware\b|vboxnet\d|vmnet\d|docker\d|docker_gwbridge|br-[0-9a-f]{6,}|virbr\d|lxcbr\d|lxdbr\d|podman\d|cni\d|cni-|flannel|vnic\d|bridge1\d\d)/i;
+/**
+ * Hyper-V, VirtualBox (guest and host-only), VMware, Parallels, QEMU/KVM. Not Docker's 02:42: a
+ * Wi-Fi adapter's random hardware address may start that way too, and Docker's bridges are known
+ * by their names.
+ */
+const VIRTUAL_MAC_PREFIXES = ['00:15:5d:', '08:00:27:', '0a:00:27:', '00:50:56:', '00:0c:29:', '00:05:69:', '00:1c:14:', '00:1c:42:', '52:54:00:'];
+/**
+ * A virtual network is taken as at least this wide (and /24, or /64, when its mask cannot be
+ * read): WSL and Hyper-V use a /20, Docker a /16. Never wider, so an odd mask never turns a whole
+ * private range (an office network included) into "this computer".
+ */
+const MIN_VIRTUAL_PREFIX_V4 = 16;
+const MIN_VIRTUAL_PREFIX_V6 = 48;
+
+function isVirtualAdapter(name, entry) {
+  if (VIRTUAL_ADAPTER_NAME.test(String(name || ''))) return true;
+  const mac = String((entry && entry.mac) || '').toLowerCase().replace(/-/g, ':');
+  return VIRTUAL_MAC_PREFIXES.some((p) => mac.startsWith(p));
+}
+
+/** An IPv6 address as its eight 16-bit words, or null when it is not one. */
+function ipv6Words(a) {
+  let s = String(a || '').toLowerCase();
+  if (!net.isIPv6(s)) return null;
+  const v4 = /^(.*:)(\d+\.\d+\.\d+\.\d+)$/.exec(s);
+  if (v4) {
+    const n = hostingCore.parseIPv4(v4[2]);
+    if (n === null) return null;
+    s = `${v4[1]}${(n >>> 16).toString(16)}:${(n & 0xffff).toString(16)}`;
+  }
+  const halves = s.split('::');
+  if (halves.length > 2) return null;
+  const words = (h) => (h ? h.split(':') : []);
+  const left = words(halves[0]);
+  const right = halves.length === 2 ? words(halves[1]) : [];
+  const fill = halves.length === 2 ? 8 - left.length - right.length : 0;
+  const all = [...left, ...Array(Math.max(fill, 0)).fill('0'), ...right];
+  if (all.length !== 8 || all.some((w) => !/^[0-9a-f]{1,4}$/.test(w))) return null;
+  return all.map((w) => parseInt(w, 16));
+}
+
+function sameIPv6Prefix(a, b, bits) {
+  for (let i = 0; i < 8 && bits > 0; i++, bits -= 16) {
+    const take = Math.min(bits, 16);
+    const mask = take === 16 ? 0xffff : (0xffff << (16 - take)) & 0xffff;
+    if ((a[i] & mask) !== (b[i] & mask)) return false;
+  }
+  return true;
+}
+
+/** The prefix length an interface entry says (its netmask, else its cidr), or null. */
+function entryPrefix(e, v4) {
+  if (v4) {
+    const bits = hostingCore.maskBits(e.netmask);
+    if (bits !== null) return bits;
+  }
+  const n = typeof e.cidr === 'string' ? Number(e.cidr.split('/')[1]) : NaN;
+  return Number.isInteger(n) && n >= 0 && n <= (v4 ? 32 : 128) ? n : null;
+}
+
+/**
+ * The networks of this computer's virtual adapters (isVirtualAdapter): [{ v4, base, prefix }].
+ * Link-local addresses are left out (the window never joins one anyway).
+ */
+function virtualNetworks(interfaces) {
+  let list = {};
+  try {
+    list = interfaces() || {};
+  } catch {
+    list = {};
+  }
+  const out = [];
+  for (const [name, entries] of Object.entries(list)) {
+    for (const e of Array.isArray(entries) ? entries : []) {
+      if (!e || !e.address || e.internal || !isVirtualAdapter(name, e)) continue;
+      const address = plainAddress(e.address);
+      const v4 = hostingCore.parseIPv4(address);
+      if (v4 !== null) {
+        const p = entryPrefix(e, true);
+        out.push({ v4: true, base: address, prefix: p === null ? 24 : Math.max(p, MIN_VIRTUAL_PREFIX_V4) });
+        continue;
+      }
+      const w = ipv6Words(address);
+      if (!w || (w[0] & 0xffc0) === 0xfe80) continue;
+      const p = entryPrefix(e, false);
+      out.push({ v4: false, base: w, prefix: p === null ? 64 : Math.max(p, MIN_VIRTUAL_PREFIX_V6) });
+    }
+  }
+  return out;
+}
+
+/** True when `host` (an address) is on one of the networks of this computer's virtual adapters. */
+function onVirtualNetwork(host, networks) {
+  const v4 = hostingCore.subnetKey(host, 32) !== null;
+  const w = v4 ? null : ipv6Words(host);
+  return networks.some((n) => {
+    if (n.v4 !== v4) return false;
+    if (v4) return hostingCore.subnetKey(host, n.prefix) === hostingCore.subnetKey(n.base, n.prefix);
+    return Boolean(w) && sameIPv6Prefix(w, n.base, n.prefix);
+  });
+}
+
+/**
+ * Null when an agent may ask to join the multi-user host at `raw`, otherwise why not. Joining
+ * makes the Ironbooks window close the books open here, restart, and show the pages the program at
+ * that address serves, with this window's trust, where people then type their passwords: so it is
+ * never this computer itself, where that program could be anything, the agent included. Refused:
+ * what the window would refuse anyway (normalizeHostAddress: only this office network or a
+ * tailnet), localhost and every loopback address, this computer's own addresses (each network
+ * adapter's, its Tailscale address too) and name, an address on the network of one of its virtual
+ * adapters (a WSL, Hyper-V or Docker guest is a program on this computer one hop removed:
+ * virtualNetworks), and a name that leads to any of them now (it is looked up; a name that cannot
+ * be looked up is refused). A Hyper-V switch shared with the office network (an "external" switch)
+ * counts as virtual too: an agent then cannot join a host on that network, a person still can.
+ */
+async function joinProblem(raw, network = REAL_NETWORK) {
+  const net0 = { ...REAL_NETWORK, ...(network || {}) };
+  const shown = oneLine(raw, 120);
+  const n = hostingCore.normalizeHostAddress(raw);
+  if (!n.ok) return `${oneLine(n.error, 240)} Ironbooks did not join "${shown}". The agent can ask again with the address the host computer's Company > Multi-user page shows.`;
+  const host = plainAddress(n.host);
+  const self =
+    `"${shown}" is this computer itself, so Ironbooks did not join it. Joining a host makes the Ironbooks window show the pages ` +
+    'of the program at that address instead of its own, so an agent may only join another computer that hosts the company file. ' +
+    "The agent can ask again with the address the host computer's Company > Multi-user page shows.";
+  const guest =
+    `"${shown}" is a virtual machine or container running on this computer (such as WSL, Hyper-V, Docker or VirtualBox), so ` +
+    'Ironbooks did not join it. Joining a host makes the Ironbooks window show the pages of the program at that address instead ' +
+    'of its own, so an agent may only join another computer that hosts the company file. If that address really is your host ' +
+    'computer, a person can join it from File > Open company on host.';
+  if (hostingCore.classifyAddress(host) === 'loopback') return self;
+  const own = ownAddresses(net0.interfaces);
+  if (own.has(host)) return self;
+  const guests = virtualNetworks(net0.interfaces);
+  if (isIpAddress(host)) return onVirtualNetwork(host, guests) ? guest : null;
+  let me = '';
+  try {
+    me = String(net0.hostname() || '').trim().toLowerCase();
+  } catch {
+    me = '';
+  }
+  if (me && (host === me || host.startsWith(`${me}.`))) return self;
+  let found = null;
+  let timer = null;
+  try {
+    found = await Promise.race([
+      Promise.resolve().then(() => net0.lookup(host)),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), LOOKUP_MS);
+      }),
+    ]);
+  } catch {
+    found = null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  const addresses = (Array.isArray(found) ? found : found ? [found] : []).map((a) => plainAddress(a && typeof a === 'object' ? a.address : a)).filter(Boolean);
+  if (!addresses.length) {
+    return `Ironbooks could not look up "${shown}", so it did not join it. Check the address on the host computer's Company > Multi-user page; the agent can ask again.`;
+  }
+  if (addresses.some((a) => hostingCore.classifyAddress(a) === 'loopback' || own.has(a))) return self;
+  if (addresses.some((a) => onVirtualNetwork(a, guests))) return guest;
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // The operations the shell carries out (lib/agent/operations/shell.ts, runner 'electron')
 // ---------------------------------------------------------------------------
 //
 // fields: the input it takes. saveDialog / openDialog: the input field a Save / Open dialog takes
 // its answer from. newFile: the input field naming a company file the flow writes (".ironbooks"
 // added when missing), which must not be there yet. password: the secret a password prompt takes.
-// hostPrompt: the field the "Open company on host" prompt takes. questions: the flow questions
+// hostPrompt: the field the "Open company on host" prompt takes; joinHost: the field naming a host
+// to join, which must not be this computer (joinProblem). questions: the flow questions
 // (QUESTIONS) the approver may answer. confirmedByApproval: the flow's own "do it?" question,
 // answered yes by the approval itself. pdf: a PDF comes with the request.
 
@@ -389,7 +733,7 @@ const OPERATIONS = Object.freeze({
   'shell.sandbox.leave': { fields: {}, questions: [] },
   'shell.hosting.start': { fields: { network: { type: 'string', required: true, oneOf: ['office', 'tailnet'] } }, questions: [] },
   'shell.hosting.stop': { fields: {}, questions: ['disconnectOthers'] },
-  'shell.hosting.connect': { fields: { host: { type: 'string', required: true } }, hostPrompt: 'host', questions: [] },
+  'shell.hosting.connect': { fields: { host: { type: 'string', required: true } }, hostPrompt: 'host', joinHost: 'host', questions: [] },
   'shell.hosting.disconnect': { fields: {}, questions: [] },
   'shell.update.install': { fields: {}, questions: ['closeOverUnsavedForm'] },
   'shell.ollama.install': { fields: {}, questions: [], confirmedByApproval: ['installOllama'] },
@@ -843,87 +1187,129 @@ function isPdf(bytes) {
   return Buffer.isBuffer(bytes) || bytes instanceof Uint8Array ? Buffer.from(bytes.subarray(0, 5)).toString('latin1') === '%PDF-' : false;
 }
 
+const UNREADABLE_REQUEST = 'The request could not be read, so nothing was done. The agent can ask again.';
+
 /**
- * The checking and running of requests, without the endpoint: `handle(line)` resolves the answer.
- * `flows`: operation id → async ({ input, file, script }) => { done, restarting, result }.
- * `folders`: () => the default folders agents may use right now.
+ * The checking and running of requests, without the endpoint: `handle(line)` resolves the answer
+ * as it goes on the line (signed: signAnswer). `flows`: operation id → async ({ input, file,
+ * script }) => { done, restarting, result }. `folders`: () => the default folders agents may use
+ * right now. `network`: how a host to join is looked at (joinProblem; tests pass their own).
  */
-function createShellCore({ key, flows, folders = () => [], now = () => Date.now(), pathOptions, fileExists, log = () => {} }) {
+function createShellCore({ key, flows, folders = () => [], now = () => Date.now(), pathOptions, fileExists, network, log = () => {} }) {
   const memory = createReplayMemory();
   const taken = typeof fileExists === 'function' ? fileExists : pathTaken;
   let running = null;
 
-  async function handle(line) {
-    let req;
-    try {
-      req = JSON.parse(line);
-    } catch {
-      return refuse('The request could not be read.');
-    }
-    if (!req || typeof req !== 'object' || Array.isArray(req)) return refuse('The request could not be read.');
+  /** One request, checked and run: the answer before it is signed. */
+  async function run(req) {
+    if (!req || typeof req !== 'object' || Array.isArray(req)) return refuse(UNREADABLE_REQUEST);
     const { ticket, operation, input } = req;
-    const bad = ticketProblem(key, ticket, operation, input, now());
+    // Passwords and files only ever travel sealed: a line that carries them in the open was not
+    // made by this Ironbooks's server.
+    if (Object.prototype.hasOwnProperty.call(req, 'secrets') || Object.prototype.hasOwnProperty.call(req, 'file')) return refuse(UNREADABLE_REQUEST);
+    if (typeof key !== 'string' || !key) return refuse(NO_KEY);
+    if (!readableTicket(ticket)) return refuse(UNREADABLE_TICKET);
+    let priv = {};
+    if (req.sealed !== undefined) {
+      priv = openPrivate(key, ticket.mac, req.sealed);
+      if (!priv) return refuse(NOT_OURS);
+    }
+    const secretsIn = priv.secrets && typeof priv.secrets === 'object' && !Array.isArray(priv.secrets) ? priv.secrets : {};
+    const fileIn = priv.file && typeof priv.file === 'object' ? priv.file : null;
+    // The MAC covers everything the shell acts on, exactly as it came.
+    const bound = { answers: req.answers, folders: req.folders, file: fileRef(fileIn), secrets: Object.keys(secretsIn) };
+    const bad = ticketProblem(key, ticket, operation, input, now(), bound);
     if (bad) return refuse(bad);
+    // Used once, from here on, whatever happens next: an approval never runs twice.
+    if (!memory.use(ticket, now())) return refuse('This approval was already used, so nothing more was done. The agent can ask again.');
     const spec = Object.prototype.hasOwnProperty.call(OPERATIONS, operation) ? OPERATIONS[operation] : null;
     const flow = spec && flows && typeof flows[operation] === 'function' ? flows[operation] : null;
     if (!flow) return refuse(`This Ironbooks cannot carry out "${oneLine(operation, 80)}".`);
     // One at a time: two flows would answer each other's questions on screen.
     if (running) return refuse('Ironbooks is carrying out another approved request, so it did not start this one. The agent can ask again in a minute.');
-    if (!memory.use(ticket, now())) return refuse('This approval was already used, so nothing more was done. The agent can ask again.');
-    const wrongInput = inputProblem(spec, input);
-    if (wrongInput) return refuse(wrongInput);
-    let allowed;
-    try {
-      allowed = [...(folders() || []), ...(Array.isArray(req.folders) ? req.folders.filter((f) => typeof f === 'string' && f) : [])];
-    } catch (err) {
-      return refuse(`Ironbooks could not tell which folders agents may use (${errorText(err)}).`);
-    }
-    for (const [k, f] of Object.entries(spec.fields)) {
-      if (f.type !== 'path' || input[k] === undefined || input[k] === null) continue;
-      const p = pathProblem(input[k], allowed, pathOptions);
-      if (p) return refuse(p);
-    }
-    if (spec.newFile) {
-      // The company file the flow will write, ".ironbooks" added: checked as written, and never
-      // one that is there (the save of a copy replaces a file without asking).
-      const made = companyFilePath(input[spec.newFile]);
-      const p = pathProblem(made, allowed, pathOptions);
-      if (p) return refuse(p);
-      if (taken(made)) return refuse(`There is already a file at "${oneLine(made, 200)}". Choose a new name: Ironbooks never replaces a file for an agent.`);
-    }
-    let file = null;
-    if (spec.pdf) {
-      file = pdfOf(req.file);
-      if (!file) return refuse('Only a PDF of up to 1.5 MB can be printed this way, and this request carries none. A person can print a larger one from the Ironbooks window.');
-    }
-    const script = new ShellScript({
-      operation,
-      spec,
-      input,
-      answers: req.answers,
-      secrets: req.secrets,
-      fileExists: taken,
-      checkPath: (p) => pathProblem(p, allowed, pathOptions),
-    });
-    const secrets = script.secretValues;
-    let outcome;
-    let error = null;
     running = operation;
     try {
-      outcome = await runScripted(script, () => flow({ input, file, script }));
-    } catch (err) {
-      error = err;
+      const wrongInput = inputProblem(spec, input);
+      if (wrongInput) return refuse(wrongInput);
+      if (req.answers !== undefined && (!req.answers || typeof req.answers !== 'object' || Array.isArray(req.answers))) return refuse(UNREADABLE_REQUEST);
+      if (req.folders !== undefined && !Array.isArray(req.folders)) return refuse(UNREADABLE_REQUEST);
+      let allowed;
+      try {
+        allowed = [...(folders() || []), ...(Array.isArray(req.folders) ? req.folders.filter((f) => typeof f === 'string' && f) : [])];
+      } catch (err) {
+        return refuse(`Ironbooks could not tell which folders agents may use (${errorText(err)}).`);
+      }
+      for (const [k, f] of Object.entries(spec.fields)) {
+        if (f.type !== 'path' || input[k] === undefined || input[k] === null) continue;
+        const p = pathProblem(input[k], allowed, pathOptions);
+        if (p) return refuse(p);
+      }
+      if (spec.newFile) {
+        // The company file the flow will write, ".ironbooks" added: checked as written, and never
+        // one that is there (the save of a copy replaces a file without asking).
+        const made = companyFilePath(input[spec.newFile]);
+        const p = pathProblem(made, allowed, pathOptions);
+        if (p) return refuse(p);
+        if (taken(made)) return refuse(`There is already a file at "${oneLine(made, 200)}". Choose a new name: Ironbooks never replaces a file for an agent.`);
+      }
+      if (spec.joinHost) {
+        const p = await joinProblem(input[spec.joinHost], network);
+        if (p) return refuse(p);
+      }
+      let file = null;
+      if (spec.pdf) {
+        file = pdfOf(fileIn);
+        if (!file) return refuse('Only a PDF of up to 1.5 MB can be printed this way, and this request carries none. A person can print a larger one from the Ironbooks window.');
+      }
+      const script = new ShellScript({
+        operation,
+        spec,
+        input,
+        answers: req.answers,
+        secrets: secretsIn,
+        fileExists: taken,
+        checkPath: (p) => pathProblem(p, allowed, pathOptions),
+      });
+      const secrets = script.secretValues;
+      let outcome;
+      let error = null;
+      try {
+        outcome = await runScripted(script, () => flow({ input, file, script }));
+      } catch (err) {
+        error = err;
+      }
+      const answer = scrub(answerOf(script, outcome, error), secrets);
+      script.secretValues = [];
+      // The log has the operation and the plain outcome only: never the input's secrets (scrubbed above).
+      log(`${operation}: ${answer.ok ? (answer.restarting ? 'done, restarting' : 'done') : `not done: ${answer.error}`}`);
+      return answer;
     } finally {
       running = null;
     }
-    const answer = scrub(answerOf(script, outcome, error), secrets);
-    script.secretValues = [];
-    log(`${operation}: ${answer.ok ? (answer.restarting ? 'done, restarting' : 'done') : `not done: ${answer.error}`}`);
-    return answer;
+  }
+
+  async function handle(line) {
+    let req = null;
+    try {
+      req = JSON.parse(line);
+    } catch {
+      req = null;
+    }
+    const mac = req && typeof req === 'object' && req.ticket && typeof req.ticket.mac === 'string' && HEX64.test(req.ticket.mac) ? req.ticket.mac : '';
+    let answer;
+    try {
+      answer = await run(req);
+    } catch (err) {
+      log(`a request failed: ${errorText(err)}`);
+      answer = refuse('Ironbooks could not carry out the request.');
+    }
+    return signAnswer(key, mac, answer);
   }
 
   return {
     handle,
+    /** An answer this endpoint gives without reading a request (one too large): signed all the same. */
+    sign: (answer, mac = '') => signAnswer(key, mac, answer),
     memory,
     get running() {
       return running;
@@ -945,10 +1331,11 @@ function newEndpointPath({ platform = process.platform, tmpdir = os.tmpdir() } =
 }
 
 /** One connection: read one line, answer it, close. */
-function serveConnection(socket, core, log) {
+function serveConnection(socket, core, log, firstByteMs = FIRST_BYTE_MS) {
   const chunks = [];
   let size = 0;
   let settled = false;
+  let heard = false;
   const reply = (answer) => {
     if (!socket.destroyed) socket.end(`${JSON.stringify(answer)}\n`);
   };
@@ -959,8 +1346,23 @@ function serveConnection(socket, core, log) {
   const deadline = setTimeout(() => {
     if (!settled) socket.destroy();
   }, READ_TIMEOUT_MS);
-  socket.on('close', () => clearTimeout(deadline));
+  // A connection that says nothing at all is let go much sooner. When the time is up, what already
+  // arrived is read first (setImmediate runs after the reads waiting in this turn), so a busy moment
+  // in this process never costs the server's real request.
+  const quiet = setTimeout(() => {
+    setImmediate(() => {
+      if (!heard && !settled) socket.destroy();
+    });
+  }, firstByteMs);
+  socket.on('close', () => {
+    clearTimeout(deadline);
+    clearTimeout(quiet);
+  });
   socket.on('data', (chunk) => {
+    if (!heard) {
+      heard = true;
+      clearTimeout(quiet);
+    }
     if (settled) return;
     const nl = chunk.indexOf(0x0a);
     const part = nl < 0 ? chunk : chunk.subarray(0, nl);
@@ -969,7 +1371,7 @@ function serveConnection(socket, core, log) {
       settled = true;
       clearTimeout(deadline);
       chunks.length = 0;
-      reply(refuse('The request is too large.'));
+      reply(core.sign(refuse('The request is too large.')));
       return;
     }
     chunks.push(part);
@@ -980,7 +1382,7 @@ function serveConnection(socket, core, log) {
     chunks.length = 0;
     core.handle(line).then(reply, (err) => {
       log(`a request failed: ${errorText(err)}`);
-      reply(refuse('Ironbooks could not carry out the request.'));
+      reply(core.sign(refuse('Ironbooks could not carry out the request.')));
     });
   });
 }
@@ -988,15 +1390,16 @@ function serveConnection(socket, core, log) {
 /**
  * Open the endpoint. Resolves nothing: `ready` settles once it listens. `env` is what the company
  * server gets: { endpoint, key }. Options are those of createShellCore, plus `platform` and
- * `tmpdir` for where to listen.
+ * `tmpdir` for where to listen and `firstByteMs` (tests: how long a silent connection is kept).
  */
 function openEndpoint(opts = {}) {
   const log = typeof opts.log === 'function' ? opts.log : () => {};
   const key = typeof opts.key === 'string' && opts.key ? opts.key : crypto.randomBytes(32).toString('hex');
   const where = newEndpointPath({ platform: opts.platform, tmpdir: opts.tmpdir });
   const core = createShellCore({ ...opts, key, log });
-  const server = net.createServer((socket) => serveConnection(socket, core, log));
-  server.maxConnections = 8;
+  const firstByteMs = Number.isInteger(opts.firstByteMs) && opts.firstByteMs > 0 ? Math.min(opts.firstByteMs, FIRST_BYTE_MS) : FIRST_BYTE_MS;
+  const server = net.createServer((socket) => serveConnection(socket, core, log, firstByteMs));
+  server.maxConnections = MAX_CONNECTIONS;
   const ready = new Promise((resolve, reject) => {
     server.once('listening', resolve);
     server.once('error', reject);
@@ -1135,22 +1538,56 @@ async function printPdf({ BrowserWindow, bytes, printer = null, copies = 1, sett
 
 /** Pages a notice may open: the approval center, or one request in it. */
 const NOTICE_ROUTE = /^\/agent-requests(?:\/[A-Za-z0-9_-]{1,64})?$/;
+const NOTICE_HOME = '/agent-requests';
 
 /** Title and body as one plain line each, and the page to open (the approval center unless it is one of its own). */
 function cleanNotice(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const title = oneLine(raw.title, 80);
   if (!title) return null;
-  const href = typeof raw.href === 'string' && NOTICE_ROUTE.test(raw.href) ? raw.href : '/agent-requests';
+  const href = typeof raw.href === 'string' && NOTICE_ROUTE.test(raw.href) ? raw.href : NOTICE_HOME;
   return { title, body: oneLine(raw.body, 240), href };
+}
+
+/**
+ * The notice, worded here from what the app's own server answers for the title bar's count
+ * (GET /api/agent-requests/count, AgentRequestCount): the newest request's agent name and the
+ * summary the server built from the operation, never the agent's own words and never any text the
+ * page sends. `count` null (the server could not be asked): a notice that names nothing. `href`:
+ * the page the page asked to open, only when it is one of the approval center's own.
+ */
+function noticeFromCount(count, href) {
+  const c = count && typeof count === 'object' ? count : {};
+  const newest = c.newest && typeof c.newest === 'object' ? c.newest : null;
+  const pending = Number.isInteger(c.pending) && c.pending > 0 ? c.pending : 0;
+  const name = newest ? oneLine(newest.agentName, 60) : '';
+  const summary = newest ? oneLine(newest.summary, 180).replace(/[.\s]+$/u, '') : '';
+  const waiting = pending > 1 ? ` ${pending} requests are waiting.` : '';
+  const it = pending > 1 ? 'them' : 'it';
+  return cleanNotice({
+    title: name ? `${name} asks for your approval` : 'An agent asks for your approval',
+    body: summary ? `${summary}.${waiting} Click to review ${it}.` : `A request is waiting in Agent requests.${waiting} Click to review ${it}.`,
+    href: typeof href === 'string' ? href : NOTICE_HOME,
+  });
+}
+
+/** Bring the window forward (out of the taskbar, the tray or behind others) and open `route` in it. */
+function showWindowOn(win, route, navigate) {
+  if (win && typeof win.isDestroyed === 'function' && !win.isDestroyed()) {
+    if (typeof win.isMinimized === 'function' && win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  }
+  if (typeof navigate === 'function') navigate(NOTICE_ROUTE.test(String(route)) ? route : NOTICE_HOME);
 }
 
 /** Notices on screen, kept until clicked or closed (one that is collected forgets its click). */
 const shownNotices = new Set();
 
 /**
- * Show the notice unless the window is in front. Electron is passed in (`Notification`); `open`
- * brings the window forward on the page. True when it was shown.
+ * Show the notice unless the window is in front (a minimized, hidden or covered window is not).
+ * Electron is passed in (`Notification`); `open` brings the window forward on the page
+ * (showWindowOn). True when it was shown.
  */
 function showNotice({ Notification, win, notice, open }) {
   const n = cleanNotice(notice);
@@ -1177,18 +1614,28 @@ module.exports = {
   TICKET_SECONDS,
   OUTBOX_NAME,
   MAX_LINE_BYTES,
+  FIRST_BYTE_MS,
+  MAX_CONNECTIONS,
   OPERATIONS,
   QUESTIONS,
   stableJson,
   inputHash,
+  fileRef,
+  boundHash,
   ticketProblem,
+  sealPrivate,
+  openPrivate,
+  answerMac,
+  signAnswer,
   createReplayMemory,
+  driveOrShareRoot,
   defaultFolders,
   cleanPath,
   windowsFold,
   insideFolder,
   pathProblem,
   companyFilePath,
+  joinProblem,
   inputProblem,
   dialogOptions,
   ShellScript,
@@ -1205,5 +1652,7 @@ module.exports = {
   printRequestAllowed,
   printPdf,
   cleanNotice,
+  noticeFromCount,
+  showWindowOn,
   showNotice,
 };

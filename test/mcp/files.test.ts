@@ -5,14 +5,17 @@
  */
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { LOST_ANSWER_MESSAGE, IronbooksError } from '../../mcp/client.mjs';
 import { createIronbooksServer } from '../../mcp/ironbooks-mcp.mjs';
+import { MAX_MESSAGE_CHARS } from '../../mcp/protocol.mjs';
 import {
   BASE64_MAX_CHARS,
   FILE_TOOLS,
+  IRONBOOKS_OWN_MESSAGE,
   NOT_A_PATH_MESSAGE,
   NOT_FOUND_MESSAGE,
   NO_FOLDERS_MESSAGE,
@@ -20,12 +23,21 @@ import {
   UPLOAD_MAX_BYTES,
   contentBlock,
   decodeBase64,
+  ironbooksFiles,
+  ironbooksFolders,
   outsideMessage,
   plainPath,
   readAllowedFile,
   readUpTo,
   uploadBytes,
 } from '../../mcp/files-tools.mjs';
+import * as endpointFile from '@/lib/agent/endpointFile';
+import { stagedFilesRoot } from '@/lib/agent/files';
+
+const companySession = createRequire(import.meta.url)('../../electron/companySession.js') as {
+  workingRoot: (o: { platform?: string; env?: Record<string, string | undefined>; userData?: string }) => string;
+  sandboxRoot: (o: { platform?: string; env?: Record<string, string | undefined>; userData?: string }) => string;
+};
 
 type Any = Record<string, any>;
 const WIN = process.platform === 'win32';
@@ -156,7 +168,25 @@ describe('upload_file', () => {
     expect(wrapped(64)).toBeLessThanOrEqual(BASE64_MAX_CHARS);
     // Not much more: anything longer could not be a file under the cap.
     expect(BASE64_MAX_CHARS).toBeLessThan(bare * 1.04);
+    // And the message carrying it is not too long for the connector to read: in JSON each CR LF is
+    // four characters ("\r\n"), and the rest of the message is short.
+    const asJson = (every: number) => bare + 4 * Math.ceil(bare / every) + 1_000;
+    expect(asJson(76)).toBeLessThan(MAX_MESSAGE_CHARS);
+    expect(asJson(64)).toBeLessThan(MAX_MESSAGE_CHARS);
   });
+
+  it('a file near the cap, wrapped at 76 characters, goes through upload_file whole', async () => {
+    const bytes = Buffer.alloc(UPLOAD_MAX_BYTES - 7);
+    for (let i = 0; i < bytes.length; i += 4096) bytes[i] = i % 251;
+    const wrapped = bytes.toString('base64').replace(/(.{76})/g, '$1\r\n');
+    expect(wrapped.length).toBeGreaterThan(Math.ceil(UPLOAD_MAX_BYTES / 3) * 4 + 4096); // more than the old limit allowed
+    expect(wrapped.length).toBeLessThanOrEqual(BASE64_MAX_CHARS);
+    const { client, uploaded } = app();
+    const r = await call(client, 'upload_file', { name: 'scan.pdf', type: 'application/pdf', base64: wrapped });
+    expect(r.isError, r.text.slice(0, 200)).toBe(false);
+    expect(r.data.size).toBe(bytes.length);
+    expect(uploaded().equals(bytes)).toBe(true);
+  }, 60_000);
 
   it('an upload whose part was lost, or that did not arrive whole, is to be started over', async () => {
     const lost = { async act() { throw new IronbooksError(LOST_ANSWER_MESSAGE); } };
@@ -250,19 +280,42 @@ describe('attach_local_file: only from the folders an Admin opened to the agent'
       expect(await run({ path: path.join(ALLOWED, 'a folder') })).toBe('That is not a file. Give the path of one file.');
       expect(await run({ path: ALLOWED })).toBe('That is not a file. Give the path of one file.');
       expect(await run({ path: path.join(ALLOWED, 'big.bin') })).toMatch(/^The file is 50\.0 MB; at most 50 MB can be handed to Ironbooks\. Nothing was uploaded\.$/);
-      expect(await run({ path: path.join(ALLOWED, 'statement.csv') }, [])).toBe(NO_FOLDERS_MESSAGE);
+      // Missing, a folder, too large: not refusals, so not logged.
       expect(stderr).not.toHaveBeenCalled();
+      expect(await run({ path: path.join(ALLOWED, 'statement.csv') }, [])).toBe(NO_FOLDERS_MESSAGE);
       expect(await run({ path: 'statement.csv' })).toBe(NOT_A_PATH_MESSAGE);
       expect(await run({ path: `.${path.sep}allowed${path.sep}statement.csv` })).toBe(NOT_A_PATH_MESSAGE);
-      // A path that is not a plain full path is a refusal too, and is written to the log, quoted.
+      // No folders at all, and a path that is not a plain full path, are refusals: written to the log, quoted.
       const logged = stderr.mock.calls.map(([line]) => String(line));
       expect(logged).toEqual([
+        `[ironbooks-mcp] attach_local_file refused ${JSON.stringify(path.join(ALLOWED, 'statement.csv'))}: no folders are open to this agent.\n`,
         '[ironbooks-mcp] attach_local_file refused "statement.csv": not a plain full path (relative, a device, a stream or a device name).\n',
         `[ironbooks-mcp] attach_local_file refused ${JSON.stringify(`.${path.sep}allowed${path.sep}statement.csv`)}: not a plain full path (relative, a device, a stream or a device name).\n`,
       ]);
       // A path cannot add lines of its own to the log.
       await expect(readAllowedFile('a\nb', [ALLOWED])).rejects.toThrow(NOT_A_PATH_MESSAGE);
       expect(String(stderr.mock.calls.at(-1)![0])).toBe('[ironbooks-mcp] attach_local_file refused "a\\nb": not a plain full path (relative, a device, a stream or a device name).\n');
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('a path the input schema refuses (not text, too long) is logged as a refusal too, and nothing is sent', async () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      for (const args of [{ path: 5 }, { path: `C:\\${'a'.repeat(1_100)}` }, { path: 'C:\\x.txt', 'x\ny': 1 }]) {
+        const { client, acted } = app();
+        const r = await call(client, 'attach_local_file', args);
+        expect(r.isError, JSON.stringify(args)).toBe(true);
+        expect(acted, JSON.stringify(args)).toEqual([]);
+      }
+      const lines = stderr.mock.calls.map(([line]) => String(line));
+      expect(lines).toHaveLength(3);
+      expect(lines[0]).toBe('[ironbooks-mcp] attach_local_file refused "5": the arguments were refused: "path" must be text.\n');
+      // Cut short in the log, as every refused path is.
+      expect(lines[1]).toMatch(/^\[ironbooks-mcp\] attach_local_file refused "C:\\\\a{297}": the arguments were refused: "path" is too long\.\n$/);
+      // An argument's name the agent chose cannot add a line of its own to the log.
+      expect(lines[2]).toBe('[ironbooks-mcp] attach_local_file refused "C:\\\\x.txt": the arguments were refused: Unknown argument "x y".\n');
     } finally {
       stderr.mockRestore();
     }
@@ -325,10 +378,140 @@ describe('attach_local_file: only from the folders an Admin opened to the agent'
     expect(upper.bytes.toString()).toBe(CSV);
   });
 
+  describe('Ironbooks\' own folders stay out, even inside a folder open to the agent', () => {
+    const OWN = path.join(ALLOWED, 'profile', 'AppData', 'Local', 'Ironbooks');
+    const WORKING = path.join(OWN, 'Working', 'company-1');
+    const REAL_SETTINGS = path.join(ALLOWED, 'profile', 'settings-real');
+    const SETTINGS_LINK = path.join(ROOT, 'settings-link');
+    const TOKEN_FILE = path.join(ALLOWED, 'agent-token.txt');
+    const own = { folders: [OWN, SETTINGS_LINK], files: [TOKEN_FILE] };
+
+    beforeAll(() => {
+      fs.mkdirSync(path.join(WORKING, 'data'), { recursive: true });
+      fs.writeFileSync(path.join(WORKING, 'data', 'PG_VERSION'), '17');
+      fs.mkdirSync(path.join(OWN, 'agent-files'), { recursive: true });
+      fs.writeFileSync(path.join(OWN, 'agent-files', 'other-agent.bin'), SECRET);
+      fs.mkdirSync(REAL_SETTINGS, { recursive: true });
+      fs.writeFileSync(path.join(REAL_SETTINGS, 'config.json'), '{"device":"key"}');
+      // Ironbooks' folder is named by a link here; the files are really inside the allowed folder.
+      fs.symlinkSync(REAL_SETTINGS, SETTINGS_LINK, 'junction');
+      fs.writeFileSync(TOKEN_FILE, 'ibka_0123abcd_x');
+      // And a link inside the allowed folder that leads into Ironbooks' folder.
+      fs.symlinkSync(path.join(OWN, 'agent-files'), path.join(ALLOWED, 'link-to-own'), 'junction');
+    });
+
+    it('refuses them in plain words, whether the file is there or not, and logs each refusal', async () => {
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const refused = [
+          path.join(WORKING, 'data', 'PG_VERSION'),
+          path.join(OWN, 'agent-files', 'other-agent.bin'),
+          // missing: refused the same, so nothing is learnt about what is there
+          path.join(WORKING, 'data', 'no-such-file'),
+          path.join(OWN, 'no-such-folder', 'x.txt'),
+          // the folder itself
+          OWN,
+          // reached through a link inside the allowed folder
+          path.join(ALLOWED, 'link-to-own', 'other-agent.bin'),
+          // Ironbooks' folder named by a link, the file reached by its real path
+          path.join(REAL_SETTINGS, 'config.json'),
+          // the connector's token file
+          TOKEN_FILE,
+        ];
+        for (const p of refused) {
+          await expect(readAllowedFile(p, [ALLOWED], { own }), p).rejects.toThrow(IRONBOOKS_OWN_MESSAGE);
+        }
+        const lines = stderr.mock.calls.map(([line]) => String(line)).filter((l) => l.includes('attach_local_file refused'));
+        expect(lines).toHaveLength(refused.length);
+        expect(lines.every((l) => l.endsWith(': inside a folder Ironbooks keeps for itself.\n'))).toBe(true);
+        // Next to them, the agent's own files are read as before.
+        expect((await readAllowedFile(path.join(ALLOWED, 'statement.csv'), [ALLOWED], { own })).bytes.toString()).toBe(CSV);
+        expect(IRONBOOKS_OWN_MESSAGE).not.toMatch(/copy/i);
+        // It names only what is kept out: the backups Ironbooks makes in its settings folder when it
+        // closes, not "its backups" wherever the person keeps them (those are not known here).
+        expect(IRONBOOKS_OWN_MESSAGE).toMatch(/its settings folder with the backups it makes when it closes/);
+        expect(IRONBOOKS_OWN_MESSAGE).not.toMatch(/its backups/);
+        expect(IRONBOOKS_OWN_MESSAGE).toMatch(/this connector's access token/);
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
+    it('attach_local_file keeps them out with what this computer says they are, and sends nothing', async () => {
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const saved = process.env.IRONBOOKS_USER_DATA;
+      process.env.IRONBOOKS_USER_DATA = OWN;
+      try {
+        const { client, acted } = app();
+        const r = await call(client, 'attach_local_file', { path: path.join(WORKING, 'data', 'PG_VERSION') });
+        expect(r).toMatchObject({ isError: true, text: IRONBOOKS_OWN_MESSAGE });
+        expect(acted.map((a) => a.verb)).toEqual(['get_my_permissions']);
+      } finally {
+        if (saved === undefined) delete process.env.IRONBOOKS_USER_DATA;
+        else process.env.IRONBOOKS_USER_DATA = saved;
+        stderr.mockRestore();
+      }
+    });
+  });
+
+  it('Ironbooks\' own folders are where Ironbooks really keeps its settings, working copies, agent files and endpoint files', () => {
+    const home = os.homedir();
+    /** `child` is `parent` or inside it. */
+    const within = (child: string, parent: string) => {
+      const rel = path.relative(parent.toLowerCase(), child.toLowerCase());
+      return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+    };
+    const covered = (p: string, folders: string[]) => folders.some((f) => within(p, f));
+    const cases: Array<[string, Record<string, string>, string]> = [
+      ['win32', { APPDATA: path.join(home, 'AppData', 'Roaming'), LOCALAPPDATA: path.join(home, 'AppData', 'Local') }, path.join(home, 'AppData', 'Roaming', 'Ironbooks')],
+      ['win32', {}, path.join(home, 'AppData', 'Roaming', 'BookKeeper AI')],
+      ['darwin', {}, path.join(home, 'Library', 'Application Support', 'Ironbooks')],
+      ['linux', {}, path.join(home, '.config', 'Ironbooks')],
+      ['linux', { XDG_CONFIG_HOME: path.join(home, 'cfg'), XDG_STATE_HOME: path.join(home, 'state') }, path.join(home, 'cfg', 'bookkeeper-ai')],
+    ];
+    for (const [platform, env, userData] of cases) {
+      const folders = ironbooksFolders(env, platform, home);
+      const label = `${platform} ${JSON.stringify(env)}`;
+      // electron/main.js userData (by its older names too), its working copies and practice copies.
+      expect(covered(userData, folders), label).toBe(true);
+      expect(covered(companySession.workingRoot({ platform, env, userData }), folders), label).toBe(true);
+      expect(covered(companySession.sandboxRoot({ platform, env, userData }), folders), label).toBe(true);
+      expect(covered(companySession.workingRoot({ platform, env }), folders), label).toBe(true);
+      // lib/agent/endpointFile.ts: where Ironbooks writes the value it proves itself with.
+      expect(covered(endpointFile.endpointDir(env, platform), folders), label).toBe(true);
+    }
+    // Set by hand: the settings folder and the endpoint folder named in the environment, and the token file.
+    const custom = ironbooksFolders({ IRONBOOKS_USER_DATA: path.join(ROOT, 'portable'), IRONBOOKS_AGENT_ENDPOINT_DIR: path.join(ROOT, 'ep') }, process.platform, home);
+    expect(custom).toEqual(expect.arrayContaining([path.join(ROOT, 'portable'), path.join(ROOT, 'ep')]));
+    expect(ironbooksFiles({ IRONBOOKS_AGENT_TOKEN_FILE: path.join(ROOT, 't.txt') })).toEqual([path.join(ROOT, 't.txt')]);
+    expect(ironbooksFiles({})).toEqual([]);
+    // lib/agent/files.ts: every agent's staged files, in this computer's app data folder or the open file's working folder.
+    const saved = { state: process.env.BKA_COMPANY_STATE, dir: process.env.BKA_AGENT_FILES_DIR };
+    try {
+      delete process.env.BKA_AGENT_FILES_DIR;
+      delete process.env.BKA_COMPANY_STATE;
+      expect(covered(stagedFilesRoot()!, ironbooksFolders()), 'app data').toBe(true);
+      const userData = process.platform === 'win32' ? path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'Ironbooks') : undefined;
+      process.env.BKA_COMPANY_STATE = path.join(companySession.workingRoot({ userData }), 'abc123', 'state.json');
+      expect(covered(stagedFilesRoot()!, ironbooksFolders()), 'working folder').toBe(true);
+    } finally {
+      if (saved.state === undefined) delete process.env.BKA_COMPANY_STATE;
+      else process.env.BKA_COMPANY_STATE = saved.state;
+      if (saved.dir === undefined) delete process.env.BKA_AGENT_FILES_DIR;
+      else process.env.BKA_AGENT_FILES_DIR = saved.dir;
+    }
+  });
+
   it('an allowed folder given with ".." or a trailing separator still works; one that is not a full path is ignored', async () => {
     const r = await readAllowedFile(path.join(ALLOWED, 'statement.csv'), [`${path.join(ALLOWED, 'sub', '..')}${path.sep}`, 'relative/folder']);
     expect(r.bytes.toString()).toBe(CSV);
-    await expect(readAllowedFile(path.join(ALLOWED, 'statement.csv'), ['relative/folder'])).rejects.toThrow(NO_FOLDERS_MESSAGE);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await expect(readAllowedFile(path.join(ALLOWED, 'statement.csv'), ['relative/folder'])).rejects.toThrow(NO_FOLDERS_MESSAGE);
+      expect(String(stderr.mock.calls.at(-1)?.[0])).toMatch(/no folders are open to this agent/);
+    } finally {
+      stderr.mockRestore();
+    }
   });
 });
 

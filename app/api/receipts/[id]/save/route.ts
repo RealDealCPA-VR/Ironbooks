@@ -11,7 +11,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { invalidJsonBody, readJsonObject, routeError } from '@/lib/routeErrors';
+import { validation } from '@/lib/services/_base';
 import { saveReceipt } from '@/lib/services/receipts';
+import { saveReceiptBodySchema } from '@/lib/validation/receipts';
 
 type RouteContext = { params: Promise<{ id: string }> };
 
@@ -21,6 +23,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const ctx = await getServerContext();
     const body = await readJsonObject(req);
     if (!body) return invalidJsonBody();
+    // The service's own schema with its fields described for agents (lib/validation/receipts.ts),
+    // refused with the same answer saveReceipt gives (it parses the body again).
+    const checked = saveReceiptBodySchema.safeParse(body);
+    if (!checked.success) throw validation(checked.error.issues[0]?.message ?? 'Invalid receipt.', checked.error.flatten());
     return NextResponse.json(await saveReceipt(ctx, id, body), { status: 201 });
   } catch (err) {
     return routeError(err, 'POST /api/receipts/[id]/save');

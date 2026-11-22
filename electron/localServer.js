@@ -81,7 +81,10 @@ const DEV_SWITCHES = new Set(['BKA_ALLOW_DEV_FALLBACK', 'BKA_AUTH_SECRET', 'BKA_
 /**
  * Variables only the shell itself is meant to set (main.js startNextServer / startScratchServer):
  * the open file and its lock, this computer's secrets, the launch's pass and tokens, the sandbox
- * record, backup and migration folders. A server that is not given one of them (a scratch server
+ * record, backup and migration folders, and where agents' approved desktop requests go with this
+ * launch's key for them (electron/agentShell.js), the Documents folder their files may be saved in
+ * and where their staged files are kept (lib/agent/files.ts, which reads that one in tests only).
+ * A server that is not given one of them (a scratch server
  * sets fewer than the company server) must see it unset, never a same-named value planted in this
  * computer's environment. Deliberately kept: BKA_DATA_DIR and BKA_REPORT_EXPORT_DIR, which main.js
  * reads from its own environment as documented overrides and always sets for the server anyway,
@@ -107,6 +110,10 @@ const SHELL_ONLY = new Set([
   'BKA_MIGRATIONS_DIR',
   'BKA_BACKUP_DIR',
   'BKA_BACKUP_INTERVAL_HOURS',
+  'BKA_AGENT_SHELL',
+  'BKA_AGENT_SHELL_KEY',
+  'BKA_AGENT_DOCUMENTS',
+  'BKA_AGENT_FILES_DIR',
 ]);
 /**
  * NODE_* settings about reaching the internet through a company network (extra certificate

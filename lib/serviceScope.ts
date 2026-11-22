@@ -54,6 +54,21 @@ export const SERVICE_SCOPE_CHANGED_MESSAGE =
   'This agent request changed while it was running, so it was stopped. Send the request again.';
 
 /**
+ * The secrets a scope's synthetic set may carry (lower case): the closing-date password, and the
+ * user name, password and recovery key that open a backup, a portable file or an Accountant's Copy
+ * transfer file (lib/net/archiveCredentials.ts LOGIN_HEADER, PASSWORD_HEADER, RECOVERY_KEY_HEADER;
+ * lib/agent/guards.ts SECRET_HEADERS names the same four). The bridge sets them only on a commit,
+ * only from what the approving person typed on the card (lib/agent/guards.ts applySecrets), never
+ * from the agent's input. Work a scope left running after it ended no longer reads any of them.
+ */
+export const SERVICE_SCOPE_SECRET_HEADERS: readonly string[] = Object.freeze([
+  CLOSING_PASSWORD_HEADER,
+  'x-ironbooks-login',
+  'x-ironbooks-password',
+  'x-ironbooks-recovery-key',
+]);
+
+/**
  * The only headers the bridge may add to a scope's synthetic set (lower case). Any other name is
  * refused before the work runs: a forwarded cookie, Authorization, launch pass, proxy secret,
  * remote address or Host would carry the trust of the request the bridge runs in (perhaps the
@@ -61,7 +76,7 @@ export const SERVICE_SCOPE_CHANGED_MESSAGE =
  * lib/services/concurrency.ts EXPECTED_VERSION_HEADER (record locking).
  */
 export const SERVICE_SCOPE_HEADERS: readonly string[] = Object.freeze([
-  CLOSING_PASSWORD_HEADER,
+  ...SERVICE_SCOPE_SECRET_HEADERS,
   'x-expected-updated-at',
   'content-type',
   'accept',
@@ -79,8 +94,8 @@ export interface ServiceScopeOptions {
   method: string;
   /**
    * Further headers the handler may read, only names in SERVICE_SCOPE_HEADERS. Nothing of the real
-   * request is copied in, so an x-closing-password is here only when the bridge puts it here (an
-   * approving person typed it).
+   * request is copied in, so a secret (SERVICE_SCOPE_SECRET_HEADERS) is here only when the bridge
+   * puts it here (an approving person typed it).
    */
   headers?: Record<string, string>;
   /**
@@ -128,7 +143,7 @@ interface ScopeState {
   readonly seal: ScopeSeal;
   /** The synthetic header set, lower-case names. Copied out fresh for every reader. */
   readonly headers: ReadonlyArray<readonly [string, string]>;
-  /** The same set without the closing-date password: what work left running after the end reads. */
+  /** The same set without any secret (SERVICE_SCOPE_SECRET_HEADERS): what work left running after the end reads. */
   readonly endedHeaders: ReadonlyArray<readonly [string, string]>;
   /** False once fn has settled: anything it left running can no longer get the context. */
   open: boolean;
@@ -153,10 +168,13 @@ function serviceScopeStore(): AsyncLocalStorage<ScopeState> {
   const g = globalThis as unknown as Record<symbol, unknown>;
   const held = Object.getOwnPropertyDescriptor(g, SERVICE_SCOPE_KEY);
   if (held && 'value' in held && held.value instanceof AsyncLocalStorage) {
-    // An earlier copy of this module put it there (already locked), or other code did by plain
-    // assignment: lock it in place either way, so that from now on it can only be this store.
+    // An earlier copy of this module put it there (already locked), or other code in this process
+    // did. Either way it is locked in place from now on (its enumerable mark is left as it is, so
+    // that locking never throws), so it stays this store. Code that put it there keeps its own
+    // reference to it, as any code here can look it up anyway: the guarantee is only that no
+    // REQUEST reaches it (see the header).
     if (held.writable || held.configurable) {
-      Object.defineProperty(g, SERVICE_SCOPE_KEY, { value: held.value, enumerable: false, writable: false, configurable: false });
+      Object.defineProperty(g, SERVICE_SCOPE_KEY, { value: held.value, writable: false, configurable: false });
     }
     return held.value as AsyncLocalStorage<ScopeState>;
   }
@@ -187,9 +205,10 @@ const serviceScope = serviceScopeStore();
  * approval are unchanged, and refuses it otherwise (SERVICE_SCOPE_CHANGED_MESSAGE).
  *
  * What getServerContext checks inside the scope, on every call, with the same functions a person's
- * request meets, on the scope's own path and method: the route map against `ctx.access` (a second
- * check after the bridge's policy, plan 11.3), the Preferences feature switches and the
- * Accountant's Copy gate. What it does NOT check, and the bridge must have settled before opening
+ * request meets, on the scope's own path and method: the route map against the frozen copy of
+ * `ctx.access` taken when the scope opened (ServiceScope.access; a second check after the bridge's
+ * policy, plan 11.3), the Preferences feature switches and the Accountant's Copy gate. What it does
+ * NOT check, and the bridge must have settled before opening
  * it, because they are about the person signed in or the file rather than the request: the
  * company-file password, single-user mode, a password that must be changed, a practice copy, the
  * agent's policy and approval. getAgentContext settles the first ones at the door for the agent's
@@ -218,7 +237,7 @@ export async function runWithServiceContext<T>(
     scope: Object.freeze({ ctx, access, gate: opts.gate ?? null, path: request.path, method: request.method }),
     seal,
     headers: request.headers,
-    endedHeaders: Object.freeze(request.headers.filter(([name]) => name !== CLOSING_PASSWORD_HEADER)),
+    endedHeaders: Object.freeze(request.headers.filter(([name]) => !SERVICE_SCOPE_SECRET_HEADERS.includes(name))),
     open: true,
   };
   try {
@@ -342,6 +361,8 @@ function syntheticRequest(opts: ServiceScopeOptions): {
 const DOT_SEGMENT = /^(?:\.|%2e){1,2}$/i;
 /** Characters a parsed URL path never holds as they are: a backslash, controls, a space. */
 const NOT_IN_A_PARSED_PATH = /[\\\u0000- \u007f]/;
+/** A slash or a backslash written with percent signs (%2F, %5C, any case). */
+const ENCODED_SEPARATOR = /%(?:2f|5c)/i;
 
 /**
  * Why `path` could not be a stamp middleware.ts would set (nextUrl.pathname of a real request), or
@@ -349,16 +370,20 @@ const NOT_IN_A_PARSED_PATH = /[\\\u0000- \u007f]/;
  * segments and takes ".." for an id, and the Accountant's Copy allow-list compares the start of
  * the path, so a stamp no real request could carry might be judged as another route than the one
  * the handler serves. The bridge builds its paths so they always pass (lib/agent/bridge.ts
- * buildPath refuses "." and ".." and encodes every value); this is the second line.
+ * buildPath refuses "." and "..", a slash, a backslash and a percent sign in a value, and encodes
+ * the rest); this is the second line.
  *
- * An encoded slash or backslash inside a segment (%2F, %5C) is let through: buildPath encodes a
- * value's "/" and "\" exactly so, a real request's pathname keeps them encoded too, and nothing on
- * the way to the route checks decodes them, so they stay inside their one segment.
+ * An encoded slash or backslash (%2F, %5C) is refused too. A real request may carry one inside a
+ * segment, but whatever decodes the path once on its way (a helper, a later version of the route
+ * map, the Accountant's Copy list) would read it as two segments, and the route the stamp is
+ * judged as would no longer be the route the handler serves. No record id holds one, so nothing an
+ * agent needs is lost.
  */
 function stampedPathProblem(path: string): string | null {
   if (NOT_IN_A_PARSED_PATH.test(path)) {
     return 'An agent request needs a path without backslashes, spaces or control characters.';
   }
+  if (ENCODED_SEPARATOR.test(path)) return 'An agent request needs a path without encoded slashes or backslashes (%2F, %5C).';
   const segments = path.slice(1).split('/');
   if (segments.some((s) => s === '')) return 'An agent request needs a path without empty parts ("//" or a "/" at the end).';
   if (segments.some((s) => DOT_SEGMENT.test(s))) return 'An agent request needs a path without "." or ".." parts.';
@@ -411,10 +436,11 @@ export type RequestHeaders = Awaited<ReturnType<typeof headers>>;
  * scope's own label (SERVICE_ORIGIN_HEADER) gets it dropped; nothing else of it changes.
  *
  * Work a scope left running after it ended still gets the synthetic set (stamps, origin "agent"),
- * so it is still judged as the agent's, but without the closing-date password an approver typed:
- * that was for the request, which is over. It does not throw there: getRequestOrigin and
- * currentRequestInfo take a throw for "not inside a request", which means local trust and no route
- * checks, so a throw would let that work through rather than stop it.
+ * so it is still judged as the agent's, but with no secret in it (SERVICE_SCOPE_SECRET_HEADERS:
+ * the closing-date password, a backup's or a copy's user name, password and recovery key an
+ * approver typed): those were for the request, which is over. It does not throw there:
+ * getRequestOrigin and currentRequestInfo take a throw for "not inside a request", which means
+ * local trust and no route checks, so a throw would let that work through rather than stop it.
  */
 export async function requestHeaders(): Promise<RequestHeaders> {
   const state = serviceScope.getStore();

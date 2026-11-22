@@ -25,6 +25,8 @@ import { categorize } from '@/lib/services/bankCategorize';
 import { learnRuleFromChoice, offerForTransaction } from '@/lib/services/bankRules';
 import { splitSchema } from '@/lib/bankRules/schemas';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { categorizeBankLineSchema } from '@/lib/validation/bankTransactions';
 
 function errResponse(err: ServiceError): NextResponse {
   return NextResponse.json(
@@ -50,6 +52,10 @@ export async function POST(req: NextRequest) {
     if (!accountId && !parsedSplits) {
       return NextResponse.json({ error: 'accountId is required.' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/bankTransactions.ts). The checks above
+    // answer first, so this refuses only a value the service could not have used.
+    const checked = categorizeBankLineSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const result = await categorize(ctx, {
       bankTransactionId,

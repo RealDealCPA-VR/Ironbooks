@@ -9,7 +9,17 @@
  *
  * Masking (plan §5.9): bank account numbers come back as the last 4 digits unless the caller has
  * "view full account numbers" (lib/permissions/mask.ts). Those reads keep class "read" and carry
- * `reveal`, so an unmasked answer is a separate, approved request.
+ * `reveal`, so an unmasked answer is a separate, approved request. The same goes for the check
+ * print queue: a check's memo line is "Acct # <the payee's account number>" when left blank, and
+ * the queue's answers mask it (printQueue.ts checkMemoFor). The check PDF is the exception: it is
+ * the printed text and keeps the full number for every caller, so it is protected data itself
+ * (POST /api/checks/pdf, read_sensitive).
+ *
+ * Confirmation flags: allowReconciledEdit is in the body schema of every check, deposit, transfer
+ * and journal entry save because one schema serves both the new record and the edit, but only the
+ * edit asks for it (the services raise the "reconciled" warning in updateExpense, updateDeposit,
+ * updateTransfer and updateEntry only; a new record has no reconciled lines). So it is listed on
+ * the PATCH entries alone.
  *
  * Standing automation: a memorized transaction set to post automatically, and a bank rule set to
  * "Add automatically", both post later without anyone reviewing the line. Creating or changing
@@ -26,14 +36,21 @@
  * and voiding a check, deposit or transfer names the amount its answer carries (expense.total, a
  * deposit's total, a transfer's amount); a void answers with the record, whose amount stays as it
  * was. A request with no amount counts as over every amount limit (policy.ts needsTwoPerson,
- * grantCovers) until its dry run. After it the bridge (lib/agent/bridge.ts factsFor) takes the
- * larger of that figure and the largest SINGLE ledger entry the run posted (with no amountField,
- * the entry alone). A journal entry's answer has its
- * debit and credit lines but no total, so the journal entry routes set no amountField: each posts
- * one entry, and that entry is its true size. The bulk bank feed routes (bulk, bulk-accept,
- * bank-rules/run) and recurring/run post one entry per line but answer no amounts, so after the dry
- * run they are judged by their largest single line; they always ask, and the card's ledger preview
- * lists every entry.
+ * grantCovers) until its dry run. After it the bridge (lib/agent/bridge.ts factsFor) reads the
+ * run's whole ledger: the entries it posted, and the entries already in the books that it voided,
+ * deleted or changed in place. A void posts nothing new (posting.ts voidJournalEntry only marks the
+ * entry void), but the bridge counts the voided entry at its total, and an entry deleted outright
+ * at the total its audit row kept. With an amountField the amount is the larger of that field and
+ * the largest single one of those entries (an amountField it cannot read stays over every limit).
+ * With none it is all of them added up (the entries posted, or the entries touched, whichever is
+ * larger), "0.00" for a run that posted and touched no entry at all, and unknown when a touched
+ * entry's total cannot be read. So voiding a $50,000 journal entry is a $50,000 request after its
+ * dry run, with or without an amountField: an amountField can only raise that figure. Entering or
+ * editing a journal entry sets no amountField: the answer has its lines but no total, and the
+ * entry it posts is its true size. The bulk bank feed routes (bulk, bulk-accept, bank-rules/run)
+ * and recurring/run post one entry per line but answer no amounts, so after the dry run they are
+ * judged by every entry they post, added up; they always ask, and the card's ledger preview lists
+ * every entry.
  *
  * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
  * ".post", with a short verb; the real lists whose records live at another address also get
@@ -79,7 +96,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   'GET /api/bank-transactions/suggestions': {
     class: 'outside',
     describe:
-      'Suggest accounts for the bank feed lines of bank account {bankAccountId}, ai={ai} (when 1, the payee, description and amount of unsure lines go to the company\'s AI model)',
+      'Suggest accounts for the bank feed lines of bank account {bankAccountId} (ai: {ai}; with ai 1, the payee, description and amount of unsure lines go to the company\'s AI model)',
     why: 'Not a plain read. Every call refreshes the learned categorizer stored in the company file (ai_categorizer_models), and with ai=1 the low-confidence lines (payee, description, amount) are sent to the AI model the company set up, which may be a cloud service, plus the optional vendor web lookup. No dry run: a preview would send the same lines out.',
     effects: ['network'],
     dryRun: 'none',
@@ -97,7 +114,8 @@ export const BANKING_CLASSES: ClassificationMap = {
   'POST /api/bank-transactions/unmatch': {
     class: 'change',
     describe: 'Undo the categorization or match of bank feed line {bankTransactionId}',
-    why: 'Voids the entry that adding the line created (or only clears the link to an older entry) and puts the line back in review.',
+    why: 'Voids the entry that adding the line created (or only clears the link to an older entry, which stays as it was) and puts the line back in review. The amount is the line\'s own amount in the answer (the feed line). After the dry run the bridge also counts the entry the run voided, at its total, and the larger of the two is the amount.',
+    amountField: 'amount',
   },
   'POST /api/bank-transactions/exclude': {
     class: 'change',
@@ -107,7 +125,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   'POST /api/bank-transactions/bulk': {
     class: 'bulk',
     describe:
-      'Post (categorizeSuggested) or re-suggest (applyRules) every waiting bank feed line of bank account {bankAccountId}: {action}',
+      'Post or re-suggest every waiting bank feed line of bank account {bankAccountId} (action: {action}; categorizeSuggested posts, applyRules re-suggests)',
     why: 'One request over every waiting line of the bank account: applyRules rewrites the suggested account of each line, categorizeSuggested posts an entry for every line a live rule still covers. The body has no list, so the count is only known after the run; it always asks.',
     alwaysAsk: true,
   },
@@ -163,7 +181,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   'POST /api/bank-rules/offers': {
     class: 'enter',
     id: 'bank-rules.offers.answer',
-    describe: 'Answer the suggested bank rule for {pattern} ({action})',
+    describe: 'Answer the suggested bank rule for {pattern} (action: {action})',
     why: 'accept saves a learned rule, and mode auto makes it post bank lines later without review, so it always asks like making a rule. dismiss saves a "never ask again" note.',
     alwaysAsk: true,
   },
@@ -187,7 +205,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   // Sample data for trying the bank feed.
   'POST /api/demo-feed': {
     class: 'enter',
-    describe: 'Load 8 made-up sample lines into the bank feed of real bank account {bankAccountId}',
+    describe: 'Load 8 made-up sample lines into the real bank feed of bank account {bankAccountId}',
     why: 'Adds made-up statement lines (a $3,850 payroll payment, customer deposits, travel ...) to a real bank account\'s feed, with no audit row. They are not prepare work: a line an "Add automatically" rule matches is posted without review the next time anyone opens the bank feed. Sample data has no use in a real company file, so it always asks.',
     alwaysAsk: true,
   },
@@ -203,14 +221,17 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'POST /api/registers/[accountId]': {
     class: 'enter',
-    describe: 'Enter {amount} ({side}) in the register of account {accountId}',
+    describe: 'Enter a transaction of {amount} in the register of account {accountId} (side: {side})',
     confirmFlags: ['allowDuplicateNumber'],
     amountField: 'amount',
   },
   'DELETE /api/registers/[accountId]': {
     class: 'remove',
-    describe: 'Void or delete ({action}) the transaction of entry {entryId} in the register of account {accountId}',
-    why: 'action=void keeps the transaction with its amounts zeroed, but action=delete removes it for good. One class covers both, so it is the stricter one.',
+    describe: 'Void or delete the transaction of entry {entryId} in the register of account {accountId} (action: {action}; void when left out)',
+    why:
+      'action=void keeps the transaction, marked void, but action=delete removes it for good. One class covers both, so it is the stricter one. ' +
+      'No amountField: the answer is only { key, ok, action }. Until the dry run the amount is unknown and counts as over every amount limit. ' +
+      'After it the bridge counts the entry the run voided or deleted at its total (read from the audit row when the entry itself is gone); when that total cannot be read, the amount stays unknown.',
   },
 
   // Checks and expenses (Write Checks, cash expenses, credit card charges).
@@ -220,7 +241,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'POST /api/expenses': {
     class: 'enter',
-    describe: 'Write a {method} expense dated {date} from account {paymentAccountId}',
+    describe: 'Write an expense (paid by {method}) dated {date} from account {paymentAccountId}',
     confirmFlags: ['allowDuplicateNumber'],
     amountField: 'expense.total',
   },
@@ -255,9 +276,13 @@ export const BANKING_CLASSES: ClassificationMap = {
     describe: 'Check whether check number {number} is already used on account {paymentAccountId}',
   },
   'POST /api/checks/pdf': {
-    class: 'read',
+    class: 'read_sensitive',
     describe: 'Make a check PDF',
-    why: 'Only renders a PDF (a recorded check, a batch, a one-off check or an alignment test page). Nothing is recorded: numbers are recorded by the print queue, and printing on paper is a separate print operation.',
+    why:
+      'Only renders a PDF (a recorded check, a batch, a one-off check or an alignment test page); nothing is recorded: numbers are recorded by the print queue, and printing on paper is a separate print operation. ' +
+      'But it is protected data: a recorded check prints the payee\'s full account number (vendor, Other Name or sales tax agency) on the memo line and the voucher stub for every caller, as the payee needs it to apply the payment (printQueue.ts checkPrintData), and nothing can mask a PDF. ' +
+      'So it always asks someone with "view full account numbers" (reveal account_numbers), one PDF at a time. One operation covers every mode, so a one-off check or a test page asks too.',
+    reveal: 'account_numbers',
     output: 'pdf',
   },
   'GET /api/checks/settings': {
@@ -270,18 +295,24 @@ export const BANKING_CLASSES: ClassificationMap = {
     why: 'The company check style, paper and alignment used for every check printed.',
   },
 
-  // Print Checks queue: checks to print, a print run, and "Did the checks print OK?".
+  // Print Checks queue: checks to print, a print run, and "Did the checks print OK?". A queued
+  // check's memo is "Acct # <the payee's full account number>" when left blank (a Sales Tax Payment
+  // check stores it so); the listing and the check answers mask it for a caller without "view full
+  // account numbers" (printQueue.ts and liabilityPayments.ts checkMemoFor), so a reveal shows it.
   'GET /api/print-queue': {
     class: 'read',
     id: 'print-queue.list',
     describe: 'List checks waiting to print',
+    why: 'The memo of each check is masked to the last 4 digits of the account number unless revealed (listPrintQueue masks it).',
+    reveal: 'account_numbers',
   },
   'POST /api/print-queue': {
     class: 'print',
     id: 'print-queue.mark-printed',
-    describe: 'Record {source} {id} as printed with check number {checkNumber}',
-    why: 'Marks one queued check printed and stamps its number on the check and its entry.',
+    describe: 'Record check {id} (kind: {source}) as printed with check number {checkNumber}',
+    why: 'Marks one queued check printed and stamps its number on the check and its entry. The answer is the check; a Sales Tax Payment check answers its stored memo masked like the listing.',
     confirmFlags: ['allowDuplicateNumber'],
+    reveal: 'account_numbers',
   },
   'GET /api/print-queue/paychecks': {
     class: 'read',
@@ -302,7 +333,9 @@ export const BANKING_CLASSES: ClassificationMap = {
     class: 'enter',
     id: 'print-queue.refunds.add',
     describe: 'Put customer refund {entryId} in the check print queue',
-    why: 'Adds a check document for a refund that is already posted. No new ledger entry.',
+    why: 'Adds a check document for a refund that is already posted. No new ledger entry. The answer is the queued check, its memo masked like the print queue\'s (an account number in a typed memo shows only its last 4 digits unless revealed).',
+    reveal: 'account_numbers',
+    sensitiveFields: ['memo'],
   },
   'POST /api/print-queue/run': {
     class: 'read',
@@ -319,7 +352,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'POST /api/print-queue/reprint': {
     class: 'print',
-    describe: 'Put printed {source} {id} back in the print queue to print again',
+    describe: 'Put printed check {id} (kind: {source}) back in the print queue to print again',
     why: 'Clears the printed check number from the check and its entry and queues it again.',
   },
 
@@ -402,7 +435,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   'DELETE /api/journal-entries/[id]': {
     class: 'change',
     describe: 'Void journal entry {id}',
-    why: 'Voids, does not delete: the entry stays with its amounts reversed. Voiding a depreciation entry also takes that period off the fixed asset (its schedule row is removed and its accumulated depreciation lowered); the period can be posted again. No amountField: the answer is the entry row with no total, so the amount is unknown until the ledger preview shows it and counts as over every amount limit.',
+    why: 'Voids, does not delete: the entry stays with its amounts reversed. Voiding a depreciation entry also takes that period off the fixed asset (its schedule row is removed and its accumulated depreciation lowered); the period can be posted again. No amountField: the answer is the entry row, with no total and no lines. Until the dry run the amount is unknown and counts as over every amount limit. After it the bridge counts the entry the run voided at its total (its debits added up), so voiding a $50,000 entry is a $50,000 request.',
   },
   'GET /api/journal-entries/[id]/history': {
     class: 'read',
@@ -440,7 +473,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'PATCH /api/reconciliations/[id]': {
     class: 'change',
-    describe: 'Work on reconciliation {id} ({action})',
+    describe: 'Work on reconciliation {id} (action: {action})',
     why: 'The same request ticks lines and corrects the statement (prepare work), but also completes the reconciliation and posts service charge, interest and discrepancy entries (action complete or adjustments). One class covers every action, so it is the stricter one.',
   },
   'DELETE /api/reconciliations/[id]': {
@@ -489,7 +522,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'POST /api/recurring': {
     class: 'enter',
-    describe: 'Memorize {docType} {name} to repeat {frequency}',
+    describe: 'Memorize a transaction named {name} ({docType}) to repeat {frequency}',
     why: 'A memorized transaction set to automatic posts on its schedule without anyone reviewing it, so making one always asks (plan §8, Recurring).',
     alwaysAsk: true,
   },
@@ -521,10 +554,10 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'GET /api/smart-defaults/expenses': {
     class: 'read',
-    describe: 'Recall the last {form} of vendor {vendorId}',
+    describe: 'Recall the last form ({form}) of vendor {vendorId}',
   },
   'GET /api/smart-defaults/sales': {
     class: 'read',
-    describe: 'Recall the last {form} of customer {customerId}',
+    describe: 'Recall the last form ({form}) of customer {customerId}',
   },
 };

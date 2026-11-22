@@ -38,6 +38,8 @@ import {
   addStatementAdjustments,
 } from '@/lib/services/reconcile';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { reconciliationUpdateSchema } from '@/lib/validation/reconciliations';
 
 /** Map ServiceErrorCode to an HTTP status. */
 function errResponse(err: ServiceError): NextResponse {
@@ -45,6 +47,15 @@ function errResponse(err: ServiceError): NextResponse {
     { error: err.message, code: err.code, details: err.details ?? null },
     { status: serviceErrorStatus(err.code) },
   );
+}
+
+/**
+ * The PATCH body as agents read it described (lib/validation/reconciliations.ts). Called once the
+ * checks of the action answered, so it refuses only a value the service could not have used.
+ */
+function checkPatchBody(body: unknown): void {
+  const checked = reconciliationUpdateSchema.safeParse(body);
+  if (!checked.success) throw bodyValidationError(checked.error);
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +91,7 @@ export async function PATCH(
     const { action } = body ?? {};
 
     if (action === 'complete') {
+      checkPatchBody(body);
       if (body?.adjust === true) {
         const { reconciliation } = await completeWithAdjustment(ctx, id);
         return NextResponse.json(reconciliation);
@@ -96,6 +108,7 @@ export async function PATCH(
       if (typeof isCleared !== 'boolean') {
         return NextResponse.json({ error: 'isCleared (boolean) is required.' }, { status: 400 });
       }
+      checkPatchBody(body);
       return NextResponse.json(await setClearedMany(ctx, id, journalEntryLineIds, isCleared));
     }
 
@@ -107,6 +120,7 @@ export async function PATCH(
       if (typeof isCleared !== 'boolean') {
         return NextResponse.json({ error: 'isCleared (boolean) is required.' }, { status: 400 });
       }
+      checkPatchBody(body);
       await toggleCleared(ctx, id, journalEntryLineId, isCleared);
       // Return updated progress so the client can refresh in one round-trip.
       const progress = await getProgress(ctx, id);
@@ -121,6 +135,7 @@ export async function PATCH(
           { status: 400 },
         );
       }
+      checkPatchBody(body);
       await updateStatement(ctx, id, {
         statementBalance: statementBalance ?? undefined,
         statementDate: statementDate || undefined,
@@ -138,6 +153,7 @@ export async function PATCH(
           { status: 400 },
         );
       }
+      checkPatchBody(body);
       const progress = await addStatementAdjustments(ctx, id, {
         serviceCharge: serviceCharge ?? null,
         interestEarned: interestEarned ?? null,

@@ -2,7 +2,7 @@
  * Zod schemas for /api/estimates — mirrors CreateEstimateInput / EstimateLineInput.
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLenient, zLines, zUuid } from './helpers';
 import { sendFlagFields, customerMessageField, zShipTo } from './sales';
 
 export const estimateLineSchema = z.object({
@@ -51,3 +51,56 @@ export const createEstimateSchema = z.object({
   ...customerMessageField,
 });
 export type CreateEstimateBody = z.infer<typeof createEstimateSchema>;
+
+/**
+ * POST /api/estimates/:id — convert, progress-bill or void the estimate.
+ *
+ * The route reads this body by hand, and its own checks answer first with the messages they always
+ * gave. The schema is checked after them: it says what each field is, for agents (plan §6.3), and
+ * the fields are zLenient because the handler converts any value it gets, so what the route
+ * accepts is unchanged.
+ */
+const amountText = z.union([z.string(), z.number()]).nullable();
+const overrideCreditLimit = zLenient(z.boolean()).describe(
+  'Send true only after the app warned that the invoice puts the customer over their credit limit, to save it anyway.',
+);
+
+export const estimateActionSchema = z.discriminatedUnion('action', [
+  z.object({
+    action: z.literal('convert').describe('convert: turn the whole estimate into one invoice.'),
+    overrideCreditLimit,
+  }),
+  z.object({
+    action: z
+      .literal('progress')
+      .describe('progress: bill part of the estimate on a new invoice (QB progress invoicing); send percent, remaining or lines.'),
+    percent: zLenient(amountText).describe('Percentage of every line to bill, such as "25"; send this, remaining or lines.'),
+    remaining: zLenient(z.boolean()).describe('true bills everything not billed yet; send this, percent or lines.'),
+    lines: zLenient(
+      z.array(
+        z.object({
+          lineId: z.string().describe('Id of the estimate line (GET /api/estimates/:id, lines).'),
+          percent: zLenient(amountText).describe('Percentage of the line to bill, such as "50"; send one of percent, quantity and amount.'),
+          quantity: zLenient(amountText).describe('Quantity of the line to bill, as decimal text such as "2"; send one of percent, quantity and amount.'),
+          amount: zLenient(amountText).describe('Amount of the line to bill, as decimal text such as "500.00"; send one of percent, quantity and amount.'),
+        }),
+      ),
+    ).describe('Bill only these estimate lines, each by percentage, quantity or amount; send this, percent or remaining.'),
+    lineAmounts: zLenient(
+      z.array(
+        z.object({
+          lineId: z.string().describe('Id of the estimate line.'),
+          amount: amountText.describe('Amount of the line to bill, as decimal text such as "500.00".'),
+        }),
+      ),
+    ).describe('Older form of lines, by amount only; use lines instead.'),
+    date: zLenient(z.union([z.string(), z.number()]).nullable()).describe('Date of the invoice, YYYY-MM-DD; leave out for today.'),
+    overrideCreditLimit,
+    allowOverBilling: zLenient(z.boolean()).describe(
+      'Send true only after the app answered PROGRESS_OVERBILL (a line would be billed over 100%), to bill it anyway.',
+    ),
+  }),
+  z.object({
+    action: z.literal('void').describe('void: void the estimate (QB Edit > Void Estimate).'),
+  }),
+]);

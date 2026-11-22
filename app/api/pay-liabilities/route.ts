@@ -29,7 +29,8 @@ import { getServerContext } from '@/lib/context';
 import { payrollLiabilitiesDue, payPayrollLiabilities } from '@/lib/services/liabilityPayments';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
-import { parseDateInput } from '@/lib/validation/helpers';
+import { bodyValidationError, parseDateInput } from '@/lib/validation/helpers';
+import { payPayrollLiabilitiesSchema } from '@/lib/validation/liabilities';
 
 function errorStatus(code: string): number {
   return serviceErrorStatus(code);
@@ -101,6 +102,10 @@ export async function POST(req: NextRequest) {
     if (!parsedDate) {
       return NextResponse.json({ error: `"${date}" is not a valid date.`, code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/liabilities.ts). The checks above answer
+    // first, so this refuses nothing they let through.
+    const checked = payPayrollLiabilitiesSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const str = (v: unknown) => (typeof v === 'string' ? v : null);
     const entry = await payPayrollLiabilities(ctx, {

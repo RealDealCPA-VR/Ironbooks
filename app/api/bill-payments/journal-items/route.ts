@@ -10,7 +10,6 @@
  *        { action: 'unapply', applicationId } — remove one credit application
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getServerContext } from '@/lib/context';
 import {
   applyJournalCredit,
@@ -18,20 +17,8 @@ import {
   unapplyJournalApplication,
 } from '@/lib/services/journalApplications';
 import { routeError } from '@/lib/routeErrors';
-import { zDate, zMoneyPositive, zUuid, zodErrorBody } from '@/lib/validation/helpers';
-
-const bodySchema = z.discriminatedUnion('action', [
-  z.object({
-    action: z.literal('apply_credit'),
-    journalLineId: zUuid,
-    /** The bill to apply the credit to — or `chargeLineId`, a General Journal amount owed (P1). */
-    billId: zUuid.nullish(),
-    chargeLineId: zUuid.nullish(),
-    amount: zMoneyPositive,
-    date: zDate.nullish(),
-  }),
-  z.object({ action: z.literal('unapply'), applicationId: zUuid }),
-]);
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { billPaymentJournalItemsSchema } from '@/lib/validation/billPayments';
 
 export async function GET(req: NextRequest) {
   try {
@@ -49,7 +36,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = bodySchema.safeParse(await req.json().catch(() => ({})));
+    const parsed = billPaymentJournalItemsSchema.safeParse(await req.json().catch(() => ({})));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const b = parsed.data;
     if (b.action === 'apply_credit') {

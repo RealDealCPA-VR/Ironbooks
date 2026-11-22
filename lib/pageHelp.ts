@@ -16,6 +16,13 @@ export interface PageHelpEntry {
   first: string;
   /** QuickBooks name, when different from the title. */
   qb?: string;
+  /**
+   * A few more short points, for the screens two sentences cannot explain (the agent screens).
+   * No screen shows them yet: the "What is this page?" bubble (components/Help.tsx) and the F1
+   * window (components/ShortcutsHelp.tsx) show `what` and `first` only. So whatever a person must
+   * know goes in those two; these points only add detail, for the F1 window to list once it can.
+   */
+  more?: string[];
 }
 
 export const PAGE_HELP: Record<string, PageHelpEntry> = {
@@ -32,11 +39,25 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Use the button on each line (Sort it, Send reminder, Pay, Done). Not now? Choose Later to snooze or dismiss it.',
     qb: 'Company Snapshot / Reminders',
   },
-  // Agent full access (plan §7.2): the approval center, on the menu while the company has an agent.
+  // Agent full access (plan §7): the approval center, on the menu while the company has an agent.
+  // The Agents tab of Users & Roles has its own entry in TAB_HELP below. What a person must know
+  // (on its own vs asks, approve once or standing permission, pausing one or all, the record) is in
+  // `what` and `first`, the part every help screen shows. Every approver reads it, so pausing is
+  // said as an Admin's: the Agents tab (pause one, Revoke) shows to Admins only (app/users/page.tsx),
+  // and Pause all agents only to whoever the count route says may use it (canPauseAll). Only what
+  // an agent's settings say to ask about comes here: work set to Never is refused without asking.
   '/agent-requests': {
     title: 'Agent requests',
-    what: 'Changes your connected AI agents asked to make that wait for a person to approve, each with what it would do to your books.',
-    first: 'Open a request to see what it would change, then choose Approve once or Deny.',
+    what: 'On its own an agent does only what its settings allow, usually looking and drafting; what it must ask for waits here, showing the change. The Audit Trail and Agent Activity report keep the record.',
+    first: 'Approve once, Approve similar… (standing permission) or Deny. An Admin can pause one agent (Users & Roles > Agents) or all.',
+    more: [
+      'Usually an agent looks and prepares drafts by itself, and asks before it enters, changes, deletes, emails or prints anything.',
+      'Work set to Never in its settings is refused without asking, so it never shows up here.',
+      'Approve once runs just that request. Approve similar… also lets the agent do requests like it by itself for a while; an Admin can take that back in Users & Roles > Agents.',
+      'Some requests need an Admin, a second person or a password: the request says so.',
+      'An Admin can stop one agent with Pause this agent in Users & Roles > Agents, or every agent at once with Pause all agents at the top of the window.',
+      'Everything an agent did or asked is kept: see the Audit Trail, or Reports > Accountant & Taxes > Agent Activity.',
+    ],
   },
   '/todos': {
     title: 'To Do list',
@@ -441,9 +462,36 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
 };
 
+/**
+ * Help for a tab that has no address of its own (its page keeps the tab in its state), keyed
+ * '<page>/<tab>'. The tab is to show it itself, with <Help page="/users/agents">; the page's own
+ * help (PAGE_HELP) covers the page as a whole, and is what the shell's bubble and F1 show on
+ * /users. app/users/AgentsTab.tsx does not render it yet, so today no screen shows this entry. As
+ * with PAGE_HELP, the essentials are in `what` and `first`, the part the bubble shows.
+ */
+export const TAB_HELP: Record<string, PageHelpEntry> = {
+  // Agent full access (plan §7.1): Users & Roles > Agents, a tab only Admins see
+  // (app/users/page.tsx), so this help speaks to an Admin. The server also lets anyone who may
+  // modify Users make an agent stricter or pause it, but no screen offers that to them today.
+  '/users/agents': {
+    title: 'Agents',
+    what: 'AI agents you let into this file. For each kind of work choose Allow (does it alone), Ask (waits in Agent requests, where a person approves once or gives standing permission) or Never.',
+    first: 'Click an agent. Pause this agent stops it; an Admin can pause all. The Audit Trail and Agent Activity report keep the record.',
+    more: [
+      'A preset is the starting point: Read only, Ask for every change (the usual choice), Trusted bookkeeper, or Full, with asks.',
+      'Only an Admin can let an agent do more by itself: a higher preset, Allow, a higher limit or another folder.',
+      'A person approves a request once, or gives standing permission for similar requests for a while; Revoke takes that back.',
+      'Pause this agent stops one agent. An Admin can stop every agent at once with Pause all agents at the top of the window. Nothing already done is undone.',
+      'Each agent’s Activity lists its recent work and requests. The Audit Trail and Reports > Accountant & Taxes > Agent Activity keep the full record.',
+    ],
+  },
+};
+
 /** The help for a path (longest matching prefix, so /registers/abc gets the Registers help). */
 export function pageHelpFor(pathname: string): PageHelpEntry | null {
   const path = pathname.split('?')[0].split('#')[0];
+  // A tab's own help, asked for by its '<page>/<tab>' key, before the page's help it would match.
+  if (Object.prototype.hasOwnProperty.call(TAB_HELP, path)) return TAB_HELP[path];
   let best: string | null = null;
   for (const key of Object.keys(PAGE_HELP)) {
     if (path === key || path.startsWith(key + '/')) {

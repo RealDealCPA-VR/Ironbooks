@@ -17,12 +17,24 @@ import { inventoryDate, inventoryValuation } from '@/lib/services/inventory';
 import { adjustQuantityAtSite } from '@/lib/services/inventorySiteOps';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { inventoryActionSchema } from '@/lib/validation/inventory';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
   const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
   return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+}
+
+/**
+ * The body as agents read it described (lib/validation/inventory.ts inventoryActionSchema). Called
+ * once the checks of the action answered, so it refuses only a value the service could not have
+ * used (answered 400 through serviceErrorToResponse).
+ */
+function checkBody(body: unknown): void {
+  const checked = inventoryActionSchema.safeParse(body);
+  if (!checked.success) throw bodyValidationError(checked.error);
 }
 
 /** Optional Advanced Inventory fields from the raw body. */
@@ -91,6 +103,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       if (!date) {
         return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
       }
+      checkBody(body);
 
       const result = await adjustQuantityAtSite(ctx, {
         ...siteFields(body),
@@ -124,6 +137,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       if (!date) {
         return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
       }
+      checkBody(body);
 
       // COGS relief = a removal valued at cost (Dr COGS / Cr Inventory).
       const result = await adjustQuantityAtSite(ctx, {

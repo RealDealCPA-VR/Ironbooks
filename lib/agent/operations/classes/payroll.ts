@@ -5,30 +5,41 @@
  * Masking (plan §5.9): the app masks SSNs and state account numbers unless the caller has
  * "view sensitive payroll data" / "view full account numbers" (lib/permissions/mask.ts). Routes
  * that mask keep their ordinary class and carry `reveal`, so an unmasked answer is a separate,
- * approved request. Nothing else in payroll is masked by the app, so paychecks, pay stubs and
- * the payroll forms are ordinary reads. That departs on purpose from the plan's §5.9 list
+ * approved request. Nothing else in payroll is masked by the app but an account number in a
+ * liability check's memo (see there), so paychecks, pay stubs and the payroll forms are ordinary
+ * reads. That departs on purpose from the plan's §5.9 list
  * (paystub, W-3/941/940 as read_sensitive): the stub carries only names and pay a payroll user
- * already sees on the paycheck, and W-3/941/940 carry only the company's EIN.
+ * already sees on the paycheck, and W-3/941/940 carry only the company's EIN. The state wage
+ * worksheet shows employees by the last 4 digits of the SSN only (no caller sees more there) and
+ * masks the employer's state account number like the state settings list, so it is a read whose
+ * reveal is that account number.
  *
  * Amounts (two-person approval, D8, and a grant's maxAmount), the same rule in every bucket:
  * amountField names the money the route's ANSWER carries (lib/agent/facts.ts takes the larger of
  * the body's and the answer's figure, so a typed figure the route ignores cannot lower it). Where the
  * answer lists one figure per row, a '*' path adds them up. A request with no amount counts as over
- * every amount limit until its dry run. After it the bridge (lib/agent/bridge.ts factsFor) takes the
- * larger of that figure and the largest SINGLE ledger entry the run posted (with no amountField, the
- * entry alone; an amountField it cannot read stays over every limit). One entry is the true size of
- * a request that posts one (a paycheck void, an adjustment), but only the largest row of one that
- * posts an entry per row, so a per-row route names its rows with '*'.
+ * every amount limit until its dry run. After it the bridge (lib/agent/bridge.ts factsFor) reads the
+ * run's whole ledger: the entries it posted, and the entries already in the books that it voided,
+ * deleted or changed in place. With an amountField the amount is the larger of that field and the
+ * largest SINGLE one of those entries (an amountField it cannot read stays over every limit), so a
+ * route that posts an entry per row names its rows with '*'. With none it is all of them added up,
+ * and "0.00" for a run that posted and touched no entry at all. A void posts nothing new
+ * (voidJournalEntry only marks the entry void), but the bridge counts the voided entry at its
+ * total: voiding a paycheck is sized by the paycheck's entry after its dry run. A void that touches
+ * no entry (a payroll adjustment entered without affectsAccounts never posted one) comes out "0.00",
+ * although its year-to-date figures leave the W-2, the 941 and the 940.
  *
  * Paychecks: writing or editing one pays a person, so both always ask, like a pay run. Their
  * amountField is the gross pay in the route's ANSWER (the preview or dry run), never the body:
  * the service ignores a typed grossPay whenever earnings lines are sent. A pay run adds up the gross
  * pay of every check it wrote (results.*.grossPay), never one check's. Voiding a liability check
- * names its amount (the void answers with the check, its amount as it was). Where no answer field
- * holds the money (an adjustment's money sits in grossPay for a year-to-date one but in totalTaxes
- * and totalDeductions for a liability one, whose grossPay is 0, and the paycheck void takes
- * adjustments too), no amountField is set rather than one that could read low: each posts one entry,
- * so after the dry run its ledger entry is the amount.
+ * names its amount (the void answers with the check, its amount as it was). An adjustment's money
+ * sits in grossPay for a year-to-date one but in totalTaxes and totalDeductions for a liability one,
+ * whose grossPay is 0. Entering one names its lines (lines.*.amount: the answer and the body list
+ * them, whatever the kind). Voiding a paycheck (which takes an adjustment too) or an adjustment
+ * answers the bare row, with no lines, so no field of it is right for every row: those set no
+ * amountField rather than grossPay, which reads a liability adjustment as 0. Their amount is unknown
+ * until the dry run and then the entry the void touched, at its total ("0.00" when there is none).
  *
  * Payroll items (the cross-bucket rule, with planning.ts): an item edit stays 'change', since plan
  * §8 lists payroll items with the list entries and an item's rate is not what paychecks charge. But
@@ -84,9 +95,12 @@ export const PAYROLL_CLASSES: ClassificationMap = {
 
   // Payroll items: the list of earnings, taxes and deductions paychecks post with.
   'GET /api/payroll-items': {
-    class: 'enter',
-    describe: 'List payroll items (adds the standard items on first use)',
-    why: 'When the company has no payroll items yet, this GET first adds the standard set (about 15 items, with audit rows) for any role that can write. Every later call only reads, but the first one writes, so it is not a read. It can become a read once the standard set is added somewhere else (when the company is created, or by its own POST).',
+    class: 'read',
+    describe: 'List payroll items',
+    why:
+      'Read only for an agent. When the company has no payroll items yet, this GET first adds the standard set (about 15 items, with audit rows) for any role but viewer (ensureDefaultPayrollItems has no read-only guard). ' +
+      'An agent\'s read runs on the read-only database handle (lib/agent/bridge.ts, mode \'read\'), which refuses that write: on such a company the read fails with "This connection can only read the books" until a person opens the payroll item list. Every later call only reads. ' +
+      'Classing it \'enter\' for that one write made every listing ask a person and kept a Read only agent from it.',
   },
   'POST /api/payroll-items': {
     class: 'enter',
@@ -130,7 +144,7 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   'DELETE /api/payroll/[id]': {
     class: 'change',
     describe: 'Void paycheck {id}',
-    why: "Voids the paycheck and its ledger entry; the check stays on file marked void. Nothing is deleted. No amountField: voidPaycheck takes any payroll row, a payroll adjustment too, and a liability adjustment's grossPay is 0, so the answer's grossPay could read a large void as 0. The amount stays unknown until the ledger preview shows it and counts as over every amount limit.",
+    why: "Voids the paycheck and its ledger entry; the check stays on file marked void. Nothing is deleted. No amountField: voidPaycheck takes any payroll row, a payroll adjustment too, and a liability adjustment's grossPay is 0, so the answer's grossPay could read a large void as 0. Until the dry run the amount is unknown and counts as over every amount limit. After it the bridge counts the paycheck's entry, which the void marks void (it posts nothing new), at its total, its debits added up. A payroll row that never posted an entry comes out 0.00.",
   },
 
   // Pay runs: many paychecks in one request.
@@ -143,7 +157,7 @@ export const PAYROLL_CLASSES: ClassificationMap = {
     class: 'bulk',
     id: 'payroll.pay-runs.create',
     describe: 'Run payroll dated {payDate} for the employees listed',
-    why: "One paycheck per employee listed, each posted on its own (a refused employee does not stop the others). The amount is the total gross pay of the run: the answer lists each paycheck's grossPay under results, and results.*.grossPay adds them up (a refused employee has none). Each check posts its own ledger entry, so without this path the bridge would judge the run by its largest single check. Before the dry run has answered, the amount is unknown and counts as over every amount limit.",
+    why: "One paycheck per employee listed, each posted on its own (a refused employee does not stop the others). The amount is the total gross pay of the run: the answer lists each paycheck's grossPay under results, and results.*.grossPay adds them up (a refused employee has none). Each check posts its own ledger entry, and with an amountField the bridge compares the field only with the largest single entry, so the field must be the whole run's. Before the dry run has answered, the amount is unknown and counts as over every amount limit.",
     countField: 'employees',
     amountField: 'results.*.grossPay',
     alwaysAsk: true,
@@ -162,7 +176,7 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   },
   'GET /api/payroll/unpaid-time': {
     class: 'read',
-    describe: 'List time of employee {employeeId} not yet paid from {periodStart} to {periodEnd}',
+    describe: 'List the unpaid time of employee {employeeId} from {periodStart} to {periodEnd}',
   },
 
   // Year-to-date and liability adjustments.
@@ -172,14 +186,15 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   },
   'POST /api/payroll/adjustments': {
     class: 'enter',
-    describe: 'Enter a payroll adjustment ({type}) for employee {employeeId} dated {date}',
-    why: "Year-to-date amounts land on the employee's W-2, the 941 and 940, and the wage bases of later checks. With affectsAccounts, a year-to-date adjustment posts net pay out of a bank account like a paycheck, and a liability adjustment moves what payroll owes. So it always asks, like a paycheck. No amountField: a year-to-date adjustment answers its money as grossPay, but a liability adjustment answers grossPay 0 with the money in totalTaxes and totalDeductions, so one path would read a large liability adjustment as 0. The amount stays unknown until the ledger preview shows it and counts as over every amount limit.",
+    describe: 'Enter a payroll adjustment for employee {employeeId} dated {date} (type: {type})',
+    why: "Year-to-date amounts land on the employee's W-2, the 941 and 940, and the wage bases of later checks. With affectsAccounts, a year-to-date adjustment posts net pay out of a bank account like a paycheck, and a liability adjustment moves what payroll owes. So it always asks, like a paycheck. The amount adds up its lines (lines.*.amount, in the body and in the answer): grossPay alone would read a liability adjustment as 0 (its money is in totalTaxes and totalDeductions), and without affectsAccounts nothing is posted for the ledger preview to size. For a year-to-date adjustment the lines add the withholdings to the gross, so it reads high, never low.",
+    amountField: 'lines.*.amount',
     alwaysAsk: true,
   },
   'DELETE /api/payroll/adjustments/[id]': {
     class: 'change',
     describe: 'Void payroll adjustment {id}',
-    why: 'Voids the adjustment (and its ledger entry when it has one); it stays on file marked void. Nothing is deleted. No amountField, for the same reason as entering one: a liability adjustment answers grossPay 0, so the amount counts as over every amount limit.',
+    why: "Voids the adjustment (and its ledger entry when it has one); it stays on file marked void. Nothing is deleted. No amountField: the void answers the bare row, without the lines that entering it answers, and its grossPay is 0 for a liability adjustment. Until the dry run the amount is unknown and counts as over every amount limit. After it the bridge counts the adjustment's entry, which the void marks void, at its total. An adjustment entered without affectsAccounts has no entry, so its void comes out 0.00, although its year-to-date figures leave the W-2, the 941 and the 940.",
   },
 
   // Payroll setup: state tax rates, workers' comp codes, sick and vacation accruals (plan §8).
@@ -239,14 +254,15 @@ export const PAYROLL_CLASSES: ClassificationMap = {
     describe: 'Run payroll reports from {from} to {to}',
   },
   'GET /api/payroll/state-wage-worksheet': {
-    class: 'read_sensitive',
-    describe: 'Show the {state} wage worksheet for quarter {quarter} of {year}',
-    why: "Employees show by the last 4 digits of the SSN, but the employer's state account number comes back in full: unlike the state settings list, neither the route nor the service masks it. Until it does, the whole worksheet is protected data. Once it is masked, this becomes a read with reveal 'account_numbers'.",
+    class: 'read',
+    describe: 'Show the state wage worksheet of {state} for {year} (quarter {quarter})',
+    why: "Employees show by the last 4 digits of the SSN for every caller (the service never answers more of it, so there is no SSN to reveal), and the employer's state account number is masked to its last 4 digits unless the caller may view full account numbers, as on the state settings list (payrollReports.ts stateWageWorksheet). So the worksheet is an ordinary read, and only revealing that account number is protected.",
+    reveal: 'account_numbers',
     sensitiveFields: ['accountNumber'],
   },
   'GET /api/payroll/941': {
     class: 'read',
-    describe: 'Show Form 941 for quarter {quarter} of {year}',
+    describe: 'Show Form 941 for {year} (quarter {quarter})',
     output: 'pdf',
   },
   'GET /api/payroll/940': {
@@ -292,15 +308,23 @@ export const PAYROLL_CLASSES: ClassificationMap = {
     confirmFlags: ['allowDuplicateNumber'],
     amountField: 'items.*.amount',
   },
+  // A liability check's memo can hold an account number someone typed; every check answer masks it
+  // for a caller without "view full account numbers" (liabilityPayments.ts checkMemoFor), as for
+  // the Sales Tax Payment checks in planning.ts, so a reveal shows it.
   'GET /api/pay-liabilities/checks': {
     class: 'read',
     describe: 'List payroll liability checks',
+    why: 'The memo of each check is masked to the last 4 digits of an account number in it unless revealed (listPaymentChecks masks it).',
+    reveal: 'account_numbers',
+    sensitiveFields: ['items.*.memo'],
   },
   'POST /api/pay-liabilities/checks/[id]': {
     class: 'change',
     describe: 'Void payroll liability check {id}',
-    why: 'The only action is "void": the check and its ledger entry are voided and the check stays on file marked void. The answer is the voided check with its amount as it was.',
+    why: 'The only action is "void": the check and its ledger entry are voided and the check stays on file marked void. The answer is the voided check, its amount as it was and its memo masked.',
     amountField: 'amount',
+    reveal: 'account_numbers',
+    sensitiveFields: ['memo'],
   },
   'GET /api/pay-liabilities/sales-tax': {
     class: 'read',

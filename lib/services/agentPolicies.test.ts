@@ -6,17 +6,22 @@
  *  - the grid shows the locked cells with the reason in plain words;
  *  - only a signed-in person who may modify Users & Roles changes an agent's settings, and never a
  *    context that carries an agent or runs inside an agent's bridged run (D9, the hard floor);
- *  - a person who is not an Admin may not change or turn back on an agent beyond their own access;
+ *  - letting an agent do more is an Admin's (plan 4.4): a non-Admin's save that loosens any field
+ *    is refused whole and keeps nothing; tightening is open to everyone who manages agents, for
+ *    any agent; a person who is not an Admin may not turn back on an agent beyond their own access;
  *  - a save is checked against the engine's rules and refused with what to change; it replaces
- *    the overrides, keeps the older mode in step with the preset and writes one audit row;
- *  - folders must be full paths that exist, and never the books' own folders;
- *  - pause one agent, or all of them through the Integrated Applications switch;
+ *    the overrides, keeps the older mode in step with the preset and writes one audit row; the
+ *    engine's own check catches what a hand-edited file keeps (a cell stored twice, a stored Allow);
+ *  - folders must be full paths that exist, never a whole drive or share, and never the books' or
+ *    Ironbooks' own folders (staged files, working copies of every company file, settings, backups);
+ *  - pause one agent, or all of them through the Integrated Applications switch, "paused since"
+ *    staying put through later company saves;
  *  - the ceiling, the detail page and the activity list.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-agent-policies');
 const TEST_DIR = path.join(ROOT, 'live');
@@ -32,7 +37,10 @@ delete process.env.BKA_AGENT_FILES_DIR;
 // Another unit's modules, replaced here: whether code runs inside an agent's bridged run (the
 // service scope), and the folder check the save check shares with save_file and where staged
 // files are kept (lib/agent/files.ts).
-const scope = vi.hoisted(() => ({ inside: false, staged: null as string | null }));
+// `realFolders` hands the folder check to the real allowedFolder, loaded only then, to show what
+// a person is told for what it never takes (a whole drive or share). The stand-in takes an
+// existing folder that is one of `allowed` or inside one. `looked` is every path either was asked of.
+const scope = vi.hoisted(() => ({ inside: false, staged: null as string | null, realFolders: false, looked: [] as string[] }));
 vi.mock('@/lib/serviceScope', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   inServiceScope: () => scope.inside,
@@ -40,11 +48,19 @@ vi.mock('@/lib/serviceScope', async (importOriginal) => ({
 vi.mock('@/lib/agent/files', () => ({
   stagedFilesRoot: () => scope.staged,
   allowedFolder: async (allowed: readonly string[], folder: string) => {
+    scope.looked.push(...allowed, folder);
+    if (scope.realFolders) {
+      const real = await vi.importActual<typeof import('@/lib/agent/files')>('@/lib/agent/files');
+      return real.allowedFolder(allowed, folder);
+    }
     const nodeFs = await import('node:fs');
     const nodePath = await import('node:path');
-    if (!allowed.includes(folder) || !nodePath.isAbsolute(folder)) return null;
+    if (!nodePath.isAbsolute(folder)) return null;
+    const want = nodePath.resolve(folder);
+    const inside = (a: string) => nodePath.isAbsolute(a) && (want === nodePath.resolve(a) || want.startsWith(nodePath.resolve(a) + nodePath.sep));
+    if (!allowed.some(inside)) return null;
     try {
-      return nodeFs.statSync(folder).isDirectory() ? nodePath.resolve(folder) : null;
+      return nodeFs.statSync(folder).isDirectory() ? want : null;
     } catch {
       return null;
     }
@@ -56,7 +72,7 @@ import { agentGrants, agentPermissionRequests, agentPolicies, agents, auditLogs,
 import { builtinRole, fullAccess, unionRoles, type RoleDefinition } from '@/lib/permissions/model';
 import { DEFAULT_BULK_CAP, PRESET_DEFAULTS, isPaused } from '@/lib/agent/policy';
 import { NEVER_ALLOW_CLASSES } from '@/lib/agent/operations/types';
-import { createCompany } from './company';
+import { createCompany, updateCompany } from './company';
 import { ServiceError, type ServiceContext, writeAudit } from './_base';
 import { agentAccess, createAgent, findAgentByToken, revokeAgent } from './agents';
 import {
@@ -133,6 +149,8 @@ beforeAll(async () => {
 beforeEach(() => {
   scope.inside = false;
   scope.staged = null;
+  scope.realFolders = false;
+  scope.looked = [];
 });
 
 afterAll(async () => {
@@ -333,6 +351,48 @@ describe('saving a policy', () => {
     await revokeAgent(admin, agent.id);
   });
 
+  it("the engine's check also catches the same cell stored twice, and a stored Allow in an area", async () => {
+    // A save can never send either (readPolicyInput refuses both), so only a hand-edited file holds
+    // them: here one without the index that keeps one row per cell.
+    const { agent } = await newAgent('Doubled', ['bookkeeper']);
+    const companyId = admin.companyId;
+    await db.execute(sql`DROP INDEX IF EXISTS "agent_policies_key_idx"`);
+    try {
+      await db.insert(agentPolicies).values([
+        { companyId, agentId: agent.id, class: 'enter', area: 'banking', setting: 'allow' },
+        { companyId, agentId: agent.id, class: 'enter', area: 'banking', setting: 'never' },
+      ]);
+      await expectError(
+        saveAgentPolicy(admin, agent.id, { requestExpiryDays: 4 }),
+        'VALIDATION',
+        /^"Enter new" in Banking was saved twice with different settings; the stricter one \(Never\) is used\. Fix this setting and save again\.$/,
+      );
+      expect((await loadAgentPolicy(admin, agent.id)).requestExpiryDays).toBe(7);
+      expect(await db.select().from(agentPolicies).where(eq(agentPolicies.agentId, agent.id))).toHaveLength(2);
+      // Sending the settings replaces both rows with one, and the save goes through.
+      const view = await saveAgentPolicy(admin, agent.id, { requestExpiryDays: 4, overrides: [{ class: 'enter', area: 'banking', setting: 'ask' }] });
+      expect(view.overrides).toEqual([{ class: 'enter', area: 'banking', setting: 'ask' }]);
+      expect(await db.select().from(agentPolicies).where(eq(agentPolicies.agentId, agent.id))).toHaveLength(1);
+    } finally {
+      await db.delete(agentPolicies).where(eq(agentPolicies.agentId, agent.id));
+      await db.execute(
+        sql`CREATE UNIQUE INDEX IF NOT EXISTS "agent_policies_key_idx" ON "agent_policies" ("agent_id", "class", "area") NULLS NOT DISTINCT`,
+      );
+    }
+
+    // An Allow kept in one area on a class that can never be Allow.
+    await db.insert(agentPolicies).values({ companyId, agentId: agent.id, class: 'file', area: 'banking', setting: 'allow' });
+    await expectError(
+      saveAgentPolicy(admin, agent.id, { notifyEmail: true }),
+      'VALIDATION',
+      /^"Company file" in Banking can never be set to Allow for an agent, so it is set to Ask\. Fix this setting and save again\.$/,
+    );
+    expect((await loadAgentPolicy(admin, agent.id)).notifyEmail).toBe(false);
+    // The engine itself never lets it run unasked meanwhile.
+    expect((await loadAgentPolicy(admin, agent.id)).areas.banking?.file).toBe('ask');
+    await revokeAgent(admin, agent.id);
+  });
+
   it('takes folders that are full paths on this computer, never the books own folders', async () => {
     const { agent } = await newAgent('Filer', ['bookkeeper']);
     const receipts = path.join(FOLDERS, 'receipts');
@@ -389,6 +449,87 @@ describe('saving a policy', () => {
     }
     await revokeAgent(admin, agent.id);
   });
+
+  it('never the staging folder stagedFilesRoot names, wherever it is, nor any company file’s working folder, nor the company file’s own folder', async () => {
+    const { agent } = await newAgent('Working', ['bookkeeper']);
+    const working = path.join(FOLDERS, 'Working');
+    const openOne = path.join(working, 'Acme-1a2b');
+    const otherOne = path.join(working, 'Other-3c4d');
+    // Where files.ts keeps staged files when the open file's working folder will not do: this
+    // computer's local app data (the shape of %LOCALAPPDATA%\Ironbooks\agent-files), outside every
+    // working folder and under a name the usual places do not list, so only stagedFilesRoot refuses it.
+    const localApp = path.join(FOLDERS, 'LocalAppData', 'IronbooksTest');
+    const staged = path.join(localApp, 'agent-files');
+    const beside = path.join(FOLDERS, 'LocalAppData', 'Other app');
+    const filed = path.join(FOLDERS, 'books');
+    for (const d of [path.join(staged, 'company'), openOne, otherOne, beside, filed]) fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(filed, 'Acme.ironbooks'), 'x');
+    const saved = { state: process.env.BKA_COMPANY_STATE, file: process.env.BKA_COMPANY_FILE };
+    // As the desktop app starts the server for an open company file (electron/main.js).
+    process.env.BKA_COMPANY_STATE = path.join(openOne, 'state.json');
+    process.env.BKA_COMPANY_FILE = path.join(filed, 'Acme.ironbooks');
+    try {
+      // While stagedFilesRoot names no folder, the one it would name is an ordinary folder here:
+      // what refuses it below is the staging rule and nothing else.
+      scope.staged = null;
+      await saveAgentPolicy(admin, agent.id, { folders: [staged] });
+      await saveAgentPolicy(admin, agent.id, { folders: [] });
+      scope.staged = staged;
+      const own = /one of the folders Ironbooks keeps its own data in/;
+      // The staging folder, a folder inside it and the folder that holds it.
+      for (const folder of [staged, path.join(staged, 'company'), localApp]) {
+        await expectError(saveAgentPolicy(admin, agent.id, { folders: [folder] }), 'VALIDATION', own);
+      }
+      // A folder beside it is fine.
+      expect((await saveAgentPolicy(admin, agent.id, { folders: [beside] })).policy.folders).toEqual([path.resolve(beside)]);
+      await saveAgentPolicy(admin, agent.id, { folders: [] });
+      // Another company file's working folder: not the open one's, so only the rule for all of them refuses it.
+      await expectError(saveAgentPolicy(admin, agent.id, { folders: [otherOne] }), 'VALIDATION', own);
+      // The open file's working folder and the folder of them all hold, or sit in, the open books
+      // as well: refused, by whichever rule comes first.
+      for (const folder of [openOne, working]) {
+        await expectError(
+          saveAgentPolicy(admin, agent.id, { folders: [folder] }),
+          'VALIDATION',
+          /holds the company file or its working data|one of the folders Ironbooks keeps its own data in/,
+        );
+      }
+      // The folder that holds the company file itself.
+      await expectError(saveAgentPolicy(admin, agent.id, { folders: [filed] }), 'VALIDATION', /holds the company file/);
+    } finally {
+      for (const [key, value] of [['BKA_COMPANY_STATE', saved.state], ['BKA_COMPANY_FILE', saved.file]] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([]);
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('never a whole drive or network share, and the person is told so (the real folder check)', async () => {
+    const { agent } = await newAgent('Drive', ['bookkeeper']);
+    const whole = /is a whole drive or network share\. Choose a folder on it for the agent/;
+    const drive = path.parse(process.cwd()).root;
+    // The real allowedFolder answers null for a whole drive or share, as for a folder that is not
+    // there: the save says which it is, by the words, before asking it.
+    for (const real of [false, true]) {
+      scope.realFolders = real;
+      await expectError(saveAgentPolicy(admin, agent.id, { folders: [drive] }), 'VALIDATION', whole);
+      await expectError(saveAgentPolicy(admin, agent.id, { folders: [path.join(FOLDERS, 'missing')] }), 'VALIDATION', /was not found on this computer/);
+      if (process.platform === 'win32') {
+        // The drive letter alone, written without its separator, is the current folder of that
+        // drive: not a full path at all.
+        await expectError(saveAgentPolicy(admin, agent.id, { folders: [drive.slice(0, 2)] }), 'VALIDATION', /not a full folder path/);
+        // A share's own folder, by the words alone: the server is never looked at, so one that
+        // does not exist is refused the same way.
+        for (const folder of [String.raw`\\localhost\c$`, String.raw`\\localhost\c$\\`, String.raw`\\no-such-server.invalid\books`]) {
+          await expectError(saveAgentPolicy(admin, agent.id, { folders: [folder] }), 'VALIDATION', whole);
+        }
+      }
+    }
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([]);
+    await revokeAgent(admin, agent.id);
+  });
 });
 
 describe('who may change an agent', () => {
@@ -425,26 +566,296 @@ describe('who may change an agent', () => {
     await revokeAgent(admin, agent.id);
   });
 
-  it('a person who is not an Admin may not loosen or turn back on an agent beyond their own access', async () => {
+  it('a person who is not an Admin may tighten any agent, but not turn back on one beyond their own access', async () => {
     const within = await newAgent('Within', ['view_only']);
     const boss = await newAgent('Admin agent', ['admin']);
     // Accountant includes the closing date, which the manager's own access only views.
     const beyond = await newAgent('Beyond', ['accountant']);
 
+    // Changed on purpose (plan 4.4, wave 3): a non-Admin's save may only tighten, so it is open
+    // for every agent, an Admin-role one and one beyond the manager's own access included.
     await saveAgentPolicy(manager, within.agent.id, { preset: 'read_only' });
-    await expectError(saveAgentPolicy(manager, boss.agent.id, { preset: 'read_only' }), 'FORBIDDEN', /holds the Admin role/);
-    await expectError(saveAgentPolicy(manager, beyond.agent.id, { preset: 'read_only' }), 'FORBIDDEN', /more access than you/);
+    await saveAgentPolicy(manager, boss.agent.id, { preset: 'read_only' });
+    await saveAgentPolicy(manager, beyond.agent.id, { overrides: [{ class: 'enter', area: null, setting: 'never' }] });
+    expect((await loadAgentPolicy(admin, boss.agent.id)).preset).toBe('read_only');
+    expect((await loadAgentPolicy(admin, beyond.agent.id)).classes.enter).toBe('never');
+    // Loosening any of them is not, within the manager's access or not.
+    await expectError(saveAgentPolicy(manager, boss.agent.id, { preset: 'full_with_asks' }), 'FORBIDDEN', /Only an Admin can let an agent do more/);
+    await expectError(saveAgentPolicy(manager, within.agent.id, { preset: 'ask_every_change' }), 'FORBIDDEN', /Only an Admin/);
 
     // Stopping is never held back; turning back on is.
     await pauseAgent(manager, beyond.agent.id, true);
     expect(isPaused((await loadAgentPolicy(admin, beyond.agent.id)).pausedAt)).toBe(true);
     await expectError(pauseAgent(manager, beyond.agent.id, false), 'FORBIDDEN', /turn back on/);
+    await pauseAgent(manager, boss.agent.id, true);
+    await expectError(pauseAgent(manager, boss.agent.id, false), 'FORBIDDEN', /holds the Admin role/);
     await pauseAgent(admin, beyond.agent.id, false);
     expect((await loadAgentPolicy(admin, beyond.agent.id)).pausedAt).toBeNull();
 
-    // An Admin may change any of them.
+    // An Admin may change any of them, in either direction.
     await saveAgentPolicy(admin, boss.agent.id, { preset: 'full_with_asks' });
     for (const a of [within, boss, beyond]) await revokeAgent(admin, a.agent.id);
+  });
+});
+
+describe('letting an agent do more is for an Admin (plan 4.4)', () => {
+  /** The stored row and override rows, to show a refused save kept nothing. */
+  async function snapshot(agentId: string) {
+    const [row] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const rows = await db.select().from(agentPolicies).where(eq(agentPolicies.agentId, agentId));
+    return {
+      row: { ...row, lastUsedAt: null },
+      overrides: rows.map((r) => [r.class, r.area, r.setting]).sort(),
+      audits: (await auditRowsFor(agentId)).length,
+    };
+  }
+
+  /** A manager's save is refused whole, naming the loosening, and keeps nothing. */
+  async function refusedForManager(agentId: string, input: Parameters<typeof saveAgentPolicy>[2], names: RegExp) {
+    const before = await snapshot(agentId);
+    const e = await saveAgentPolicy(manager, agentId, input).then(
+      () => null,
+      (err: unknown) => err,
+    );
+    expect(e, `expected ${JSON.stringify(input)} to be refused`).toBeInstanceOf(ServiceError);
+    expect((e as ServiceError).code).toBe('FORBIDDEN');
+    expect((e as ServiceError).message).toMatch(/^Only an Admin can let an agent do more\. This change would /);
+    expect((e as ServiceError).message).toMatch(names);
+    expect((e as ServiceError).message).toMatch(/Ask an Admin to make it\. You can still tighten this agent's settings or pause it\.$/);
+    expect(((e as ServiceError).details as { looser: string[] }).looser.length).toBeGreaterThan(0);
+    expect(await snapshot(agentId)).toEqual(before);
+  }
+
+  it('the preset: a higher one only for an Admin, a lower one for anyone who manages agents', async () => {
+    const { agent } = await newAgent('Preset steps', ['view_only']);
+    await refusedForManager(agent.id, { preset: 'trusted_bookkeeper' }, /move it from "Ask for every change" to "Trusted bookkeeper"/);
+    await refusedForManager(agent.id, { preset: 'full_with_asks' }, /to "Full, with asks"/);
+    await saveAgentPolicy(manager, agent.id, { preset: 'read_only' });
+    expect((await loadAgentPolicy(admin, agent.id)).preset).toBe('read_only');
+    // Back up again is loosening, even to where it was.
+    await refusedForManager(agent.id, { preset: 'ask_every_change' }, /move it from "Read only" to "Ask for every change"/);
+    await saveAgentPolicy(admin, agent.id, { preset: 'trusted_bookkeeper' });
+    expect((await loadAgentPolicy(admin, agent.id)).preset).toBe('trusted_bookkeeper');
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('a cell, everywhere or in one area: toward Allow only for an Admin, toward Never for anyone', async () => {
+    const { agent } = await newAgent('Cells', ['view_only']);
+    const o = (cls: 'enter' | 'change', area: 'banking' | 'payroll' | null, setting: 'allow' | 'ask' | 'never') => ({ class: cls, area, setting });
+    await refusedForManager(agent.id, { overrides: [o('enter', null, 'allow')] }, /set "Enter new" from Ask to Allow/);
+    await refusedForManager(agent.id, { overrides: [o('enter', 'banking', 'allow')] }, /set "Enter new" in Banking from Ask to Allow/);
+
+    await saveAgentPolicy(manager, agent.id, { overrides: [o('enter', null, 'never')] });
+    expect((await loadAgentPolicy(admin, agent.id)).classes.enter).toBe('never');
+    // Taking that adjustment away again puts the cell back at Ask: loosening.
+    await refusedForManager(agent.id, { overrides: [] }, /set "Enter new" from Never to Ask/);
+    // An area that keeps what everywhere says changes nothing; one that steps back from it loosens.
+    await saveAgentPolicy(manager, agent.id, { overrides: [o('enter', null, 'never'), o('enter', 'payroll', 'never')] });
+    await refusedForManager(agent.id, { overrides: [o('enter', null, 'never'), o('enter', 'banking', 'ask')] }, /set "Enter new" in Banking from Never to Ask/);
+    // One save that tightens one cell and loosens another is refused whole.
+    await refusedForManager(agent.id, { overrides: [o('change', null, 'never')] }, /set "Enter new" from Never to Ask/);
+    expect((await loadAgentPolicy(admin, agent.id)).classes.change).toBe('ask');
+
+    // A loosening everywhere is named once, not again for every area that follows it.
+    const { agent: wide } = await newAgent('Cells wide', ['view_only']);
+    const e = await saveAgentPolicy(manager, wide.id, { preset: 'trusted_bookkeeper' }).catch((err: ServiceError) => err);
+    const looser = ((e as ServiceError).details as { looser: string[] }).looser;
+    expect(looser.filter((l) => l.startsWith('set "Enter new"'))).toEqual(['set "Enter new" from Ask to Allow']);
+    expect((e as ServiceError).message).toMatch(/; and \d+ more\./);
+
+    // An Admin moves any cell toward Allow.
+    await saveAgentPolicy(admin, agent.id, { overrides: [o('enter', null, 'allow'), o('enter', 'banking', 'allow')] });
+    expect((await loadAgentPolicy(admin, agent.id)).classes.enter).toBe('allow');
+    for (const id of [agent.id, wide.id]) await revokeAgent(admin, id);
+  });
+
+  it('the bulk cap: higher or none only for an Admin, lower for anyone', async () => {
+    const { agent } = await newAgent('Capped', ['view_only']);
+    await saveAgentPolicy(manager, agent.id, { bulkCap: 50 }); // none to 50: a limit where there was none
+    await refusedForManager(agent.id, { bulkCap: 100 }, /raise the most records one request may change from 50 to 100/);
+    await refusedForManager(agent.id, { bulkCap: null }, /remove the limit of 50 records one request may change/);
+    await saveAgentPolicy(manager, agent.id, { bulkCap: 20 });
+    expect((await loadAgentPolicy(admin, agent.id)).bulkCap).toBe(20);
+    await saveAgentPolicy(admin, agent.id, { bulkCap: null });
+    expect((await loadAgentPolicy(admin, agent.id)).bulkCap).toBeNull();
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('the bulk cap where there was none: above the usual one only for an Admin, since grants are held to it', async () => {
+    // "Ask for every change" and "Trusted bookkeeper" store no cap; a standing permission for bulk
+    // work is then held to DEFAULT_BULK_CAP (createGrant), so a higher cap would let grants cover more.
+    for (const preset of ['ask_every_change', 'trusted_bookkeeper'] as const) {
+      const { agent } = await newAgent(`No cap ${preset}`, ['view_only'], preset);
+      expect((await loadAgentPolicy(admin, agent.id)).bulkCap).toBeNull(); // as created: no stored cap
+      await refusedForManager(
+        agent.id,
+        { bulkCap: DEFAULT_BULK_CAP + 1 },
+        new RegExp(`raise the most records one request may change from the usual ${DEFAULT_BULK_CAP} to ${DEFAULT_BULK_CAP + 1}`),
+      );
+      await refusedForManager(agent.id, { bulkCap: 100000 }, /from the usual \d+ to 100000/);
+      // The usual cap itself, or less, only tightens.
+      await saveAgentPolicy(manager, agent.id, { bulkCap: DEFAULT_BULK_CAP });
+      expect((await loadAgentPolicy(admin, agent.id)).bulkCap).toBe(DEFAULT_BULK_CAP);
+      await refusedForManager(agent.id, { bulkCap: DEFAULT_BULK_CAP + 1 }, new RegExp(`from ${DEFAULT_BULK_CAP} to ${DEFAULT_BULK_CAP + 1}`));
+      await saveAgentPolicy(admin, agent.id, { bulkCap: null });
+      await saveAgentPolicy(manager, agent.id, { bulkCap: 10 });
+      expect((await loadAgentPolicy(admin, agent.id)).bulkCap).toBe(10);
+      // An Admin may set any cap.
+      await saveAgentPolicy(admin, agent.id, { bulkCap: 100000 });
+      expect((await loadAgentPolicy(admin, agent.id)).bulkCap).toBe(100000);
+      await revokeAgent(admin, agent.id);
+    }
+  });
+
+  it('two-person approval: on or lower for anyone, higher or off only for an Admin', async () => {
+    const { agent } = await newAgent('Two people', ['view_only']);
+    await saveAgentPolicy(manager, agent.id, { twoPersonOver: '1000' });
+    await saveAgentPolicy(manager, agent.id, { twoPersonOver: '500.00' });
+    expect((await loadAgentPolicy(admin, agent.id)).twoPersonOver).toBe('500.00');
+    await refusedForManager(agent.id, { twoPersonOver: '800' }, /raise the amount that needs two people from 500\.00 to 800\.00/);
+    await refusedForManager(agent.id, { twoPersonOver: null }, /turn off two-person approval \(now needed above 500\.00\)/);
+    // The same amount written another way is no change.
+    await saveAgentPolicy(manager, agent.id, { twoPersonOver: '500' });
+    await saveAgentPolicy(admin, agent.id, { twoPersonOver: null });
+    expect((await loadAgentPolicy(admin, agent.id)).twoPersonOver).toBeNull();
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('folders: a folder it could not reach before only for an Admin; fewer, or one inside its own, for anyone', async () => {
+    const { agent } = await newAgent('Folders', ['view_only']);
+    const receipts = path.join(FOLDERS, 'receipts');
+    const statements = path.join(FOLDERS, 'statements');
+    const year = path.join(receipts, '2026');
+    fs.mkdirSync(year, { recursive: true });
+    await refusedForManager(agent.id, { folders: [receipts] }, /let it use the folder ".*receipts"/);
+    await saveAgentPolicy(admin, agent.id, { folders: [receipts, statements] });
+    await saveAgentPolicy(manager, agent.id, { folders: [receipts] });
+    await saveAgentPolicy(manager, agent.id, { folders: [year] });
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([path.resolve(year)]);
+    // Wider again, or another folder, is loosening.
+    await refusedForManager(agent.id, { folders: [receipts] }, /let it use the folder/);
+    await refusedForManager(agent.id, { folders: [year, statements] }, /let it use the folder ".*statements"/);
+    await saveAgentPolicy(manager, agent.id, { folders: [] });
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('folders: a stored folder that reaches nothing today (a whole drive, the books) is not one it already had', async () => {
+    const { agent } = await newAgent('Stored folders', ['view_only']);
+    const receipts = path.join(FOLDERS, 'receipts');
+    const drive = path.parse(FOLDERS).root;
+    // As an older version or a hand edit may have left them: the folder check never takes a whole
+    // drive (allowedFolder skips one when used), nor a folder that holds the books' data folder.
+    for (const stored of [[drive], [ROOT]]) {
+      await db.update(agents).set({ folders: stored }).where(eq(agents.id, agent.id));
+      await refusedForManager(agent.id, { folders: [receipts] }, /let it use the folder ".*receipts"/);
+    }
+    // A stored folder that does reach something still counts: a folder inside it only tightens.
+    await db.update(agents).set({ folders: [FOLDERS] }).where(eq(agents.id, agent.id));
+    await saveAgentPolicy(manager, agent.id, { folders: [receipts] });
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([path.resolve(receipts)]);
+    // An Admin may add it either way.
+    await db.update(agents).set({ folders: [drive] }).where(eq(agents.id, agent.id));
+    await saveAgentPolicy(admin, agent.id, { folders: [receipts] });
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([path.resolve(receipts)]);
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('folders: one it already has is not new, whatever the disk says of it today, and is never looked at', async () => {
+    const { agent } = await newAgent('Kept folders', ['view_only']);
+    // An Admin gave it a folder that was later deleted.
+    const gone = path.join(FOLDERS, 'gone');
+    fs.mkdirSync(gone, { recursive: true });
+    await saveAgentPolicy(admin, agent.id, { folders: [gone] });
+    fs.rmSync(gone, { recursive: true, force: true });
+    const deleted = (await loadAgentPolicy(admin, agent.id)).folders;
+    expect(deleted).toEqual([path.resolve(gone)]);
+    const drive = path.parse(FOLDERS).root;
+    // A network folder, as an older or crafted company file may hold one: looking at it would offer
+    // this person's sign-in to that server, or hang the save while the share is offline.
+    const share = '\\\\nowhere.invalid\\share\\Receipts';
+    const tighten = { class: 'enter' as const, area: null, setting: 'never' as const };
+    // Every way this module looks at the disk (lib/agent/files.ts's allowedFolder is the stand-in's `looked`).
+    const disk = [vi.spyOn(fs, 'statSync'), vi.spyOn(fs, 'lstatSync'), vi.spyOn(fs.realpathSync, 'native')];
+    const asked = () => [...scope.looked, ...disk.flatMap((spy) => spy.mock.calls.map((call) => String(call[0])))];
+    const key = (p: string) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+    try {
+      for (const stored of [deleted, [drive], [share], [ROOT], [...deleted, drive, share, ROOT]]) {
+        await db.update(agents).set({ folders: stored, requestExpiryDays: 7 }).where(eq(agents.id, agent.id));
+        await db.delete(agentPolicies).where(eq(agentPolicies.agentId, agent.id));
+        scope.looked = [];
+        for (const spy of disk) spy.mockClear();
+        // A manager tightens one cell, then shortens the wait. Neither save sends folders (the
+        // screen sends only what changed), so the folders kept are the ones it had: no loosening.
+        await saveAgentPolicy(manager, agent.id, { overrides: [tighten] });
+        await saveAgentPolicy(manager, agent.id, { requestExpiryDays: 3 });
+        const policy = await loadAgentPolicy(admin, agent.id);
+        expect(policy).toMatchObject({ folders: stored, requestExpiryDays: 3 });
+        expect(policy.classes.enter).toBe('never');
+        // No stored folder was looked at, on the disk or by the folder check.
+        const keys = new Set(stored.map(key));
+        expect(asked().filter((p) => keys.has(key(p)))).toEqual([]);
+        // Taking a folder away is tightening too, and looks at none of the rest.
+        if (stored.length > 1) {
+          await saveAgentPolicy(manager, agent.id, { folders: [] });
+          expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([]);
+          expect(asked().filter((p) => keys.has(key(p)))).toEqual([]);
+        }
+      }
+      // The watch above sees this module's looks: a folder a save sends is looked at.
+      const receipts = path.join(FOLDERS, 'receipts');
+      await saveAgentPolicy(admin, agent.id, { folders: [receipts] });
+      expect(disk.flatMap((spy) => spy.mock.calls.map((call) => key(String(call[0]))))).toContain(key(receipts));
+    } finally {
+      for (const spy of disk) spy.mockRestore();
+    }
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('folders: only a stored folder that holds one just chosen is looked at, and the check is the save check', async () => {
+    const { agent } = await newAgent('Narrowing', ['view_only']);
+    const receipts = path.join(FOLDERS, 'receipts');
+    const gone = path.join(FOLDERS, 'never-made');
+    const share = '\\\\nowhere.invalid\\share\\Receipts';
+    for (const real of [false, true]) {
+      scope.realFolders = real;
+      await db.update(agents).set({ folders: [FOLDERS, gone, share] }).where(eq(agents.id, agent.id));
+      scope.looked = [];
+      // Narrowing to a folder inside one it has, while another it has is gone: tightening.
+      await saveAgentPolicy(manager, agent.id, { folders: [receipts] });
+      expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([real ? fs.realpathSync.native(receipts) : path.resolve(receipts)]);
+      expect(scope.looked).toContain(FOLDERS);
+      expect(scope.looked).not.toContain(gone);
+      expect(scope.looked).not.toContain(share);
+    }
+    // Wider than the folder it has is still new, and the stored folders are not looked at for it.
+    await db.update(agents).set({ folders: [receipts, gone, share] }).where(eq(agents.id, agent.id));
+    scope.looked = [];
+    await refusedForManager(agent.id, { folders: [FOLDERS] }, /let it use the folder ".*folders"/);
+    expect(scope.looked.filter((p) => p !== FOLDERS)).toEqual([]);
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('a longer wait and the email notice only for an Admin; shorter and off for anyone', async () => {
+    const { agent } = await newAgent('Waits', ['view_only']);
+    await saveAgentPolicy(manager, agent.id, { requestExpiryDays: 3 });
+    await refusedForManager(agent.id, { requestExpiryDays: 10 }, /let its requests wait 10 days instead of 3/);
+    await refusedForManager(agent.id, { notifyEmail: true }, /turn on the email notice, which sends email outside this computer/);
+    await saveAgentPolicy(admin, agent.id, { notifyEmail: true, requestExpiryDays: 10 });
+    await saveAgentPolicy(manager, agent.id, { notifyEmail: false, requestExpiryDays: 5 });
+    expect(await loadAgentPolicy(admin, agent.id)).toMatchObject({ notifyEmail: false, requestExpiryDays: 5 });
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('a person read from the company file is judged the same way', async () => {
+    const { agent } = await newAgent('From file', ['view_only']);
+    const [mgr] = await db.select().from(users).where(eq(users.email, 'mgr@policies.test'));
+    const notMember: ServiceContext = { db, companyId: admin.companyId, userId: mgr.id };
+    // Not a member of the company in the file: no access at all.
+    await expectError(saveAgentPolicy(notMember, agent.id, { preset: 'read_only' }), 'FORBIDDEN');
+    // The owner, read from the file, is an Admin and may loosen.
+    await saveAgentPolicy({ db, companyId: admin.companyId, userId: adminId }, agent.id, { preset: 'full_with_asks' });
+    expect((await loadAgentPolicy(admin, agent.id)).preset).toBe('full_with_asks');
+    await revokeAgent(admin, agent.id);
   });
 });
 
@@ -514,12 +925,40 @@ describe('pausing', () => {
     await revokeAgent(admin, agent.id);
   });
 
-  it('a switch with no audit row (an older version, or by hand) reads as paused since the last company change', async () => {
-    const { agent } = await createAgent(otherCompanyAdmin, { name: 'Elsewhere', roleKeys: ['bookkeeper'] });
-    const when = new Date('2026-11-01T08:30:00.000Z');
-    await db.update(companies).set({ settings: { integratedAppsBlocked: true }, updatedAt: when }).where(eq(companies.id, otherCompanyAdmin.companyId));
+  it('"paused since" stays put through later company saves that do not turn the switch', async () => {
+    const { agent } = await newAgent('Steady', ['bookkeeper']);
+    await pauseAllAgents(admin, true);
     try {
-      expect((await loadAgentPolicy(otherCompanyAdmin, agent.id)).pausedAt).toBe(when.toISOString());
+      const first = (await loadAgentPolicy(admin, agent.id)).pausedAt;
+      expect(Number.isFinite(Date.parse(first!))).toBe(true);
+      // Another Preferences save, a save that sends the switch again unchanged, and the company's
+      // last-change time moved by hand: none of them is when the agents were paused.
+      await new Promise((r) => setTimeout(r, 5));
+      await updateCompany(admin, { settings: { phone: '555-0100' } });
+      await updateCompany(admin, { settings: { integratedAppsBlocked: true } });
+      await db.update(companies).set({ updatedAt: new Date('2031-05-05T00:00:00.000Z') }).where(eq(companies.id, admin.companyId));
+      expect((await loadAgentPolicy(admin, agent.id)).pausedAt).toBe(first);
+    } finally {
+      await pauseAllAgents(admin, false);
+    }
+    expect((await loadAgentPolicy(admin, agent.id)).pausedAt).toBeNull();
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('a switch with no audit row (an older version, or by hand) reads as paused since a time no save moves', async () => {
+    const { agent } = await createAgent(otherCompanyAdmin, { name: 'Elsewhere', roleKeys: ['bookkeeper'] });
+    const [company] = await db.select().from(companies).where(eq(companies.id, otherCompanyAdmin.companyId));
+    await db
+      .update(companies)
+      .set({ settings: { integratedAppsBlocked: true }, updatedAt: new Date('2026-11-01T08:30:00.000Z') })
+      .where(eq(companies.id, otherCompanyAdmin.companyId));
+    try {
+      const policy = await loadAgentPolicy(otherCompanyAdmin, agent.id);
+      expect(isPaused(policy.pausedAt)).toBe(true);
+      // When the company was made: the earliest it can have been switched off, and nothing moves it.
+      expect(policy.pausedAt).toBe(company.createdAt.toISOString());
+      await db.update(companies).set({ updatedAt: new Date('2032-01-01T00:00:00.000Z') }).where(eq(companies.id, otherCompanyAdmin.companyId));
+      expect((await loadAgentPolicy(otherCompanyAdmin, agent.id)).pausedAt).toBe(company.createdAt.toISOString());
     } finally {
       await db.update(companies).set({ settings: {} }).where(eq(companies.id, otherCompanyAdmin.companyId));
     }

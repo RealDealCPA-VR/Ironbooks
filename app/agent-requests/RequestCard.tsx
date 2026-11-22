@@ -1,30 +1,38 @@
 'use client';
 /**
- * Agent requests: the approval card (plan 4.3, 4.4, 5.8, 7.2, 7.4, 11.2).
+ * Agent requests: the approval card (plan 4.3, 4.4, 5.5, 5.8, 7.2, 7.4, 11.2).
  *
  * First who asked and why, in the agent's own words: shown in quotes under "The agent says", as
  * text only, never as fact (an outsider's words can reach the agent through a vendor name or an
  * emailed PDF and steer it). Then what Ironbooks itself worked out from a trial run (Preview.tsx):
- * the summary, the ledger, the record changes, what would leave the computer, warnings and what is
- * lost. Then what the approval needs: a password field for each secret, the questions a desktop
- * flow would have asked. Then Approve once, Approve similar… (standing permission,
- * ApproveSimilar.tsx, hidden when this person may give none) and Deny with a note the agent reads.
+ * the summary, the files and computers a desktop request touches (whole paths), the ledger, the
+ * record changes, what would leave the computer, warnings and what is lost. Then who may answer it
+ * and what the approval needs: the boxes for each secret, the questions a desktop flow would have
+ * asked (sent by the server with the request). Then Approve once, Approve similar… (standing
+ * permission, ApproveSimilar.tsx, hidden when this person may give none) and Deny with a note the
+ * agent reads.
  *
- * Secrets typed here (plan 5.8) live only in their password fields. They are read when Approve is
- * pressed, sent with that one approval, and the fields are emptied and replaced at once: never in
- * React state, never logged, never stored. A second approval (after the books changed) asks for
- * them again. Secrets the run produced are shown once and live only in this card's state, so they
- * are gone when it closes; the page never sees them.
+ * Secrets typed here (plan 5.8) live only in their boxes. They are read when Approve is pressed,
+ * sent with that one approval (a secret of several parts, such as the sign-in of a protected
+ * backup, as the one text lib/agent/guards.ts encodeSecretParts makes), and the boxes are emptied
+ * and replaced at once: never in React state, never logged, never stored. A second approval (after
+ * the books changed) asks for them again. A mail password's box names the server it goes to.
+ * Secrets the run produced are shown once and live only in this card's state, so they are gone
+ * when it closes; the page never sees them.
  *
  * The server decides everything again (who may approve, the time limit of standing permission,
  * whether the books changed); this card only asks, and fails closed: anything it cannot show or
  * pass on safely is not approvable here. Approve waits for the card's own fresh copy of the
  * request: the list's copy may be old.
  *
- * "The books changed" (plan 7.4) is only ever said, and acceptStale only ever sent, after THIS card
- * got a 'stale' answer and showed the new preview: the next Approve is the person's yes to that
- * preview. A card opened later starts over with a plain Approve, and the server checks the books
- * again and answers 'stale' once more when they moved.
+ * "The books changed" (plan 7.4): a request the server marks `stale` says so, and that Approve
+ * first shows what would happen now. acceptStale is only ever sent after THIS card got a 'stale'
+ * answer and showed the new preview: the next Approve is the person's yes to that preview. A card
+ * opened later starts over with a plain Approve, and the server checks the books again and
+ * answers 'stale' once more when they moved. "Approve similar…" then takes again from the new
+ * preview only what the person had not changed (its amount, the count of a bulk change): a shorter
+ * time, fewer uses, other dates or an unticked limit stay as they left them (words.ts
+ * rebuildGrantForm).
  */
 import * as React from 'react';
 import Link from 'next/link';
@@ -35,30 +43,52 @@ import { sourceFormHref } from '@/lib/reports/drilldown';
 import { RISK_CLASS_LABELS, type SecretKind } from '@/lib/agent/operations/types';
 import type { EffectReport } from '@/lib/effects';
 import type { AgentRequestForPerson, ApproveInput, ApproveResult, FlowQuestion, ProducedSecret } from '@/lib/agent/contract';
-import RequestPreview, { NeedsChips } from './Preview';
+import RequestPreview, { DomainChips, NeedsChips, UNUSUAL_NOTE } from './Preview';
 import ApproveSimilar from './ApproveSimilar';
 import ProducedSecrets from './ProducedSecrets';
 import { requestsChanged } from './notify';
 import {
   ageText,
   amountText,
+  approverLines,
   canGiveGrant,
   clockTime,
   constraintLines,
+  desktopLines,
+  doneEntryIds,
   durationLabel,
   flowQuestionsOf,
   grantFromForm,
+  grantGivenText,
+  grantNeverHere,
+  grantRuleLine,
   initialGrantForm,
+  isUnusualDomain,
   isWaiting,
+  mailServerOf,
   plain,
-  postedEntryIds,
   reasonText,
+  rebuildGrantForm,
+  secretBoxes,
+  secretFieldReady,
   secretFieldsOf,
+  secretValueOf,
+  waitsForSecondPerson,
+  writtenPathOf,
   type GrantForm,
+  type SecretPartName,
 } from './words';
 
 /** What the card says once the books changed between the ask and the approval (plan 7.4). */
 export const STALE_MESSAGE = 'The books changed since the agent asked. This is what would happen now.';
+
+/**
+ * What the card says of a request the server marks as changed (its preview is already the new one),
+ * before this card got a 'stale' answer: the first Approve is the person's word that they saw it.
+ */
+export const STALE_MARK = 'The books changed since the agent asked.';
+export const STALE_MARK_NEXT =
+  'The preview below is what would happen now. Read it, then approve: the first approval only confirms you have seen it, and nothing runs until you approve again.';
 
 /** Said on a request that asks to see full values (plan 5.9, D6). */
 export const REVEAL_NOTE =
@@ -70,14 +100,15 @@ function errMsg(e: unknown) {
 
 const sectionTitle = 'mb-1 text-xs font-semibold uppercase tracking-wide text-navy/50';
 
-/** An answer that came back from Approve, other than "the books changed". */
+/** An answer that came back from Approve, other than "the books changed" or "not approved". */
 interface Outcome {
-  status: Exclude<ApproveResult['status'], 'stale'>;
+  status: Exclude<ApproveResult['status'], 'stale' | 'not_approved'>;
   produced: ProducedSecret[];
   effects: EffectReport[];
   /**
    * Standing permission was asked for with it, for this many minutes. Whether it was given is the
-   * request's grantId: the run can go through while the permission is not made.
+   * request's `grant` (or, from an older server, its grantId): the run can go through while the
+   * permission is not made.
    */
   grantMinutes: number | null;
   at: Date;
@@ -87,11 +118,12 @@ interface Outcome {
 function decidedText(r: AgentRequestForPerson): string | null {
   const by = r.decidedByName ? plain(r.decidedByName) : '';
   const second = r.secondApproverName ? plain(r.secondApproverName) : '';
+  if (waitsForSecondPerson(r)) return `Approved by ${by}. A second person must also approve before it runs.`;
   switch (r.status) {
     case 'executed':
       return `Done${by ? `, approved by ${by}` : ''}${second ? ` and ${second}` : ''}.`;
     case 'approved':
-      return `Approved${by ? ` by ${by}` : ''}. A second person must also approve before it runs.`;
+      return `Approved${by ? ` by ${by}` : ''}${second ? ` and ${second}` : ''}. Ironbooks is carrying it out now.`;
     case 'denied':
       return `Denied${by ? ` by ${by}` : ''}.`;
     case 'failed':
@@ -106,14 +138,18 @@ function decidedText(r: AgentRequestForPerson): string | null {
 }
 
 /**
- * Links to what an approved run entered, taken from the run's own answer (words.ts postedEntryIds),
- * and the audit trail. Never from the preview: its entries came from a trial run that was rolled
- * back, so they do not exist.
+ * Links to what an approved run entered: the entries the server says the committed run created
+ * (request.entryIds), or from an older server the ones the run's own answer names (words.ts
+ * doneEntryIds). Never from the preview: its entries came from a trial run that was rolled back, so
+ * they do not exist. Then the file a desktop request wrote, and the audit trail.
  */
 function DoneLinks({ request }: { request: AgentRequestForPerson }) {
-  const entries = postedEntryIds(request);
+  const entries = doneEntryIds(request);
+  const written = writtenPathOf(request);
+  // For a person without the View flag the run needed, the server sends a note instead of the answer.
+  const note = typeof request.result === 'string' ? plain(request.result).trim() : '';
   return (
-    <ul className="mt-1 space-y-0.5">
+    <ul className="mt-1 space-y-0.5" data-done-links="">
       {entries.map((id, i) => (
         <li key={id}>
           <Link href={sourceFormHref(id, '/agent-requests')} className="text-electric underline">
@@ -121,13 +157,55 @@ function DoneLinks({ request }: { request: AgentRequestForPerson }) {
           </Link>
         </li>
       ))}
+      {entries.length === 0 && request.posted === true && <li className="text-navy/80">It posted to the ledger. The Audit Trail shows what.</li>}
+      {written && (
+        <li className="text-navy/80">
+          It wrote{' '}
+          <code data-written-path="" className="break-all font-mono text-xs">
+            {written}
+          </code>
+        </li>
+      )}
       {request.file && <li className="text-navy/80">It made a file: {plain(request.file.name)}</li>}
+      {note && <li className="text-navy/60">{note}</li>}
       <li>
         <Link href="/audit-trail" className="text-electric underline">
           See it in the Audit Trail
         </Link>
       </li>
     </ul>
+  );
+}
+
+/** The standing permission the server says was given with the approval (it may be narrower than asked). */
+function GrantGiven({ request, now }: { request: AgentRequestForPerson; now: Date }) {
+  const g = request.grant;
+  if (!g) return null;
+  const until = Date.parse(g.expiresAt);
+  const ended = Number.isFinite(until) && until <= now.getTime();
+  const lines = constraintLines(g.constraints);
+  return (
+    <div data-grant-given="" className="mt-0.5">
+      <p>{ended ? 'The standing permission given with it has ended.' : grantGivenText(request.agentName, g)}</p>
+      {lines.length > 0 && (
+        <ul className="mt-0.5 list-disc pl-5 text-navy/80">
+          {lines.map((l) => (
+            <li key={l}>{l}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** The run went through, and the standing permission asked for with it was not given: why. */
+function GrantNotGiven({ request }: { request: AgentRequestForPerson }) {
+  const why = plain(request.grantError).trim();
+  return (
+    <p data-grant-not-given="" className="mt-0.5 text-amber-800">
+      It was done, but standing permission was not given, so {plain(request.agentName)} will ask again next time.
+      {why ? ` Why: ${why}` : ''}
+    </p>
   );
 }
 
@@ -198,6 +276,28 @@ function QuestionField({
   );
 }
 
+/** Where a typed mail password goes (guards.ts puts it into the request's own mail settings). */
+function MailServer({ server }: { server: NonNullable<ReturnType<typeof mailServerOf>> }) {
+  if (!server.host) {
+    return (
+      <p data-mail-server="" className="mt-1 text-xs text-navy/60">
+        The request names no mail server, so Ironbooks tests its saved settings and the password you type is not sent anywhere.
+      </p>
+    );
+  }
+  return (
+    <div data-mail-server="" className="mt-1.5 space-y-1 text-xs text-navy/70">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span>{server.saved ? 'The password is kept for, and sent to, the mail server' : 'The password you type is sent to the mail server'}</span>
+        <DomainChips domains={[server.host]} attr="data-mail-host" />
+        {server.port && <span>on port {server.port}</span>}
+      </div>
+      <p>Check that this is your own mail server: whoever runs that server can read the password.</p>
+      {isUnusualDomain(server.host) && <p className="font-semibold text-red-700">{UNUSUAL_NOTE}</p>}
+    </div>
+  );
+}
+
 export default function RequestCard({
   id,
   initial,
@@ -224,15 +324,17 @@ export default function RequestCard({
   const [failure, setFailure] = React.useState('');
   const [note, setNote] = React.useState('');
   const [answers, setAnswers] = React.useState<Record<string, string | boolean>>({});
-  // Whether each password field has something in it. Never the value itself.
-  const [filled, setFilled] = React.useState<Partial<Record<SecretKind, boolean>>>({});
-  // New password fields after every send: the old elements, and anything that remembered their
-  // value by element (the field-level undo of components/KeyboardBase.tsx), go away with them.
+  // Whether each secret box ("kind:part") has something in it. Never the value itself.
+  const [filled, setFilled] = React.useState<Record<string, boolean>>({});
+  // New secret boxes after every send: the old elements, and anything that remembered their value
+  // by element (the field-level undo of components/KeyboardBase.tsx), go away with them.
   const [secretRound, setSecretRound] = React.useState(0);
   const [grantForm, setGrantForm] = React.useState<GrantForm | null>(null);
+  // The books changed and "Approve similar…" was filled in again from the new preview: what the form says about it.
+  const [grantRebuilt, setGrantRebuilt] = React.useState<string | null>(null);
   const [grantError, setGrantError] = React.useState('');
   const [now] = React.useState(() => new Date());
-  const secretInputs = React.useRef<Partial<Record<SecretKind, HTMLInputElement | null>>>({});
+  const secretInputs = React.useRef<Record<string, HTMLInputElement | null>>({});
   const resultRef = React.useRef<HTMLDivElement>(null);
   const onChangedRef = React.useRef(onChanged);
   onChangedRef.current = onChanged;
@@ -270,7 +372,7 @@ export default function RequestCard({
   const { fields: secretFields, unanswerable } = request ? secretFieldsOf(request) : { fields: [], unanswerable: false };
   const actionable = !!request && isWaiting(request.status) && request.canApprove && outcome === null;
   const grantOffered = !!request && fresh && canGiveGrant(request) && grantForm !== null;
-  const secretsReady = secretFields.every((f) => filled[f.kind]);
+  const secretsReady = secretFields.every((f) => secretFieldReady(f, (n) => !!filled[`${f.kind}:${n}`]));
   const answersReady = questions.every((q) => answers[q.id] !== undefined && answers[q.id] !== '');
   const ready = actionable && fresh && !busy && secretsReady && answersReady && !unanswerable;
 
@@ -283,19 +385,25 @@ export default function RequestCard({
     onClose();
   }
 
-  /** Read the typed secrets and empty their fields: from here on they exist only in the request being sent. */
-  function takeSecrets(): Partial<Record<SecretKind, string>> {
+  /**
+   * Read the typed secrets and empty their boxes: from here on they exist only in the request being
+   * sent. A secret of several parts becomes its one text here (words.ts secretValueOf). An error
+   * (two copies of a new password that differ) sends nothing: the boxes are emptied all the same.
+   */
+  function takeSecrets(): { secrets: Partial<Record<SecretKind, string>> } | { error: string } {
     const out: Partial<Record<SecretKind, string>> = {};
+    let error: string | null = null;
     for (const f of secretFields) {
-      const el = secretInputs.current[f.kind];
-      if (!el) continue;
-      if (el.value) out[f.kind] = el.value;
-      el.value = '';
+      const read = (name: SecretPartName | 'value') => secretInputs.current[`${f.kind}:${name}`]?.value ?? '';
+      const v = secretValueOf(f, read);
+      if (v && 'error' in v) error = error ?? v.error;
+      else if (v) out[f.kind] = v.value;
     }
+    for (const el of Object.values(secretInputs.current)) if (el) el.value = '';
     secretInputs.current = {};
     setFilled({});
     setSecretRound((n) => n + 1);
-    return out;
+    return error ? { error } : { secrets: out };
   }
 
   async function approve(withGrant: boolean) {
@@ -316,8 +424,12 @@ export default function RequestCard({
     }
     if (questions.length) body.answers = Object.fromEntries(questions.map((q) => [q.id, answers[q.id]]));
     if (stale) body.acceptStale = true;
-    const secrets = takeSecrets();
-    if (Object.keys(secrets).length) body.secrets = secrets;
+    const taken = takeSecrets();
+    if ('error' in taken) {
+      setFailure(taken.error);
+      return;
+    }
+    if (Object.keys(taken.secrets).length) body.secrets = taken.secrets;
     setBusy('approve');
     try {
       const r = await api.post<ApproveResult>(`/api/agent-requests/${encodeURIComponent(request.id)}/approve`, body, { noUndo: true });
@@ -328,7 +440,16 @@ export default function RequestCard({
       if (r.status === 'stale') {
         // Nothing ran. The new preview is on screen; approving again is a second, explicit yes.
         setStale(true);
-        setMode(withGrant ? 'similar' : 'main');
+        // "Approve similar…" takes again from the new preview only what the person had not changed
+        // (its amount, the count of a bulk change); their own choices stay as they left them.
+        const again = canGiveGrant(r.request);
+        const rebuilt = again && grantForm ? rebuildGrantForm(grantForm, request, r.request, now) : null;
+        setGrantRebuilt(rebuilt?.note ?? null);
+        setGrantForm(again ? (rebuilt?.form ?? initialGrantForm(r.request, now)) : null);
+        setMode(withGrant && again ? 'similar' : 'main');
+      } else if (r.status === 'not_approved') {
+        // Nothing ran and it still waits: say why, and let the person try again.
+        setFailure(plain(r.request.error) || 'It was not approved, and nothing was done. Try again in a moment.');
       } else {
         setStale(false);
         setMode('main');
@@ -430,6 +551,12 @@ export default function RequestCard({
   const reason = request ? reasonText(request.reason) : '';
   const decided = request && outcome === null ? decidedText(request) : null;
   const amount = request ? amountText(request.amount) : '';
+  const desktop = request ? desktopLines(request) : [];
+  const mail = request ? mailServerOf(request) : null;
+  const who = request && isWaiting(request.status) ? approverLines(request.needs) : [];
+  const grantRule = request && isWaiting(request.status) ? grantRuleLine(request) : null;
+  // The server marks a request whose books changed; until this card was shown the new preview, say so.
+  const staleMark = !!request && request.stale === true && !stale && isWaiting(request.status) && outcome === null;
 
   const retry = (
     <Button size="sm" variant="secondary" onClick={() => setLoadRound((n) => n + 1)}>
@@ -472,15 +599,18 @@ export default function RequestCard({
             {outcome?.status === 'executed' && (
               <div className="rounded-lg border border-emerald/30 bg-emerald/10 p-3 text-sm text-navy">
                 <div className="font-semibold text-emerald">Done.</div>
-                {outcome.grantMinutes && request.grantId ? (
+                {request.grant ? (
+                  <GrantGiven request={request} now={now} />
+                ) : request.grantError ? (
+                  <GrantNotGiven request={request} />
+                ) : outcome.grantMinutes && request.grantId ? (
+                  // From a server that does not say what was given: what was asked for, from now.
                   <p className="mt-0.5">
                     {plain(request.agentName)} may do more of the same without asking for {durationLabel(outcome.grantMinutes)}, until about{' '}
                     {clockTime(new Date(outcome.at.getTime() + outcome.grantMinutes * 60_000))}. You can take it back in Users &amp; Roles &gt; Agents.
                   </p>
                 ) : outcome.grantMinutes ? (
-                  <p data-grant-not-given="" className="mt-0.5 text-amber-800">
-                    It was done, but standing permission was not given, so {plain(request.agentName)} will ask again next time.
-                  </p>
+                  <GrantNotGiven request={request} />
                 ) : null}
                 {request.kind === 'operation' && <DoneLinks request={request} />}
                 <EffectReports reports={outcome.effects} />
@@ -515,12 +645,20 @@ export default function RequestCard({
                   <p className="mt-1 whitespace-pre-wrap break-words">Note to the agent: &ldquo;{plain(request.note)}&rdquo;</p>
                 )}
                 {request.status === 'failed' && request.error && <p className="mt-1 whitespace-pre-wrap break-words text-red-700">{plain(request.error)}</p>}
+                {request.status === 'executed' && (request.grant ? <GrantGiven request={request} now={now} /> : request.grantError ? <GrantNotGiven request={request} /> : null)}
                 {request.status === 'executed' && request.kind === 'operation' && <DoneLinks request={request} />}
               </div>
             )}
           </div>
           {/* Outside the status region above: a screen reader announces only its heading, never the value. */}
           {outcome && <ProducedSecrets produced={outcome.produced} />}
+
+          {staleMark && (
+            <div data-stale-notice="" className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+              <div className="font-semibold">{STALE_MARK}</div>
+              <p className="mt-0.5">{STALE_MARK_NEXT}</p>
+            </div>
+          )}
 
           <section aria-labelledby="req-reason-title">
             <h3 id="req-reason-title" className={sectionTitle}>
@@ -552,6 +690,25 @@ export default function RequestCard({
               </div>
               <NeedsChips needs={request.needs} />
             </div>
+            {desktop.length > 0 && (
+              <div data-desktop-lines="" className="space-y-2 rounded-lg border border-slate-200 p-3 text-sm text-navy">
+                {desktop.map((d) => (
+                  <div key={d.label}>
+                    <div className="text-xs text-navy/60">{d.label}</div>
+                    {d.path ? (
+                      <code data-desktop-path="" className="mt-0.5 block break-all rounded border border-slate-200 bg-slate-50 px-2 py-1 font-mono text-xs text-navy">
+                        {d.value}
+                      </code>
+                    ) : (
+                      <span className="mt-0.5 flex flex-wrap items-center gap-1.5">
+                        <DomainChips domains={[d.value]} attr="data-network-host" />
+                      </span>
+                    )}
+                    {!d.path && isUnusualDomain(d.value) && <p className="mt-1 text-xs font-semibold text-red-700">{UNUSUAL_NOTE}</p>}
+                  </div>
+                ))}
+              </div>
+            )}
             {request.kind === 'grant' && (
               <div className="rounded-lg border border-slate-200 p-3 text-sm text-navy">
                 <div className="font-semibold">The agent asks for standing permission to do this without asking each time.</div>
@@ -577,6 +734,20 @@ export default function RequestCard({
             )}
           </section>
 
+          {(who.length > 0 || grantRule) && (
+            <section aria-labelledby="req-who-title">
+              <h3 id="req-who-title" className={sectionTitle}>
+                Who can answer it
+              </h3>
+              <ul data-who-approves="" className="space-y-0.5 text-sm text-navy/80">
+                {who.map((l) => (
+                  <li key={l}>{l}</li>
+                ))}
+                {grantRule && <li data-grant-rule="">{grantRule}</li>}
+              </ul>
+            </section>
+          )}
+
           {isWaiting(request.status) && !request.canApprove && (
             <div role="note" className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-navy/80">
               <span className="font-semibold">You cannot approve this one.</span> {plain(request.cannotApproveWhy) || 'Someone else must answer it.'}
@@ -588,25 +759,46 @@ export default function RequestCard({
               <h3 id="req-inputs-title" className="text-sm font-semibold text-navy">
                 Before you approve
               </h3>
-              {secretFields.map((f) => (
-                <div key={`${f.kind}-${secretRound}`}>
-                  <Label htmlFor={`secret-${f.kind}`}>{f.label}</Label>
-                  <Input
-                    id={`secret-${f.kind}`}
-                    type="password"
-                    autoComplete="off"
-                    spellCheck={false}
-                    aria-describedby="secret-help"
-                    ref={(el) => {
-                      secretInputs.current[f.kind] = el;
-                    }}
-                    onChange={(e) => {
-                      const has = e.currentTarget.value.length > 0;
-                      setFilled((prev) => (Boolean(prev[f.kind]) === has ? prev : { ...prev, [f.kind]: has }));
-                    }}
-                  />
-                </div>
-              ))}
+              {secretFields.map((f) => {
+                const single = !f.parts?.length;
+                const boxes = secretBoxes(f).map((b) => {
+                  const boxId = single ? `secret-${f.kind}` : `secret-${f.kind}-${b.name}`;
+                  const key = `${f.kind}:${b.name}`;
+                  return (
+                    <div key={b.name}>
+                      <Label htmlFor={boxId}>{b.label}</Label>
+                      <Input
+                        id={boxId}
+                        type={b.type}
+                        autoComplete="off"
+                        spellCheck={false}
+                        aria-describedby="secret-help"
+                        ref={(el) => {
+                          secretInputs.current[key] = el;
+                        }}
+                        onChange={(e) => {
+                          const has = e.currentTarget.value.length > 0;
+                          setFilled((prev) => (Boolean(prev[key]) === has ? prev : { ...prev, [key]: has }));
+                        }}
+                      />
+                    </div>
+                  );
+                });
+                return (
+                  <div key={`${f.kind}-${secretRound}`} data-secret-field={f.kind}>
+                    {single ? (
+                      boxes
+                    ) : (
+                      <fieldset className="space-y-2">
+                        <legend className="mb-1 text-[13px] font-semibold text-navy/80">{f.label}</legend>
+                        {boxes}
+                      </fieldset>
+                    )}
+                    {f.help && <p className="mt-1 text-xs text-navy/50">{f.help}</p>}
+                    {f.kind === 'mail_password' && mail && <MailServer server={mail} />}
+                  </div>
+                );
+              })}
               {secretFields.length > 0 && (
                 <p id="secret-help" className="text-xs text-navy/50">
                   Used for this one approval only. Ironbooks does not keep it, and the agent never sees it.
@@ -625,11 +817,15 @@ export default function RequestCard({
           )}
 
           {actionable && grantForm && (mode === 'similar' || request.kind === 'grant') && grantOffered && (
-            <ApproveSimilar request={request} form={grantForm} onChange={setGrantForm} now={now} error={grantError} />
+            <ApproveSimilar request={request} form={grantForm} onChange={setGrantForm} now={now} error={grantError} rebuilt={stale ? grantRebuilt : null} />
           )}
           {actionable && fresh && request.kind === 'grant' && !grantOffered && (
             <p role="note" className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-navy/80">
-              You cannot give standing permission for this kind of work. Deny it, or let the agent ask each time.
+              {grantNeverHere(request.needs)
+                ? `${grantNeverHere(request.needs)} Deny it, and let the agent ask each time.`
+                : request.needs?.grantAdminOnly && request.needs.grantable !== 'no'
+                  ? 'Only an Admin can give this standing permission. Deny it, or ask an Admin to answer it.'
+                  : 'You cannot give standing permission for this kind of work. Deny it, or let the agent ask each time.'}
             </p>
           )}
 

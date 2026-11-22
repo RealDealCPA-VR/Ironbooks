@@ -6,7 +6,8 @@
  *  - it is OFF unless an Admin ticked it for that agent: every other agent is still told to wait
  *    until a person signs in, exactly as before;
  *  - an agent with the permission works before anyone signs in, read-only on its request like any
- *    agent, and its changes go through the same action runner under its own name;
+ *    agent, and its changes go through the same door (lib/agent/operate.ts) under its own name;
+ *    what its policy asks a person about waits for one (D7: nothing is ever approved by itself);
  *  - never past a company-file password, and never in a file protected with passwords (not open
  *    at all before a person's sign-in), and never in a practice copy;
  *  - only the desktop shell (its per-launch token) can ask the server to serve agents with no
@@ -40,7 +41,8 @@ delete process.env.PORT;
 
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { isReadOnlyDb } from '@/lib/db/readOnly';
-import { accounts, auditLogs, journalEntries, users } from '@/lib/db/schema';
+import { accounts, agentPermissionRequests, auditLogs, journalEntries, users } from '@/lib/db/schema';
+import { saveAgentPolicy } from '@/lib/services/agentPolicies';
 import { getServerContext } from '@/lib/context';
 import { AGENT_NOT_READY_MESSAGE, AGENT_SANDBOX_MESSAGE } from '@/lib/agentContext';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
@@ -191,7 +193,8 @@ describe('an agent an Admin allowed to work while nobody is signed in', () => {
     await refusedWith(getServerContext(), AGENT_NOT_READY_MESSAGE);
   });
 
-  it('what it enters is entered under its own name, through the same checks', async () => {
+  /** One curated action as the unattended agent, the way the connector sends it. */
+  async function nightAction(requestId: string, description: string): Promise<{ status: number; body: Record<string, any> }> {
     const rows = await db.select().from(accounts).where(eq(accounts.companyId, companyId));
     const bank = rows.find((a) => a.type === 'asset');
     const expense = rows.find((a) => a.type === 'expense');
@@ -202,10 +205,10 @@ describe('an agent an Admin allowed to work while nobody is signed in', () => {
         method: 'POST',
         body: JSON.stringify({
           action: 'enter_journal_entry',
-          requestId: 'night-1',
+          requestId,
           input: {
             date: '2026-03-01',
-            description: 'Entered at night',
+            description,
             lines: [
               { accountId: expense!.id, debit: '12.00' },
               { accountId: bank!.id, credit: '12.00' },
@@ -214,13 +217,30 @@ describe('an agent an Admin allowed to work while nobody is signed in', () => {
         }),
       }),
     );
-    const body = await res.json();
-    expect(res.status, JSON.stringify(body)).toBe(200);
-    expect(body.outcome).toBe('posted');
+    return { status: res.status, body: await res.json() };
+  }
+
+  it('what it enters is entered under its own name, through the same door and checks', async () => {
+    const { status, body } = await nightAction('night-1', 'Entered at night');
+    expect(status, JSON.stringify(body)).toBe(200);
+    expect(body).toMatchObject({ outcome: 'posted', operation: 'journal-entries.create' });
     const [je] = await db.select().from(journalEntries).where(eq(journalEntries.description, 'Entered at night'));
     expect(je.agentId).toBe(unattendedId);
     // The person it stands in for where a person must be named is the Admin who made it.
     expect(je.createdBy).toBe(ownerId);
+    // Nobody approved it: it ran on the agent's own policy.
+    const audit = await db.select().from(auditLogs).where(eq(auditLogs.entityId, je.id));
+    expect(audit.every((a) => a.agentId === unattendedId && a.approvedBy === null)).toBe(true);
+  });
+
+  it('what its policy asks a person about waits for one; nothing is approved by itself', async () => {
+    await saveAgentPolicy(admin, unattendedId, { preset: 'ask_every_change' });
+    const { status, body } = await nightAction('night-2', 'Asked at night');
+    expect(status, JSON.stringify(body)).toBe(200);
+    expect(body).toMatchObject({ outcome: 'asked', status: 'pending' });
+    expect(await db.select().from(journalEntries).where(eq(journalEntries.description, 'Asked at night'))).toEqual([]);
+    const [waiting] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.id, body.requestId));
+    expect(waiting).toMatchObject({ agentId: unattendedId, status: 'pending', decidedBy: null });
   });
 
   it('the shell can see when an agent last worked', async () => {

@@ -31,9 +31,9 @@
  * cannot come back with an older copy of the books.
  */
 import { createHash, createHmac, randomBytes } from 'node:crypto';
-import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
 import { resolveDataDir, type DB } from '@/lib/db';
-import { agents, companies, users } from '@/lib/db/schema';
+import { agentGrants, agentPolicies, agents, companies, users } from '@/lib/db/schema';
 import { companyFileId } from '@/lib/auth';
 import { deviceKey } from '@/lib/ai/keyVault';
 import { AGENT_TOKEN_RE } from '@/lib/net/agentToken';
@@ -79,6 +79,11 @@ export interface AgentView {
   status: 'active' | 'revoked';
   /** May work while nobody is signed in (never in a file with passwords or a file password). */
   unattended: boolean;
+  /**
+   * How many adjustments it has on top of its preset (stored agent_policies rows), so the list can
+   * say "adjusted" next to the preset's name (contract section 11, GET /api/agents).
+   */
+  overrideCount: number;
 }
 
 export interface CreateAgentInput {
@@ -223,7 +228,13 @@ export async function agentsBlockedFor(db: DB, companyId: string): Promise<boole
 // Create / list / revoke
 // ---------------------------------------------------------------------------
 
-function toView(row: AgentRow, roleNames: Map<string, string>, createdByName: string | null, lastUsed: Date | null): AgentView {
+function toView(
+  row: AgentRow,
+  roleNames: Map<string, string>,
+  createdByName: string | null,
+  lastUsed: Date | null,
+  overrideCount: number,
+): AgentView {
   const keys = Array.isArray(row.roleKeys) ? row.roleKeys : [];
   return {
     id: row.id,
@@ -240,11 +251,22 @@ function toView(row: AgentRow, roleNames: Map<string, string>, createdByName: st
     revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
     status: row.revokedAt ? 'revoked' : 'active',
     unattended: row.unattended === true,
+    overrideCount,
   };
 }
 
 async function roleNameMap(db: DB, companyId: string): Promise<Map<string, string>> {
   return new Map((await listRoleDefinitions(db, companyId)).map((r) => [r.key, r.name]));
+}
+
+/** Stored adjustments (agent_policies rows) per agent of this company; an agent with none is absent. */
+async function overrideCounts(db: DB, companyId: string, agentId?: string): Promise<Map<string, number>> {
+  const rows = await db
+    .select({ agentId: agentPolicies.agentId, n: sql<number>`count(*)::int` })
+    .from(agentPolicies)
+    .where(agentId ? and(eq(agentPolicies.companyId, companyId), eq(agentPolicies.agentId, agentId)) : eq(agentPolicies.companyId, companyId))
+    .groupBy(agentPolicies.agentId);
+  return new Map(rows.map((r) => [r.agentId, Number(r.n)]));
 }
 
 /**
@@ -308,10 +330,14 @@ export async function createAgent(ctx: ServiceContext, input: CreateAgentInput):
     return created;
   });
   syncAgentEndpoint(ctx.db).catch(() => undefined);
-  return { agent: toView(row, names, null, null), token };
+  // A new agent has no adjustments yet: its preset is its whole policy.
+  return { agent: toView(row, names, null, null, 0), token };
 }
 
-/** The company's agents, newest first, for anyone who may see Users & Roles. Never the digest. */
+/**
+ * The company's agents, newest first, for anyone who may see Users & Roles > Users (the same
+ * people who may open an agent's page), each with how many adjustments it has. Never the digest.
+ */
 export async function listAgents(ctx: ServiceContext): Promise<AgentView[]> {
   await assertMaySeeAgents(ctx);
   const rows = await ctx.db
@@ -321,7 +347,8 @@ export async function listAgents(ctx: ServiceContext): Promise<AgentView[]> {
     .where(eq(agents.companyId, ctx.companyId))
     .orderBy(desc(agents.createdAt));
   const names = await roleNameMap(ctx.db, ctx.companyId);
-  return rows.map((r) => toView(r.agent, names, r.createdByName ?? null, lastUsedOf(r.agent)));
+  const adjusted = await overrideCounts(ctx.db, ctx.companyId);
+  return rows.map((r) => toView(r.agent, names, r.createdByName ?? null, lastUsedOf(r.agent), adjusted.get(r.agent.id) ?? 0));
 }
 
 /**
@@ -336,7 +363,13 @@ export async function agentCount(db: DB, companyId: string): Promise<number> {
   return Number(row?.n ?? 0);
 }
 
-/** Take an agent's access away. Its token stops working with the next request. */
+/**
+ * Take an agent's access away. Its token stops working with the next request, and the standing
+ * permission people gave it (agent_grants still unexpired and not taken back) is taken back in the
+ * same step, each audited as taken back with the agent's removal: nothing a person lent it outlives
+ * it on the record either. (A removed agent's grants were already refused when used, by liveGrants
+ * and useGrant in lib/services/agentGrants.ts.)
+ */
 export async function revokeAgent(ctx: ServiceContext, id: string): Promise<AgentView> {
   assertAdminPerson(ctx, 'Removing an agent');
   if (typeof id !== 'string' || !UUID_RE.test(id)) throw notFound('Agent');
@@ -344,22 +377,46 @@ export async function revokeAgent(ctx: ServiceContext, id: string): Promise<Agen
     const [existing] = await tx.db.select().from(agents).where(and(eq(agents.id, id), eq(agents.companyId, tx.companyId)));
     if (!existing) throw notFound('Agent');
     if (existing.revokedAt) return existing;
+    const now = new Date();
     const [updated] = await tx.db
       .update(agents)
-      .set({ revokedAt: new Date(), revokedBy: tx.userId })
+      .set({ revokedAt: now, revokedBy: tx.userId })
       .where(eq(agents.id, id))
       .returning();
+    const ended = await tx.db
+      .update(agentGrants)
+      .set({ revokedAt: now, revokedBy: tx.userId })
+      .where(
+        and(
+          eq(agentGrants.companyId, tx.companyId),
+          eq(agentGrants.agentId, id),
+          isNull(agentGrants.revokedAt),
+          gt(agentGrants.expiresAt, now),
+        ),
+      )
+      .returning({ id: agentGrants.id, operation: agentGrants.operation });
     await writeAudit(tx, {
       action: 'update',
       entityType: 'agent',
       entityId: id,
       oldValues: { name: existing.name, revoked: false },
-      newValues: { name: existing.name, revoked: true },
+      newValues: { name: existing.name, revoked: true, ...(ended.length ? { grantsTakenBack: ended.length } : {}) },
     });
+    // The same audit shape revokeGrant writes, so the grant's own history says it ended.
+    for (const g of ended) {
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'agent_grant',
+        entityId: g.id,
+        oldValues: { agentId: id, operation: g.operation, revoked: false },
+        newValues: { agentId: id, operation: g.operation, revoked: true, reason: 'agent removed' },
+      });
+    }
     return updated;
   });
   syncAgentEndpoint(ctx.db).catch(() => undefined);
-  return toView(row, await roleNameMap(ctx.db, ctx.companyId), null, lastUsedOf(row));
+  const adjusted = await overrideCounts(ctx.db, ctx.companyId, row.id);
+  return toView(row, await roleNameMap(ctx.db, ctx.companyId), null, lastUsedOf(row), adjusted.get(row.id) ?? 0);
 }
 
 /**

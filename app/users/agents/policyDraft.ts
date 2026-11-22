@@ -11,6 +11,8 @@
  */
 import type { AgentPolicyInput, AgentPolicyView } from '@/lib/agent/contract';
 import {
+  AGENT_PRESETS,
+  AGENT_PRESET_LABELS,
   RISK_CLASSES,
   RISK_CLASS_LABELS,
   type AgentPolicy,
@@ -119,20 +121,33 @@ export function looser(a: PolicySetting, b: PolicySetting): boolean {
 /**
  * Choose a cell. A locked cell changes nothing.
  *
- * Everywhere, an adjustment is kept only where it differs from the preset, so choosing the
- * preset's own setting takes the adjustment away.
- *
- * In an area, what the person chooses is kept as that area's own setting even when it is the same
- * as everywhere's: a restriction chosen for Payroll must not loosen by itself when someone later
- * loosens the setting for everywhere. "As everywhere" (clearSetting) makes the area follow again.
+ * What the person clicks is kept as the cell's own setting, even when it is the same as the one
+ * the cell would follow (the preset's everywhere, everywhere's in an area): a restriction someone
+ * chose must not loosen by itself when the preset, or the setting for everywhere, is loosened
+ * later. "As the preset" / "As everywhere" (clearSetting) makes the cell follow again.
  */
 export function chooseSetting(draft: PolicyDraft, locked: Locked, area: Area | null, cls: RiskClass, setting: PolicySetting): PolicyDraft {
   if (lockedReason(locked, cls, setting)) return draft;
   const rest = draft.overrides.filter((o) => !(o.class === cls && (o.area ?? null) === area));
-  const inherited = inheritedSetting({ ...draft, overrides: rest }, area, cls);
-  const keep = area !== null || setting !== inherited;
-  const overrides = keep ? [...rest, { class: cls, area, setting }] : rest;
-  return { ...draft, overrides: sortOverrides(overrides) };
+  return { ...draft, overrides: sortOverrides([...rest, { class: cls, area, setting }]) };
+}
+
+/** An adjustment everywhere that only repeats the preset's own setting (kept so it cannot move). */
+export function repeatsPreset(draft: PolicyDraft, o: PolicyOverride): boolean {
+  return o.area === null && o.setting === presetSetting(draft.preset, o.class);
+}
+
+/**
+ * The adjustments that change nothing today: each keeps the setting its cell would follow anyway
+ * (the preset's everywhere, everywhere's in an area), only so a later change cannot move it. They
+ * count as the agent's own settings (AgentView.overrideCount counts every stored row), so the
+ * detail page says how many of them are only kept as chosen.
+ */
+export function keptAsChosen(draft: PolicyDraft): PolicyOverride[] {
+  return draft.overrides.filter((o) => {
+    const s = o.setting === 'allow' && !canBeAllowed(o.class) ? 'ask' : o.setting;
+    return s === inheritedSetting(draft, o.area ?? null, o.class);
+  });
 }
 
 /** The preset's own setting for a class, as the engine holds it (an Allow it never gives is Ask). */
@@ -177,6 +192,163 @@ export function capThatApplies(draft: PolicyDraft): number | null {
   if (cap === '') return allowsBulk(draft) ? DEFAULT_BULK_CAP : null;
   const n = wholeNumber(cap);
   return n >= 1 && n <= BULK_CAP_MAX ? n : null;
+}
+
+// ---------------------------------------------------------------------------
+// Loosening: only an Admin may let an agent do more by itself (plan 4.4)
+// ---------------------------------------------------------------------------
+//
+// A person who may manage agents but is not an Admin may make an agent stricter or pause it. What
+// counts as loosening: a higher preset, a cell that lets the agent do more by itself than it does
+// now (as the engine resolves it), a higher limit on records per request or none, another folder,
+// a higher two-person amount or none, and, as the server also holds them (lib/services/
+// agentPolicies.ts), a longer wait for requests and turning the email notice on (an outside
+// send). Everything is compared with what was saved (`before`),
+// so a person who tightened something in the draft may always put it back. The screen uses this to
+// disable those controls and say why; the server checks the same and has the last word.
+
+/** `a` is a preset that lets the agent do more by itself than `b` (AGENT_PRESETS runs strictest first). */
+export function presetLooser(a: AgentPreset, b: AgentPreset): boolean {
+  return AGENT_PRESETS.indexOf(a) > AGENT_PRESETS.indexOf(b);
+}
+
+/** One cell that would let the agent do more by itself: everywhere (area null) or in one area. */
+export interface LooserCell {
+  class: RiskClass;
+  area: Area | null;
+  from: PolicySetting;
+  to: PolicySetting;
+}
+
+/**
+ * The cells where `after` lets the agent do more by itself than `before`, everywhere and in each
+ * area, as the engine resolves them. When everywhere loosened, an area that simply moved with it
+ * (it showed everywhere's setting before and shows it after) is not named again: that line already
+ * covers it. An area that loosened otherwise, by its own row, is named too, so the list is
+ * everything a save loosens, as the server's own check names it (lib/services/agentPolicies.ts
+ * loosenings). `only` checks one kind of work.
+ */
+export function looserCells(before: PolicyDraft, after: PolicyDraft, only?: RiskClass): LooserCell[] {
+  const a = policyOf(before);
+  const b = policyOf(after);
+  const out: LooserCell[] = [];
+  for (const cls of only ? [only] : RISK_CLASSES) {
+    const from = settingFor(a, null, cls);
+    const to = settingFor(b, null, cls);
+    const everywhereLoosened = looser(to, from);
+    if (everywhereLoosened) out.push({ class: cls, area: null, from, to });
+    for (const area of AREA_KEYS) {
+      const f = settingFor(a, area, cls);
+      const t = settingFor(b, area, cls);
+      if (!looser(t, f)) continue;
+      if (everywhereLoosened && f === from && t === to) continue;
+      out.push({ class: cls, area, from: f, to: t });
+    }
+  }
+  return out;
+}
+
+/**
+ * The limit on records per request a save would raise or take away: what applies now and what
+ * would apply (null = no limit). Null when the cap is not sent, is not raised, or is typed wrong
+ * (changesOf says why then).
+ *
+ * As the server measures it (lib/services/agentPolicies.ts loosenings): where no limit was saved,
+ * a standing permission for bulk work is still held to the usual DEFAULT_BULK_CAP, so a number
+ * above it is a raise from that usual limit (`usual`), and one at or below it only tightens.
+ */
+export function capLoosened(before: PolicyDraft, after: PolicyDraft): { from: number; to: number | null; usual?: true } | null {
+  const typed = after.bulkCap.trim().replace(/,/g, '');
+  const had = before.bulkCap.trim().replace(/,/g, '');
+  if (typed === had) return null;
+  const saved = capThatApplies(before);
+  const usual = saved === null && had === '';
+  const from = saved ?? (usual ? DEFAULT_BULK_CAP : null);
+  if (from === null) return null;
+  let to: number | null;
+  if (typed === '') to = allowsBulk(after) ? DEFAULT_BULK_CAP : null;
+  else {
+    const n = wholeNumber(typed);
+    if (!(n >= 1 && n <= BULK_CAP_MAX)) return null;
+    to = n;
+  }
+  if (!(to === null || to > from)) return null;
+  return usual ? { from, to, usual: true } : { from, to };
+}
+
+/**
+ * The two-person amount a save would raise or turn off: the saved amount and the new one (null =
+ * off). Compared as decimals (lib/money.ts). Null when it is not loosened, or typed wrong.
+ */
+export function twoPersonLoosened(before: PolicyDraft, after: PolicyDraft): { from: string; to: string | null } | null {
+  const from = before.twoPersonOver.trim() === '' ? null : amountText(before.twoPersonOver);
+  if (from === null) return null;
+  const typed = after.twoPersonOver.trim();
+  if (typed === '') return { from, to: null };
+  const to = amountText(typed);
+  if (to === null) return null;
+  return toDecimal(to).greaterThan(toDecimal(from)) ? { from, to } : null;
+}
+
+/** The days a request waits, raised: saved and new. Null when not raised, or typed wrong. */
+export function expiryLoosened(before: PolicyDraft, after: PolicyDraft): { from: number; to: number } | null {
+  const from = wholeNumber(before.requestExpiryDays.trim());
+  const to = wholeNumber(after.requestExpiryDays.trim());
+  if (!(to >= 1 && to <= EXPIRY_DAYS_MAX) || !(from >= 1)) return null;
+  return to > from ? { from, to } : null;
+}
+
+/** The email notice turned on (it is itself an email that leaves this computer). */
+export function notifyLoosened(before: PolicyDraft, after: PolicyDraft): boolean {
+  return after.notifyEmail && !before.notifyEmail;
+}
+
+/**
+ * Folders in `after` that `before` did not have (the same folder in other letter case is not new).
+ *
+ * Deliberately stricter than the server: lib/services/agentPolicies.ts loosenings does not count a
+ * folder inside one the agent already has, but only when that folder really reaches something on
+ * this computer's disk (not a whole drive, a mounted volume or one of Ironbooks' own folders), and
+ * a window cannot see the disk. So here every new path counts, and a person who is not an Admin is
+ * not offered "Add folder" at all (LimitsForm). It fails closed: nothing the server would refuse is
+ * ever sent, and an Admin is never held back by it.
+ */
+export function addedFolders(before: PolicyDraft, after: PolicyDraft): string[] {
+  const had = new Set(before.folders.map((f) => f.toLowerCase()));
+  return after.folders.filter((f) => !had.has(f.toLowerCase()));
+}
+
+const SETTING_WORD: Record<PolicySetting, string> = { allow: 'Allow', ask: 'Ask', never: 'Never' };
+
+/**
+ * What a save would let the agent do more of by itself, one short phrase each, in plain words.
+ * Empty when it only tightens or changes nothing that matters for safety.
+ */
+export function looseningsOf(before: PolicyDraft, after: PolicyDraft): string[] {
+  const out: string[] = [];
+  if (presetLooser(after.preset, before.preset)) {
+    out.push(`the preset "${AGENT_PRESET_LABELS[after.preset]}" in place of "${AGENT_PRESET_LABELS[before.preset]}"`);
+  } else {
+    for (const c of looserCells(before, after)) {
+      const what = c.area ? `"${RISK_CLASS_LABELS[c.class]}" in ${areaLabel(c.area)}` : `"${RISK_CLASS_LABELS[c.class]}"`;
+      out.push(`${what} from ${SETTING_WORD[c.from]} to ${SETTING_WORD[c.to]}`);
+    }
+  }
+  const cap = capLoosened(before, after);
+  if (cap) {
+    out.push(
+      cap.to === null
+        ? 'no limit on the records one request may change'
+        : `up to ${cap.to.toLocaleString('en-US')} records in one request instead of ${cap.usual ? 'the usual ' : ''}${cap.from.toLocaleString('en-US')}`,
+    );
+  }
+  const two = twoPersonLoosened(before, after);
+  if (two) out.push(two.to === null ? 'two-person approval turned off' : `two-person approval only above ${two.to} instead of ${two.from}`);
+  for (const f of addedFolders(before, after)) out.push(`another folder: ${f}`);
+  const days = expiryLoosened(before, after);
+  if (days) out.push(`requests that wait ${days.to} days instead of ${days.from}`);
+  if (notifyLoosened(before, after)) out.push('the email notice turned on, which sends email outside this computer');
+  return out;
 }
 
 /** Take one adjustment away: the cell follows the preset (everywhere) or everywhere's setting (an area). */
@@ -232,7 +404,7 @@ export function changesOf(initial: PolicyDraft, draft: PolicyDraft): { input: Ag
       if (!(n >= 1 && n <= BULK_CAP_MAX)) {
         return {
           input: null,
-          error: `The most records one request may change must be a whole number from 1 to ${BULK_CAP_MAX.toLocaleString('en-US')}, or empty for no limit.`,
+          error: `The most records one request may change must be a whole number from 1 to ${BULK_CAP_MAX.toLocaleString('en-US')}, or empty: no limit, or ${DEFAULT_BULK_CAP} while "${RISK_CLASS_LABELS.bulk}" is Allow anywhere.`,
         };
       }
       input.bulkCap = n;

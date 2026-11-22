@@ -6,8 +6,17 @@
  * security", "Backup & file utilities" and "Multi-user & hosting" of section 8):
  *  - Users, roles, password rules, the file password and sessions are 'admin'. An operation whose
  *    whole point is a secret (a user's new password, a recovery key, a new file key) is 'secret'.
+ *  - Reading Users & Roles is 'admin' too (plan 4.2): who may sign in, what each role allows and
+ *    the password rules are what an attacker would read first, and the door asks by class, not by
+ *    area, so a 'read' here would run for an Admin-role agent with nobody asked.
  *  - Backups, restores, portable files, the company list and saving the file are 'file'. A restore
  *    is 'file' (Admin, never Allow) rather than 'remove': it replaces every company in the file.
+ *    File Utilities reads that show file names, folders or backups, or produce a file, are 'file'
+ *    as well (plan 4.2). Pure checks of the books (integrity, books in balance) stay 'read': they
+ *    answer pass or fail per check and show nothing of the files on disk.
+ *  - A GET classed above 'read' is dryRun 'none'. A dry run hands the route's answer back to the
+ *    agent (lib/agent/operate.ts tryOnly), and for a read the answer is the very thing a person is
+ *    asked about, so it is described only and runs once someone approves.
  *  - Signing in, unlocking the file and a person's own two-step sign-in are 'person_only': they ARE
  *    a person acting as themselves. The desktop shell's own calls (internal token) are marked the
  *    same way: an agent cannot ask for them; its way is the shell operation (plan 5.5).
@@ -36,17 +45,29 @@ const COMPANY_BACKUP_MASKED = ['ssn', 'employeeSsn', 'taxId', 'accountNumber', '
   (k) => `tables.*.*.${k}`,
 );
 
+/** Why a read of Users & Roles is 'admin' (see the header), said once for each of them. */
+const USERS_READ_WHY =
+  'A read of Users & Roles, so class admin (plan 4.2): it shows who can sign in to the books and what each of them may do, which is where an attacker would start. An Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.';
+
+/** Why a File Utilities read that shows the files on disk is 'file' (see the header). */
+const FILE_READ_WHY =
+  'A File Utilities read that shows the company file on disk (backup, archive or copy names, folders, or a file to download), so class file (plan 4.2): an Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.';
+
+/** Why a pure check of the books stays 'read' although it sits in File Utilities. */
+const BOOKS_CHECK_WHY =
+  'Stays class read on purpose, although File Utilities: a pure check of the books (plan 4.2 lets those stay read). It runs read-only queries and answers pass or fail per check, with no file names, folders or backups. Through the door it runs without asking for an agent whose role may view File Utilities; an agent\'s own request never reaches it (lib/permissions/agentAccess.ts AGENT_DOOR_ONLY_AREAS).';
+
 export const ADMIN_CLASSES: ClassificationMap = {
   // ---- Users (Users & Roles) ----
-  'GET /api/users': { class: 'read', describe: 'List the users of this company' },
+  'GET /api/users': { class: 'admin', describe: 'List the users of this company', why: USERS_READ_WHY, dryRun: 'none' },
   'POST /api/users': {
     class: 'admin',
-    describe: 'Add user {name} with login {login}',
+    describe: 'Add user {name} (login: {login})',
     why: "Adds a person who can sign in to the books. A new login needs a password (body field password), which the approving Admin types; the agent never sees it and must never supply it, or it could sign in as that person. A login that already exists in the file is added as it is, without a password.",
     needsSecret: ['new_user_password'],
     sensitiveFields: ['password'],
   },
-  'GET /api/users/[id]': { class: 'read', describe: 'Show user {id} and what they may do' },
+  'GET /api/users/[id]': { class: 'admin', describe: 'Show user {id} and what they may do', why: USERS_READ_WHY, dryRun: 'none' },
   'PATCH /api/users/[id]': {
     class: 'admin',
     describe: 'Change user {id}: name, login, roles or whether they can sign in',
@@ -59,7 +80,12 @@ export const ADMIN_CLASSES: ClassificationMap = {
     needsSecret: ['new_user_password'],
     sensitiveFields: ['password', 'currentPassword'],
   },
-  'GET /api/users/password-policy': { class: 'read', describe: 'Show the password rules of the company file' },
+  'GET /api/users/password-policy': {
+    class: 'admin',
+    describe: 'Show the password rules of the company file',
+    why: USERS_READ_WHY,
+    dryRun: 'none',
+  },
   'PUT /api/users/password-policy': {
     class: 'admin',
     describe: 'Change the password rules of the company file',
@@ -67,19 +93,20 @@ export const ADMIN_CLASSES: ClassificationMap = {
     fileAdmin: true,
   },
   'GET /api/users/permissions-report': {
-    class: 'read',
+    class: 'admin',
     describe: 'Show a permissions report of the users or roles',
-    why: '?kind= picks the report (roles when left out). ?format=csv answers the same report as a CSV file (text/csv) instead of JSON.',
+    why: `${USERS_READ_WHY} ?kind= picks the report (roles when left out). ?format=csv answers the same report as a CSV file (text/csv) instead of JSON.`,
+    dryRun: 'none',
   },
 
   // ---- Roles ----
-  'GET /api/roles': { class: 'read', describe: 'List the roles and what each one allows' },
+  'GET /api/roles': { class: 'admin', describe: 'List the roles and what each one allows', why: USERS_READ_WHY, dryRun: 'none' },
   'POST /api/roles': {
     class: 'admin',
     describe: 'Make role {name}',
     why: 'Roles decide what people and agents may do. Never more than the approver has (assertCanGrant).',
   },
-  'GET /api/roles/[id]': { class: 'read', describe: 'Show role {id}' },
+  'GET /api/roles/[id]': { class: 'admin', describe: 'Show role {id} and what it allows', why: USERS_READ_WHY, dryRun: 'none' },
   'PATCH /api/roles/[id]': {
     class: 'admin',
     describe: 'Change what role {id} allows',
@@ -341,11 +368,14 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
 
   // ---- Agents (Users & Roles > Agents): the hard floor ----
+  // The GETs of the Agents tab are Users & Roles reads, so class admin like the others; on the
+  // hard floor the class decides nothing, but no list shows them as a plain read.
   'GET /api/agents': {
-    class: 'read',
+    class: 'admin',
     describe: 'List the agents of this company',
     availability: 'hard_floor',
     why: 'Agents never manage agents (plan 4.6, D9). The service already refuses any caller that is not a person (assertAdminPerson), and the answer tells where the connector lives on this computer.',
+    dryRun: 'none',
   },
   'POST /api/agents': {
     class: 'admin',
@@ -363,10 +393,11 @@ export const ADMIN_CLASSES: ClassificationMap = {
     hostOnly: true,
   },
   'GET /api/agents/[id]': {
-    class: 'read',
+    class: 'admin',
     describe: 'Show agent {id} with its roles and permissions',
     availability: 'hard_floor',
     why: "Agents never manage agents (plan 4.6, D9): the detail page is where a person decides what an agent may do, so even reading it is a person's, in their own window. An agent reads its own permissions with get_my_permissions.",
+    dryRun: 'none',
   },
   'PATCH /api/agents/[id]': {
     class: 'admin',
@@ -388,16 +419,18 @@ export const ADMIN_CLASSES: ClassificationMap = {
     why: 'The kill switch (the Integrated Applications switch, one click away) stays with people in both directions (plan 4.6).',
   },
   'GET /api/agents/[id]/grants': {
-    class: 'read',
+    class: 'admin',
     describe: 'List the standing permissions of agent {id}',
     availability: 'hard_floor',
     why: "Agents never manage agents' standing permissions (plan 4.6, D9); this list is the person's, with Revoke beside each one. An agent reads its own live grants with get_my_permissions.",
+    dryRun: 'none',
   },
   'GET /api/agents/[id]/activity': {
-    class: 'read',
+    class: 'admin',
     describe: 'Show what agent {id} ran and asked for',
     availability: 'hard_floor',
     why: "Part of a person watching over agents (plan 7.1, 4.6): one agent's record is not another agent's to read.",
+    dryRun: 'none',
   },
 
   // ---- Answering agents: the approval center (plan 7.2). All on the hard floor (plan 4.6) ----
@@ -496,17 +529,27 @@ export const ADMIN_CLASSES: ClassificationMap = {
   // Both GETs also start the in-process backup timer when it is not running yet. The GET itself
   // writes nothing, but the timer's first check (about 15 seconds later) writes a scheduled backup
   // if one is due. A read-only handle would not catch that: it happens outside the request.
-  'GET /api/backups': { class: 'read', describe: 'Show the backup history and automatic backup settings' },
+  'GET /api/backups': {
+    class: 'file',
+    describe: 'Show the backup history and automatic backup settings',
+    why: `${FILE_READ_WHY} The history names every backup file and, for a file Admin, the backup folder on this computer.`,
+    dryRun: 'none',
+  },
   'PUT /api/backups': {
     class: 'file',
-    describe: 'Change automatic backups: {schedule}, keep {keep}, folder {folder}',
+    describe: 'Change automatic backups (schedule: {schedule}) (versions kept: {keep}) (folder: {folder})',
     why: 'Decides how often and where the whole company file is copied, from then on, unattended. The folder can be any folder this computer can write to, a network share included, so full copies of the file can leave this computer on schedule. The folder can only be changed at the host computer, so host-only. Settings and a test file are written on disk, so no dry run.',
     fileAdmin: true,
     hostOnly: true,
     dryRun: 'none',
     effects: ['file'],
   },
-  'GET /api/backups/status': { class: 'read', describe: 'Show when the company file was last backed up' },
+  'GET /api/backups/status': {
+    class: 'file',
+    describe: 'Show when the company file was last backed up',
+    why: `${FILE_READ_WHY} It tells when the last backup was made, whether the books changed since and when the next one is due.`,
+    dryRun: 'none',
+  },
   'POST /api/backups/preview': {
     class: 'file',
     describe: 'Look inside a backup before restoring it',
@@ -538,12 +581,17 @@ export const ADMIN_CLASSES: ClassificationMap = {
   // ---- Condense ----
   'POST /api/condense': {
     class: 'remove',
-    describe: 'Condense the books before {beforeDate}',
-    why: 'Rewrites the detail of a closed period into summary entries: cannot be undone except by restoring the archive copy it saves first. The route has its own read-only preview (dryRun: true).',
-    dryRun: 'preview',
+    describe: 'Condense the books (the detail dated before {beforeDate}) (preview only: {dryRun})',
+    why: "Rewrites the detail of a closed period into summary entries: cannot be undone except by restoring the archive copy it saves first. No dry run: the service opens the company's own folder through getDb() (protectionForDir) and writes a safety copy and an archive of it on disk before it condenses, so inside the bridge's transaction it would wait on that transaction for ever (PGlite runs one at a time), and a rollback could not take the files back. So the card shows no preview and no loss statement, only this line. The route's own read-only preview (body dryRun: true) is the same operation and needs the same approval; the line says which of the two is asked for (\"preview only: yes\", or \"no\" or nothing at all for the real condense).",
+    dryRun: 'none',
     effects: ['file'],
   },
-  'GET /api/condense/archives': { class: 'read', describe: 'List the copies saved before each condense' },
+  'GET /api/condense/archives': {
+    class: 'file',
+    describe: 'List the copies saved before each condense',
+    why: `${FILE_READ_WHY} Each archive copy is listed by its file name.`,
+    dryRun: 'none',
+  },
   'POST /api/condense/archives': {
     class: 'file',
     describe: 'Restore the whole company file from the pre-condense copy {id}',
@@ -555,8 +603,8 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
 
   // ---- Data integrity ----
-  'GET /api/integrity': { class: 'read', describe: 'Check the books for data problems' },
-  'GET /api/integrity/books-in-balance': { class: 'read', describe: 'Check that the books are in balance' },
+  'GET /api/integrity': { class: 'read', describe: 'Check the books for data problems', why: BOOKS_CHECK_WHY },
+  'GET /api/integrity/books-in-balance': { class: 'read', describe: 'Check that the books are in balance', why: BOOKS_CHECK_WHY },
 
   // ---- Portable company file and shareable ledger ----
   'GET /api/portable': {
@@ -589,9 +637,11 @@ export const ADMIN_CLASSES: ClassificationMap = {
   // An export of the books, nothing masked to hide (no tax IDs or account numbers in it): an Excel
   // workbook, or with ?format=pdf a PDF summary. The route map asks for File Utilities' Print right.
   'GET /api/portable/shareable': {
-    class: 'read',
+    class: 'file',
     describe: 'Download a shareable ledger (an Excel workbook, or a PDF summary when format is pdf)',
+    why: `${FILE_READ_WHY} The answer is a file of the whole ledger, made to be shared outside the company.`,
     output: 'file',
+    dryRun: 'none',
   },
 
   // ---- The single company file ----
@@ -634,7 +684,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
   'POST /api/companies/select': {
     class: 'file',
-    describe: 'Switch to company {companyId}',
+    describe: 'Switch to another company ({companyId})',
     availability: 'person_only',
     why: "Sets the person's own active-company cookie for their window. An agent is tied to one company and has no cookie.",
   },
@@ -650,7 +700,12 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
 
   // ---- Practice copy (sandbox): working in one is on the hard floor ----
-  'GET /api/sandbox': { class: 'read', describe: 'Show whether this is a practice copy and any copies left over' },
+  'GET /api/sandbox': {
+    class: 'file',
+    describe: 'Show whether this is a practice copy and any copies left over',
+    why: `${FILE_READ_WHY} In the real file it lists the practice copies left over on disk.`,
+    dryRun: 'none',
+  },
   'POST /api/sandbox': {
     class: 'file',
     describe: 'Make a practice copy of the company file and switch to it',
@@ -672,7 +727,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
   'POST /api/sandbox/keep': {
     class: 'file',
-    describe: 'Leave the practice copy and keep it as training file {name}',
+    describe: 'Leave the practice copy and keep it as a training file ({name})',
     availability: 'hard_floor',
     why: 'Agents never work in a practice copy (plan 4.6); leaving one is part of that work, and agents are refused inside one anyway.',
     fileAdmin: true,

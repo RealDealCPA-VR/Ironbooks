@@ -38,13 +38,26 @@ export const LISTS_CLASSES: ClassificationMap = {
     why: 'Income tax setup: the form is a company setting the income tax reports are built from.',
   },
 
-  // Classes and locations. The PATCH only makes the entry inactive; it reads no body.
+  // Classes and locations. The PATCH is not an edit: it only makes the entry inactive and reads no
+  // body (deactivateClass / deactivateLocation, checked and audited as a delete). Nothing in the app
+  // makes a class or location active again (no route, and Undo does not cover them), so it is
+  // treated like a delete, the same rule as customers and vendors.
   'GET /api/classes': { class: 'read', describe: 'List classes' },
   'POST /api/classes': { class: 'enter', describe: 'Add class {name}' },
-  'PATCH /api/classes/[id]': { class: 'change', describe: 'Make class {id} inactive', body: 'none' },
+  'PATCH /api/classes/[id]': {
+    class: 'remove',
+    describe: 'Make class {id} inactive',
+    why: 'Only makes the class inactive (its history stays), but nothing in the app makes a class active again, so it is treated like a delete. The route reads no body.',
+    body: 'none',
+  },
   'GET /api/locations': { class: 'read', describe: 'List locations' },
   'POST /api/locations': { class: 'enter', describe: 'Add location {name}' },
-  'PATCH /api/locations/[id]': { class: 'change', describe: 'Make location {id} inactive', body: 'none' },
+  'PATCH /api/locations/[id]': {
+    class: 'remove',
+    describe: 'Make location {id} inactive',
+    why: 'Only makes the location inactive (its history stays), but nothing in the app makes a location active again, so it is treated like a delete. The route reads no body.',
+    body: 'none',
+  },
 
   // Simple lists (other names, job types, terms, ship via, payment methods, customer messages,
   // sales tax codes, vehicles). The body schema depends on {list}, so none is named here. Other
@@ -58,7 +71,7 @@ export const LISTS_CLASSES: ClassificationMap = {
   },
   'POST /api/lists/[list]': {
     class: 'enter',
-    describe: 'Add {name} to the {list} list',
+    describe: 'Add entry {name} to the {list} list',
     sensitiveFields: ['accountNumber'],
   },
   'PATCH /api/lists/[list]/[id]': {
@@ -84,7 +97,7 @@ export const LISTS_CLASSES: ClassificationMap = {
   'POST /api/type-lists/vendor-assign': {
     class: 'change',
     describe: 'Set the vendor type of vendor {vendorId} to {vendorTypeId}',
-    why: 'Edits an existing vendor record (its type); nothing new is entered. Known leak: the answer is the whole vendor row and assignVendorType (lib/services/typeLists.ts) does not pass it through maskForContext, so the full tax ID (a sole proprietor\'s SSN) and the full account number come back to any caller. sensitiveFields only covers previews, stored requests and logs; until the service masks its answer, the bridge must mask it (maskForContext) before an agent sees it.',
+    why: 'Edits an existing vendor record (its type); nothing new is entered. The answer is the whole vendor row, masked by the service as the vendor screens are (assignVendorType passes it through maskForContext): the tax ID needs "view sensitive payroll data" and the account number "view full account numbers". No reveal: setting a type has no need of either, and a person or agent who does reads the vendor (vendors.get, with reveal). sensitiveFields keeps both out of previews, stored requests and logs.',
     sensitiveFields: ['taxId', 'accountNumber'],
   },
 
@@ -97,7 +110,7 @@ export const LISTS_CLASSES: ClassificationMap = {
   },
   'POST /api/custom-fields/values': {
     class: 'change',
-    describe: 'Set custom field values on {entity} {id}',
+    describe: 'Set the custom field values of record {id} ({entity})',
     why: 'Edits the custom field values of an existing customer, vendor, item or invoice; nothing new is entered.',
   },
 
@@ -126,14 +139,18 @@ export const LISTS_CLASSES: ClassificationMap = {
   'DELETE /api/currencies/home-currency-adjustment/[id]': {
     class: 'change',
     describe: 'Void home currency adjustment {id} and its reversal',
-    why: 'Voids, not deletes: the adjustment and both its entries stay, marked void.',
+    why:
+      'Voids, not deletes: the adjustment and both its entries stay, marked void. The amount is the size of the revaluation: the answer is the adjustment, ' +
+      'whose detail lists each account revalued with its gain or loss, and detail.*.gainLoss adds them up by size (its net total could be small while the lines are large). ' +
+      'After the dry run the bridge also counts the two entries the void marks void, and the amount is the larger of that sum and the total of the larger entry.',
+    amountField: 'detail.*.gainLoss',
   },
 
   // Dated notes on customers, vendors, employees and other names: never reach the ledger.
-  'GET /api/notes': { class: 'read', describe: 'List the notes on {entityType} {entityId}' },
+  'GET /api/notes': { class: 'read', describe: 'List the notes on record {entityId} ({entityType})' },
   'POST /api/notes': {
     class: 'prepare',
-    describe: 'Add a note to {entityType} {entityId}',
+    describe: 'Add a note to record {entityId} ({entityType})',
     why: 'A note on a record never reaches the books, and a person can delete it.',
     bodySchema: '@/lib/validation/lists#noteSchema',
   },
@@ -196,7 +213,8 @@ export const LISTS_CLASSES: ClassificationMap = {
   },
   'POST /api/billing-rate-levels/assign': {
     class: 'change',
-    describe: 'Set billing rate level {levelId} on employee {employeeId} / vendor {vendorId} / other name {otherNameId} (empty level clears it)',
+    describe:
+      'Set billing rate level {levelId} on one name (employee: {employeeId}, vendor: {vendorId}, other name: {otherNameId}; an empty level clears it)',
     why: 'Edits an existing employee, vendor or other name record (its billing rate level); nothing new is entered.',
   },
   'GET /api/billing-rate-levels/resolve': { class: 'read', describe: 'Look up the hourly rate billed for item {itemId}' },
@@ -205,7 +223,7 @@ export const LISTS_CLASSES: ClassificationMap = {
   'GET /api/uom-sets': { class: 'read', describe: 'List unit of measure sets' },
   'POST /api/uom-sets': {
     class: 'enter',
-    describe: 'Add unit of measure set {name}',
+    describe: 'Add a unit of measure set named {name}',
     bodySchema: '@/lib/validation/lists#uomSetSchema',
   },
   'GET /api/uom-sets/[id]': { class: 'read', describe: 'Show unit of measure set {id}' },
@@ -222,10 +240,14 @@ export const LISTS_CLASSES: ClassificationMap = {
   // Merge Entries and Clean Up Company Data: list entries go away for good.
   'POST /api/merge': {
     class: 'remove',
-    describe: 'Merge {type} {fromId} into {toId}',
+    describe: 'Merge {type} entry {fromId} into {toId}',
     why: 'Every transaction of the merged entry moves to the one kept and the merged entry is retired. There is no unmerge, so it is treated as a delete (plan section 8: merge is remove-like). It rewrites posted history: journal lines are re-pointed on every date under allowLedgerRewrite(\'merge\'), closed periods included, with no closing-date check.',
   },
-  'GET /api/cleanup': { class: 'read', describe: 'Preview the unused inactive list entries Clean Up would delete' },
+  'GET /api/cleanup': {
+    class: 'read',
+    describe: 'Preview the unused inactive list entries Clean Up would delete',
+    why: 'A File Utilities read that stays an ordinary read: it lists list entries of the books (names that are inactive and unused), never a file name, folder or backup, and it produces no file (plan 4.2: those File Utilities reads are class "file"; a check of the books may stay a read).',
+  },
   'POST /api/cleanup': {
     class: 'remove',
     id: 'cleanup.run',
@@ -262,7 +284,7 @@ export const LISTS_CLASSES: ClassificationMap = {
   },
   'POST /api/items/change-prices': {
     class: 'bulk',
-    describe: 'Change item prices by {value} ({adjustBy})',
+    describe: 'Change item prices by {value} (adjust by: {adjustBy})',
     why: 'Change Item Prices: one request reprices many items. itemIds names them; without it every item (of itemType, when given) is repriced, and the answer\'s "changed" says how many. dryRun: true only previews.',
     countField: 'itemIds',
     dryRun: 'preview',

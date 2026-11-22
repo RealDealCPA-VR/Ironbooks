@@ -1,41 +1,39 @@
 /**
- * The tools an agent gets: what a bookkeeper looks at before touching anything. All of them read;
- * none can change the books.
+ * The tools an agent gets, and first the reads: what a bookkeeper looks at before touching
+ * anything (READ_TOOLS). None of these reads can change the books.
  *
- * Each tool calls one of the routes Ironbooks lets an agent use
- * (lib/permissions/agentAccess.ts AGENT_READ_ROUTES) and trims the answer to what is useful, so an
- * agent does not spend its attention on internal fields. Conventions, the same in every tool:
+ * Each read calls one plain GET route and trims the answer to what is useful, so an agent does not
+ * spend its attention on internal fields. Whether the agent may read a route is decided by
+ * Ironbooks, not here: lib/permissions/agentAccess.ts agentRouteAllowed, with the operation
+ * registry (lib/agent/operations) and the agent's role. Conventions, the same in every tool:
  *
  *  - dates are YYYY-MM-DD; money is a string with two decimals ("1250.00"), never a float;
  *  - ids are the long ids other tools return (accounts, customers, vendors, journal entries);
  *  - a long answer is cut at `max_rows`, and says so, so the agent can narrow the question.
+ *
+ * TOOLS (at the end) adds the rest: the tools that change the books, the entry and report tools
+ * over the generic door, the generic door itself, and files.
  */
 import { ToolError } from './protocol.mjs';
 import { WRITE_READ_TOOLS, WRITE_TOOLS } from './write-tools.mjs';
 import { BANKING_READ_TOOLS, BANKING_WRITE_TOOLS } from './banking-tools.mjs';
+import { ENTRY_TOOLS } from './entry-tools.mjs';
+import { DATE_PRESETS, REPORT_TOOLS, TXN_TYPES, shapeReport } from './report-tools.mjs';
 import { OPERATION_TOOLS, REQUEST_TEMPLATE, REQUEST_URI_PREFIX, readRequestResource } from './operations-tools.mjs';
 import { FILE_TEMPLATE, FILE_TOOLS, FILE_URI_PREFIX, readFileResource } from './files-tools.mjs';
 import { GUIDE_PROMPT, GUIDE_PROMPT_NAME, GUIDE_RESOURCE, GUIDE_URI, guideContents, guidePrompt } from './guide.mjs';
+
+// The report shaping and the choices the reports share live with the report tools; kept
+// exported here for the callers and tests that import them from this file.
+export { DATE_PRESETS, TXN_TYPES, shapeReport };
 
 const DATE = { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', patternHint: 'must be a date as YYYY-MM-DD' };
 const ID = { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', patternHint: 'must be an id returned by another tool' };
 const MONEY = { type: 'string', pattern: '^\\d{1,13}(\\.\\d{1,2})?$', patternHint: 'must be an amount like 1250.00' };
 
-export const DATE_PRESETS = [
-  'today', 'this_week', 'this_month', 'this_month_to_date', 'last_month', 'this_quarter', 'this_quarter_to_date',
-  'last_quarter', 'this_year', 'this_year_to_date', 'last_year', 'this_fiscal_year', 'this_fiscal_year_to_date',
-  'last_fiscal_year', 'all',
-];
-
 export const OTHER_LISTS = [
   'terms', 'payment-methods', 'sales-tax-codes', 'sales-tax-items', 'other-names', 'ship-via', 'job-types',
   'customer-messages', 'vehicles',
-];
-
-export const TXN_TYPES = [
-  'invoice', 'payment', 'sales_receipt', 'credit_memo', 'refund', 'bill', 'bill_payment', 'bill_credit', 'check',
-  'deposit', 'transfer', 'paycheck', 'journal', 'inventory', 'item_receipt', 'build_assembly', 'depreciation',
-  'sales_tax_payment', 'cc_payment', 'expense_report', 'opening_balance', 'other',
 ];
 
 const MAX_ROWS = { type: 'integer', minimum: 1, maximum: 2000, description: 'Most rows to return (default 300). The answer says when it was cut.' };
@@ -67,42 +65,6 @@ function capped(rows, maxRows, key, hint) {
 }
 
 const asList = (v, key) => (Array.isArray(v) ? v : Array.isArray(v?.[key]) ? v[key] : []);
-
-/**
- * A standard report as Ironbooks returns it, made compact: column headers once, then each row as
- * its cells in column order, with its level and kind (section heading, line, subtotal, total).
- * @param {any} report
- * @param {number} [maxRows]
- * @returns {Record<string, any>}
- */
-export function shapeReport(report, maxRows) {
-  const columns = Array.isArray(report?.columns) ? report.columns : [];
-  const rows = (Array.isArray(report?.rows) ? report.rows : []).filter((r) => r && r.kind !== 'spacer');
-  const limit = maxRows ?? 300;
-  const out = {
-    report: report?.title ?? report?.key ?? 'Report',
-    ...(report?.subtitle ? { subtitle: report.subtitle } : {}),
-    ...(report?.basis ? { basis: report.basis } : {}),
-    ...(report?.range ? { period: report.range } : {}),
-    ...(typeof report?.balanced === 'boolean' ? { balanced: report.balanced } : {}),
-    columns: columns.map((c) => ({ name: c.header || c.key, ...(c.type ? { type: c.type } : {}) })),
-    row_count: rows.length,
-    rows: rows.slice(0, limit).map((r) => ({
-      kind: r.kind,
-      level: r.depth ?? 0,
-      cells: columns.map((c) => r.cells?.[c.key] ?? null),
-      ...(r.entryId ? { journal_entry_id: r.entryId } : {}),
-    })),
-  };
-  const notes = Array.isArray(report?.notes) ? report.notes.filter(Boolean) : [];
-  if (report?.truncated) notes.push('Ironbooks cut this report short. Use a shorter date range or a filter.');
-  if (rows.length > limit) {
-    out.truncated = true;
-    notes.push(`Showing the first ${limit} of ${rows.length} rows. Use a shorter date range, a filter, or a higher max_rows.`);
-  }
-  if (notes.length) out.notes = notes;
-  return out;
-}
 
 /** The date arguments of a period report: either a named period or from/to. */
 function periodQuery(a) {
@@ -461,20 +423,34 @@ export const READ_TOOLS = [
 ];
 
 /**
- * Every tool: the reads, the tools that change the books (mcp/write-tools.mjs, banking-tools.mjs),
- * then the generic door to every other operation (operations-tools.mjs) and files (files-tools.mjs).
+ * Every tool: the reads (with every standard report, report-tools.mjs), the tools that change the
+ * books (write-tools.mjs, banking-tools.mjs, and entry-tools.mjs over the generic door), then the
+ * generic door to every other operation (operations-tools.mjs) and files (files-tools.mjs).
+ * About 80 tools: clients slow down and models choose badly past about 100 (plan §6), so anything
+ * else is one find_operations away rather than a tool of its own.
  * @type {import('./protocol.mjs').Tool[]}
  */
-export const TOOLS = [...READ_TOOLS, ...WRITE_READ_TOOLS, ...BANKING_READ_TOOLS, ...WRITE_TOOLS, ...BANKING_WRITE_TOOLS, ...OPERATION_TOOLS, ...FILE_TOOLS];
+export const TOOLS = [
+  ...READ_TOOLS,
+  ...WRITE_READ_TOOLS,
+  ...BANKING_READ_TOOLS,
+  ...REPORT_TOOLS,
+  ...WRITE_TOOLS,
+  ...BANKING_WRITE_TOOLS,
+  ...ENTRY_TOOLS,
+  ...OPERATION_TOOLS,
+  ...FILE_TOOLS,
+];
 
 export const INSTRUCTIONS = [
   'Ironbooks is a desktop accounting system (a double-entry ledger, like QuickBooks Desktop). These tools work in one company\'s books. The full guide is the resource ironbooks://guide (also the prompt ironbooks_guide): read it before your first change.',
   'Start with get_company_info (which company, the closing date, who you are) and get_my_permissions (what you may do on your own, what a person must approve, what is not allowed).',
   'Before entering anything, look: use find_transactions or search to make sure it is not already there, and list_accounts, list_customers or list_vendors for the ids you need.',
-  'The named tools cover everyday bookkeeping. For anything else, find_operations, then describe_operation, then run_operation: every operation a person can do in Ironbooks has an id.',
+  'Every standard report (about 100) is list_reports, then run_report; report_drilldown lists the transactions behind an amount, and export_report makes the report a PDF or Excel file.',
+  'The named tools cover everyday bookkeeping: invoices, bills, payments, checks, deposits, estimates, purchase orders, receiving items, credit memos, vendor credits, time, inventory adjustments, sales tax, bank statements and reconciling. For anything else (1099s, paystubs, the audit trail, emailing a form, budgets …), find_operations, then describe_operation, then run_operation: every operation a person can do in Ironbooks has an id.',
   'Every tool that changes the books takes dry_run and request_id. dry_run true checks the change and shows what it would post, without keeping anything: use it whenever you are not sure. request_id is your own name for one change; asking again with the same request_id never does it twice, so repeat a request with the SAME request_id after a timeout, and use a NEW one for each new change.',
   'When an answer says "asked", a person must approve it in Ironbooks: call wait_for_decision with its request_id, and do not send it again. "needs_confirmation" is a warning a person would have been asked about: go ahead only if it is right, as the answer says. "Refused" means stop.',
-  'The named tools never delete: a mistake is voided (void_transaction) or corrected (edit_transaction). Deleting for good, closed-period work, sending anything outside this computer and settings always need a person. Dates are YYYY-MM-DD and amounts are text with two decimals ("1250.00").',
+  'The named tools never delete: a mistake is voided (void_transaction) or corrected (edit_transaction). Deleting for good, closed-period work and settings always need a person; sending anything outside this computer does too, unless a person gave you a short standing permission for it. Dates are YYYY-MM-DD and amounts are text with two decimals ("1250.00").',
   'Never ask the person for a password, code or key, and never send one: when an operation needs one, the person types it on their own screen.',
   'If a tool says Ironbooks is not ready, the person needs to open the company file in Ironbooks and sign in. If Ironbooks stops answering, it may be restarting: wait a minute, then read what you need again.',
 ].join(' ');

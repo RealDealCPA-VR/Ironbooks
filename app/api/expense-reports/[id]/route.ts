@@ -12,6 +12,17 @@ import { getServerContext } from '@/lib/context';
 import { getReport, submitReport, approveAndReimburse } from '@/lib/services/expenseReports';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { expenseReportActionSchema } from '@/lib/validation/expenseReports';
+
+/**
+ * The POST body as agents read it described (lib/validation/expenseReports.ts). Called once the
+ * action is known, so it refuses nothing the handler let through.
+ */
+function checkActionBody(body: unknown): void {
+  const checked = expenseReportActionSchema.safeParse(body);
+  if (!checked.success) throw bodyValidationError(checked.error);
+}
 
 function errorResponse(err: unknown, prefix = 'expense-reports') {
   if (err instanceof ServiceError) {
@@ -47,11 +58,13 @@ export async function POST(
     const action = body?.action;
 
     if (action === 'submit') {
+      checkActionBody(body);
       const updated = await submitReport(ctx, id);
       return NextResponse.json(updated);
     }
 
     if (action === 'reimburse') {
+      checkActionBody(body);
       const bankAccountId = typeof body.bankAccountId === 'string' && body.bankAccountId ? body.bankAccountId : null;
       const updated = await approveAndReimburse(ctx, id, { bankAccountId });
       return NextResponse.json(updated);

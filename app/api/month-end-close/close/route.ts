@@ -12,18 +12,14 @@ import { getServerContext } from '@/lib/context';
 import { invalidJsonBody, readJsonObject, routeError } from '@/lib/routeErrors';
 import { closeMonth } from '@/lib/services/monthEndClose';
 import { zodErrorBody } from '@/lib/validation/helpers';
-import { zCurrentClosingPassword } from '@/lib/validation/company';
-import { monthEndCloseSchema } from '@/lib/validation/monthEndClose';
-
-/** The month-end body plus the current closing-date password (still strict: nothing else). */
-const closeBodySchema = monthEndCloseSchema.extend({ currentPassword: zCurrentClosingPassword });
+import { monthEndCloseBodySchema } from '@/lib/validation/monthEndClose';
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const body = await readJsonObject(req);
     if (!body) return invalidJsonBody();
-    const parsed = closeBodySchema.safeParse(body);
+    const parsed = monthEndCloseBodySchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     return NextResponse.json(await closeMonth(ctx, parsed.data));
   } catch (err) {

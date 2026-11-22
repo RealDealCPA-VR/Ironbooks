@@ -32,10 +32,13 @@ export const LOG_LEVELS = ['debug', 'info', 'notice', 'warning', 'error', 'criti
  *
  * @typedef {{ name: string, title?: string, description: string, inputSchema: object,
  *   changes?: boolean, destructive?: boolean,
- *   handler: (args: Record<string, any>, client: any, session: Session) => Promise<unknown> }} Tool
+ *   handler: (args: Record<string, any>, client: any, session: Session) => Promise<unknown>,
+ *   refused?: (args: unknown, problem: string) => void }} Tool
  *
  * `changes`: the tool can change the books or the disk (every such change can be repeated safely
  * with its request id). `destructive`: it voids, makes something inactive, or may remove something.
+ * `refused`: told when the arguments were refused by the input schema, before the handler runs, so
+ * a tool that logs every refusal (attach_local_file) logs those too.
  *
  * @typedef {{ list: () => object[], templates?: () => object[],
  *   read: (uri: string, client: any) => Promise<object[] | null> }} Resources
@@ -286,7 +289,14 @@ export function createServer(opts) {
       /** @param {string} text @param {boolean} isError */
       const text = (text, isError) => ok(id, { content: [{ type: 'text', text }], isError });
       const problem = argumentProblem(tool.inputSchema, args);
-      if (problem) return text(problem, true);
+      if (problem) {
+        try {
+          tool.refused?.(args, problem);
+        } catch {
+          // A log that cannot be written changes nothing about the answer.
+        }
+        return text(problem, true);
+      }
       try {
         const result = await tool.handler(/** @type {Record<string, any>} */ (args), opts.client, session);
         if (result instanceof ToolContent) return ok(id, { content: result.content, isError: false });
@@ -310,18 +320,110 @@ export function createServer(opts) {
 }
 
 /**
+ * The longest message read, in characters. The largest a tool takes is upload_file with a file at
+ * the 50 MB cap, base64 encoded with line breaks (files-tools.mjs BASE64_MAX_CHARS, about 72
+ * million); a longer line is not read into memory at all, and gets an error.
+ */
+export const MAX_MESSAGE_CHARS = 96 * 1024 * 1024;
+
+/**
+ * How much of a line too long to read is kept: enough to find the id it is answered with (a
+ * client writes "jsonrpc", "id" and "method" before the long params), never the long part.
+ */
+export const HEAD_CHARS = 512;
+
+/** Index just past the end of the JSON string that starts at `i`, or -1 when it does not end in `s`. */
+function stringEnd(/** @type {string} */ s, /** @type {number} */ i) {
+  for (let j = i + 1; j < s.length; j++) {
+    if (s[j] === '\\') j++;
+    else if (s[j] === '"') return j + 1;
+  }
+  return -1;
+}
+
+/**
+ * The id of a JSON-RPC message from the start of its line (the rest was too long to read), or
+ * null when the start does not hold the whole of a top-level "id" (an "id" inside params is not
+ * it). Only a string or a number, as JSON-RPC allows.
+ * @param {string} head
+ * @returns {string | number | null}
+ */
+export function idFromHead(head) {
+  let depth = 0;
+  let wantKey = false;
+  for (let i = 0; i < head.length; ) {
+    const ch = head[i];
+    if (ch === '"') {
+      if (depth === 0) return null;
+      const end = stringEnd(head, i);
+      if (end < 0) return null;
+      if (depth === 1 && wantKey) {
+        wantKey = false;
+        let key;
+        try {
+          key = JSON.parse(head.slice(i, end));
+        } catch {
+          return null;
+        }
+        const colon = /^\s*:\s*/.exec(head.slice(end));
+        if (!colon) return null;
+        i = end + colon[0].length;
+        if (key !== 'id') continue;
+        // The whole value, and something after it: a number at the very end may be cut short.
+        const m = /^("(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*[,}]/.exec(head.slice(i));
+        if (!m) return null;
+        try {
+          const id = JSON.parse(m[1]);
+          return typeof id === 'string' || (typeof id === 'number' && Number.isFinite(id)) ? id : null;
+        } catch {
+          return null;
+        }
+      }
+      i = end;
+      continue;
+    }
+    if (ch === '{' || ch === '[') {
+      if (depth === 0 && ch !== '{') return null;
+      depth++;
+      if (depth === 1) wantKey = true;
+    } else if (ch === '}' || ch === ']') {
+      depth--;
+      if (depth <= 0) return null;
+    } else if (ch === ',') {
+      if (depth === 1) wantKey = true;
+    } else if (depth === 0 && !/\s/.test(ch)) {
+      return null;
+    }
+    i++;
+  }
+  return null;
+}
+
+/**
  * Serve messages from a readable stream of newline-delimited JSON, writing responses (and the
  * server's own notifications) to a writable stream. Resolves when the input ends.
+ *
+ * Each chunk is searched for line ends on its own, and the pieces of a line are joined once, when
+ * it ends: a long line (a large upload arrives as one line of tens of megabytes, in chunks of a
+ * few kilobytes) is never searched or copied again with every chunk.
  * @param {{ handle: (msg: any) => Promise<object | null>, connect?: (send: (message: object) => void) => void }} server
  * @param {{ input: NodeJS.ReadableStream, output: NodeJS.WritableStream }} io
+ * @param {{ maxMessageChars?: number }} [opts]
  */
-export function serve(server, io) {
+export function serve(server, io, opts = {}) {
+  const maxChars = opts.maxMessageChars ?? MAX_MESSAGE_CHARS;
   /** @param {object} response */
   const send = (response) => {
     io.output.write(`${JSON.stringify(response)}\n`);
   };
   server.connect?.(send);
-  let buffer = '';
+  /** The pieces of the line not ended yet, and how long they are together. */
+  let pieces = /** @type {string[]} */ ([]);
+  let piecesLength = 0;
+  /** The line now arriving is too long: its pieces are dropped until it ends. */
+  let tooLong = false;
+  /** The first HEAD_CHARS of the line now arriving, kept even when it is too long, for its id. */
+  let head = '';
   /** Requests still being answered: the process must not exit before they are. */
   let pending = Promise.resolve();
   /** @param {string} line */
@@ -345,19 +447,51 @@ export function serve(server, io) {
       });
     pending = pending.then(() => work);
   };
+  /** Keep one piece of the line now arriving, unless that makes it too long. */
+  const keep = (/** @type {string} */ piece) => {
+    if (!piece) return;
+    if (head.length < HEAD_CHARS) head += piece.slice(0, HEAD_CHARS - head.length);
+    if (tooLong) return;
+    if (piecesLength + piece.length > maxChars) {
+      tooLong = true;
+      pieces = [];
+      piecesLength = 0;
+      return;
+    }
+    pieces.push(piece);
+    piecesLength += piece.length;
+  };
+  /**
+   * The line now arriving has ended: answer it, or say it was too long, under the id its start
+   * names (null when it names none), so the client's own call gets the error instead of waiting.
+   */
+  const endLine = () => {
+    const start = head;
+    head = '';
+    if (tooLong) {
+      tooLong = false;
+      send({ jsonrpc: '2.0', id: idFromHead(start.trimStart()), error: { code: ERR_INVALID_REQUEST, message: `Message too large: at most ${maxChars} characters.` } });
+      return;
+    }
+    const line = pieces.length === 1 ? pieces[0] : pieces.join('');
+    pieces = [];
+    piecesLength = 0;
+    onLine(line);
+  };
   return new Promise((resolve) => {
     io.input.setEncoding('utf8');
-    io.input.on('data', (chunk) => {
-      buffer += chunk;
+    io.input.on('data', (/** @type {string} */ chunk) => {
+      let start = 0;
       let nl;
-      while ((nl = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, nl);
-        buffer = buffer.slice(nl + 1);
-        onLine(line);
+      while ((nl = chunk.indexOf('\n', start)) >= 0) {
+        keep(chunk.slice(start, nl));
+        endLine();
+        start = nl + 1;
       }
+      keep(chunk.slice(start));
     });
     io.input.on('end', () => {
-      if (buffer.trim()) onLine(buffer);
+      if (tooLong || pieces.length) endLine();
       pending.then(() => resolve(undefined));
     });
   });

@@ -18,18 +18,25 @@
  *  - A bulk route that enters one invoice per customer or order lists each invoice's total in its
  *    answer, and a '*' path adds them up (created.*.total, results.*.total, assessed.*.charge), so
  *    two-person approval and a grant's maxAmount see the whole run. Each posts one ledger entry per
- *    invoice, and without the '*' path the bridge would judge the run by its largest single invoice.
- *    The Income Tracker's 'convert' answers no totals, so it alone still has that gap; its "why" says so.
+ *    invoice, and with an amountField the bridge compares the field only with the largest single
+ *    entry, so the field must be the whole run's. The Income Tracker's 'convert' answers no totals
+ *    and names no amountField, so after its dry run the bridge adds up every entry it posted.
  *  - Every GET here only reads. Two of them (GET /api/customers/bulk and GET /api/payments/discounts)
  *    reach ensureSeeded (lists/simpleLists.ts: the Terms and Sales Tax Code defaults), which saves
  *    nothing for a read-only context such as an agent's read; each says so in its "why".
  *  - Amounts, the same rule in every bucket: amountField names the money the route's ANSWER carries
  *    (lib/agent/facts.ts takes the larger of the body's and the answer's figure). A request with no
  *    amount counts as over every amount limit (policy.ts: the grant maxAmount check and
- *    needsTwoPerson) until its dry run. After it the bridge (lib/agent/bridge.ts factsFor) takes the
- *    larger of that figure and the largest SINGLE ledger entry the run posted (with no amountField,
- *    the entry alone). One entry is the true size of a request that posts one, and only the largest
- *    row of one that posts an entry per row.
+ *    needsTwoPerson) until its dry run. After it the bridge (lib/agent/bridge.ts factsFor) reads the
+ *    run's whole ledger: the entries it posted, and the entries already in the books that it
+ *    voided, deleted or changed in place (a void posts nothing new, but its entry counts at its
+ *    total). With an amountField the amount is the larger of that field and the largest SINGLE one
+ *    of those entries; with none it is all of them added up, and "0.00" for a run that posted and
+ *    touched no entry.
+ *  - Confirmation flags: the sales receipt and payment body schemas carry allowReconciledEdit (and
+ *    the payment one removeFromDeposit) because one schema serves the new record and the edit, but
+ *    only the edit asks for them (updateSalesReceipt, updatePayment; a new record has no reconciled
+ *    lines and is in no deposit yet), so they are listed on the PUT and PATCH entries alone.
  *  - `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
  *    ".post" or a word that misleads, with a short verb: customers.bulk.save, invoices.post-draft.
  */
@@ -216,7 +223,7 @@ export const SALES_CLASSES: ClassificationMap = {
   },
   'POST /api/estimates/[id]': {
     class: 'change',
-    describe: 'Estimate {id}: {action} (make an invoice from it, progress-bill it, or void it)',
+    describe: 'Make an invoice from estimate {id}, progress-bill it, or void it (action: {action})',
     why:
       "One door for 'convert' and 'progress' (a new invoice from the estimate) and 'void'; classed by its riskiest " +
       "action, voiding. 'convert' answers with the new invoice and 'void' with the estimate, both with a total; " +
@@ -256,7 +263,7 @@ export const SALES_CLASSES: ClassificationMap = {
   },
   'POST /api/sales-orders/[id]': {
     class: 'change',
-    describe: 'Sales order {id}: {action} (make an invoice from it, or set its status)',
+    describe: 'Make an invoice from sales order {id}, or set its status (action: {action})',
     why:
       "One door for 'convert' (a new invoice from the order) and 'status' (close, reopen or void the order); " +
       "classed by its riskiest action, changing or voiding the order. 'convert' answers with the new invoice and " +
@@ -324,12 +331,13 @@ export const SALES_CLASSES: ClassificationMap = {
   'POST /api/payments': {
     class: 'enter',
     describe: 'Receive a payment of {amount} from customer {customerId}',
+    why: "The amount is the cash received (the body's amount, which the route saves; the answer is { payment, entry }). Credits applied in the same save (credit memos, earlier payments, General Journal credits) are not counted: the answer holds no total of them and applying them posts no new entry, so a $1 payment that applies a $50,000 credit is judged at $1 by the two-person rule and a grant's maxAmount. Closing that needs a total of the credits in the answer, as Pay Bills answers creditsApplied.",
     amountField: 'amount',
   },
   'GET /api/payments/[id]': { class: 'read', describe: 'Show payment {id}' },
   'POST /api/payments/[id]': {
     class: 'change',
-    describe: 'Payment {id}: {action} (apply, unapply, refund or record a bounced check)',
+    describe: 'Apply, unapply or refund payment {id}, or record it as a bounced check (action: {action})',
     why: "One door for 'apply' and 'unapply' (applying credit to invoices), 'refund' (a refund paid from a bank account) and 'bounce' (Record Bounced Check). All of them change an existing payment and what it pays. 'amount' is in the body for 'refund' (and a partial 'unapply'); 'apply' (applications[].amountApplied) and 'bounce' (bankFee, customerFee) have none, and a missing amount counts as over every amount limit.",
     amountField: 'amount',
   },
@@ -365,7 +373,7 @@ export const SALES_CLASSES: ClassificationMap = {
   'POST /api/payments/journal-items': {
     class: 'change',
     id: 'payments.journal-items.apply',
-    describe: 'General Journal items: {action} for a customer',
+    describe: "Apply or unapply a customer's General Journal credits and payments (action: {action})",
     why: "Applies (or unapplies) an existing General Journal credit or payment to invoices or General Journal charges. It creates no new transaction. 'amount' is in the body for 'apply_credit' only; 'apply_payment' (items[].amount) and 'unapply' have none, and a missing amount counts as over every amount limit.",
     amountField: 'amount',
   },
@@ -381,7 +389,7 @@ export const SALES_CLASSES: ClassificationMap = {
   'GET /api/credit-memos/[id]': { class: 'read', describe: 'Show credit memo {id}' },
   'POST /api/credit-memos/[id]': {
     class: 'change',
-    describe: 'Credit memo {id}: {action} (apply to an invoice, refund, or unapply)',
+    describe: 'Apply credit memo {id} to an invoice, refund it, or unapply it (action: {action})',
     why: "One door for 'apply' and 'unapply' (applying the credit to an invoice) and 'refund' (paying the credit back from a bank account). All of them change what the existing credit memo is used for.",
     amountField: 'amount',
   },
@@ -445,8 +453,8 @@ export const SALES_CLASSES: ClassificationMap = {
   'GET /api/income-tracker': { class: 'read', describe: 'Show the Income Tracker' },
   'POST /api/income-tracker/actions': {
     class: 'outside',
-    describe: 'Income Tracker: {action} the selected rows',
-    why: "One door for 'email' (emails each selected form), 'queue_print' and 'queue_email' (marks forms to send later) and 'convert' (one invoice per estimate, sales order or customer's unbilled time). Classed by its riskiest action, the email. No amountField: 'convert' answers with done and failed lists and no totals, so nothing can add them up. It posts one ledger entry per invoice, so after the dry run the two-person rule and a grant's maxAmount see only the largest single invoice, not the total; the bulk cap still limits how many.",
+    describe: 'Email, queue or convert the selected Income Tracker rows (action: {action})',
+    why: "One door for 'email' (emails each selected form), 'queue_print' and 'queue_email' (marks forms to send later) and 'convert' (one invoice per estimate, sales order or customer's unbilled time). Classed by its riskiest action, the email. No amountField: 'convert' answers with done and failed lists and no totals, so nothing can add them up. It posts one ledger entry per invoice, and after the dry run the bridge adds up every entry posted, so the two-person rule and a grant's maxAmount see the whole run, not its largest invoice; the bulk cap limits how many.",
     effects: ['email'],
     countField: 'items',
     confirmFlags: ['overrideCreditLimit'],
@@ -461,7 +469,7 @@ export const SALES_CLASSES: ClassificationMap = {
   },
   'POST /api/collections/email': {
     class: 'outside',
-    describe: 'Email customer {customerId} their overdue {what} (to {to} when given)',
+    describe: 'Email customer {customerId} a collection reminder with their overdue {what} (to {to} when given)',
     why: 'Emails the overdue invoices or a statement, then records the contact.',
     effects: ['email'],
   },
@@ -499,7 +507,7 @@ export const SALES_CLASSES: ClassificationMap = {
   'POST /api/sales-forms/queue': {
     class: 'outside',
     id: 'sales-forms.queue.run',
-    describe: 'Print Forms / Send Forms: {action} for the selected forms',
+    describe: 'Email the selected forms, or mark them printed (Print Forms / Send Forms, action: {action})',
     why: "One door for 'send_emails' (emails every selected form) and 'mark_printed' (clears their \"to be printed\" mark). Classed by its riskiest action, the email.",
     effects: ['email'],
     countField: 'items',

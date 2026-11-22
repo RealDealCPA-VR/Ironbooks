@@ -2,7 +2,7 @@
  * Zod schemas for /api/credit-memos — mirrors CreateCreditMemoInput / CreditMemoLineInput.
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLenient, zLines, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
 import { sendFlagFields, customerMessageField } from './sales';
 
@@ -62,3 +62,38 @@ export const createCreditMemoSchema = z.object({
   ...customerMessageField,
 });
 export type CreateCreditMemoBody = z.infer<typeof createCreditMemoSchema>;
+
+/**
+ * POST /api/credit-memos/:id — apply the credit to an invoice, refund it, or undo one application.
+ *
+ * The route reads this body by hand, and its own checks answer first with the messages they always
+ * gave. The schema is checked after them: it says what each field is, for agents (plan §6.3), and
+ * refuses only a value the service could not use anyway (an id that is not text, an amount that is
+ * not a number). Fields the handler converts or checks itself are zLenient, so what the route
+ * accepts is unchanged.
+ */
+const creditAmount = z
+  .union([z.string(), z.number()], { invalid_type_error: 'must be an amount' })
+  .describe('Amount of the credit used, as decimal text such as "125.00"; at most what is left on the credit memo.');
+
+export const creditMemoActionSchema = z.discriminatedUnion('action', [
+  z.object({
+    action: z.literal('apply').describe("apply: use the credit to pay one of the customer's open invoices."),
+    invoiceId: z.string().min(1).describe("Id of the customer's open invoice the credit pays."),
+    amount: creditAmount,
+    date: zLenient(z.string().nullable()).describe(
+      "Date of the application, YYYY-MM-DD; leave out to date it on the later of the credit memo's and the invoice's dates.",
+    ),
+  }),
+  z.object({
+    action: z.literal('refund').describe('refund: pay the credit back to the customer from a bank account.'),
+    bankAccountId: z.string().min(1).describe('Id of the bank or cash account the refund is paid from (chart of accounts), in the home currency.'),
+    amount: creditAmount,
+    date: zLenient(z.string().nullable()).describe('Date of the refund, YYYY-MM-DD; leave out for today.'),
+    memo: zLenient(z.string().nullable()).describe('Memo saved with the refund; leave out for none.'),
+  }),
+  z.object({
+    action: z.literal('unapply').describe('unapply: undo one earlier application of this credit memo.'),
+    applicationId: z.string().min(1).describe('Id of the application to undo (GET /api/credit-memos/:id, applications).'),
+  }),
+]);

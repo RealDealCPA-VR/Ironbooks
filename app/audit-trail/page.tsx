@@ -184,9 +184,21 @@ function JsonDiff({ label, value }: { label: string; value: unknown }) {
 // Expandable row component
 // ---------------------------------------------------------------------------
 
-function AuditRow({ row, entityLabels }: { row: AuditLogRow; entityLabels: LabelMap }) {
-  const [expanded, setExpanded] = useState(false);
-  const [detail, setDetail] = useState<AuditLogRow | null>(null);
+function AuditRow({
+  row,
+  entityLabels,
+  startOpen = false,
+  focused = false,
+}: {
+  row: AuditLogRow;
+  entityLabels: LabelMap;
+  /** Open from the start: `row` is the full entry (from the detail endpoint). */
+  startOpen?: boolean;
+  /** The entry the address names (?id=): marked so the eye finds it. */
+  focused?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(startOpen);
+  const [detail, setDetail] = useState<AuditLogRow | null>(startOpen ? row : null);
   const [loading, setLoading] = useState(false);
 
   async function toggleExpand() {
@@ -222,8 +234,10 @@ function AuditRow({ row, entityLabels }: { row: AuditLogRow; entityLabels: Label
   return (
     <>
       <Tr
-        className="cursor-pointer select-none"
+        className={`cursor-pointer select-none${focused ? ' bg-electric/5' : ''}`}
         onClick={toggleExpand}
+        data-audit-row={row.id}
+        data-focused={focused ? 'true' : undefined}
       >
         <Td className="w-6 pr-0">
           {expanded ? (
@@ -326,6 +340,42 @@ export default function AuditTrailPage() {
 
   // Human labels for entity references (entityType:entityId -> document number / name).
   const [entityLabels, setEntityLabels] = useState<LabelMap>(new Map());
+
+  // The entry an address names (?id=, e.g. the Agents tab's Activity links): opened at the top,
+  // expanded and scrolled to, above the whole trail. Not found (or not one this person may see):
+  // said once, and the trail is shown as usual. Any other failure (a dropped connection, a server
+  // error) is said in its own words with Try again, never as "not found", since the entry may well
+  // be there. A row of the trail is marked only once the entry itself has loaded.
+  const [focusId, setFocusId] = useState<string | null>(null);
+  const [focused, setFocused] = useState<AuditLogRow | null>(null);
+  const [focusMissing, setFocusMissing] = useState(false);
+  const [focusError, setFocusError] = useState('');
+  const [focusTry, setFocusTry] = useState(0);
+
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get('id');
+    if (!id) return;
+    setFocusId(id);
+    setFocusError('');
+    let cancelled = false;
+    api
+      .get<AuditLogRow>(`/api/audit-trail/${encodeURIComponent(id)}`)
+      .then((r) => {
+        if (!cancelled) setFocused(r);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        if (err instanceof ApiError && (err.status === 404 || err.status === 403)) setFocusMissing(true);
+        else setFocusError(err instanceof Error && err.message ? err.message : 'Something went wrong');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [focusTry]);
+
+  useEffect(() => {
+    if (focused) document.querySelector('[data-audit-focus]')?.scrollIntoView({ block: 'start' });
+  }, [focused]);
 
   // Filters
   const [filterAction, setFilterAction] = useState('');
@@ -466,6 +516,52 @@ export default function AuditTrailPage() {
         </div>
       </Card>
 
+      {/* ---- The entry the address names (?id=) ---- */}
+      {focusId && (focused || focusMissing || focusError) && (
+        <Card className="mb-6" data-audit-focus={focusId}>
+          <div className="flex items-center justify-between gap-2 px-4 pt-4">
+            <p className="text-sm font-semibold text-navy">
+              {focused ? 'The entry you opened' : focusMissing ? 'Entry not found' : 'The entry could not be opened'}
+            </p>
+            <div className="flex gap-2">
+              {!focused && !focusMissing && (
+                <Button variant="secondary" size="sm" onClick={() => setFocusTry((n) => n + 1)}>
+                  Try again
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setFocusId(null);
+                  setFocused(null);
+                  setFocusMissing(false);
+                  setFocusError('');
+                  window.history.replaceState(null, '', window.location.pathname);
+                }}
+              >
+                Close
+              </Button>
+            </div>
+          </div>
+          {focused ? (
+            <Table>
+              <tbody>
+                <AuditRow row={focused} entityLabels={entityLabels} startOpen focused />
+              </tbody>
+            </Table>
+          ) : focusMissing ? (
+            <p className="px-4 pb-4 pt-1 text-sm text-navy/60">
+              That entry is not in this company&apos;s audit trail, or it is about records you may not see. The whole trail is below.
+            </p>
+          ) : (
+            <p className="px-4 pb-4 pt-1 text-sm text-red-600" data-audit-focus-error="">
+              {focusError} Try again, or find the entry in the trail below.
+            </p>
+          )}
+        </Card>
+      )}
+
       {/* ---- Table ---- */}
       <Card>
         {loading ? (
@@ -493,7 +589,7 @@ export default function AuditTrailPage() {
               </thead>
               <tbody>
                 {rows.map((row) => (
-                  <AuditRow key={row.id} row={row} entityLabels={entityLabels} />
+                  <AuditRow key={row.id} row={row} entityLabels={entityLabels} focused={focused !== null && row.id === focused.id} />
                 ))}
               </tbody>
             </Table>

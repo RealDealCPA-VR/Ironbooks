@@ -11,29 +11,13 @@
  * exports always match the on-screen filters exactly.
  */
 import { type NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getServerContext } from '@/lib/context';
 import { getCompany } from '@/lib/services/company';
 import { ServiceError } from '@/lib/services/_base';
 import { buildXlsx, type XlsxCell } from '@/lib/export/xlsx';
 import { buildReportPdf } from '@/lib/export/reportPdf';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
-
-const cellSchema = z.union([z.string(), z.number(), z.null()]);
-
-const bodySchema = z.object({
-  format: z.enum(['xlsx', 'pdf']),
-  filename: z.string().min(1).max(120),
-  title: z.string().min(1).max(200),
-  subtitle: z.string().max(300).optional(),
-  columns: z
-    .array(z.object({ header: z.string().max(120), numeric: z.boolean().optional() }))
-    .min(1)
-    .max(64),
-  rows: z.array(z.array(cellSchema)).max(50_000),
-  totals: z.array(z.array(cellSchema)).max(200).optional(),
-  landscape: z.boolean().optional(),
-});
+import { exportReportSchema } from '@/lib/validation/reports';
 
 /** Strip path separators / control chars so the filename is download-safe. */
 function safeFilename(name: string, ext: string): string {
@@ -57,7 +41,7 @@ function attachment(name: string, ext: string): string {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = bodySchema.safeParse(await requireJsonObject(req));
+    const parsed = exportReportSchema.safeParse(await requireJsonObject(req));
     if (!parsed.success) {
       return NextResponse.json(
         { error: `Invalid export payload: ${parsed.error.issues[0]?.message ?? 'bad request'}` },

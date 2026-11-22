@@ -55,6 +55,13 @@ export interface NavLink {
   qb?: string;
   /** Extra words people might search for. */
   keywords?: string;
+  /**
+   * 'agents': the page is on the menu only while the company has an agent ("Agent requests"). The
+   * sidebar hides it otherwise (components/AppShell.tsx puts it in hiddenPaths). A search list
+   * still finds it unless hiddenPaths hides it or `hasAgents: false` is passed; a strict match
+   * (the top hit acted on, "go to …") finds it only with searchPages' `hasAgents: true`.
+   */
+  shownWith?: 'agents';
 }
 export interface NavGroup {
   heading: string;
@@ -69,6 +76,8 @@ export type NavMode = 'simple' | 'advanced';
  * (components/AppShell.tsx adds it to the hidden paths) and shows the count waiting for this person.
  */
 const AGENT_REQUESTS_KEYWORDS = 'agents approve approval waiting asked deny';
+/** Users & Roles > Agents, where an agent is connected: what a hidden "Agent requests" points to. */
+const AGENTS_TAB_WORDS = 'Users & Roles > Agents';
 
 export const navGroups: NavGroup[] = [
   {
@@ -76,7 +85,7 @@ export const navGroups: NavGroup[] = [
     links: [
       { icon: PieChart, label: 'Home', path: '/dashboard', qb: 'Home page', keywords: 'dashboard start overview' },
       { icon: Inbox, label: 'Needs attention', path: '/attention', qb: 'Company Snapshot alerts', keywords: 'inbox alerts urgent caught up' },
-      { icon: Bot, label: 'Agent requests', path: '/agent-requests', keywords: AGENT_REQUESTS_KEYWORDS }, // agent full access (shown while the company has an agent)
+      { icon: Bot, label: 'Agent requests', path: '/agent-requests', keywords: AGENT_REQUESTS_KEYWORDS, shownWith: 'agents' }, // agent full access
       { icon: ClipboardCheck, label: 'To Do list', path: '/todos', qb: 'To Do List', keywords: 'task reminder call follow up' },
     ],
   },
@@ -255,7 +264,7 @@ export const simpleNavGroups: NavGroup[] = [
     links: [
       { icon: Home, label: 'Home', path: '/dashboard', qb: 'Home page', keywords: 'dashboard start' },
       { icon: Inbox, label: 'Needs attention', path: '/attention', qb: 'Company Snapshot alerts', keywords: 'inbox alerts urgent caught up' },
-      { icon: Bot, label: 'Agent requests', path: '/agent-requests', keywords: AGENT_REQUESTS_KEYWORDS }, // agent full access (shown while the company has an agent)
+      { icon: Bot, label: 'Agent requests', path: '/agent-requests', keywords: AGENT_REQUESTS_KEYWORDS, shownWith: 'agents' }, // agent full access
       { icon: ScanLine, label: 'Receipts', path: '/receipts', qb: 'Doc Center (receipts)', keywords: 'receipt photo scan snap phone' },
     ],
   },
@@ -382,6 +391,30 @@ export function visibleNavGroups(
     .filter((g) => g.links.length > 0);
 }
 
+/**
+ * Pages on the menu only while the company has an agent (NavLink.shownWith 'agents'). The menus'
+ * data does not know whether it has one: a window learns it from its count poll
+ * (components/AgentRequestsBadge.tsx), and server code counts the company's agents itself
+ * (lib/services/agents.ts agentCount). Either passes it to searchPages as `hasAgents`.
+ */
+export const AGENT_ONLY_PATHS: ReadonlySet<string> = new Set(
+  [...navGroups, ...simpleNavGroups].flatMap((g) => g.links.filter((l) => l.shownWith === 'agents').map((l) => l.path)),
+);
+
+/**
+ * Why a page this window hides is not on, in the person's words, with where to go next (the
+ * command bar says it when a command leads to one). Only "Agent requests" is hidden for want of an
+ * agent; every other hidden page is a feature switched off in Preferences.
+ */
+export function hiddenPageNotice(path: string): { heading: string; body: string } {
+  const base = path.split('?')[0].split('#')[0];
+  if (AGENT_ONLY_PATHS.has(base)) {
+    // Not "no agent is connected": the window may simply not have heard from the server yet.
+    return { heading: 'Agent requests are not shown yet', body: `Agent requests appear once an agent is connected (${AGENTS_TAB_WORDS}).` };
+  }
+  return { heading: 'That feature is turned off', body: 'Turn it on in Preferences to use it.' };
+}
+
 /** Pages that exist but are intentionally not in the sidebar. */
 export const EXTRA_DESTINATIONS: { label: string; href: string }[] = [
   { label: 'Budgets', href: '/budgets' },
@@ -487,13 +520,24 @@ export function searchPages(
      * (used where the top hit is acted on without a list to pick from, e.g. "go to …").
      */
     strict?: boolean;
+    /**
+     * The company has an agent (a window's count poll, components/AgentRequestsBadge.tsx; on the
+     * server, agentCount in lib/services/agents.ts). true: the pages shown only then
+     * (AGENT_ONLY_PATHS) are found; false: they are not. Left out, a list still offers them (its
+     * caller hides what is off with hiddenPaths), but a strict match never lands on one: a caller
+     * that acts on the top hit without saying, such as the server's command bar
+     * (lib/services/commandBar.ts), must not open a page that is not on. Fail closed.
+     */
+    hasAgents?: boolean;
   } = {},
 ): PageSearchResult[] {
   const q = query.trim().toLowerCase();
   if (!q) return [];
   const limit = opts.limit ?? 8;
+  const agentPagesOn = opts.hasAgents ?? !opts.strict;
   const allowed = (path: string) => {
     const base = path.split('?')[0].split('#')[0];
+    if (!agentPagesOn && AGENT_ONLY_PATHS.has(base)) return false;
     return !opts.hiddenPaths?.has(base) && canSeePath(base, opts.permissions);
   };
   const out: PageSearchResult[] = [];

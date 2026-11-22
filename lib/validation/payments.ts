@@ -161,3 +161,47 @@ export const bouncedCheckSchema = z.object({
   customerFeeAccountId: zUuid.nullish().describe('Id of the income account the customer fee posts to (chart of accounts).'),
   memo: z.string().nullish().describe('Note saved with the bounced check record.'),
 });
+
+/**
+ * POST /api/payments/journal-items — General Journal A/R items of a customer in Receive Payments
+ * (QB invariant I11): apply a General Journal credit, apply an earlier payment's unapplied credit
+ * to General Journal charges, or take one application off again.
+ */
+export const paymentJournalItemsSchema = z.discriminatedUnion('action', [
+  z.object({
+    action: z
+      .literal('apply_credit')
+      .describe('apply_credit: apply a General Journal credit of this customer to an invoice or to a General Journal charge.'),
+    journalLineId: zUuid.describe('Id of the General Journal line that holds the credit (from GET /api/payments/journal-items, credits).'),
+    /** The invoice to apply the credit to — or `chargeLineId`, a General Journal charge (P1). */
+    invoiceId: zUuid.nullish().describe("Id of the customer's open invoice the credit pays; send exactly one of invoiceId and chargeLineId."),
+    chargeLineId: zUuid
+      .nullish()
+      .describe(
+        'Id of the General Journal charge line the credit pays (from GET /api/payments/journal-items, charges); send exactly one of invoiceId and chargeLineId.',
+      ),
+    amount: zMoneyPositive.describe('Amount of the credit to apply, as decimal text such as "125.00".'),
+    date: zDate
+      .nullish()
+      .describe('Date of the application, YYYY-MM-DD; leave out for today. It is never earlier than the credit or the document it pays.'),
+  }),
+  z.object({
+    action: z
+      .literal('apply_payment')
+      .describe("apply_payment: apply an earlier payment's unapplied credit to General Journal charges of the same customer."),
+    paymentId: zUuid.describe('Id of the customer payment that still has an unapplied amount.'),
+    items: z
+      .array(
+        z.object({
+          journalLineId: zUuid.describe('Id of the General Journal charge line to pay.'),
+          amount: zMoneyPositive.describe('Amount applied to that line, as decimal text such as "125.00".'),
+        }),
+      )
+      .min(1, 'Pick at least one item.')
+      .describe('The General Journal charges to pay and how much of each; at least one.'),
+  }),
+  z.object({
+    action: z.literal('unapply').describe('unapply: take one earlier application off again.'),
+    applicationId: zUuid.describe('Id of the application to remove (from the application list of the credit or charge).'),
+  }),
+]);

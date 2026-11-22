@@ -3,10 +3,14 @@
  * against the REAL route handler it calls, as an agent would reach it: through getServerContext
  * with a token, the view-only role and the read-only database handle (lib/agentContext.ts).
  *
- * This is the test that proves two things at once:
- *  - the routes on the agent list really are reads: each one answers through a handle that
- *    refuses every write, and the books are byte-for-byte unchanged afterwards;
- *  - each tool and its route agree: the fields a tool reads are the fields the route returns.
+ * This is the test that proves three things at once:
+ *  - the routes the read tools use really are reads: each one is a plain read the registry opens
+ *    to agents, it answers through a handle that refuses every write, and the books are
+ *    byte-for-byte unchanged afterwards;
+ *  - each tool and its route agree: the fields a tool reads are the fields the route returns;
+ *  - the tools that change the books go through the agent's door under its policy, exactly as
+ *    run_operation does: Read only is refused, "Ask for every change" asks a person (and a
+ *    person's approval enters it), and an agent allowed to enters it.
  *
  * The client here stands in for mcp/client.mjs (tested on its own in test/mcp/client.test.ts): it
  * turns a tool's GET into a call of the route handler, stamped the way middleware stamps it.
@@ -35,7 +39,8 @@ import { getDb, closeDb, type DB } from '@/lib/db';
 import { createSessionToken, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE, getServerContext } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER, matchRoutePattern } from '@/lib/permissions/routes';
-import { AGENT_READ_ROUTES } from '@/lib/permissions/agentAccess';
+import { AGENT_OWN_ROUTES, agentDirectReadAllowed } from '@/lib/permissions/agentAccess';
+import { operationForRoute } from '@/lib/agent/operations/registry';
 import { fullAccess } from '@/lib/permissions/model';
 import { resetAgentEndpointState } from '@/lib/agent/endpointFile';
 import { seedRichCompany, type RichCompany } from '@/lib/services/companyFile.fixture';
@@ -84,6 +89,8 @@ import { GET as reconciliationOne } from '@/app/api/reconciliations/[id]/route';
 import { GET as reconciliationClearable } from '@/app/api/reconciliations/[id]/clearable/route';
 import { GET as reconciliationInfo } from '@/app/api/reconciliations/info/route';
 import { createBankAccount } from '@/lib/services/bankAccounts';
+import { approveAgentRequest } from '@/lib/services/agentRequests';
+import { resetAgentRateLimits } from '@/lib/agent/operate';
 import { POST as actionsPOST } from '@/app/api/agent/actions/route';
 import { AGENT_ACTION_ROUTE } from '@/lib/permissions/agentAccess';
 
@@ -226,11 +233,14 @@ beforeAll(async () => {
   db = await getDb(TEST_DIR);
   rich = await seedRichCompany(db, TEST_DIR, 'Tools Co');
   admin = { ...rich.ctx, role: 'owner', access: fullAccess() };
-  bookkeeper = (await createAgent(admin, { name: 'Bookkeeper agent', roleKeys: ['bookkeeper'], mode: 'read_only' })).token;
-  reportsOnly = (await createAgent(admin, { name: 'Reports agent', roleKeys: ['reports_only'], mode: 'read_only' })).token;
-  payroll = (await createAgent(admin, { name: 'Payroll agent', roleKeys: ['payroll_processor'], mode: 'read_only' })).token;
-  poster = (await createAgent(admin, { name: 'Posting agent', roleKeys: ['full_access'], mode: 'post' })).token;
-  proposer = (await createAgent(admin, { name: 'Proposing agent', roleKeys: ['bookkeeper'], mode: 'propose' })).token;
+  resetAgentRateLimits();
+  bookkeeper = (await createAgent(admin, { name: 'Bookkeeper agent', roleKeys: ['bookkeeper'], preset: 'read_only' })).token;
+  reportsOnly = (await createAgent(admin, { name: 'Reports agent', roleKeys: ['reports_only'], preset: 'read_only' })).token;
+  payroll = (await createAgent(admin, { name: 'Payroll agent', roleKeys: ['payroll_processor'], preset: 'read_only' })).token;
+  // "Full, with asks": everyday entry and changes, and bulk work (statement lines) within its cap,
+  // run on its own; removals (undoing or cancelling a reconciliation) still ask a person.
+  poster = (await createAgent(admin, { name: 'Posting agent', roleKeys: ['full_access'], preset: 'full_with_asks' })).token;
+  proposer = (await createAgent(admin, { name: 'Proposing agent', roleKeys: ['bookkeeper'], preset: 'ask_every_change' })).token;
   // A person signs in to the file: agents may work from here on.
   h.cookies.clear();
   h.headers.clear();
@@ -475,8 +485,9 @@ describe('the reads that go with entering transactions', () => {
     expect(missing.ok).toBe(false);
   });
 
-  it('list_my_proposals answers for a reading agent too', async () => {
-    expect(await ok(bookkeeper, 'list_my_proposals')).toEqual({ proposals: [] });
+  it('list_my_proposals answers for a reading agent too, as list_my_requests does', async () => {
+    expect(await ok(bookkeeper, 'list_my_proposals')).toEqual({ count: 0, requests: [] });
+    expect(await ok(bookkeeper, 'list_my_requests')).toEqual({ count: 0, requests: [] });
   });
 
   it('a reading agent is refused every tool that changes the books, in plain words', async () => {
@@ -487,7 +498,9 @@ describe('the reads that go with entering transactions', () => {
     ] as Array<[string, Record<string, unknown>]>) {
       const r = await run(bookkeeper, name, args);
       expect(r.ok, name).toBe(false);
-      expect(r.text, name).toMatch(/This agent can only read/);
+      // The policy's refusal (Read only sets every change to Never), or the role's when it lacks the right.
+      expect(r.text, name).toMatch(/^Refused: (An Admin has not allowed agents to|Your role does not allow this)/);
+      expect(r.text, name).toMatch(/Nothing was done/);
     }
   });
 });
@@ -589,8 +602,11 @@ describe('the tools that change the books, against the real services', () => {
 
     const bill = await ok(poster, 'enter_bill', { vendor_id: vendor.id, bill_number: 'TMV-1', date: '2026-04-06', lines: [{ account_id: account.id, amount: '99.00', description: 'Monthly plan' }], request_id: 'mcp-bill-1' });
     expect(bill.result).toMatchObject({ type: 'bill', number: 'TMV-1', total: '99.00' });
-    const dup = await run(poster, 'enter_bill', { vendor_id: vendor.id, bill_number: 'TMV-1', date: '2026-04-06', lines: [{ account_id: account.id, amount: '99.00' }], dry_run: true });
-    expect(dup.ok).toBe(false);
+    // The same bill number again is the warning a person would have seen, with the tool's own
+    // field to accept it; nothing is entered.
+    const dup = await ok(poster, 'enter_bill', { vendor_id: vendor.id, bill_number: 'TMV-1', date: '2026-04-06', lines: [{ account_id: account.id, amount: '99.00' }], dry_run: true });
+    expect(dup.outcome).toBe('needs_confirmation');
+    expect(dup.warnings).toEqual([expect.objectContaining({ flag: 'allowDuplicateNumber', resend_with: 'allow_duplicate_number: true' })]);
     const paid = await ok(poster, 'pay_bills', { vendor_id: vendor.id, date: '2026-04-07', method: 'check', payment_account_id: rich.acct['1000'], applications: [{ bill_id: bill.result.id, amount_applied: '99.00' }], request_id: 'mcp-bp-1' });
     expect(paid.result.type).toBe('bill_payment');
     expect((await ok(poster, 'list_bills', { vendor_id: vendor.id, unpaid_only: true })).count).toBe(0);
@@ -605,8 +621,21 @@ describe('the tools that change the books, against the real services', () => {
     // Edit a list entry by the tool's own field names, then make it inactive.
     const renamed = await ok(poster, 'edit_list_entry', { type: 'customer', id: customer.id, changes: { name: 'Tool Made Customer LLC', phone: '555-0100' }, request_id: 'mcp-cust-1-edit' });
     expect(renamed.result.name).toBe('Tool Made Customer LLC');
-    expect((await ok(poster, 'deactivate_list_entry', { type: 'class', id: cls.id, request_id: 'mcp-class-1-off' })).result.active).toBe(false);
-    expect((await ok(poster, 'deactivate_list_entry', { type: 'item', id: item.id, request_id: 'mcp-item-1-off' })).result.active).toBe(false);
+    // What the registry says of each (lib/agent/operations/classes/lists.ts): nothing in the app
+    // makes a class active again, so PATCH /api/classes/[id] is class 'remove', which always asks a
+    // person; an item can be made active again, so DELETE /api/items/[id] is a 'change', which
+    // "Full, with asks" makes itself. The approved run answers the same request id.
+    for (const [type, id, expected] of [['class', cls.id, 'asked'], ['item', item.id, 'done']]) {
+      const args = { type, id, request_id: `mcp-${type}-1-off` };
+      let off = await ok(poster, 'deactivate_list_entry', args);
+      expect(off.outcome, `${type}: ${JSON.stringify(off)}`).toBe(expected);
+      if (expected === 'asked') {
+        expect((await approveAgentRequest(admin, off.request_id, {}, { atHost: true })).status).toBe('executed');
+        off = await ok(poster, 'deactivate_list_entry', args);
+        expect(off).toMatchObject({ outcome: 'done', repeated: true });
+      }
+      expect(off.result?.active, JSON.stringify(off)).toBe(false);
+    }
 
     // Void the check, with the version it was entered with.
     expect((await ok(poster, 'void_transaction', { type: 'check', id: check.result.id, expected_updated_at: check.result.updated_at, request_id: 'mcp-chk-1-void' })).result.status).toBe('void');
@@ -617,15 +646,25 @@ describe('the tools that change the books, against the real services', () => {
     expect((await ok(poster, 'report_balance_sheet', { as_of: '2026-12-31' })).balanced).toBe(true);
   });
 
-  it('in Propose mode the same tool queues the change and a person decides', async () => {
+  it('on "Ask for every change" the same tool asks a person, and their approval enters it', async () => {
     const start = await fingerprint();
     const out = await ok(proposer, 'enter_journal_entry', { ...je('18.00', 'Proposed by tool'), request_id: 'mcp-prop-1' });
-    expect(out).toMatchObject({ outcome: 'proposed', said: 'Not entered. Waiting for a person to approve it in Ironbooks.' });
-    expect(out.proposal_id).toMatch(/^[0-9a-f-]{36}$/);
-    expect(out.ledger[0].lines).toHaveLength(2);
+    expect(out).toMatchObject({ outcome: 'asked', said: 'Not done yet. A person must approve it in Ironbooks first.', status: 'pending' });
+    expect(out.request_id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(out.next).toMatch(/wait_for_decision/);
+    expect(out.would_post[0].lines).toHaveLength(2);
     expect((await fingerprint()).journal).toEqual(start.journal);
+    // list_my_proposals is the older name of list_my_requests: the same answer.
     const mine = await ok(proposer, 'list_my_proposals');
-    expect(mine.proposals).toEqual([expect.objectContaining({ proposal_id: out.proposal_id, status: 'pending', action: 'enter_journal_entry' })]);
+    expect(mine.requests).toEqual([expect.objectContaining({ request_id: out.request_id, decision: 'pending', operation: 'journal-entries.create' })]);
+    expect(await ok(proposer, 'list_my_requests')).toEqual(mine);
+
+    expect((await approveAgentRequest(admin, out.request_id, {}, { atHost: true })).status).toBe('executed');
+    const count = (await db.execute(sql`select count(*)::int as n from journal_entries where description = 'Proposed by tool' and status = 'posted'`)) as unknown as { rows: Array<{ n: number }> };
+    expect(count.rows[0].n).toBe(1);
+    // Asked again with its request_id, the tool says what became of it.
+    const again = await ok(proposer, 'enter_journal_entry', { ...je('18.00', 'Proposed by tool'), request_id: 'mcp-prop-1' });
+    expect(again).toMatchObject({ outcome: 'posted', repeated: true, result: { type: 'journal_entry', status: 'posted' } });
   });
 });
 
@@ -762,7 +801,8 @@ describe('a bank statement, start to finish', () => {
     expect((await ok(poster, 'get_reconciliation', { reconciliation_id: reconciliationId, only_uncleared: true })).can_finish).toBe(true);
 
     const done = await ok(poster, 'finish_reconciliation', { reconciliation_id: reconciliationId, request_id: 'recon-finish-1' });
-    expect(done).toMatchObject({ outcome: 'posted', result: { status: 'completed', statement_date: '2026-05-31', statement_balance: '759.00' } });
+    // Finishing posts nothing of its own (the fee and the interest were posted above).
+    expect(done).toMatchObject({ outcome: 'done', result: { status: 'completed', statement_date: '2026-05-31', statement_balance: '759.00' } });
     const after = await ok(bookkeeper, 'reconcile_status', { bank_account_id: bankAccountId });
     expect(after).toMatchObject({ last_reconciled_date: '2026-05-31', in_progress: null, last_finished: { reconciliation_id: reconciliationId } });
     expect(Number(after.beginning_balance)).toBe(759);
@@ -774,53 +814,73 @@ describe('a bank statement, start to finish', () => {
     expect((await ok(poster, 'report_trial_balance', { as_of: '2026-12-31' })).balanced).toBe(true);
   });
 
-  it('the last reconciliation can be undone, and only the last', async () => {
+  it('the last reconciliation can be undone, and only the last: that always asks a person', async () => {
+    // Tried first, so a wrong one is refused now rather than put to a person.
     const wrong = await run(poster, 'undo_last_reconciliation', { bank_account_id: bankAccountId, expect_statement_date: '2026-04-30', request_id: 'recon-undo-wrong' });
     expect(wrong.ok).toBe(false);
+    const asked = await ok(poster, 'undo_last_reconciliation', { bank_account_id: bankAccountId, expect_statement_date: '2026-05-31', request_id: 'recon-undo-1' });
+    expect(asked).toMatchObject({ outcome: 'asked', status: 'pending' });
+    expect((await ok(bookkeeper, 'reconcile_status', { bank_account_id: bankAccountId })).last_reconciled_date).toBe('2026-05-31');
+    expect((await approveAgentRequest(admin, asked.request_id, {}, { atHost: true })).status).toBe('executed');
     const undone = await ok(poster, 'undo_last_reconciliation', { bank_account_id: bankAccountId, expect_statement_date: '2026-05-31', request_id: 'recon-undo-1' });
-    expect(undone.result).toMatchObject({ status: 'undone', statement_date: '2026-05-31' });
+    expect(undone).toMatchObject({ outcome: 'done', repeated: true, result: { status: 'undone', statement_date: '2026-05-31' } });
     expect((await ok(bookkeeper, 'reconcile_status', { bank_account_id: bankAccountId })).last_reconciled_date).toBeNull();
   });
 
-  it('in Propose mode the agent lays the work out, and a person finishes it', async () => {
+  it('on "Ask for every change" the agent lays out what it may, and asks a person for the rest', async () => {
     // Its own bank account, so it does not meet the other agent's work.
     const acct = (await ok(poster, 'add_account', { name: 'Proposer Checking', account_type: 'Bank', request_id: 'prop-acct-1' })).result;
     const bank = (await createBankAccount(admin, { accountId: acct.id, bankName: 'Second Test Bank', accountNumber: '9999' })).id;
     const ledgerBefore = (await fingerprint()).journal;
+    const statement = { bank_account_id: bank, statement_kind: 'bank', opening_balance: '0.00', closing_balance: '-18.00', lines: [{ date: '2026-06-03', description: 'MONTHLY FEE', amount: '-18.00' }] };
 
-    // Statement lines and a reconciliation in progress: done directly, nothing posted.
-    const imported = await ok(proposer, 'import_statement_lines', { bank_account_id: bank, statement_kind: 'bank', opening_balance: '0.00', closing_balance: '-18.00', lines: [{ date: '2026-06-03', description: 'MONTHLY FEE', amount: '-18.00' }], request_id: 'prop-import-1' });
-    expect(imported).toMatchObject({ outcome: 'done', result: { added_to_feed: 1 } });
+    // Statement lines are bulk work, which this preset asks a person about. KNOWN TO FOLLOW THE
+    // CLASSIFICATION: POST /api/import is class 'bulk' for every file type, the reviewed 'rows' of
+    // a statement included (lib/agent/operations/classes/documents.ts). Should the classification
+    // owner class a rows import as prepare, this answer becomes 'done': update it then.
+    const imported = await ok(proposer, 'import_statement_lines', { ...statement, request_id: 'prop-import-1' });
+    expect(imported).toMatchObject({ outcome: 'asked', status: 'pending' });
+    expect((await ok(proposer, 'get_bank_feed', { bank_account_id: bank })).count).toBe(0);
+    // An agent allowed bulk work lays them out itself; nothing is posted.
+    expect(await ok(poster, 'import_statement_lines', { ...statement, request_id: 'prop-import-by-poster' })).toMatchObject({ outcome: 'done', result: { added_to_feed: 1 } });
     const feed = (await ok(proposer, 'get_bank_feed', { bank_account_id: bank })).lines as Out[];
     expect(feed).toHaveLength(1);
+    // A reconciliation in progress is prepare work: done directly, nothing posted.
     const started = await ok(proposer, 'start_reconciliation', { bank_account_id: bank, statement_date: '2026-06-30', statement_balance: '-18.00', request_id: 'prop-start-1' });
-    expect(started.outcome).toBe('done');
+    expect(started).toMatchObject({ outcome: 'done', result: { status: 'in_progress', statement_balance: '-18.00' } });
     expect((await fingerprint()).journal).toEqual(ledgerBefore);
 
     // Entering the line would post to the ledger: that goes to a person.
     const proposed = await ok(proposer, 'categorize_bank_line', { bank_transaction_id: feed[0].bank_transaction_id, account_id: rich.acct['6100'], request_id: 'prop-cat-1' });
-    expect(proposed).toMatchObject({ outcome: 'proposed', said: 'Not entered. Waiting for a person to approve it in Ironbooks.' });
-    expect(proposed.ledger[0].lines).toEqual(expect.arrayContaining([expect.objectContaining({ account: '6100 Bank & Merchant Fees', debit: '18.00' })]));
+    expect(proposed).toMatchObject({ outcome: 'asked', said: 'Not done yet. A person must approve it in Ironbooks first.' });
+    expect(proposed.would_post[0].lines).toEqual(expect.arrayContaining([expect.objectContaining({ account: '6100 Bank & Merchant Fees', debit: '18.00' })]));
     expect((await fingerprint()).journal).toEqual(ledgerBefore);
     expect((await ok(proposer, 'get_bank_feed', { bank_account_id: bank })).count).toBe(1);
 
-    // A reconciliation someone else started is not its to work on.
+    // Ticking lines is a change (the same request also finishes a reconciliation): a person
+    // approves it, on someone else's reconciliation as on its own. KNOWN TO FOLLOW THE
+    // CLASSIFICATION: PATCH /api/reconciliations/[id] is class 'change' whatever its body's action
+    // (lib/agent/operations/classes/banking.ts). Should the classification owner class
+    // setClearedMany and updateStatement as prepare, this answer becomes 'done': update it then.
     const other = await ok(poster, 'start_reconciliation', { bank_account_id: bankAccountId, statement_date: '2026-05-31', statement_balance: '759.00', request_id: 'recon-start-again' });
     const sheet = await ok(proposer, 'get_reconciliation', { reconciliation_id: other.result.reconciliation_id });
-    const theirs = await run(proposer, 'mark_cleared', { reconciliation_id: other.result.reconciliation_id, line_ids: [sheet.lines[0].line_id], request_id: 'prop-mark-theirs' });
-    expect(theirs.ok).toBe(false);
-    expect(theirs.text).toMatch(/started by someone else/);
+    const theirs = await ok(proposer, 'mark_cleared', { reconciliation_id: other.result.reconciliation_id, line_ids: [sheet.lines[0].line_id], request_id: 'prop-mark-theirs' });
+    expect(theirs).toMatchObject({ outcome: 'asked', status: 'pending' });
     // Cancelling one needs the Delete right on Reconcile, which the Bookkeeper role does not have,
     // for an agent as for a person.
     const cancel = await run(proposer, 'cancel_reconciliation', { reconciliation_id: started.result.reconciliation_id, request_id: 'prop-cancel-1' });
     expect(cancel.ok).toBe(false);
-    expect(cancel.text).toMatch(/You do not have permission to delete Reconcile/);
+    expect(cancel.text).toMatch(/Your role does not allow this: it needs the right to delete/);
     // Finishing its own reconciliation is a change a person approves (here it is not at 0.00 yet,
-    // so it is refused now rather than queued).
+    // so it is refused now rather than asked).
     const finish = await run(proposer, 'finish_reconciliation', { reconciliation_id: started.result.reconciliation_id, request_id: 'prop-finish-1' });
     expect(finish.ok).toBe(false);
     expect(finish.text).toMatch(/Cannot complete: difference/);
-    expect((await ok(poster, 'cancel_reconciliation', { reconciliation_id: other.result.reconciliation_id, request_id: 'recon-cancel-1' })).result).toMatchObject({ cancelled: true });
+    // Cancelling deletes the session for good: a person approves that too.
+    const cancelOther = await ok(poster, 'cancel_reconciliation', { reconciliation_id: other.result.reconciliation_id, request_id: 'recon-cancel-1' });
+    expect(cancelOther).toMatchObject({ outcome: 'asked', status: 'pending' });
+    expect((await approveAgentRequest(admin, cancelOther.request_id, {}, { atHost: true })).status).toBe('executed');
+    expect((await ok(bookkeeper, 'reconcile_status', { bank_account_id: bankAccountId })).in_progress).toBeNull();
   });
 
   it('a reading agent can look at all of it and change none of it', async () => {
@@ -832,7 +892,7 @@ describe('a bank statement, start to finish', () => {
     ] as Array<[string, Record<string, unknown>]>) {
       const r = await run(bookkeeper, name, args);
       expect(r.ok, name).toBe(false);
-      expect(r.text, name).toMatch(/This agent can only read/);
+      expect(r.text, name).toMatch(/^Refused: An Admin has not allowed agents to/);
     }
     // A role without Banking sees no feed.
     const denied = await run(reportsOnly, 'get_bank_feed', { bank_account_id: bankAccountId });
@@ -842,8 +902,13 @@ describe('a bank statement, start to finish', () => {
 });
 
 describe('the routes the tools used', () => {
-  it('every read route on the agent list, and no other', () => {
-    expect([...reached].sort()).toEqual([...AGENT_READ_ROUTES].sort());
-    expect(Object.keys(ROUTES).sort()).toEqual([...AGENT_READ_ROUTES].sort());
+  it('each one is the agent\'s own or a plain read the registry opens to agents, and every one was used', () => {
+    // There is no fixed list of reads any more (plan 5.3): a GET is reachable when the registry
+    // classes it as a read open to agents (lib/permissions/agentAccess.ts agentDirectReadAllowed).
+    for (const pattern of reached) {
+      const own = AGENT_OWN_ROUTES.includes(pattern);
+      expect(own || agentDirectReadAllowed(operationForRoute('GET', pattern)), pattern).toBe(true);
+    }
+    expect([...reached].sort()).toEqual(Object.keys(ROUTES).sort());
   });
 });

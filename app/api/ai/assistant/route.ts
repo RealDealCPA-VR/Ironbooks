@@ -10,24 +10,16 @@
  * then {"type":"reply", ...AssistantReply} or {"type":"error","error","code"}.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getServerContext } from '@/lib/context';
 import { ask } from '@/lib/services/aiAssistant';
 import { zodErrorBody } from '@/lib/validation/helpers';
+import { assistantMessageSchema } from '@/lib/validation/ai';
 import { aiErrorResponse } from '../_errors';
-
-const bodySchema = z.object({
-  message: z.string().trim().min(1).max(4000),
-  history: z
-    .array(z.object({ role: z.enum(['user', 'assistant']), content: z.string().max(8000) }))
-    .max(40)
-    .default([]),
-});
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = bodySchema.safeParse(await req.json().catch(() => ({})));
+    const parsed = assistantMessageSchema.safeParse(await req.json().catch(() => ({})));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     if (req.nextUrl.searchParams.get('stream') !== '1') {
       return NextResponse.json(await ask(ctx, parsed.data.history, parsed.data.message));

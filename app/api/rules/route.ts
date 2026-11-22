@@ -18,6 +18,8 @@ import { getServerContext } from '@/lib/context';
 import { listRules, createRule } from '@/lib/services/rules';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { createRuleSchema } from '@/lib/validation/rules';
 
 const VALID_MATCH_FIELDS = ['description', 'payee', 'amount'] as const;
 const VALID_OPERATORS = ['contains', 'equals', 'starts_with'] as const;
@@ -74,6 +76,11 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
+
+    // The body as agents read it described (lib/validation/rules.ts). The checks above answer
+    // first, so this refuses nothing they let through.
+    const checked = createRuleSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const rule = await createRule(ctx, {
       name: body.name,

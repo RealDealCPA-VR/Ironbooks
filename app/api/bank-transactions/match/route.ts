@@ -17,6 +17,8 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { matchTransaction } from '@/lib/services/bankCategorize';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { matchBankLineSchema } from '@/lib/validation/bankTransactions';
 
 function errResponse(err: ServiceError): NextResponse {
   return NextResponse.json(
@@ -37,6 +39,10 @@ export async function POST(req: NextRequest) {
     if (!journalEntryId) {
       return NextResponse.json({ error: 'journalEntryId is required.' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/bankTransactions.ts). The checks above
+    // answer first, so this refuses only a value the service could not have used.
+    const checked = matchBankLineSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const result = await matchTransaction(ctx, bankTransactionId, journalEntryId);
     return NextResponse.json(result);

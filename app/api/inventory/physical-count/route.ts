@@ -15,6 +15,8 @@ import { physicalCount } from '@/lib/services/inventoryOps';
 import { assertPhysicalCountable, inventoryDate } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { physicalCountSchema } from '@/lib/validation/inventory';
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
   const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
@@ -48,6 +50,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (!date) {
       return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/inventory.ts). The checks above answer
+    // first, so this refuses only a value the service could not have used.
+    const checked = physicalCountSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     // physicalCount is an average-cost operation: reject non-inventory item
     // types and FIFO-tracked items (their stock lives in inventoryLayers and

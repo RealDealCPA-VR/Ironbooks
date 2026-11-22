@@ -9,7 +9,8 @@
  * that touched an account together with a running balance. The running balance respects the
  * natural sign convention (debit-normal for asset/expense, credit-normal for liability/equity/revenue).
  */
-import { and, asc, desc, eq, gte, inArray, isNull, lt, lte, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, isNull, lt, lte, ne, sql, type SQL } from 'drizzle-orm';
+import { maskAccountsInText } from '@/lib/agent/guards';
 import {
   accounts,
   classes,
@@ -37,6 +38,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { hasFlag } from './access';
 import { assertPeriodOpen } from './fiscalPeriods';
 import { assertAccountantMayVoidEntry } from './accountantCopy/guard';
 import { balanceFixes, balanceSummary } from '@/lib/errorFixes';
@@ -476,6 +478,178 @@ export function onOrBeforeDay(to: Date) {
   return lt(journalEntries.date, nextDay);
 }
 
+// ---------------------------------------------------------------------------
+// Line memos as the caller may see them (plan 5.9, decision D6)
+// ---------------------------------------------------------------------------
+
+/**
+ * A journal line memo as this caller may see it. A line memo can hold a payee's full account
+ * number: Sales Tax Payment entries posted before the payment stopped copying its check memo onto
+ * the ledger carry "Acct # 000123456789" on their 2200 line, and anyone can type one. mask.ts masks
+ * account numbers by field name only, so without this a caller without "view full account numbers"
+ * read the whole number in the journal entry, the registers and every report that lists memos.
+ * The rule of the check memo (liabilityPayments.ts checkMemoFor): such a caller sees the number
+ * masked the way an agent's answers mask it (lib/agent/guards.ts maskAccountsInText: "Acct #
+ * ••••6789"); a caller with the right, and a trusted context (no `access`), see the memo as stored.
+ * Only answers go through this. The stored memo stays as it is: a save that sends a memo back as
+ * it was shown keeps the stored text (keepHiddenMemos).
+ *
+ * Deliberate, and fail closed: after a label with "#" everything to the end of the memo is masked,
+ * chart-of-accounts numbers too ("Reclass to account #6100 Office Supplies" shows as "Reclass to
+ * account #••••lies"), because the app writes "Acct # <vendor's account number>" itself and that
+ * number is free text: nothing in the memo tells where it ends. "account 6100" (no "#") is shown as
+ * typed. A caller with the right sees every memo as typed.
+ */
+export function lineMemoFor(ctx: Pick<ServiceContext, 'access'>, memo: string | null): string | null {
+  if (!memo || hasFlag(ctx, 'fullAccountNumbers')) return memo;
+  return maskAccountsInText(memo);
+}
+
+/**
+ * True when this caller's memo searches must match memos as shown (lineMemoFor), not as stored.
+ * Matching the stored text would let a caller who sees "Acct # ••••6789" test guesses at the
+ * hidden digits ("Acct # 0001%"): the line would come back only when the guess was right.
+ */
+export function searchesShownMemos(ctx: Pick<ServiceContext, 'access'>): boolean {
+  return !hasFlag(ctx, 'fullAccountNumbers');
+}
+
+/**
+ * The labels maskAccountsInText masks after (lib/agent/guards.ts ACCT_LABEL: "Acct #", "Account
+ * No.", "A/C Number" and the like), as a Postgres regular expression that matches a little more:
+ * any marks or spaces between the word and "#" / "No" / "Number" ([^[:alnum:]]* holds every space
+ * `\s` does, in any locale), and "No" even when a word goes on ("Acct Now"). A memo it does not
+ * match is shown as stored, so the database's own ILIKE is right for it.
+ */
+const MEMO_LABEL_PATTERN = '(acct|account|a/c)s?[^[:alnum:]]*(#|no|number)';
+
+/**
+ * SQL: the line's memo may hold a protected number (MEMO_LABEL_PATTERN, in any case), so a search
+ * reads these lines whatever their stored text and matches them in code against the memo as shown
+ * (ilikeMatches). Narrow on purpose: a memo-filtered report reads every such line in its range (up
+ * to the General Ledger's scan cap), and bank memos like "ONLINE TRANSFER TO ACCOUNT 1234" are
+ * common; the mask leaves those as they are, so they are not read.
+ */
+export function memoMayHoldAccountNumber(): SQL {
+  return sql`COALESCE(${journalEntryLines.memo}, '') ~* ${MEMO_LABEL_PATTERN}`;
+}
+
+/** A `%` of an ILIKE pattern (any text) and a `_` (one character); a plain character is itself. */
+const ANY_TEXT = 0;
+const ONE_CHAR = 1;
+type LikeStep = typeof ANY_TEXT | typeof ONE_CHAR | string;
+
+/**
+ * Postgres ILIKE in code, for text the database never held (a memo as shown): `%` is any text,
+ * `_` one character, `\` makes the next character plain, letters match in any case.
+ *
+ * Matched in one pass that steps back only to the last `%` (the classic wildcard match), so it
+ * takes at most (text length + 1) × (pattern length + 1) steps whatever the pattern. The caller
+ * picks the pattern (Transaction Detail and the assistant pass a search as typed, `%` and `_`
+ * included) and this runs on the one server every window uses: a regular expression built from it
+ * does several times the work for every `%` added, and "%_%_%_%_%_%_%_%_Q" against one masked memo
+ * held the server for over a minute.
+ */
+export function ilikeMatches(text: string | null | undefined, pattern: string): boolean {
+  if (text == null) return false;
+  const chars = [...pattern];
+  const steps: LikeStep[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i];
+    if (c === '\\' && i + 1 < chars.length) steps.push(chars[++i].toLowerCase());
+    else if (c === '%') {
+      // "%%" is the same as "%": one step, so a run of them costs nothing more.
+      if (steps[steps.length - 1] !== ANY_TEXT) steps.push(ANY_TEXT);
+    } else if (c === '_') steps.push(ONE_CHAR);
+    else steps.push(c.toLowerCase());
+  }
+  // Characters (code points, as Postgres counts them for `_`), each in lower case.
+  const t = [...text].map((c) => c.toLowerCase());
+  let ti = 0;
+  let si = 0;
+  // The last `%` met, and the text position it is taken to end at: a mismatch after it lets that
+  // `%` take one more character and tries again from there (never any `%` before it).
+  let lastAny = -1;
+  let anyEnd = 0;
+  while (ti < t.length) {
+    const step = si < steps.length ? steps[si] : undefined;
+    if (step === ONE_CHAR || (typeof step === 'string' && step === t[ti])) {
+      ti++;
+      si++;
+    } else if (step === ANY_TEXT) {
+      lastAny = si++;
+      anyEnd = ti;
+    } else if (lastAny >= 0) {
+      si = lastAny + 1;
+      ti = ++anyEnd;
+    } else {
+      return false;
+    }
+  }
+  while (si < steps.length && steps[si] === ANY_TEXT) si++;
+  return si === steps.length;
+}
+
+/**
+ * The submitted lines, each memo the caller was shown masked put back as stored. A caller without
+ * "view full account numbers" opens the entry with its line memos masked (getEntryForCaller) and
+ * sends them back as shown when saving it; saving that text would replace "Acct # 000123456789"
+ * with "Acct # ••••6789" in the books for good. A memo the caller changed is saved as typed.
+ *
+ * Each submitted line still showing a hidden memo is paired with the stored line it came from,
+ * closest first, each stored line used once:
+ *   1. the same account, amounts, class and name (a memo or description edit);
+ *   2. the same account and name, amounts or class changed;
+ *   3. the same amounts, account or name changed (a reclass), when exactly one stored line shows
+ *      that memo with those amounts and exactly one submitted line carries it.
+ * The text typed on a line that is none of these (the masked memo pasted onto the other side of
+ * the entry, say) is saved as typed: a hidden number moves only with its own line. A line whose
+ * account and amounts both changed, memo left as shown, is saved as shown, so the number is lost
+ * on it: nothing then tells which stored line it was, and guessing could put a number on a line it
+ * never belonged to. Undo needs none of this: it snapshots the entry as stored (getEntry).
+ */
+function keepHiddenMemos(
+  ctx: Pick<ServiceContext, 'access'>,
+  stored: ReadonlyArray<JournalEntryLine>,
+  lines: PostingLine[],
+): PostingLine[] {
+  const hidden = stored.filter((l) => l.memo && lineMemoFor(ctx, l.memo) !== l.memo);
+  if (hidden.length === 0) return lines;
+  const nameOf = (l: { entityType?: string | null; entityId?: string | null }) =>
+    l.entityType ? `${l.entityType}:${l.entityId ?? ''}` : '';
+  const amountsOf = (l: { debit?: string | number | null; credit?: string | number | null }) =>
+    lineKey({ accountId: '', debit: l.debit, credit: l.credit });
+  const out = [...lines];
+  const settled = new Set<number>();
+  const used = new Set<string>();
+  const shows = (s: JournalEntryLine, memo: string) => !used.has(s.id) && lineMemoFor(ctx, s.memo) === memo;
+  const keep = (i: number, s: JournalEntryLine) => {
+    used.add(s.id);
+    settled.add(i);
+    out[i] = { ...lines[i], memo: s.memo };
+  };
+  // Tier by tier over every line, so a line of the same account never loses its memo to a reclassed
+  // line listed before it.
+  const sameLine = (s: JournalEntryLine, nl: PostingLine) => lineKey(s) === lineKey(nl);
+  const sameAccount = (s: JournalEntryLine, nl: PostingLine) => s.accountId === nl.accountId && nameOf(s) === nameOf(nl);
+  for (const same of [sameLine, sameAccount]) {
+    lines.forEach((nl, i) => {
+      if (settled.has(i) || !nl.memo) return;
+      const match = hidden.find((s) => same(s, nl) && shows(s, nl.memo!));
+      if (match) keep(i, match);
+    });
+  }
+  lines.forEach((nl, i) => {
+    if (settled.has(i) || !nl.memo) return;
+    const memo = nl.memo;
+    const amounts = amountsOf(nl);
+    const from = hidden.filter((s) => amountsOf(s) === amounts && shows(s, memo));
+    const to = lines.filter((o, j) => !settled.has(j) && o.memo === memo && amountsOf(o) === amounts);
+    if (from.length === 1 && to.length === 1) keep(i, from[0]);
+  });
+  return out;
+}
+
 export async function listEntries(ctx: ServiceContext, opts: ListEntriesOptions = {}) {
   // Entries deleted by Batch Delete/Void (accountant 0089) are gone from the Journal, as in QB.
   const conds = [eq(journalEntries.companyId, ctx.companyId), isNull(journalEntries.deletedAt)];
@@ -500,7 +674,23 @@ export async function listEntries(ctx: ServiceContext, opts: ListEntriesOptions 
 // getEntry
 // ---------------------------------------------------------------------------
 
-/** Fetch a single journal entry with its lines and account names. */
+/**
+ * A single journal entry with its lines and account names, as an answer to this caller: line memos
+ * as they may see them (lineMemoFor). For GET /api/journal-entries/[id] and every other answer that
+ * returns an entry to a person (an agent's answers are masked by the bridge as well).
+ */
+export async function getEntryForCaller(ctx: ServiceContext, id: string): Promise<JournalEntryDetail> {
+  const entry = await getEntry(ctx, id);
+  return { ...entry, lines: entry.lines.map((l) => ({ ...l, memo: lineMemoFor(ctx, l.memo) })) };
+}
+
+/**
+ * Fetch a single journal entry with its lines and account names, as stored, line memos included:
+ * for work that keeps or copies the entry (an edit compares with it, a reversal copies its memos,
+ * Undo snapshots it and puts back or re-enters what it holds). A snapshot taken with masked memos
+ * would put "Acct # ••••6789" in the books in place of the number. An answer to a person or an
+ * agent goes through getEntryForCaller.
+ */
 export async function getEntry(ctx: ServiceContext, id: string): Promise<JournalEntryDetail> {
   // Load the entry header — scope by companyId for multi-tenant safety.
   const [entry] = await ctx.db
@@ -685,7 +875,7 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
     throw validation('A valid date is required.');
   }
 
-  // Load + tenant-check the existing entry (with lines, for the audit snapshot).
+  // Load + tenant-check the existing entry (with lines, for the audit snapshot), as stored.
   const before = await getEntry(ctx, id);
   if (before.status !== 'posted') {
     throw new ServiceError('CONFLICT', 'Only posted journal entries can be edited.');
@@ -731,6 +921,8 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
     ),
   });
   const isAdjusting = input.isAdjusting ?? before.isAdjusting;
+  // A memo sent back as this caller was shown it (masked) stays as stored.
+  const lines = keepHiddenMemos(ctx, before.lines, input.lines);
 
   return inTransaction(ctx, async (tx) => {
     // The checks above ran before this transaction: another edit or void of the same entry (a
@@ -764,7 +956,7 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
         const k = lineKey(l);
         pool.set(k, [...(pool.get(k) ?? []), l]);
       }
-      for (const nl of input.lines) {
+      for (const nl of lines) {
         const old = pool.get(lineKey(nl))?.shift();
         const memo = nl.memo?.trim() ? nl.memo : null;
         if (old && (old.memo ?? null) !== memo) {
@@ -789,7 +981,7 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
           description: input.description.trim(),
           reference,
           isAdjusting,
-          lines: input.lines,
+          lines,
         },
       });
       return row;
@@ -814,7 +1006,7 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
       description: input.description.trim(),
       reference: input.reference === undefined ? before.reference : input.reference,
       status: 'posted',
-      lines: keepForeignAmounts(before.lines, input.lines),
+      lines: keepForeignAmounts(before.lines, lines),
       ...bookedRate(before.lines),
       sourceRef: 'manual',
       isAdjusting,
@@ -839,7 +1031,7 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
         date: input.date,
         description: input.description.trim(),
         reference: replacement.reference,
-        lines: input.lines,
+        lines,
       },
     });
 
@@ -890,6 +1082,7 @@ function assertJournalScreenEntry(sourceRef: string | null | undefined, op: 'voi
  * accrual workflow (post accrual at month-end, auto-reverse next period).
  */
 export async function reverseEntry(ctx: ServiceContext, id: string, asOfDate?: Date) {
+  // As stored: the reversal carries each line's own memo, whoever reverses it.
   const original = await getEntry(ctx, id);
   if (original.status !== 'posted') {
     throw new ServiceError('CONFLICT', 'Only posted journal entries can be reversed.');
@@ -1363,7 +1556,7 @@ export async function accountRegister(
       entryNumber: r.entryNumber,
       reference: r.reference ?? null,
       description: r.description,
-      memo: r.memo ?? null,
+      memo: lineMemoFor(ctx, r.memo ?? null),
       sourceRef: r.sourceRef ?? null,
       debit: r.debit ?? null,
       credit: r.credit ?? null,
@@ -1371,7 +1564,8 @@ export async function accountRegister(
     };
   });
 
-  // Search filter (description / reference / memo, case-insensitive).
+  // Search filter (description / reference / memo, case-insensitive). The memo is the one this
+  // caller sees, so a search cannot find what the mask hides.
   const q = opts.search?.trim().toLowerCase();
   const filtered = q
     ? allRows.filter((r) =>
@@ -1501,7 +1695,7 @@ export async function getAdjustingEntries(
         ...l,
         debit: l.debit ?? null,
         credit: l.credit ?? null,
-        memo: l.memo ?? null,
+        memo: lineMemoFor(ctx, l.memo ?? null),
         classId: l.classId ?? null,
         className: l.className ?? null,
         entityType: (l.entityType as JournalEntityType | null) ?? null,
@@ -1762,7 +1956,9 @@ export async function journalOpenItems(
       date: r.date,
       reference: r.reference ?? null,
       description: r.description,
-      memo: r.memo ?? null,
+      // As this caller may see it: Pay Bills and Receive Payments list these lines
+      // (journalApplications.ts listJournalOpenItems); nothing here copies the memo.
+      memo: lineMemoFor(ctx, r.memo ?? null),
       accountId: r.accountId,
       entityType,
       entityId: r.entityId!,

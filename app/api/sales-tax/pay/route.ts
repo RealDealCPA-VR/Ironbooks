@@ -15,7 +15,8 @@ import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { routeError, requireJsonObject } from '@/lib/routeErrors';
 import { paySalesTaxAgencies, paySalesTaxScreen } from '@/lib/services/liabilityPayments';
-import { parseDateInput } from '@/lib/validation/helpers';
+import { bodyValidationError, parseDateInput } from '@/lib/validation/helpers';
+import { paySalesTaxSchema } from '@/lib/validation/liabilities';
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -42,6 +43,10 @@ export async function POST(req: NextRequest) {
     if (!checkDate) return bad('Enter the check date.');
     if (typeof body.paymentAccountId !== 'string' || !body.paymentAccountId) return bad('Pick the bank account to pay from.');
     if (!Array.isArray(body.payments) || body.payments.length === 0) return bad('Pick at least one tax agency to pay.');
+    // The body as agents read it described (lib/validation/liabilities.ts). The checks above answer
+    // first; the service checks each agency and amount.
+    const checked = paySalesTaxSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     const payments = (body.payments as Array<Record<string, unknown>>).map((p) => ({
       agencyId: typeof p?.agencyId === 'string' ? p.agencyId : '',
       amount: typeof p?.amount === 'string' || typeof p?.amount === 'number' ? (p.amount as string | number) : '',

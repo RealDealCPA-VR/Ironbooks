@@ -16,9 +16,11 @@
  *      mark_cleared             ticks the lines the statement shows;
  *      finish_reconciliation    closes it, only when the difference is exactly 0.00.
  *
- * Putting lines in the feed and working on a reconciliation in progress post nothing to the ledger,
- * so an agent in Propose mode does those itself. Entering a line, matching it, and finishing or
- * undoing a reconciliation go to a person for approval in Propose mode.
+ * Putting lines in the feed and working on a reconciliation in progress post nothing to the ledger
+ * (preparing work). Entering a line, matching it, and finishing or undoing a reconciliation change
+ * the books. Whether the agent does each step itself or a person approves it first is the agent's
+ * policy, decided in Ironbooks: the answer says "done" or "posted", or "asked" with a request_id
+ * for wait_for_decision (write-tools.mjs shapeAnswer words every answer).
  */
 import { ToolError } from './protocol.mjs';
 import { camelize, settle, shapeRecord } from './write-tools.mjs';
@@ -103,8 +105,22 @@ const READS = [
       const reviewing = filter === 'unreviewed';
       let suggestions = new Map();
       let matches = {};
+      /** Why the lines come without suggested accounts, when they do. */
+      let noSuggestions = null;
       if (reviewing && lines.length) {
-        const s = (await c.act({ action: 'bank_feed_suggestions', input: { bankAccountId: a.bank_account_id } }))?.result?.suggestions ?? [];
+        // A read: its answer is 'read' (or 'done' from an older Ironbooks) with the suggestions as
+        // the result. Anything else leaves the lines without suggestions, and says so: a refusal, an
+        // "asked" (an Admin set this read to Ask), or an error such as the door asking for a
+        // request_id this tool has no argument for. The lines themselves are still worth listing.
+        let s = [];
+        try {
+          const answer = await c.act({ action: 'bank_feed_suggestions', input: { bankAccountId: a.bank_account_id } });
+          if (Array.isArray(answer?.result?.suggestions)) s = answer.result.suggestions;
+          else if (answer?.outcome === 'refused' && typeof answer.note === 'string' && answer.note.trim()) noSuggestions = `No suggested accounts: ${answer.note.trim()}`;
+          else if (answer?.outcome && answer.outcome !== 'read' && answer.outcome !== 'done') noSuggestions = 'No suggested accounts: your permissions do not let you read them on your own.';
+        } catch {
+          noSuggestions = 'No suggested accounts: Ironbooks did not give them this time.';
+        }
         suggestions = new Map(s.map((x) => [x.bank_transaction_id, x]));
         matches = (await c.get('/api/bank-transactions/matches', { bankAccountId: a.bank_account_id }))?.matches ?? {};
       }
@@ -119,7 +135,14 @@ const READS = [
           ...(m.length ? { possible_matches: m.map((x) => ({ journal_entry_id: x.entryId, date: day(x.date), description: x.description, number: x.reference ?? null, amount: x.amount, confidence: x.confidence })) } : {}),
         };
       });
-      return { count: lines.length, lines: rows, ...(lines.length > limit ? { truncated: true, note: `Showing the first ${limit} of ${lines.length} lines.` } : {}) };
+      return {
+        count: lines.length,
+        lines: rows,
+        ...(lines.length > limit ? { truncated: true, note: `Showing the first ${limit} of ${lines.length} lines.` } : {}),
+        ...(noSuggestions
+          ? { suggestions: `${noSuggestions.replace(/[.!?]?$/, '.')} Choose each line's account from its description and list_accounts, or ask the person.` }
+          : {}),
+      };
     },
   },
   {

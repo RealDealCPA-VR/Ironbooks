@@ -6,15 +6,22 @@
  * that list leaves it out (lockedReason): the radio button is disabled, so it cannot be chosen
  * with the mouse or the keyboard.
  *
- * In an area, choosing the setting a cell already shows by following everywhere keeps it as the
- * area's own (chooseSetting), so a radio button that is already on still answers a click there.
+ * For a person who is not an Admin, a cell that would let the agent do more by itself than it does
+ * now is disabled too and says why (`adminOnly`, plan 4.4), and so is a "follow again" button that
+ * would loosen the cell (`clearBlocked`). Tightening stays open.
+ *
+ * Choosing the setting a cell already shows (by following the preset or everywhere) keeps it as the
+ * cell's own (chooseSetting), so a radio button that is already on still answers a click.
  */
 import { Lock } from 'lucide-react';
 import { Button, Td, Th } from '@/components/ui';
 import { POLICY_SETTINGS, RISK_CLASSES, type AgentPolicy, type PolicySetting, type RiskClass } from '@/lib/agent/operations/types';
 import type { Area } from '@/lib/permissions/model';
-import { cellSetting, lockedReason, overrideOf, type Locked, type PolicyDraft } from './policyDraft';
+import { cellSetting, lockedReason, overrideOf, repeatsPreset, type Locked, type PolicyDraft } from './policyDraft';
 import { CLASS_HELP, RISK_CLASS_LABELS, SETTING_HELP, SETTING_LABELS } from './words';
+
+/** The id of the page's note that says why admin-only cells are off (AgentDetailView). */
+export const ADMIN_ONLY_NOTE_ID = 'agent-admin-only-note';
 
 export default function PolicyGrid({
   draft,
@@ -24,6 +31,8 @@ export default function PolicyGrid({
   disabled,
   onChoose,
   onClear,
+  adminOnly,
+  clearBlocked,
 }: {
   draft: PolicyDraft;
   /** The draft's policy through the engine (policyOf). */
@@ -34,6 +43,10 @@ export default function PolicyGrid({
   disabled: boolean;
   onChoose: (cls: RiskClass, setting: PolicySetting) => void;
   onClear: (cls: RiskClass) => void;
+  /** Why this person may not choose a cell (it would loosen the agent), or null. */
+  adminOnly?: (cls: RiskClass, setting: PolicySetting) => string | null;
+  /** Why this person may not make the cell follow again (that would loosen it), or null. */
+  clearBlocked?: (cls: RiskClass) => string | null;
 }) {
   const scope = area ?? 'everywhere';
   return (
@@ -60,6 +73,7 @@ export default function PolicyGrid({
             const reasons = [...new Set(POLICY_SETTINGS.map((s) => lockedReason(locked, cls, s)).filter((r): r is string => Boolean(r)))];
             const reasonId = `agent-lock-${scope}-${cls}`;
             const label = RISK_CLASS_LABELS[cls];
+            const clearWhy = own && !disabled ? (clearBlocked?.(cls) ?? null) : null;
             return (
               <tr key={cls} data-class={cls} className="align-top">
                 <Td>
@@ -74,29 +88,32 @@ export default function PolicyGrid({
                 </Td>
                 {POLICY_SETTINGS.map((s) => {
                   const reason = lockedReason(locked, cls, s);
+                  const adminWhy = reason || disabled ? null : (adminOnly?.(cls, s) ?? null);
+                  const off = disabled || Boolean(reason) || Boolean(adminWhy);
                   return (
                     <Td key={s} className="text-center">
                       <label
-                        className={`inline-flex items-center justify-center gap-1 rounded p-1 ${reason || disabled ? 'opacity-60' : 'cursor-pointer hover:bg-electric/5'}`}
-                        title={reason ?? `${label}: ${SETTING_LABELS[s]}`}
+                        className={`inline-flex items-center justify-center gap-1 rounded p-1 ${off ? 'opacity-60' : 'cursor-pointer hover:bg-electric/5'}`}
+                        title={reason ?? adminWhy ?? `${label}: ${SETTING_LABELS[s]}`}
                       >
                         {reason && <Lock className="h-3.5 w-3.5 text-navy/50" aria-hidden="true" />}
                         <input
                           type="radio"
                           name={`agent-policy-${scope}-${cls}`}
                           checked={current === s}
-                          disabled={disabled || Boolean(reason)}
+                          disabled={off}
                           aria-label={`${label}: ${SETTING_LABELS[s]}`}
-                          aria-describedby={reason ? reasonId : undefined}
+                          aria-describedby={reason ? reasonId : adminWhy ? ADMIN_ONLY_NOTE_ID : undefined}
                           data-cell={`${cls}:${s}`}
                           data-locked={reason ? 'true' : undefined}
+                          data-admin-only={adminWhy ? 'true' : undefined}
                           onChange={() => {
-                            if (!reason) onChoose(cls, s);
+                            if (!off) onChoose(cls, s);
                           }}
-                          // A radio button that is already on sends no change event. In an area,
-                          // clicking the setting it follows from everywhere makes it the area's own.
+                          // A radio button that is already on sends no change event. Clicking the
+                          // setting a cell follows makes it the cell's own, kept as chosen.
                           onClick={() => {
-                            if (!reason && !disabled && area && !own && current === s) onChoose(cls, s);
+                            if (!off && !own && current === s) onChoose(cls, s);
                           }}
                         />
                       </label>
@@ -106,9 +123,17 @@ export default function PolicyGrid({
                 <Td className="text-right">
                   {own ? (
                     <span className="inline-flex flex-col items-end gap-0.5">
-                      <span className="text-[11px] text-electric">{area ? 'Set for this area' : 'Changed from the preset'}</span>
+                      <span className="text-[11px] text-electric" data-own={cls}>
+                        {area ? 'Set for this area' : repeatsPreset(draft, own) ? 'Kept as chosen' : 'Changed from the preset'}
+                      </span>
                       {!disabled && (
-                        <Button size="sm" variant="ghost" onClick={() => onClear(cls)} title={area ? 'Follow the setting for everywhere' : "Go back to the preset's setting"}>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => onClear(cls)}
+                          disabled={Boolean(clearWhy)}
+                          title={clearWhy ?? (area ? 'Follow the setting for everywhere' : "Follow the preset's setting again")}
+                        >
                           {area ? 'As everywhere' : 'As the preset'}
                         </Button>
                       )}

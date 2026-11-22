@@ -4,31 +4,16 @@
  * classId?, toBePrinted?, toBeEmailed?, overrideCreditLimit? }. Returns { created, skipped }.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getServerContext } from '@/lib/context';
 import { createBatchInvoices } from '@/lib/services/batchInvoicing';
 import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
-import { zDate, zLines, zUuid, zodErrorBody } from '@/lib/validation/helpers';
-import { invoiceLineSchema } from '@/lib/validation/invoices';
-
-const schema = z.object({
-  customerIds: z.array(zUuid).min(1, 'pick at least one customer'),
-  date: zDate,
-  dueDate: zDate.nullish(),
-  lines: zLines(invoiceLineSchema),
-  taxRateId: zUuid.nullish(),
-  useCustomerTaxRate: z.boolean().optional(),
-  memo: z.string().nullish(),
-  classId: zUuid.nullish(),
-  toBePrinted: z.boolean().optional(),
-  toBeEmailed: z.boolean().optional(),
-  overrideCreditLimit: z.boolean().optional(),
-});
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { batchInvoicesSchema } from '@/lib/validation/invoices';
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = schema.safeParse(await req.json().catch(() => ({})));
+    const parsed = batchInvoicesSchema.safeParse(await req.json().catch(() => ({})));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const { taxRateId, ...rest } = parsed.data;
     const result = await createBatchInvoices(ctx, {

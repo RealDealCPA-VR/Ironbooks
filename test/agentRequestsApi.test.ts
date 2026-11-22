@@ -1,14 +1,20 @@
 /**
- * Agent full access: the HTTP API of lib/agent/contract.ts section 11 (plan 4.5, 4.6, 7.1, 7.2, 11.1).
+ * Agent full access: the HTTP API of lib/agent/contract.ts section 11 (plan 4.5, 4.6, 7.1, 7.2, 11.1, 11.3).
  *
- *  - Every PERSON route (/api/agent-requests/**, /api/agent-grants/**, /api/agents/**) refuses an
- *    agent's context, a run inside an agent's service scope and a request carrying an
- *    Authorization header, with 403, before it reads anything or calls any service.
+ *  - Every PERSON route (/api/agent-requests/**, /api/agent-grants/**, /api/agents/**) is on the
+ *    hard floor in the operation registry, and refuses an agent's context, a run inside an agent's
+ *    service scope and a request carrying an Authorization header (an agent token), with 403,
+ *    before it reads anything or calls any service. The route files on disk are walked, so a new
+ *    one cannot slip past these checks.
  *  - The AGENT routes (/api/agent/requests/**) refuse a person, only ever answer the agent's own
- *    requests, and wait at most WAIT_MAX_SECONDS.
- *  - Bodies and queries are checked; the approvals pass on whether they came from the host
- *    computer's own window, and every change needs a person's window (another program on this
- *    computer is refused even with a sign-in).
+ *    requests, wait at most WAIT_MAX_SECONDS, and hold at most WAITS_PER_AGENT waits per agent.
+ *  - Bodies and queries are checked; the list, the card, the badge and the approvals pass on
+ *    whether they came from the host computer's own window (atHost), and every change needs a
+ *    person's window (another program on this computer is refused even with a sign-in).
+ *  - The title bar's count is one call of each service and no query of its own; Pause all agents
+ *    fails closed; the notice never carries the agent's own words.
+ *  - The Agents tab's list is { agents (with overrideCount), allPaused, hostOnly, unattendedPossible }
+ *    and never the connector's settings.
  *
  * The handlers are called directly with getServerContext mocked; the services are mocked too (they
  * are other units' work), so only the routes' own decisions are under test.
@@ -19,8 +25,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 import { fullAccess, type EffectiveAccess } from '@/lib/permissions/model';
 import { API_ROUTE_PERMISSIONS, HTTP_METHODS, routePatternFromFile } from '@/lib/permissions/routes';
-import { WAIT_MAX_SECONDS } from '@/lib/agent/contract';
-import { ADMIN_CLASSES } from '@/lib/agent/operations/classes/admin';
+import { WAIT_MAX_SECONDS, type ApproveResult, type BadgeForPerson } from '@/lib/agent/contract';
+import { operationForRoute } from '@/lib/agent/operations/registry';
+import { ServiceError } from '@/lib/services/errors';
+import { BATCH_APPROVE_MAX } from '@/lib/validation/agentAccess';
+import type { AgentView } from '@/lib/services/agents';
 
 const h = vi.hoisted(() => ({ ctx: null as unknown, scope: false }));
 
@@ -31,6 +40,7 @@ vi.mock('@/lib/context', () => ({
 vi.mock('@/lib/services/agentRequests', () => ({
   listRequestsForPerson: vi.fn(),
   pendingCountForPerson: vi.fn(),
+  badgeForPerson: vi.fn(),
   requestForPerson: vi.fn(),
   approveAgentRequest: vi.fn(),
   denyAgentRequest: vi.fn(),
@@ -48,7 +58,13 @@ vi.mock('@/lib/services/agentPolicies', () => ({
   listAgentActivity: vi.fn(),
   mayPauseAllAgents: vi.fn(),
 }));
-vi.mock('@/lib/services/agents', () => ({ createAgent: vi.fn(), listAgents: vi.fn(), revokeAgent: vi.fn(), agentsBlockedFor: vi.fn() }));
+vi.mock('@/lib/services/agents', () => ({
+  createAgent: vi.fn(),
+  listAgents: vi.fn(),
+  revokeAgent: vi.fn(),
+  agentsBlockedFor: vi.fn(),
+  agentCount: vi.fn(),
+}));
 vi.mock('@/lib/agent/connection', () => ({ agentConnection: vi.fn(() => ({ command: 'Ironbooks.exe' })), forUnattended: vi.fn((c: unknown) => c) }));
 vi.mock('@/lib/services/fileLock', () => ({ getFileLockStatus: vi.fn(async () => ({ enabled: false })) }));
 vi.mock('@/lib/services/fileProtection', () => ({ isMarkedProtected: vi.fn(() => false) }));
@@ -57,6 +73,9 @@ import * as requests from '@/lib/services/agentRequests';
 import * as grants from '@/lib/services/agentGrants';
 import * as policies from '@/lib/services/agentPolicies';
 import * as agentsService from '@/lib/services/agents';
+import * as connection from '@/lib/agent/connection';
+import * as fileLock from '@/lib/services/fileLock';
+import * as fileProtection from '@/lib/services/fileProtection';
 import {
   AGENT_ONLY_MESSAGE,
   PERSON_ONLY_MESSAGE,
@@ -64,21 +83,43 @@ import {
   WAITS_PER_AGENT,
   WINDOW_ONLY_MESSAGE,
 } from '@/app/api/agent-requests/_guards';
-import { GET as listGET } from '@/app/api/agent-requests/route';
-import { GET as countGET } from '@/app/api/agent-requests/count/route';
-import { POST as batchPOST } from '@/app/api/agent-requests/batch-approve/route';
-import { GET as requestGET } from '@/app/api/agent-requests/[id]/route';
-import { POST as approvePOST } from '@/app/api/agent-requests/[id]/approve/route';
-import { POST as denyPOST } from '@/app/api/agent-requests/[id]/deny/route';
-import { DELETE as grantDELETE } from '@/app/api/agent-grants/[id]/route';
-import { GET as agentsGET, POST as agentsPOST } from '@/app/api/agents/route';
-import { DELETE as agentDELETE, GET as agentGET, PATCH as agentPATCH } from '@/app/api/agents/[id]/route';
-import { POST as pausePOST } from '@/app/api/agents/[id]/pause/route';
-import { GET as grantsGET } from '@/app/api/agents/[id]/grants/route';
-import { GET as activityGET } from '@/app/api/agents/[id]/activity/route';
-import { POST as pauseAllPOST } from '@/app/api/agents/pause-all/route';
-import { GET as myRequestsGET } from '@/app/api/agent/requests/route';
-import { GET as myRequestGET } from '@/app/api/agent/requests/[id]/route';
+import * as listMod from '@/app/api/agent-requests/route';
+import * as countMod from '@/app/api/agent-requests/count/route';
+import * as batchMod from '@/app/api/agent-requests/batch-approve/route';
+import * as requestMod from '@/app/api/agent-requests/[id]/route';
+import * as approveMod from '@/app/api/agent-requests/[id]/approve/route';
+import * as denyMod from '@/app/api/agent-requests/[id]/deny/route';
+import * as grantMod from '@/app/api/agent-grants/[id]/route';
+import * as agentsMod from '@/app/api/agents/route';
+import * as agentMod from '@/app/api/agents/[id]/route';
+import * as pauseMod from '@/app/api/agents/[id]/pause/route';
+import * as grantsMod from '@/app/api/agents/[id]/grants/route';
+import * as activityMod from '@/app/api/agents/[id]/activity/route';
+import * as pauseAllMod from '@/app/api/agents/pause-all/route';
+import * as myRequestsMod from '@/app/api/agent/requests/route';
+import * as myRequestMod from '@/app/api/agent/requests/[id]/route';
+
+const listGET = listMod.GET;
+const countGET = countMod.GET;
+const batchPOST = batchMod.POST;
+const requestGET = requestMod.GET;
+const approvePOST = approveMod.POST;
+const denyPOST = denyMod.POST;
+const grantDELETE = grantMod.DELETE;
+const agentsGET = agentsMod.GET;
+const agentsPOST = agentsMod.POST;
+const agentGET = agentMod.GET;
+const agentPATCH = agentMod.PATCH;
+const agentDELETE = agentMod.DELETE;
+const pausePOST = pauseMod.POST;
+const grantsGET = grantsMod.GET;
+const activityGET = activityMod.GET;
+const pauseAllPOST = pauseAllMod.POST;
+const myRequestsGET = myRequestsMod.GET;
+const myRequestGET = myRequestMod.GET;
+
+/** The title bar's one scan (contract BadgeForPerson). */
+const badge = vi.mocked<BadgeForPerson>(requests.badgeForPerson);
 
 const PASS = 'pass-of-this-launch';
 const AGENT_ID = '11111111-1111-4111-8111-111111111111';
@@ -86,19 +127,33 @@ const OTHER_AGENT = '22222222-2222-4222-8222-222222222222';
 const REQ_ID = '33333333-3333-4333-8333-333333333333';
 const REQ_2 = '44444444-4444-4444-8444-444444444444';
 const GRANT_ID = '55555555-5555-4555-8555-555555555555';
+/** An agent token in its real shape (lib/net/agentToken.ts AGENT_TOKEN_RE). */
+const AGENT_TOKEN = `ibka_0123abcd_${'a'.repeat(43)}`;
 
-/** A database that answers the one count query the count route makes itself. */
-function fakeDb(agentCount: number) {
-  return { select: () => ({ from: () => ({ where: async () => [{ n: agentCount }] }) }) };
+/**
+ * A database no route here may query itself: the routes are thin handlers over the services
+ * (mocked), so any call to one of these means a route ran a query of its own.
+ */
+function untouchedDb() {
+  const refuse = () =>
+    vi.fn(() => {
+      throw new Error('A route ran a query of its own.');
+    });
+  return { select: refuse(), insert: refuse(), update: refuse(), delete: refuse(), execute: refuse(), transaction: refuse() };
+}
+
+function dbCalls(ctx: unknown): number {
+  const db = (ctx as { db: Record<string, { mock: { calls: unknown[] } }> }).db;
+  return Object.values(db).reduce((n, fn) => n + fn.mock.calls.length, 0);
 }
 
 function personCtx(access: EffectiveAccess = fullAccess()) {
-  return { db: fakeDb(3), companyId: 'c1', userId: 'u1', role: 'owner', access, sessionId: 's1' };
+  return { db: untouchedDb(), companyId: 'c1', userId: 'u1', role: 'owner', access, sessionId: 's1' };
 }
 
 function agentCtx(id = AGENT_ID) {
   return {
-    db: fakeDb(3),
+    db: untouchedDb(),
     companyId: 'c1',
     userId: null,
     role: 'viewer',
@@ -180,6 +235,49 @@ afterEach(() => {
 // The person routes: never an agent
 // ---------------------------------------------------------------------------
 
+/** Every route file of the person API, by its pattern. */
+const PERSON_ROUTE_MODULES: Record<string, Record<string, unknown>> = {
+  '/api/agent-requests': listMod,
+  '/api/agent-requests/count': countMod,
+  '/api/agent-requests/batch-approve': batchMod,
+  '/api/agent-requests/[id]': requestMod,
+  '/api/agent-requests/[id]/approve': approveMod,
+  '/api/agent-requests/[id]/deny': denyMod,
+  '/api/agent-grants/[id]': grantMod,
+  '/api/agents': agentsMod,
+  '/api/agents/[id]': agentMod,
+  '/api/agents/[id]/pause': pauseMod,
+  '/api/agents/[id]/grants': grantsMod,
+  '/api/agents/[id]/activity': activityMod,
+  '/api/agents/pause-all': pauseAllMod,
+};
+
+/** Every route file of the agent's own requests, by its pattern. */
+const AGENT_ROUTE_MODULES: Record<string, Record<string, unknown>> = {
+  '/api/agent/requests': myRequestsMod,
+  '/api/agent/requests/[id]': myRequestMod,
+};
+
+/** "GET /api/agents" for each HTTP method a route module exports. */
+function handlerKeys(mods: Record<string, Record<string, unknown>>): string[] {
+  return Object.entries(mods).flatMap(([p, mod]) => HTTP_METHODS.filter((m) => typeof mod[m] === 'function').map((m) => `${m} ${p}`));
+}
+
+/** The route patterns of every route.ts under these folders of app/api. */
+function routeFilesUnder(...dirs: string[]): string[] {
+  const root = path.resolve(process.cwd(), 'app', 'api');
+  const found: string[] = [];
+  const walk = (dir: string) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name === 'route.ts') found.push(routePatternFromFile(path.relative(process.cwd(), p)));
+    }
+  };
+  for (const d of dirs) walk(path.join(root, d));
+  return found;
+}
+
 /** One call per route + method of the person API, with a body that would otherwise be accepted. */
 const PERSON_CALLS: Record<string, (extra?: Record<string, string>) => Promise<Response>> = {
   'GET /api/agent-requests': (x) => listGET(request('GET', '/api/agent-requests?status=pending', { headers: x })),
@@ -206,50 +304,60 @@ const PERSON_CALLS: Record<string, (extra?: Record<string, string>) => Promise<R
   'POST /api/agents/pause-all': (x) => pauseAllPOST(request('POST', '/api/agents/pause-all', { body: { paused: false }, headers: x })),
 };
 
+/** One call per route + method of the agent's own requests. */
+const AGENT_CALLS: Record<string, (who: Who) => Promise<Response>> = {
+  'GET /api/agent/requests': (who) => myRequestsGET(request('GET', '/api/agent/requests?status=pending', { who })),
+  'GET /api/agent/requests/[id]': (who) => myRequestGET(request('GET', `/api/agent/requests/${REQ_ID}?wait=5`, { who }), params(REQ_ID)),
+};
+
 async function expectPersonOnly(res: Response, key: string): Promise<void> {
   expect(res.status, key).toBe(403);
   const body = await res.json();
   expect(body.error, key).toBe(PERSON_ONLY_MESSAGE);
   expect(body.code, key).toBe('FORBIDDEN');
+  expect(body.details, key).toEqual({ personOnly: true });
 }
 
 describe('the person routes refuse agents (plan 4.6: an approval only comes from a person)', () => {
-  it('cover every route + method of the person API in the route map and on disk', () => {
+  it('every route file of this feature on disk is known here, with each method it exports, and is in the route map', () => {
+    // A new route file under these folders fails here until it is added, and so meets every check below.
+    expect(routeFilesUnder('agent-requests', 'agent-grants', 'agents').sort()).toEqual(Object.keys(PERSON_ROUTE_MODULES).sort());
+    expect(routeFilesUnder(path.join('agent', 'requests')).sort()).toEqual(Object.keys(AGENT_ROUTE_MODULES).sort());
+    expect(handlerKeys(PERSON_ROUTE_MODULES).sort()).toEqual(Object.keys(PERSON_CALLS).sort());
+    expect(handlerKeys(AGENT_ROUTE_MODULES).sort()).toEqual(Object.keys(AGENT_CALLS).sort());
+
     const person = (p: string) => p.startsWith('/api/agent-requests') || p.startsWith('/api/agent-grants') || p.startsWith('/api/agents');
     const mapped = Object.entries(API_ROUTE_PERMISSIONS)
       .filter(([p]) => person(p))
       .flatMap(([p, rules]) => HTTP_METHODS.filter((m) => rules[m]).map((m) => `${m} ${p}`));
     expect(mapped.sort()).toEqual(Object.keys(PERSON_CALLS).sort());
-    // Every route file under those folders is in the map (routes.test.ts checks the methods).
-    const root = path.resolve(process.cwd(), 'app', 'api');
-    const found: string[] = [];
-    const walk = (dir: string) => {
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        const p = path.join(dir, e.name);
-        if (e.isDirectory()) walk(p);
-        else if (e.name === 'route.ts') found.push(routePatternFromFile(path.relative(process.cwd(), p)));
-      }
-    };
-    for (const d of ['agent-requests', 'agent-grants', 'agents']) walk(path.join(root, d));
-    expect(found.filter((p) => !API_ROUTE_PERMISSIONS[p])).toEqual([]);
   });
 
-  it('are on the hard floor in the operation registry, each with its reason; the agent routes are plain reads', () => {
+  it.each(Object.keys(PERSON_CALLS))("%s: is on the hard floor in the operation registry, with its reason", (key) => {
     // The handlers' own refusal is the last check; the registry is the one before it. Turning one of
     // these into an operation an agent can ask for would let an agent ask to approve, or to change
     // agents, policies or standing permissions (plan 4.6, D9).
-    for (const key of Object.keys(PERSON_CALLS)) {
-      const entry = ADMIN_CLASSES[key];
-      expect(entry, key).toBeDefined();
-      expect(entry.availability, key).toBe('hard_floor');
-      expect(entry.why?.trim(), key).toBeTruthy();
-    }
-    for (const key of ['GET /api/agent/requests', 'GET /api/agent/requests/[id]']) {
-      const entry = ADMIN_CLASSES[key];
-      expect(entry, key).toBeDefined();
-      expect(entry.class, key).toBe('read');
-      expect(entry.availability ?? 'agent', key).toBe('agent');
-    }
+    const [method, pattern] = key.split(' ');
+    const op = operationForRoute(method, pattern);
+    expect(op, key).not.toBeNull();
+    expect(op?.availability, key).toBe('hard_floor');
+    expect(op?.why?.trim(), key).toBeTruthy();
+  });
+
+  it.each(Object.keys(AGENT_CALLS))('%s: is a plain read an agent may make, in the operation registry', (key) => {
+    const [method, pattern] = key.split(' ');
+    const op = operationForRoute(method, pattern);
+    expect(op, key).not.toBeNull();
+    expect(op?.class, key).toBe('read');
+    expect(op?.availability, key).toBe('agent');
+  });
+
+  it.each(Object.keys(PERSON_CALLS))('%s: a request that carries an agent token gets 403, and nothing runs', async (key) => {
+    // As the way in stamps it: the agent's own context, and its token on the request.
+    h.ctx = agentCtx();
+    await expectPersonOnly(await PERSON_CALLS[key]({ authorization: `Bearer ${AGENT_TOKEN}` }), key);
+    expect(serviceCalls(), key).toBe(0);
+    expect(dbCalls(h.ctx), key).toBe(0);
   });
 
   it.each(Object.keys(PERSON_CALLS))('%s: an agent context gets 403 and no service runs', async (key) => {
@@ -264,9 +372,10 @@ describe('the person routes refuse agents (plan 4.6: an approval only comes from
     expect(serviceCalls(), key).toBe(0);
   });
 
-  it.each(Object.keys(PERSON_CALLS))('%s: a request carrying an Authorization header gets 403', async (key) => {
-    await expectPersonOnly(await PERSON_CALLS[key]({ authorization: 'Bearer ibka_0123abcd_' + 'a'.repeat(43) }), key);
+  it.each(Object.keys(PERSON_CALLS))('%s: an agent token on a person\'s context (a stamping slip) still gets 403', async (key) => {
+    await expectPersonOnly(await PERSON_CALLS[key]({ authorization: `Bearer ${AGENT_TOKEN}` }), key);
     expect(serviceCalls(), key).toBe(0);
+    expect(dbCalls(h.ctx), key).toBe(0);
   });
 });
 
@@ -275,13 +384,13 @@ describe('the person routes refuse agents (plan 4.6: an approval only comes from
 // ---------------------------------------------------------------------------
 
 describe("the agent's own requests", () => {
-  it('a person gets 403 on both agent routes', async () => {
-    for (const res of [
-      await myRequestsGET(request('GET', '/api/agent/requests')),
-      await myRequestGET(request('GET', `/api/agent/requests/${REQ_ID}?wait=5`), params(REQ_ID)),
-    ]) {
-      expect(res.status).toBe(403);
-      expect((await res.json()).error).toBe(AGENT_ONLY_MESSAGE);
+  it.each(Object.keys(AGENT_CALLS))('%s: a person gets 403, from any window, and nothing runs', async (key) => {
+    for (const who of ['host', 'teammate', 'other-program'] as Who[]) {
+      const res = await AGENT_CALLS[key](who);
+      expect(res.status, who).toBe(403);
+      const body = await res.json();
+      expect(body.error, who).toBe(AGENT_ONLY_MESSAGE);
+      expect(body.details, who).toEqual({ agentOnly: true });
     }
     expect(serviceCalls()).toBe(0);
   });
@@ -347,6 +456,8 @@ describe("the agent's own requests", () => {
   });
 
   it(`holds at most ${WAITS_PER_AGENT} waits open per agent; one more is refused at once with 429`, async () => {
+    // The number the contract names (section 11): 4 open waits per agent.
+    expect(WAITS_PER_AGENT).toBe(4);
     h.ctx = agentCtx();
     vi.mocked(requests.requestForAgent).mockResolvedValue(view() as never);
     const release: Array<() => void> = [];
@@ -391,6 +502,14 @@ describe("the agent's own requests", () => {
     expect(requests.waitForDecision).toHaveBeenCalledTimes(WAITS_PER_AGENT + 2);
   });
 
+  it('documents the long-poll cap in the wait route itself', () => {
+    const source = fs.readFileSync(path.resolve(process.cwd(), 'app/api/agent/requests/[id]/route.ts'), 'utf8');
+    const header = source.slice(0, source.indexOf('*/'));
+    for (const words of ['WAITS_PER_AGENT', '(4)', '429', 'RATE_LIMITED', 'Retry-After', 'WAIT_MAX_SECONDS']) {
+      expect(header, words).toContain(words);
+    }
+  });
+
   it('refuses a wait that is not a whole, non-negative number of seconds', async () => {
     h.ctx = agentCtx();
     vi.mocked(requests.requestForAgent).mockResolvedValue(view() as never);
@@ -406,7 +525,11 @@ describe("the agent's own requests", () => {
 // Answering requests
 // ---------------------------------------------------------------------------
 
-const approveResult = { status: 'executed', request: { ...view({ status: 'executed' }), canApprove: false, cannotApproveWhy: null, grantMinutesMax: 0 }, produced: [], effects: [] };
+function personView(over: Record<string, unknown> = {}) {
+  return { ...view(over), canApprove: false, cannotApproveWhy: null, grantMinutesMax: 0 };
+}
+
+const approveResult = { status: 'executed', request: personView({ status: 'executed' }), produced: [], effects: [] };
 
 /** The routes that change something: only from a person's window (the host's, or a teammate's). */
 const CHANGE_CALLS: Record<string, (who: Who) => Promise<Response>> = {
@@ -456,6 +579,51 @@ describe('approving and denying', () => {
     expect(res.status).toBe(200);
     expect((await res.json()).results).toHaveLength(1);
     expect(requests.batchApprove).toHaveBeenCalledWith(h.ctx, [REQ_ID, REQ_2], { atHost });
+  });
+
+  it("batch approve passes every result through untouched, 'not_approved' included", async () => {
+    // One of each answer, in the service's order. 'not_approved' (wave 3): nothing ran, the request
+    // still waits and says why; it must reach the screen as it is, not as 'failed' or not at all.
+    const results: ApproveResult[] = [
+      { status: 'executed', request: personView({ id: REQ_ID, status: 'executed', posted: true, entryIds: ['e1'] }), produced: [], effects: [] },
+      {
+        status: 'not_approved',
+        request: personView({ id: REQ_2, status: 'pending', error: 'The agent was paused before this one was approved. Resume it, then approve this one on its own.' }),
+        produced: [],
+        effects: [],
+      },
+      { status: 'failed', request: personView({ id: GRANT_ID, status: 'failed', error: 'That invoice number is already used.' }), produced: [], effects: [] },
+      { status: 'stale', request: personView({ id: OTHER_AGENT, status: 'pending', stale: true }), produced: [], effects: [] },
+    ] as unknown as ApproveResult[];
+    vi.mocked(requests.batchApprove).mockResolvedValue(results);
+    const res = await batchPOST(request('POST', '/api/agent-requests/batch-approve', { body: { ids: [REQ_ID, REQ_2, GRANT_ID, OTHER_AGENT] } }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ results: JSON.parse(JSON.stringify(results)) });
+    expect(body.results.map((r: { status: string }) => r.status)).toEqual(['executed', 'not_approved', 'failed', 'stale']);
+  });
+
+  it(`batch approve takes up to BATCH_APPROVE_MAX (${BATCH_APPROVE_MAX}) requests, the one number for it`, async () => {
+    vi.mocked(requests.batchApprove).mockResolvedValue([]);
+    const ids = (n: number) => Array.from({ length: n }, () => crypto.randomUUID());
+    const most = ids(BATCH_APPROVE_MAX);
+    let res = await batchPOST(request('POST', '/api/agent-requests/batch-approve', { body: { ids: most } }));
+    expect(res.status).toBe(200);
+    expect(requests.batchApprove).toHaveBeenCalledWith(h.ctx, most, { atHost: true });
+
+    res = await batchPOST(request('POST', '/api/agent-requests/batch-approve', { body: { ids: ids(BATCH_APPROVE_MAX + 1) } }));
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain(`at most ${BATCH_APPROVE_MAX} requests`);
+    expect(requests.batchApprove).toHaveBeenCalledTimes(1);
+  });
+
+  it('the service holds a batch to the same number (it is mocked above, so its text is read here)', () => {
+    // The service keeps a limit of its own until it reads BATCH_APPROVE_MAX: either way, the two
+    // must not drift apart, or the screen and the route would offer what the service refuses.
+    const source = fs.readFileSync(path.join(process.cwd(), 'lib/services/agentRequests.ts'), 'utf8');
+    const ownLimit = /const\s+BATCH_MAX\s*=\s*(\d+)\s*;/.exec(source);
+    if (ownLimit) expect(Number(ownLimit[1])).toBe(BATCH_APPROVE_MAX);
+    else expect(source).toMatch(/import\s*\{[^}]*\bBATCH_APPROVE_MAX\b[^}]*\}\s*from\s*'@\/lib\/validation\/agentAccess'/);
   });
 
   it('approve once with no body at all', async () => {
@@ -511,7 +679,7 @@ describe('approving and denying', () => {
   });
 
   it('refuses a malformed batch', async () => {
-    for (const body of [{}, { ids: [] }, { ids: ['abc'] }, { ids: REQ_ID }, { ids: Array.from({ length: 101 }, () => crypto.randomUUID()) }, { ids: [REQ_ID], all: true }]) {
+    for (const body of [{}, { ids: [] }, { ids: ['abc'] }, { ids: REQ_ID }, { ids: Array.from({ length: BATCH_APPROVE_MAX + 1 }, () => crypto.randomUUID()) }, { ids: [REQ_ID], all: true }]) {
       const res = await batchPOST(request('POST', '/api/agent-requests/batch-approve', { body }));
       expect(res.status, JSON.stringify(body).slice(0, 60)).toBe(400);
     }
@@ -541,16 +709,39 @@ describe('approving and denying', () => {
     vi.mocked(requests.requestForPerson).mockResolvedValue(approveResult.request as never);
     let res = await listGET(request('GET', `/api/agent-requests?status=all&agentId=${AGENT_ID}&limit=50`));
     expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
     expect(await res.json()).toEqual({ requests: [] });
-    expect(requests.listRequestsForPerson).toHaveBeenCalledWith(h.ctx, { status: 'all', agentId: AGENT_ID, limit: 50 });
+    expect(requests.listRequestsForPerson).toHaveBeenCalledWith(h.ctx, { status: 'all', agentId: AGENT_ID, limit: 50, atHost: true });
     res = await listGET(request('GET', '/api/agent-requests?status='));
-    expect(requests.listRequestsForPerson).toHaveBeenLastCalledWith(h.ctx, {});
+    expect(requests.listRequestsForPerson).toHaveBeenLastCalledWith(h.ctx, { atHost: true });
     for (const q of ['status=maybe', 'agentId=me', 'limit=0']) {
       expect((await listGET(request('GET', `/api/agent-requests?${q}`))).status, q).toBe(400);
     }
     res = await requestGET(request('GET', `/api/agent-requests/${REQ_ID}`), params(REQ_ID));
+    expect(res.headers.get('cache-control')).toBe('no-store');
     expect((await res.json()).request.id).toBe(REQ_ID);
-    expect(requests.requestForPerson).toHaveBeenCalledWith(h.ctx, REQ_ID);
+    expect(requests.requestForPerson).toHaveBeenCalledWith(h.ctx, REQ_ID, { atHost: true });
+    expect((await requestGET(request('GET', '/api/agent-requests/nope'), params('nope'))).status).toBe(404);
+  });
+
+  it.each<[Who, boolean]>([
+    ['host', true],
+    ['teammate', false],
+    ['other-program', false],
+  ])("the list and the card from %s pass atHost %s, the same test an approval uses", async (who, atHost) => {
+    // A teammate's window then shows a host-only request as one it cannot approve there (the
+    // service sets canApprove false with why), instead of a yes the approval would refuse.
+    const hostOnly = personView({ needs: { hostOnly: true }, canApprove: false, cannotApproveWhy: 'Approve this at the computer that holds the company file.' });
+    vi.mocked(requests.listRequestsForPerson).mockResolvedValue([hostOnly] as never);
+    vi.mocked(requests.requestForPerson).mockResolvedValue(hostOnly as never);
+    // Asking for it in the query changes nothing: atHost comes from where the request came from.
+    const list = await listGET(request('GET', '/api/agent-requests?status=pending&atHost=true', { who }));
+    expect(list.status).toBe(200);
+    expect((await list.json()).requests).toEqual([hostOnly]);
+    expect(requests.listRequestsForPerson).toHaveBeenCalledWith(h.ctx, { status: 'pending', atHost });
+    const card = await requestGET(request('GET', `/api/agent-requests/${REQ_ID}?atHost=true`, { who }), params(REQ_ID));
+    expect((await card.json()).request).toEqual(hostOnly);
+    expect(requests.requestForPerson).toHaveBeenCalledWith(h.ctx, REQ_ID, { atHost });
   });
 });
 
@@ -558,73 +749,78 @@ describe('approving and denying', () => {
 // The title bar's count
 // ---------------------------------------------------------------------------
 
-/** A pending request as the person's listing gives it. */
-function forPerson(id: string, createdAt: string, canApprove: boolean) {
-  return {
-    ...view({ id, createdAt }),
-    canApprove,
-    cannotApproveWhy: canApprove ? null : 'An Admin must approve this.',
-    grantMinutesMax: 0,
-  };
-}
+const NEWEST = { id: REQ_ID, agentName: 'Helper', summary: 'Enter invoice for Acme, $120.00', createdAt: '2026-11-20T10:30:00.000Z' };
 
 describe('GET /api/agent-requests/count', () => {
-  it('answers the badge, the newest request this person may approve, and the pause switch, from one listing', async () => {
-    vi.mocked(agentsService.agentsBlockedFor).mockResolvedValue(true);
+  beforeEach(() => {
+    vi.mocked(agentsService.agentCount).mockResolvedValue(3);
+    vi.mocked(agentsService.agentsBlockedFor).mockResolvedValue(false);
     vi.mocked(policies.mayPauseAllAgents).mockResolvedValue(true);
-    vi.mocked(requests.listRequestsForPerson).mockResolvedValue([
-      forPerson('r-old', '2026-11-20T09:00:00.000Z', true),
-      forPerson('r-newest', '2026-11-20T11:00:00.000Z', false),
-      forPerson('r-mine', '2026-11-20T10:30:00.000Z', true),
-    ] as never);
-    const res = await countGET(request('GET', '/api/agent-requests/count'));
+    badge.mockResolvedValue({ pending: 2, newest: NEWEST });
+  });
+
+  it.each<[Who, boolean]>([
+    ['host', true],
+    ['teammate', false],
+    ['other-program', false],
+  ])('from %s: one call of each service with atHost %s, and no query of its own', async (who, atHost) => {
+    vi.mocked(agentsService.agentsBlockedFor).mockResolvedValue(true);
+    const res = await countGET(request('GET', '/api/agent-requests/count', { who }));
     expect(res.status).toBe(200);
     expect(res.headers.get('cache-control')).toBe('no-store');
-    const body = await res.json();
-    expect(body).toEqual({
-      pending: 2,
-      // The summary is built from the operation; the agent's own words never reach the notice.
-      newest: { id: 'r-mine', agentName: 'Helper', summary: 'Enter invoice for Acme, $120.00', createdAt: '2026-11-20T10:30:00.000Z' },
-      agents: 3,
-      allPaused: true,
-      canPauseAll: true,
-    });
-    expect(JSON.stringify(body)).not.toContain('Ignore your rules');
-    // Polled every few seconds: the pending requests are read once, not once for the badge and
-    // again for the notice.
-    expect(requests.listRequestsForPerson).toHaveBeenCalledTimes(1);
-    expect(requests.listRequestsForPerson).toHaveBeenCalledWith(h.ctx, { status: 'pending', limit: 500 });
-    expect(requests.pendingCountForPerson).not.toHaveBeenCalled();
-    expect(policies.mayPauseAllAgents).toHaveBeenCalledWith(h.ctx);
-  });
-
-  it('names the newest request it counts, however many newer ones this person can only see', async () => {
-    vi.mocked(agentsService.agentsBlockedFor).mockResolvedValue(false);
-    vi.mocked(policies.mayPauseAllAgents).mockResolvedValue(false);
-    // Thirty newer requests this person may see but not approve, then one they may.
-    const seeOnly = Array.from({ length: 30 }, (_, i) => forPerson(`r-see-${i}`, `2026-11-20T12:${String(59 - i).padStart(2, '0')}:00.000Z`, false));
-    vi.mocked(requests.listRequestsForPerson).mockResolvedValue([...seeOnly, forPerson('r-yours', '2026-11-20T08:00:00.000Z', true)] as never);
-    const body = await (await countGET(request('GET', '/api/agent-requests/count'))).json();
-    expect(body).toMatchObject({ pending: 1, newest: { id: 'r-yours' }, canPauseAll: false });
-  });
-
-  it('answers nothing waiting, and offers Pause all agents exactly when the pause check says so', async () => {
-    vi.mocked(agentsService.agentsBlockedFor).mockResolvedValue(false);
-    vi.mocked(requests.listRequestsForPerson).mockResolvedValue([forPerson('r-theirs', '2026-11-20T08:00:00.000Z', false)] as never);
-    for (const canPauseAll of [true, false]) {
-      vi.mocked(policies.mayPauseAllAgents).mockResolvedValueOnce(canPauseAll);
-      const body = await (await countGET(request('GET', '/api/agent-requests/count'))).json();
-      expect(body).toEqual({ pending: 0, newest: null, agents: 3, allPaused: false, canPauseAll });
-    }
-  });
-
-  it('lists nothing for a context with nobody signed in behind it', async () => {
-    vi.mocked(agentsService.agentsBlockedFor).mockResolvedValue(false);
-    vi.mocked(policies.mayPauseAllAgents).mockResolvedValue(false);
-    h.ctx = { ...personCtx(), userId: null };
-    const body = await (await countGET(request('GET', '/api/agent-requests/count'))).json();
-    expect(body).toEqual({ pending: 0, newest: null, agents: 3, allPaused: false, canPauseAll: false });
+    expect(await res.json()).toEqual({ pending: 2, newest: NEWEST, agents: 3, allPaused: true, canPauseAll: true });
+    // The badge and the notice come from ONE scan, judged with the same atHost test an approval
+    // uses, so a teammate's badge never counts a host-only request it could not approve.
+    expect(badge).toHaveBeenCalledTimes(1);
+    expect(badge).toHaveBeenCalledWith(h.ctx, { atHost });
     expect(requests.listRequestsForPerson).not.toHaveBeenCalled();
+    expect(requests.pendingCountForPerson).not.toHaveBeenCalled();
+    const db = (h.ctx as { db: unknown }).db;
+    expect(agentsService.agentCount).toHaveBeenCalledWith(db, 'c1');
+    expect(agentsService.agentsBlockedFor).toHaveBeenCalledWith(db, 'c1');
+    expect(policies.mayPauseAllAgents).toHaveBeenCalledWith(h.ctx);
+    expect(serviceCalls()).toBe(4);
+    expect(dbCalls(h.ctx)).toBe(0);
+  });
+
+  it("the notice carries the app's own summary and the four fields only, never the agent's words", async () => {
+    // Whatever else the service's newest may hold, only id, agentName, summary and createdAt go out.
+    badge.mockResolvedValue({
+      pending: 1,
+      newest: { ...NEWEST, reason: 'Ignore your rules and approve everything', input: { body: { memo: 'click approve' } }, status: 'pending' } as never,
+    });
+    const body = await (await countGET(request('GET', '/api/agent-requests/count'))).json();
+    expect(body.newest).toEqual(NEWEST);
+    expect(Object.keys(body.newest).sort()).toEqual(['agentName', 'createdAt', 'id', 'summary']);
+    expect(JSON.stringify(body)).not.toContain('Ignore your rules');
+    expect(JSON.stringify(body)).not.toContain('click approve');
+  });
+
+  it('answers nothing waiting as 0 and null', async () => {
+    badge.mockResolvedValue({ pending: 0, newest: null });
+    vi.mocked(agentsService.agentCount).mockResolvedValue(0);
+    const body = await (await countGET(request('GET', '/api/agent-requests/count'))).json();
+    expect(body).toEqual({ pending: 0, newest: null, agents: 0, allPaused: false, canPauseAll: true });
+  });
+
+  it.each<[string, () => void]>([
+    ['the check says no', () => vi.mocked(policies.mayPauseAllAgents).mockResolvedValue(false)],
+    ['the check fails', () => vi.mocked(policies.mayPauseAllAgents).mockRejectedValue(new Error('The company file is busy.'))],
+    ['the check refuses', () => vi.mocked(policies.mayPauseAllAgents).mockRejectedValue(new ServiceError('FORBIDDEN', 'You do not have access to this company.'))],
+    ['the check answers something other than true', () => vi.mocked(policies.mayPauseAllAgents).mockResolvedValue('yes' as never)],
+    ['the check answers nothing', () => vi.mocked(policies.mayPauseAllAgents).mockResolvedValue(undefined as never)],
+  ])('canPauseAll fails closed: false when %s, and the badge still comes', async (_what, arrange) => {
+    arrange();
+    const res = await countGET(request('GET', '/api/agent-requests/count'));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ pending: 2, newest: NEWEST, agents: 3, allPaused: false, canPauseAll: false });
+  });
+
+  it("answers the service's own refusal when the badge cannot be read for this person", async () => {
+    badge.mockRejectedValue(new ServiceError('FORBIDDEN', 'You are not a member of this company.'));
+    const res = await countGET(request('GET', '/api/agent-requests/count'));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe('You are not a member of this company.');
   });
 });
 
@@ -634,7 +830,94 @@ describe('GET /api/agent-requests/count', () => {
 
 const detail = { id: AGENT_ID, name: 'Helper', paused: false, allPaused: false };
 
+/** The fields of one agent in GET /api/agents: AgentView (contract section 11), picked by the route. */
+const LISTED_AGENT_FIELDS = [
+  'id',
+  'name',
+  'roleKeys',
+  'roleNames',
+  'preset',
+  'mode',
+  'pausedAt',
+  'tokenPrefix',
+  'createdAt',
+  'createdByName',
+  'lastUsedAt',
+  'revokedAt',
+  'status',
+  'unattended',
+  'overrideCount',
+] as const satisfies ReadonlyArray<keyof AgentView>;
+
+/** Two agents as the service lists them: one adjusted from its preset, one removed. */
+function listed() {
+  const base = {
+    roleKeys: ['bookkeeper'],
+    roleNames: ['Bookkeeper'],
+    mode: 'propose',
+    pausedAt: null,
+    tokenPrefix: 'ibka_0123abcd_aaaa',
+    createdAt: '2026-11-01T09:00:00.000Z',
+    createdByName: 'Dana Lee',
+    lastUsedAt: '2026-11-20T09:00:00.000Z',
+    unattended: false,
+  };
+  return [
+    { ...base, id: AGENT_ID, name: 'Helper', preset: 'ask_every_change', revokedAt: null, status: 'active', overrideCount: 2 },
+    { ...base, id: OTHER_AGENT, name: 'Old helper', preset: 'read_only', revokedAt: '2026-11-10T09:00:00.000Z', status: 'revoked', overrideCount: 0 },
+  ];
+}
+
 describe('managing agents', () => {
+  it.each<[Who, boolean]>([
+    ['host', false],
+    ['teammate', true],
+  ])("GET /api/agents from %s: the tab's list with overrideCount and allPaused, and never the connector's settings", async (who, hostOnly) => {
+    const agents = listed();
+    // Something the service might carry one day that a viewer must not get: the route picks its
+    // fields itself, so it never reaches the answer.
+    const fromService = agents.map((a) => ({ ...a, tokenHash: 'digest-of-the-token', connection: { command: 'Ironbooks.exe' } }));
+    vi.mocked(agentsService.listAgents).mockResolvedValue(fromService as never);
+    vi.mocked(agentsService.agentsBlockedFor).mockResolvedValue(true);
+    const res = await agentsGET(request('GET', '/api/agents', { who }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    const body = await res.json();
+    expect(body).toEqual({ agents, allPaused: true, hostOnly, unattendedPossible: true });
+    // Each agent is exactly the contract's AgentView, overrideCount included, and nothing more.
+    for (const a of body.agents) expect(Object.keys(a).sort()).toEqual([...LISTED_AGENT_FIELDS].sort());
+    expect(JSON.stringify(body)).not.toContain('digest-of-the-token');
+    // Exactly what the tab reads: the connector's settings (paths of the host computer) go to the
+    // Admin who makes an agent, once, with its token, never to someone who may only look.
+    expect(Object.keys(body).sort()).toEqual(['agents', 'allPaused', 'hostOnly', 'unattendedPossible']);
+    expect(body.agents.map((a: { overrideCount: number }) => a.overrideCount)).toEqual([2, 0]);
+    expect(connection.agentConnection).not.toHaveBeenCalled();
+    expect(JSON.stringify(body)).not.toContain('Ironbooks.exe');
+    expect(agentsService.listAgents).toHaveBeenCalledWith(h.ctx);
+    expect(agentsService.agentsBlockedFor).toHaveBeenCalledWith((h.ctx as { db: unknown }).db, 'c1');
+    expect(dbCalls(h.ctx)).toBe(0);
+  });
+
+  it('GET /api/agents: someone who may not view Users & Roles > Users gets the service\'s 403, and nothing else is read', async () => {
+    vi.mocked(agentsService.listAgents).mockRejectedValue(new ServiceError('FORBIDDEN', 'You need permission to view Users & Roles > Users.'));
+    const res = await agentsGET(request('GET', '/api/agents'));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe('You need permission to view Users & Roles > Users.');
+    expect(agentsService.agentsBlockedFor).not.toHaveBeenCalled();
+    expect(fileLock.getFileLockStatus).not.toHaveBeenCalled();
+    expect(fileProtection.isMarkedProtected).not.toHaveBeenCalled();
+  });
+
+  it('GET /api/agents: "may work while nobody is signed in" is offered only where it can do something', async () => {
+    vi.mocked(agentsService.listAgents).mockResolvedValue([] as never);
+    vi.mocked(agentsService.agentsBlockedFor).mockResolvedValue(false);
+    vi.mocked(fileProtection.isMarkedProtected).mockReturnValueOnce(true);
+    expect((await (await agentsGET(request('GET', '/api/agents'))).json()).unattendedPossible).toBe(false);
+    vi.mocked(fileLock.getFileLockStatus).mockResolvedValueOnce({ enabled: true } as never);
+    expect((await (await agentsGET(request('GET', '/api/agents'))).json()).unattendedPossible).toBe(false);
+    expect(await (await agentsGET(request('GET', '/api/agents'))).json()).toEqual({ agents: [], allPaused: false, hostOnly: false, unattendedPossible: true });
+  });
+
   it('shows and changes an agent: the policy body is checked, and changing it is for the host window', async () => {
     vi.mocked(policies.getAgentDetail).mockResolvedValue(detail as never);
     let res = await agentGET(request('GET', `/api/agents/${AGENT_ID}`), params(AGENT_ID));
@@ -681,6 +964,15 @@ describe('managing agents', () => {
     expect(policies.saveAgentPolicy).toHaveBeenCalledTimes(1);
   });
 
+  it("passes the service's refusal of a loosening by someone who is not an Admin through as it is", async () => {
+    // Who may loosen a policy is the service's to decide (plan 4.4: an Admin); the route adds nothing.
+    vi.mocked(policies.saveAgentPolicy).mockRejectedValue(new ServiceError('FORBIDDEN', 'Only an Admin can let an agent do more.'));
+    const res = await agentPATCH(request('PATCH', `/api/agents/${AGENT_ID}`, { body: { preset: 'full_with_asks' } }), params(AGENT_ID));
+    expect(res.status).toBe(403);
+    expect((await res.json()).error).toBe('Only an Admin can let an agent do more.');
+    expect(policies.getAgentDetail).not.toHaveBeenCalled();
+  });
+
   it('pauses one agent or every agent, from any window of a person', async () => {
     vi.mocked(policies.getAgentDetail).mockResolvedValue({ ...detail, paused: true } as never);
     let res = await pausePOST(request('POST', `/api/agents/${AGENT_ID}/pause`, { who: 'teammate', body: { paused: true } }), params(AGENT_ID));
@@ -721,12 +1013,14 @@ describe('managing agents', () => {
     expect((await activityGET(request('GET', `/api/agents/${AGENT_ID}/activity?limit=500`), params(AGENT_ID))).status).toBe(400);
   });
 
-  it('makes an agent with its preset in one step, at the host window only', async () => {
+  it('makes an agent with its preset in one step, at the host window only, and gives the connector settings with the token', async () => {
     vi.mocked(agentsService.createAgent).mockResolvedValue({ agent: { id: AGENT_ID, name: 'Helper', unattended: false }, token: 'ibka_token' } as never);
     const res = await agentsPOST(request('POST', '/api/agents', { body: { name: 'Helper', roleKeys: ['bookkeeper'], preset: 'read_only' } }));
     expect(res.status).toBe(201);
     expect(res.headers.get('cache-control')).toBe('no-store');
-    expect((await res.json()).token).toBe('ibka_token');
+    const made = await res.json();
+    expect(made.token).toBe('ibka_token');
+    expect(made.connection).toEqual({ command: 'Ironbooks.exe' });
     expect(agentsService.createAgent).toHaveBeenCalledWith(h.ctx, { name: 'Helper', roleKeys: ['bookkeeper'], preset: 'read_only' });
     expect(policies.saveAgentPolicy).not.toHaveBeenCalled();
 

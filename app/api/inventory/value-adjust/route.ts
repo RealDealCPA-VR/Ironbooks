@@ -21,6 +21,8 @@ import { adjustInventoryValue } from '@/lib/services/inventoryOps';
 import { inventoryDate } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { valueAdjustSchema } from '@/lib/validation/inventory';
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
   const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
@@ -48,6 +50,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (!body.date) {
       return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/inventory.ts). The checks above answer
+    // first, so this refuses only a value the service could not have used.
+    const checked = valueAdjustSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const result = await adjustInventoryValue(ctx, {
       itemId: body.itemId,

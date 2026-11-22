@@ -109,18 +109,10 @@ const ALLOWED: Record<string, Allowance | Allowance[]> = {
 /**
  * Real violations still waiting for their fix, by "<operation id> <file>" (file relative to the
  * repo, forward slashes). Reclassify the operation dryRun 'none' or make the service use ctx.db,
- * then remove the entry.
+ * then remove the entry. Empty since condense became dryRun 'none' (its service opens the
+ * company's own folder through getDb() and writes a safety copy and an archive first).
  */
-const KNOWN: Record<string, string> = {
-  'condense lib/services/fileProtection.ts':
-    "KNOWN, needs dryRun 'none' (lib/agent/operations/classes): condensePeriod calls protectionForDir(input.dataDir), " +
-    "which opens the company's OWN folder with getDb() and reads through it while the bridge holds its transaction " +
-    '(PGlite runs one at a time: the read can wait for ever).',
-  'condense lib/services/backup.ts':
-    "KNOWN, needs dryRun 'none' (lib/agent/operations/classes): condensePeriod writes a safety copy and an archive of " +
-    'the company folder (ensurePreOpBackup, createBackup) before it condenses: file work the bridge cannot roll back, ' +
-    "and restoreBackup reopens the company's own folder with getDb().",
-};
+const KNOWN: Record<string, string> = {};
 
 // ---------------------------------------------------------------------------
 // Reading source text

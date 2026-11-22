@@ -9,11 +9,14 @@
  * (app/api/agent-requests/_guards.ts). Another agent's request, or one that does not exist, is
  * "not found" alike.
  *
- * One agent holds at most WAITS_PER_AGENT long polls open at once (_guards.ts; plan 11.3: a rate
- * limit per agent). Each one re-reads the company file every few seconds for up to WAIT_MAX_SECONDS, and the
- * company file answers one query at a time, so an agent (or a stolen token) opening dozens would
- * slow the app down for the people using it. Past the limit the answer is a 429 at once; reading a
- * request without waiting is never limited here.
+ * The long-poll cap (plan 11.3: a rate limit per agent): one agent holds at most WAITS_PER_AGENT
+ * (4) long polls open at once (app/api/agent-requests/_guards.ts). Each one re-reads the company
+ * file every few seconds for up to WAIT_MAX_SECONDS, and the company file answers one query at a
+ * time, so an agent (or a stolen token) opening dozens would slow the app down for the people
+ * using it. One wait more is answered at once with 429, code RATE_LIMITED, and a Retry-After
+ * header (5 seconds); nothing waits and nothing is counted for it. A slot is given back however a
+ * wait ends, an error included. Reading a request without waiting is never limited here; the
+ * hourly cap on new requests is the requests service's (ASKS_PER_HOUR_BEFORE_PAUSE).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext, inServiceScope } from '@/lib/context';

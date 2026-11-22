@@ -15,12 +15,20 @@
  * the request into the same structured command. Everything works with AI off.
  *
  * Keyboard: ↑/↓ move, Enter runs, Esc closes. ARIA: dialog + combobox + listbox with groups.
+ *
+ * A page this window hides (a feature switched off, or "Agent requests" while the company has no
+ * agent) is never opened from here: a command that leads to one says why it is not on and where to
+ * turn it on (lib/nav.ts hiddenPageNotice). "Go to agent requests" is settled here, from the same
+ * count poll that puts the page on the menu (`hasAgents`), so it opens exactly when the menu shows
+ * it. The server's "go to …" (lib/services/commandBar.ts: "Ask: …" and AI answers) finds that page
+ * only when it is told the company has an agent (searchPages' strict rule); a server answer that
+ * leads to a page this window hides is still said, not opened (showResult).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { Search, Sparkles, CornerDownLeft } from 'lucide-react';
 import { api, ApiError } from '@/lib/client';
-import { searchPages } from '@/lib/nav';
+import { AGENT_ONLY_PATHS, hiddenPageNotice, searchPages } from '@/lib/nav';
 import { matchIntents } from '@/lib/nav-actions';
 import { parseCommand } from '@/lib/commands/grammar';
 import { describeIntent, type CommandIntent, type ResolveHints } from '@/lib/commands/intent';
@@ -107,9 +115,12 @@ function basePath(href: string) {
 export default function CommandPalette({
   permissions,
   hiddenPaths,
+  hasAgents = false,
 }: {
   permissions?: Partial<Record<Area, readonly string[]>> | null;
   hiddenPaths?: ReadonlySet<string>;
+  /** The company has an agent (the window's count poll): "Agent requests" is on. Unknown is no. */
+  hasAgents?: boolean;
 } = {}) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -213,11 +224,20 @@ export default function CommandPalette({
     [router],
   );
 
+  /** A page this window does not show: an "Agent requests" with no agent, or a page in hiddenPaths. */
+  const isHidden = useCallback(
+    (href: string) => {
+      const base = basePath(href);
+      return hiddenPaths?.has(base) === true || (!hasAgents && AGENT_ONLY_PATHS.has(base));
+    },
+    [hiddenPaths, hasAgents],
+  );
+
   /** Open a page's NEW form with values filled in (sessionStorage handoff, lib/commands/prefill.ts). */
   const openPrefilled = useCallback(
     (href: string, prefill: FormPrefill, notes: string[] = []) => {
-      if (hiddenPaths?.has(basePath(href))) {
-        setPanel({ tone: 'warn', heading: 'That feature is turned off', body: 'Turn it on in Preferences to use it.' });
+      if (isHidden(href)) {
+        setPanel({ tone: 'warn', ...hiddenPageNotice(href) });
         setPanelRows([]);
         return;
       }
@@ -241,7 +261,7 @@ export default function CommandPalette({
         },
       });
     },
-    [hiddenPaths, router],
+    [isHidden, router],
   );
 
   // ---- running a plain-English command ----
@@ -282,8 +302,8 @@ export default function CommandPalette({
         toast(r.summary + via, 'info');
         return;
       case 'navigate':
-        if (hiddenPaths?.has(basePath(r.href))) {
-          setPanel({ tone: 'warn', heading: 'That feature is turned off', body: 'Turn it on in Preferences to use it.' });
+        if (isHidden(r.href)) {
+          setPanel({ tone: 'warn', ...hiddenPageNotice(r.href) });
           setPanelRows([backRow()]);
           return;
         }
@@ -349,6 +369,28 @@ export default function CommandPalette({
     }
   }
 
+  /**
+   * "Go to agent requests" (or any words that page answers to): its address when the words name a
+   * page shown only while the company has an agent, else null. Such a command is settled here,
+   * from the window's own count poll, so it agrees with the menu (see the header).
+   */
+  function agentOnlyTarget(intent: CommandIntent | null): string | null {
+    if (!intent || intent.kind !== 'navigate') return null;
+    const [page] = searchPages(intent.target, { permissions: perms, hasAgents: true, limit: 1, strict: true });
+    return page && AGENT_ONLY_PATHS.has(basePath(page.href)) ? page.href : null;
+  }
+
+  /** Open a page shown only with an agent, or say why it is not on and where to turn it on. */
+  function openAgentOnly(href: string) {
+    if (!isHidden(href)) {
+      go(href);
+      return;
+    }
+    setPanel({ tone: 'warn', ...hiddenPageNotice(href) });
+    setPanelRows([backRow()]);
+    setActive(0);
+  }
+
   // ---- search rows (live, as you type) ----
   const parsed = useMemo(() => (q.trim() ? parseCommand(q, new Date()) : null), [q]);
 
@@ -362,6 +404,7 @@ export default function CommandPalette({
       rows.push(r);
     };
     if (parsed) {
+      const agentPage = agentOnlyTarget(parsed);
       add(
         {
           id: 'command',
@@ -369,12 +412,12 @@ export default function CommandPalette({
           label: describeIntent(parsed),
           description: 'Press Enter — nothing is saved until you confirm it',
           badge: 'Enter',
-          run: () => void runCommand({ text }),
+          run: agentPage ? () => openAgentOnly(agentPage) : () => void runCommand({ text }),
         },
         'command',
       );
     }
-    const allowedHref = (href: string) => canOpenHref(href, perms) && !hiddenPaths?.has(basePath(href));
+    const allowedHref = (href: string) => canOpenHref(href, perms) && !isHidden(href);
     if (text) {
       for (const i of matchIntents(text)) {
         if (!allowedHref(i.href)) continue;
@@ -386,7 +429,7 @@ export default function CommandPalette({
       add({ id: `act-${a.key}`, group: 'Actions', label: a.label, description: a.description, run }, `act:${a.key}`);
     }
     if (text) {
-      for (const p of searchPages(text, { permissions: perms, hiddenPaths, limit: 6 })) {
+      for (const p of searchPages(text, { permissions: perms, hiddenPaths, hasAgents, limit: 6 })) {
         add({ id: `page-${p.href}`, group: 'Pages', label: p.label, description: p.description, run: () => go(p.href) }, basePath(p.href));
       }
       records.forEach((r, i) =>

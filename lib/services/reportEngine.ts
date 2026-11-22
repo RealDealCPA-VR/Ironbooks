@@ -55,7 +55,7 @@ import { validation } from './_base';
 import { fiscalYearWindow } from './fiscalClose';
 import { notFiscalCloseEntry } from './reports';
 import { docRef } from './docNumbers';
-import { resolveEntityNames } from './journal';
+import { ilikeMatches, lineMemoFor, memoMayHoldAccountNumber, resolveEntityNames, searchesShownMemos } from './journal';
 import { cashActivityRows, cashBasisLedger } from './cashBasisLedger';
 import { homeAmounts } from './currencies';
 
@@ -1522,9 +1522,20 @@ export async function fetchGlLines(
   const lineAmt = sql`GREATEST(COALESCE(${journalEntryLines.debit}, 0), COALESCE(${journalEntryLines.credit}, 0))`;
   if (f.amountMin) conds.push(sql`${lineAmt} >= ${f.amountMin}::numeric`);
   if (f.amountMax) conds.push(sql`${lineAmt} <= ${f.amountMax}::numeric`);
-  if (f.memo) {
-    const like = `%${f.memo.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
-    conds.push(sql`(${journalEntryLines.memo} ILIKE ${like} OR ${journalEntries.description} ILIKE ${like})`);
+  // Memo filter. A caller who sees protected numbers in memos masked (journal.ts lineMemoFor) is
+  // matched against the memo as shown, never the stored text, which would answer guesses at the
+  // hidden digits: lines whose memo may hold a number are read whatever their text, and matched
+  // below once their memo is masked (shownMemoSearch).
+  const memoLike = f.memo ? `%${f.memo.replace(/[\\%_]/g, (m) => '\\' + m)}%` : null;
+  const shownMemoSearch = memoLike !== null && searchesShownMemos(ctx);
+  const memoHit = memoLike ? sql<boolean>`(${journalEntryLines.memo} ILIKE ${memoLike})` : sql<boolean>`false`;
+  const descriptionHit = memoLike ? sql<boolean>`(${journalEntries.description} ILIKE ${memoLike})` : sql<boolean>`false`;
+  if (memoLike) {
+    conds.push(
+      shownMemoSearch
+        ? sql`(${memoHit} OR ${descriptionHit} OR ${memoMayHoldAccountNumber()})`
+        : sql`(${memoHit} OR ${descriptionHit})`,
+    );
   }
   // Cleared = marked in a completed (or the open, in-progress) reconciliation. An undone
   // reconciliation keeps its items for the history report, but they are not cleared any more
@@ -1547,11 +1558,12 @@ export async function fetchGlLines(
   // Item: entries that can involve the item (cash-basis shares are added after the read).
   if (f.itemId) conds.push(itemCandidates(ctx.companyId, f.itemId));
 
-  // Name / number / job / item filters are applied after resolution, so read a larger window first.
-  const postFilter = !!(f.nameId || f.number || f.jobCustomerId || f.itemId);
+  // Name / number / job / item filters (and a memo filter matched as shown) are applied after
+  // resolution, so read a larger window first.
+  const postFilter = !!(f.nameId || f.number || f.jobCustomerId || f.itemId || shownMemoSearch);
   const fetchCap = postFilter ? GL_LIMITS.postFilterScan : limit + 1;
 
-  const raw = await ctx.db
+  const read = await ctx.db
     .select({
       lineId: journalEntryLines.id,
       entryId: journalEntries.id,
@@ -1569,6 +1581,8 @@ export async function fetchGlLines(
       debit: journalEntryLines.debit,
       credit: journalEntryLines.credit,
       cleared: clearedExpr,
+      memoHit,
+      descriptionHit,
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
@@ -1580,6 +1594,15 @@ export async function fetchGlLines(
         : [asc(journalEntries.date), asc(journalEntries.entryNumber), asc(journalEntryLines.createdAt), asc(journalEntryLines.id)]),
     )
     .limit(fetchCap);
+  // A memo the mask changes is matched as shown; any other line as the database matched it.
+  const isTrue = (v: unknown) => v === true || v === 't';
+  const raw = shownMemoSearch
+    ? read.filter((r) => {
+        const shown = lineMemoFor(ctx, r.memo);
+        if (isTrue(r.descriptionHit)) return true;
+        return shown === r.memo ? isTrue(r.memoHit) : ilikeMatches(shown, memoLike!);
+      })
+    : read;
 
   const entryMap = new Map<string, { id: string; sourceRef: string | null; reference: string | null }>();
   for (const r of raw) entryMap.set(r.entryId, { id: r.entryId, sourceRef: r.sourceRef, reference: r.reference });
@@ -1630,7 +1653,7 @@ export async function fetchGlLines(
       nameType: n.nameType,
       nameId: n.nameId,
       name: n.name,
-      memo: r.memo ?? r.description ?? '',
+      memo: lineMemoFor(ctx, r.memo) ?? r.description ?? '',
       description: r.description ?? '',
       sourceRef: r.sourceRef,
       accountId: r.accountId,
@@ -1671,7 +1694,7 @@ export async function fetchGlLines(
   if (f.itemId) lines = await linesForItem(ctx, lines, f.itemId);
   // A post-filtered read that hit its scan cap may have left matching lines unread: say so
   // (the report shows its "only the first … lines" note) instead of a silently short report.
-  const truncated = lines.length > limit || (postFilter && raw.length >= fetchCap);
+  const truncated = lines.length > limit || (postFilter && read.length >= fetchCap);
   if (lines.length > limit) lines = lines.slice(0, limit);
 
   // Split column: the other account(s) of each entry.

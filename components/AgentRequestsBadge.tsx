@@ -6,16 +6,24 @@
  *
  * One poll for the whole window: the title bar, the menu entry, Pause all agents and the menu's
  * "only while the company has an agent" rule all read the same answer of
- * GET /api/agent-requests/count (AgentRequestCount, lib/agent/contract.ts). It asks about every 20
- * seconds while the window is on screen, stops while it is hidden, and asks at once when it shows
+ * GET /api/agent-requests/count (AgentRequestCount, lib/agent/contract.ts). It asks once at the
+ * start, then about every 20 seconds while the window is on screen, and at once when it shows
  * again or when something says the requests changed (AGENT_REQUESTS_CHANGED_EVENT). A poll that
  * fails keeps the last answer: the person never sees an error from it, the number just waits for
  * the next good answer.
+ *
+ * While the window is hidden (minimized, in the tray, or covered so the system reports it hidden)
+ * it still asks, slowly: every 90 seconds. That slow poll is there only for the desktop notice, which
+ * matters most exactly then (plan 7.2: "when an agent asks and the window is not focused"); without
+ * it a minimized window would never see a rise. The desktop app keeps Chromium's background timer
+ * throttling, so a hidden window's ask may come up to a minute later than that; it is a notice, not
+ * a deadline.
  *
  * When the number goes up while the window is not in front, a desktop notice (lib/desktop/
  * agentNotice.ts; nothing in a browser) names the agent and says what it asks in the app's own
  * words (AgentRequestCount.newest.summary, built from the operation), never the agent's own text,
  * and opens the approval center. Once per rise: the same number again, or a lower one, says nothing.
+ * The first answer is where the window starts, never news.
  */
 import * as React from 'react';
 import { useRouter } from 'next/navigation';
@@ -30,6 +38,8 @@ export const AGENT_REQUESTS_HREF = '/agent-requests';
 export const AGENT_REQUESTS_COUNT_URL = '/api/agent-requests/count';
 /** About how often the count is asked for while the window is on screen. */
 export const AGENT_REQUESTS_POLL_MS = 20_000;
+/** While the window is hidden: slowly, only so a rise can still raise the desktop notice. */
+export const AGENT_REQUESTS_HIDDEN_POLL_MS = 90_000;
 /**
  * Window event: requests were approved, denied or asked — ask for the count now instead of at the
  * next poll. Send it with agentRequestsChanged() (the approval center, after each decision).
@@ -142,6 +152,8 @@ export interface AgentCountEnv {
   /** Start listening for the window showing or hiding, and for AGENT_REQUESTS_CHANGED_EVENT. Returns the undo. */
   watch: (on: { visibility: () => void; changed: () => void }) => () => void;
   pollMs?: number;
+  /** The poll's interval while the window is hidden (AGENT_REQUESTS_HIDDEN_POLL_MS). */
+  hiddenPollMs?: number;
 }
 
 export interface AgentCountStore {
@@ -157,6 +169,7 @@ export interface AgentCountStore {
 
 export function createAgentRequestCountStore(env: AgentCountEnv): AgentCountStore {
   const pollMs = env.pollMs ?? AGENT_REQUESTS_POLL_MS;
+  const hiddenPollMs = env.hiddenPollMs ?? AGENT_REQUESTS_HIDDEN_POLL_MS;
   const listeners = new Set<() => void>();
   let current: AgentRequestCount | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -178,14 +191,17 @@ export function createAgentRequestCountStore(env: AgentCountEnv): AgentCountStor
     if (timer !== null) clearTimeout(timer);
     timer = null;
   };
+  /** The next ask: soon while the window is on screen, slowly while it is hidden (for the notice). */
   const schedule = () => {
     clearTimer();
-    if (listeners.size > 0 && visible()) {
-      timer = setTimeout(() => {
+    if (listeners.size === 0) return;
+    timer = setTimeout(
+      () => {
         timer = null;
         void poll();
-      }, pollMs);
-    }
+      },
+      visible() ? pollMs : hiddenPollMs,
+    );
   };
 
   function take(answer: AgentRequestCount) {
@@ -228,19 +244,23 @@ export function createAgentRequestCountStore(env: AgentCountEnv): AgentCountStor
     if (answer) take(answer);
     if (again) {
       again = false;
-      if (listeners.size > 0 && visible()) return poll();
+      if (listeners.size > 0) return poll();
     }
     schedule();
   }
 
   function onVisibility() {
+    // Shown again: ask now. Hidden: the next ask moves to the slow interval (a poll on its way
+    // schedules it when it lands).
     if (visible()) void poll();
-    else clearTimer();
+    else if (!running) schedule();
   }
 
   function start() {
     unwatch = env.watch({ visibility: onVisibility, changed: () => void poll() });
-    if (visible()) void poll();
+    // At once, on screen or not: a window that starts hidden needs where it starts, or the first
+    // rise it sees would be taken for that and raise no notice.
+    void poll();
   }
 
   function stop() {

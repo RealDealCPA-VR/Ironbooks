@@ -41,7 +41,13 @@ const AREA_ENUM = z.enum(AREA_KEYS as [Area, ...Area[]]);
 /** Longest note a person can leave an agent, and longest typed secret. */
 export const NOTE_MAX = 1000;
 const SECRET_MAX = 1000;
-/** Most requests one batch approval takes (each is still approved and reported on its own). */
+/**
+ * Most requests one batch approval takes (each is still approved and reported on its own). POST
+ * /api/agent-requests/batch-approve refuses more through batchApproveSchema, and the approval
+ * center reads it from here (app/agent-requests/words.ts BATCH_MAX). The service
+ * (lib/services/agentRequests.ts) still keeps a copy of its own, BATCH_MAX, until it imports this
+ * one: test/agentRequestsApi.test.ts holds the two to the same number meanwhile.
+ */
 export const BATCH_APPROVE_MAX = 100;
 /** Longest standing permission the form can ask for; the service holds it to the class's own limit. */
 const GRANT_MINUTES_MAX = 24 * 60;

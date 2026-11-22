@@ -16,6 +16,12 @@
  * Agents are made, changed and removed only on the computer that holds the company file; on another
  * computer this tab lists, and an agent can still be paused from there. The rules are enforced in
  * lib/services/agents.ts, agentPolicies.ts and lib/agentContext.ts; this component only presents them.
+ *
+ * Only an Admin makes or removes an agent, or lets one do more by itself (plan 4.4). Someone else
+ * who manages agents sees the list and each agent, and may make one stricter or pause it. The page
+ * passes whether the person is an Admin (viewerIsAdmin) when it knows; otherwise the tab asks who
+ * is signed in (GET /api/auth/me) itself. When that cannot be told, it shows only what they may do
+ * without being an Admin. The server decides either way.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { Bot, Copy, Plus, Settings2, Trash2 } from 'lucide-react';
@@ -31,8 +37,10 @@ import {
   ALL_PAUSED_NOTE,
   ALL_PAUSED_TITLE,
   NEW_AGENT_PRESET,
+  NOT_ADMIN_LIST_NOTE,
   ROLE_AND_PRESET_NOTE,
   ROLE_HELP,
+  adjustedTitle,
   presetLabelOf,
   presetSummary,
   when,
@@ -54,11 +62,20 @@ interface Agent {
   status: 'active' | 'revoked';
   unattended?: boolean;
   /**
-   * How many Allow / Ask / Never changes it has from its preset (stored overrides), so the list
-   * never shows an adjusted agent as its plain preset. Left out by a server that does not send it
-   * yet: the list then shows the preset's name, and the detail page the count.
+   * How many Allow / Ask / Never settings of its own it has (stored overrides), so the list never
+   * shows an adjusted agent as its plain preset (contract §11). Left out by an older server: the
+   * list then shows the preset's name, and the detail page the count.
    */
   overrideCount?: number;
+}
+
+/** GET /api/agents (contract §11, with what the route adds for this tab). */
+interface AgentList {
+  agents: Agent[];
+  /** Integrated Applications is off: every agent is paused. */
+  allPaused?: boolean;
+  hostOnly?: boolean;
+  unattendedPossible?: boolean;
 }
 interface Connection {
   command: string;
@@ -95,16 +112,14 @@ function errMsg(e: unknown) {
 }
 
 /**
- * Whether Integrated Applications is off for the company, which pauses every agent. The list route
- * says so once it sends `allPaused`; until then the title bar's count route does (AgentRequestCount).
- * Unknown (the count could not be read) shows the agents' own state, as before, and the detail page
- * still says it from the agent's own detail.
+ * Whether the person at this window is an Admin (GET /api/auth/me). Anything else, a failed read
+ * included, counts as not: the controls that would let an agent do more stay off. Cosmetic only:
+ * the server holds the same rule (lib/services/agents.ts, agentPolicies.ts).
  */
-async function readAllPaused(fromList: unknown): Promise<boolean> {
-  if (typeof fromList === 'boolean') return fromList;
+async function readViewerIsAdmin(): Promise<boolean> {
   try {
-    const c = await api.get<{ allPaused?: unknown }>('/api/agent-requests/count');
-    return c?.allPaused === true;
+    const me = await api.get<{ isAdmin?: unknown } | null>('/api/auth/me');
+    return me?.isAdmin === true;
   } catch {
     return false;
   }
@@ -307,7 +322,18 @@ function TokenOnce({
   );
 }
 
-export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
+export default function AgentsTab({
+  roles,
+  viewerIsAdmin: given,
+}: {
+  roles: RoleOption[];
+  /**
+   * Whether the person at this window is an Admin, when the page already knows (Users & Roles asks
+   * GET /api/auth/me itself); null while it is still asking. Left out, the tab asks on its own.
+   * Cosmetic either way: the server holds the same rule.
+   */
+  viewerIsAdmin?: boolean | null;
+}) {
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [hostOnly, setHostOnly] = useState(false);
   const [unattendedPossible, setUnattendedPossible] = useState(true);
@@ -320,15 +346,33 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
   const [busy, setBusy] = useState(false);
   /** The agent whose detail page is open, or null for the list. */
   const [openId, setOpenId] = useState<string | null>(null);
+  /** What GET /api/auth/me said, when the page did not say it (null: not known yet). */
+  const [asked, setAsked] = useState<boolean | null>(null);
+  /** The person at this window is an Admin (null: not known yet). */
+  const viewerIsAdmin = given !== undefined ? given : asked;
+  const askSelf = given === undefined;
+
+  useEffect(() => {
+    if (!askSelf) return;
+    let live = true;
+    readViewerIsAdmin().then((v) => {
+      if (live) setAsked(v);
+    });
+    return () => {
+      live = false;
+    };
+  }, [askSelf]);
 
   const load = useCallback(async () => {
     try {
-      const res = await api.get<{ agents: Agent[]; hostOnly: boolean; unattendedPossible?: boolean; allPaused?: boolean }>('/api/agents');
-      setAgents(res.agents);
+      const res = await api.get<AgentList>('/api/agents');
+      const list = Array.isArray(res.agents) ? res.agents : [];
+      setAgents(list);
       setHostOnly(Boolean(res.hostOnly));
       setUnattendedPossible(res.unattendedPossible !== false);
       setError('');
-      setAllPaused(res.agents.length > 0 ? await readAllPaused(res.allPaused) : false);
+      // The list says it itself (contract §11): every agent is paused while it is true.
+      setAllPaused(list.length > 0 && res.allPaused === true);
     } catch (e) {
       setError(errMsg(e));
       setAgents([]);
@@ -354,7 +398,9 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
     }
   }
 
-  if (agents === null) return <PageSkeleton />;
+  if (agents === null || viewerIsAdmin === null) return <PageSkeleton />;
+  /** Only an Admin makes or removes an agent, and only at the computer that holds the file. */
+  const mayMake = viewerIsAdmin && !hostOnly;
 
   const removeDialog = (
     <ConfirmDialog
@@ -376,6 +422,7 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
           key={openId}
           agentId={openId}
           hostOnly={hostOnly}
+          viewerIsAdmin={viewerIsAdmin}
           onBack={() => {
             setOpenId(null);
             load();
@@ -400,13 +447,18 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
             <p className="mt-1 text-xs text-navy/50">{ROLE_AND_PRESET_NOTE}</p>
             <p className="mt-1 text-xs text-navy/50">{MODES_NOTE}</p>
           </div>
-          {!hostOnly && (
+          {mayMake && (
             <Button onClick={() => setAdding(true)}>
               <Plus className="mr-1 h-4 w-4" /> New agent
             </Button>
           )}
         </div>
         {hostOnly && <p className="mt-3 text-sm text-amber-700">{HOST_ONLY_MESSAGE}</p>}
+        {!viewerIsAdmin && (
+          <p className="mt-3 text-sm text-navy/60" data-not-admin="">
+            {NOT_ADMIN_LIST_NOTE}
+          </p>
+        )}
         {allPaused && (
           <p className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-900" data-all-paused="">
             {ALL_PAUSED_NOTE}
@@ -452,7 +504,9 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
                   </div>
                 </Td>
                 <Td>
-                  {presetSummary(presetLabelOf(a), a.overrideCount) || a.mode}
+                  <span data-preset-of={a.id} title={adjustedTitle(a.overrideCount)}>
+                    {presetSummary(presetLabelOf(a), a.overrideCount) || a.mode}
+                  </span>
                   {a.unattended && unattendedPossible && <span className="block text-xs text-navy/50">Also while nobody is signed in</span>}
                 </Td>
                 <Td className="font-mono text-xs">{a.tokenPrefix}…</Td>
@@ -475,7 +529,7 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
                   <Button size="sm" variant="ghost" onClick={() => setOpenId(a.id)} title="Open this agent's settings" aria-label={`Open ${a.name}`}>
                     <Settings2 className="h-4 w-4" />
                   </Button>
-                  {a.status === 'active' && !hostOnly && (
+                  {a.status === 'active' && mayMake && (
                     <Button size="sm" variant="ghost" onClick={() => setRemoving(a)} title="Remove this agent's access">
                       <Trash2 className="h-4 w-4" />
                     </Button>

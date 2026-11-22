@@ -7,7 +7,9 @@
  *
  * The form opens with every limit that fits the request ticked and filled from it (words.ts
  * initialGrantForm), and never offers more time than this person may give (grantMinutesMax, worked
- * out by the server, which checks it again).
+ * out by the server, which checks it again). When the books changed, the card takes again from the
+ * new preview only what the person had not changed (its amount and count: words.ts
+ * rebuildGrantForm), and the form says what it did.
  */
 import { AmountInput, Input, Label, Select } from '@/components/ui';
 import type { AgentRequestForPerson } from '@/lib/agent/contract';
@@ -19,6 +21,7 @@ export default function ApproveSimilar({
   onChange,
   now,
   error,
+  rebuilt = null,
 }: {
   request: AgentRequestForPerson;
   form: GrantForm;
@@ -26,6 +29,8 @@ export default function ApproveSimilar({
   /** When the card opened: the times in the choices count from it. */
   now: Date;
   error: string;
+  /** The books changed and the form was filled in again: what was kept and what was taken anew. */
+  rebuilt?: string | null;
 }) {
   const options = durationOptions(request.grantMinutesMax, request.kind === 'grant' ? (request.grantAsked?.minutes ?? null) : null, now);
   const set = (patch: Partial<GrantForm>) => onChange({ ...form, ...patch });
@@ -42,6 +47,11 @@ export default function ApproveSimilar({
           {agent} may then do more of the same kind of work without asking, within the limits ticked below, until the time runs out. You can take
           it back at any time in Users &amp; Roles &gt; Agents.
         </p>
+        {rebuilt && (
+          <p data-similar-rebuilt="" className="mt-1 text-xs font-semibold text-amber-800">
+            {rebuilt}
+          </p>
+        )}
       </div>
       <div className="max-w-xs">
         <Label htmlFor="similar-minutes">For how long</Label>

@@ -15,22 +15,26 @@
  * "<Agent> (agent), approved by <person>", or "<Agent> (agent), under permission from <person>
  * until <time>". The ids behind those words come with each row too.
  *
+ * An agent reading the audit trail never sees the entries of Users & Roles or File Utilities, nor
+ * the whole log as an Admin would (auditReaderFor). The record of an agent's request or standing
+ * permission shows the person's note, the app's message and the grant's limits only to someone
+ * who may view the work it was about (auditEntryValuesFor), as the Agent Activity report does.
+ *
  * agentActivityReport: the "Agent Activity" standard report (Reports > Accountant & Taxes): every
  * permission request an agent made, whatever became of it.
  */
 import { and, asc, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { agentPermissionRequests, agents, auditLogs, users } from '@/lib/db/schema';
-import { areaLabel, canRef, type Area, type EffectiveAccess } from '@/lib/permissions/model';
+import { AGENT_DOOR_ONLY_AREAS, maskedForAgent } from '@/lib/permissions/agentAccess';
+import { areaLabel, canRef, fullAccess, withoutAreas, type Area, type EffectiveAccess } from '@/lib/permissions/model';
 import { RISK_CLASS_LABELS, isRiskClass, type RequestStatus } from '@/lib/agent/operations/types';
 import { operationById } from '@/lib/agent/operations/registry';
 import { localDateTime } from '@/lib/reports/dates';
 import type { StdReport, StdRow } from '@/lib/reports/types';
 import type { ReportParams } from '@/lib/validation/reports';
 import { ServiceError, type ServiceContext, notFound } from './_base';
-import { maskForContext } from './access';
-import { stripSecrets } from '@/lib/permissions/mask';
-import { auditVisibilitySql, canSeeAuditEntry } from './auditVisibility';
+import { auditValuesFor, auditVisibilitySql, canSeeAuditEntry } from './auditVisibility';
 import { getPreferences } from './company';
 import { companyDayBound } from './preferences';
 import {
@@ -162,6 +166,89 @@ function actorFields(r: ActorRow, grants: Map<string, StandingPermissionWords>) 
   };
 }
 
+/**
+ * The access the audit records are read with: a person's (or a trusted context's) own. An agent's
+ * leaves out Users & Roles and File Utilities and is never an Admin's, however it runs (its own
+ * request, or through the door, whose run keeps the areas of its role). Entries of those areas
+ * name who may sign in, the agents, their requests and the approvers' notes to them, backups and
+ * file names: reads of those areas are class 'admin' and 'file' (plan 4.2), which a plain read of
+ * the audit trail must not get round, and an agent never reads other agents' requests (the Agent
+ * Activity report refuses it too). An Admin's access would see the whole log. An agent's context
+ * always carries its access; one built without (a test's) gets full access less those areas,
+ * masked: never wider than it was.
+ */
+export function auditReaderFor(ctx: Pick<ServiceContext, 'access' | 'agent'>): EffectiveAccess | undefined {
+  if (!ctx.agent) return ctx.access;
+  const base = ctx.access ?? maskedForAgent(fullAccess());
+  return { ...withoutAreas(base, AGENT_DOOR_ONLY_AREAS), isAdmin: false };
+}
+
+/** Records of an agent's request (agentRequests.ts) and of standing permission (agentGrants.ts). */
+const AGENT_REQUEST_KINDS = new Set(['agent_permission_request', 'agent_grant']);
+
+/**
+ * What those records hold about the work itself, beyond the operation and the agent: the person's
+ * note (a denial's reason), the app's message (it names the records the run touched), why standing
+ * permission was not given, and a grant's limits (which customers or accounts, how much).
+ */
+const REQUEST_DETAIL_FIELDS = ['note', 'error', 'grantNotGiven', 'constraints'] as const;
+
+function isPlainRecord(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** The operation a request's or grant's record is about (both snapshots name it; '' when neither does). */
+function operationIn(...values: unknown[]): string {
+  for (const v of values) if (isPlainRecord(v) && typeof v.operation === 'string' && v.operation) return v.operation;
+  return '';
+}
+
+function withDetailsHidden(v: unknown, words: string): unknown {
+  if (!isPlainRecord(v)) return v;
+  const out = { ...v };
+  for (const k of REQUEST_DETAIL_FIELDS) if (out[k] !== undefined && out[k] !== null) out[k] = words;
+  return out;
+}
+
+/**
+ * An entry's before / after as `access` may read them: auditValuesFor (no credential material;
+ * SSNs, account numbers and "Acct #" memo text masked for the reader's flags), and on the record of
+ * an agent's request or standing permission, the details (REQUEST_DETAIL_FIELDS) replaced by
+ * "Details hidden ..." unless the reader may view the activity of the operation it was about: the
+ * Agent Activity report's rule (requestDetails). Managing agents (Users & Roles > Users) shows that
+ * a request was made and decided, not a payroll request's note to someone without payroll.
+ */
+export function auditEntryValuesFor(
+  access: EffectiveAccess | null | undefined,
+  entityType: string,
+  oldValues: unknown,
+  newValues: unknown,
+): { oldValues: unknown; newValues: unknown } {
+  const [old, next] = requestDetailsFor(access, entityType, [auditValuesFor(access, oldValues), auditValuesFor(access, newValues)]);
+  return { oldValues: old, newValues: next };
+}
+
+/** Snapshots already masked, with a request's or grant's details hidden from this reader when they must be. */
+function requestDetailsFor(access: EffectiveAccess | null | undefined, entityType: string, snapshots: unknown[]): unknown[] {
+  if (!AGENT_REQUEST_KINDS.has(entityType)) return snapshots;
+  const { visible, area } = requestDetails(access ?? undefined, operationIn(...[...snapshots].reverse()));
+  if (visible) return snapshots;
+  const words = hiddenDetails(area);
+  return snapshots.map((s) => withDetailsHidden(s, words));
+}
+
+/**
+ * A transaction-log record's data ({ old, new, llmReasoning? }) as `access` may read it: the same
+ * rule as an audit-trail entry (auditEntryValuesFor). For the log's own answer: pass the access of
+ * auditReaderFor, so an agent's read leaves out the same entries and values as here.
+ */
+export function logRecordDataFor(access: EffectiveAccess | null | undefined, record: { entityType: string; data: unknown }): unknown {
+  const masked = auditValuesFor(access, record.data);
+  if (!isPlainRecord(masked) || !AGENT_REQUEST_KINDS.has(record.entityType)) return masked;
+  const [old, next] = requestDetailsFor(access, record.entityType, [masked.old ?? null, masked.new ?? null]);
+  return { ...masked, ...('old' in masked ? { old } : {}), ...('new' in masked ? { new: next } : {}) };
+}
+
 /** Return paginated audit log rows for the company, newest first. */
 export async function listAuditLogs(
   ctx: ServiceContext,
@@ -175,7 +262,7 @@ export async function listAuditLogs(
   if (agentId) conds.push(eq(auditLogs.agentId, agentId));
   if (from) conds.push(gte(auditLogs.createdAt, from));
   if (to) conds.push(lte(auditLogs.createdAt, to));
-  const visible = auditVisibilitySql(ctx.access);
+  const visible = auditVisibilitySql(auditReaderFor(ctx));
   if (visible) conds.push(visible);
 
   const where = and(...conds);
@@ -241,9 +328,15 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
 
   if (!row) throw notFound('Audit log entry');
   // An entry about a record the caller may not view is answered like one that does not exist.
-  if (!canSeeAuditEntry(ctx.access, row.entityType, row.oldValues, row.newValues)) throw notFound('Audit log entry');
+  const reader = auditReaderFor(ctx);
+  if (!canSeeAuditEntry(reader, row.entityType, row.oldValues, row.newValues)) throw notFound('Audit log entry');
 
   const grants = await grantsOf(ctx, [factsOf(row)]);
+  // Snapshots can hold SSNs, tax IDs and account numbers, also as memo text ("Acct # …" on a
+  // check): masked per the caller's flags. Never the password hashes older builds wrote into
+  // settings snapshots, whoever asks (auditValuesFor, lib/services/auditVisibility.ts). A request's
+  // note and message only for someone who may view its work (auditEntryValuesFor).
+  const values = auditEntryValuesFor(reader, row.entityType, row.oldValues, row.newValues);
   return {
     id: row.id,
     action: row.action,
@@ -251,11 +344,8 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     entityId: row.entityId,
     ...actorFields(row, grants),
     createdAt: row.createdAt.toISOString(),
-    // Snapshots can hold SSNs, tax IDs and account numbers -- mask per the caller's flags.
-    // ... and never the password hashes older builds wrote into settings snapshots, whoever asks
-    // (stripSecrets also for trusted contexts, which maskForContext leaves untouched).
-    oldValues: maskForContext(ctx, stripSecrets(row.oldValues)),
-    newValues: maskForContext(ctx, stripSecrets(row.newValues)),
+    oldValues: values.oldValues,
+    newValues: values.newValues,
     llmReasoning: row.llmReasoning ?? null,
   };
 }
@@ -268,13 +358,17 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
 export const AGENT_ACTIVITY_LIMIT = 5000;
 
 /**
- * A request's status in plain words. 'approved' is the moment between a person's yes and the work
- * being done (agentRequests.ts claims the request, then marks it done or failed): a request left
- * there was approved but has not been carried out.
+ * A request's status in plain words. 'approved' and a first-of-two approval read as the approval
+ * center says them (app/agent-requests/words.ts statusLabel). 'approved' only ever means the work
+ * is being carried out right now: agentRequests.ts claims the request on a person's yes, then marks
+ * it done or failed. The first of two approvals (D8) leaves the request 'pending' with that person
+ * in decided_by (WAITING_FOR_SECOND_PERSON).
+ * 'cancelled' stays "Cancelled", not the center's "Taken back by the agent": a copy of the company
+ * cancels the waiting requests too (portableFile.ts), so the agent may not be the one who did.
  */
 export const REQUEST_STATUS_WORDS: Record<RequestStatus, string> = {
   pending: 'Waiting for approval',
-  approved: 'Approved, not yet done',
+  approved: 'Approved, being carried out',
   denied: 'Denied',
   expired: 'Expired',
   cancelled: 'Cancelled',
@@ -286,16 +380,39 @@ export const REQUEST_STATUS_WORDS: Record<RequestStatus, string> = {
 export const WAITING_FOR_SECOND_PERSON = 'Waiting for a second person';
 
 /**
- * The status the report shows, by the approval center's rule (agentRequests.ts shownStatus): a
- * waiting request past its time is expired whether or not anything has marked it yet. One the
- * first of two people approved is still 'pending', with that person in decided_by.
+ * How "Decided by" marks the person who gave the first of two approvals of a request no second
+ * person approved: still waiting, expired or withdrawn.
  */
-export function requestStatusWords(r: { status: string; expiresAt: Date; decidedBy: string | null }, now: Date): string {
-  if (r.status === 'pending') {
-    if (r.expiresAt.getTime() <= now.getTime()) return REQUEST_STATUS_WORDS.expired;
-    if (r.decidedBy) return WAITING_FOR_SECOND_PERSON;
-  }
-  return REQUEST_STATUS_WORDS[r.status as RequestStatus] ?? r.status;
+export const FIRST_OF_TWO = '(first of two)';
+
+/**
+ * The words of the status a person sees: `shown` is the approval center's own reading of the row
+ * (agentRequests.ts shownStatus: a waiting request past its time is expired whether or not anything
+ * has marked it yet), so the two never disagree. One the first of two people approved is still
+ * waiting, for a second person.
+ */
+export function requestStatusWords(shown: RequestStatus, decidedBy: string | null): string {
+  if (shown === 'pending' && decidedBy) return WAITING_FOR_SECOND_PERSON;
+  return REQUEST_STATUS_WORDS[shown] ?? shown;
+}
+
+/** The stored statuses in which a lone person in decided_by can only be the first of two (decidedByWords). */
+const FIRST_OF_TWO_STATUSES: ReadonlySet<string> = new Set(['pending', 'expired', 'cancelled']);
+
+/**
+ * "Decided by": who said yes or no; once the second person said yes too, both, in order. A person
+ * in decided_by with nobody after them, on a request stored as waiting, expired or withdrawn, gave
+ * the first of two approvals (D8) and is marked "(first of two)". Nothing else leaves a lone name
+ * in those states: one yes moves a request to 'approved' (then done or failed), a no overwrites
+ * decided_by, and the sweep that marks a request expired (agentRequests.ts settleRow), the agent
+ * taking it back (cancelAgentRequest) and a copy of the company (portableFile.ts) keep decided_by.
+ * So the mark stays once the request is settled, not only until the next sweep. Except on a
+ * request copied from an older proposal (proposal_id): it never takes two approvals, and a
+ * proposal already decided under Ask AI brings its own decider along with its outcome (settleRow).
+ */
+function decidedByWords(r: { status: string; first: string | null; second: string | null; copied: boolean }): string {
+  if (r.first && !r.second && !r.copied && FIRST_OF_TWO_STATUSES.has(r.status)) return `${r.first} ${FIRST_OF_TWO}`;
+  return [r.first, r.second].filter(Boolean).join(', then ');
 }
 
 export const AGENT_ACTIVITY_FOR_PEOPLE_ONLY =
@@ -340,6 +457,9 @@ function hiddenDetails(area: Area | null): string {
  */
 export async function agentActivityReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   if (ctx.agent) throw new ServiceError('FORBIDDEN', AGENT_ACTIVITY_FOR_PEOPLE_ONLY);
+  // Loaded when the report runs: the approval center's module brings the agent's door and the
+  // route bridge with it, which the audit trail's own screens never need.
+  const { shownStatus } = await import('./agentRequests');
   const { timezone } = await getPreferences(ctx);
   const from = await companyDayBound(ctx, p.from, 'from');
   const to = await companyDayBound(ctx, p.to, 'to', true);
@@ -367,6 +487,7 @@ export async function agentActivityReport(ctx: ServiceContext, p: ReportParams):
       secondEmail: second.email,
       note: agentPermissionRequests.note,
       error: agentPermissionRequests.error,
+      proposalId: agentPermissionRequests.proposalId,
     })
     .from(agentPermissionRequests)
     // Same company only: an agent id never names another company's agent here.
@@ -384,7 +505,12 @@ export async function agentActivityReport(ctx: ServiceContext, p: ReportParams):
   const now = new Date();
   const rows: StdRow[] = list.map((r) => {
     const { visible, area } = requestDetails(ctx.access, r.operation);
-    const deciders = [personName(r.decidedBy, r.deciderName, r.deciderEmail), personName(r.secondApprover, r.secondName, r.secondEmail)].filter(Boolean);
+    const decidedBy = decidedByWords({
+      status: r.status,
+      first: personName(r.decidedBy, r.deciderName, r.deciderEmail),
+      second: personName(r.secondApprover, r.secondName, r.secondEmail),
+      copied: !!r.proposalId,
+    });
     const note = [r.note, r.error].filter((t): t is string => !!t && !!t.trim()).join(' · ');
     return {
       id: `aa:${r.id}`,
@@ -395,8 +521,8 @@ export async function agentActivityReport(ctx: ServiceContext, p: ReportParams):
         agent: r.agentName ?? REMOVED_AGENT,
         what: visible ? r.summary : hiddenDetails(area),
         class: isRiskClass(r.class) ? RISK_CLASS_LABELS[r.class] : r.class,
-        status: requestStatusWords(r, now),
-        decidedBy: deciders.join(', then '),
+        status: requestStatusWords(shownStatus(r, now), r.decidedBy),
+        decidedBy,
         note: visible ? note : '',
       },
     };

@@ -6,23 +6,11 @@
  *                                → a new invoice moving the amount from Retainage Receivable to A/R.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getServerContext } from '@/lib/context';
 import { billRetainage, retainageReport } from '@/lib/services/retainage';
 import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
-import { zDate, zDocNumber, zMoney, zUuid, zodErrorBody } from '@/lib/validation/helpers';
-
-const billSchema = z.object({
-  customerId: zUuid,
-  date: zDate,
-  amount: zMoney.nullish(),
-  dueDate: zDate.nullish(),
-  memo: z.string().max(4000).nullish(),
-  refNumber: zDocNumber,
-  allowDuplicateNumber: z.boolean().nullish(),
-  classId: zUuid.nullish(),
-  overrideCreditLimit: z.boolean().optional(),
-});
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { billRetainageSchema } from '@/lib/validation/invoices';
 
 export async function GET(req: NextRequest) {
   try {
@@ -44,7 +32,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = billSchema.safeParse(await req.json().catch(() => ({})));
+    const parsed = billRetainageSchema.safeParse(await req.json().catch(() => ({})));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     return NextResponse.json(await billRetainage(ctx, parsed.data), { status: 201 });
   } catch (err) {

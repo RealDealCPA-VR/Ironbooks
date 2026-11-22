@@ -111,7 +111,12 @@ const invoiceCoreFields = {
     .describe("3-letter currency code such as \"EUR\"; leave out for the company's home currency."),
   exchangeRate: zDecimal
     .nullish()
-    .describe('Home-currency units per 1 unit of the invoice currency, as decimal text such as "1.10"; leave out for the currency list rate.'),
+    // resolveInvoiceCurrency (lib/services/invoices.ts): an edit that keeps the currency and leaves
+    // the rate blank keeps the invoice's saved rate; an edit that changes the currency takes the
+    // currency list's rate, like a new invoice.
+    .describe(
+      "Home-currency units per 1 unit of the invoice currency, as decimal text such as \"1.10\"; leave it out for the currency list's rate, except on an edit that keeps the currency, where leaving it out keeps the saved rate.",
+    ),
   customFields: z
     .record(z.string())
     .nullish()
@@ -178,3 +183,56 @@ export const updateInvoiceSchema = z.object({
   lines: zLines(invoiceLineSchema).describe('All lines of the invoice, replacing the saved ones; at least one.'),
 });
 export type UpdateInvoiceBody = z.infer<typeof updateInvoiceSchema>;
+
+/**
+ * POST /api/invoices/retainage — bill released retainage: a new invoice that moves the amount
+ * from Retainage Receivable to A/R (lib/services/retainage.ts billRetainage).
+ */
+export const billRetainageSchema = z.object({
+  customerId: zUuid.describe('Id of the customer whose held retainage is billed (customer list).'),
+  date: zDate.describe('Date of the retainage invoice, YYYY-MM-DD.'),
+  amount: zMoney
+    .nullish()
+    .describe('Retainage to bill, as decimal text such as "1500.00"; leave out to bill all retainage still held for the customer.'),
+  dueDate: zDate.nullish().describe('Date payment is due, YYYY-MM-DD; leave out to work it out as on any new invoice.'),
+  memo: z.string().max(4000).nullish().describe('Internal note saved with the invoice; leave out for "Retainage billed".'),
+  refNumber: zDocNumber.describe('Invoice number such as "INV-1001"; leave out or blank to use the next number.'),
+  allowDuplicateNumber: z
+    .boolean()
+    .nullish()
+    .describe('Send true only after the app warned that this invoice number is already used, to save it anyway.'),
+  classId: zUuid.nullish().describe('Id of a class (class list) for reports by class.'),
+  overrideCreditLimit: z
+    .boolean()
+    .optional()
+    .describe('Send true only after the app warned that this invoice puts the customer over their credit limit, to save it anyway.'),
+});
+
+/**
+ * POST /api/invoices/batch — Batch Invoicing (wave2 sales C6): the same lines billed to many
+ * customers (lib/services/batchInvoicing.ts createBatchInvoices).
+ */
+export const batchInvoicesSchema = z.object({
+  customerIds: z
+    .array(zUuid)
+    .min(1, 'pick at least one customer')
+    .describe('Ids of the customers to invoice (customer list); each gets its own invoice with the same lines.'),
+  date: zDate.describe('Date of every invoice, YYYY-MM-DD.'),
+  dueDate: zDate.nullish().describe("Date payment is due, YYYY-MM-DD; leave out to work it out from each customer's terms."),
+  lines: zLines(invoiceLineSchema).describe('The lines every invoice gets; at least one.'),
+  taxRateId: zUuid
+    .nullish()
+    .describe("Id of the sales tax item (sales tax list) for every invoice; it is used only when useCustomerTaxRate is false (send null there for no tax)."),
+  useCustomerTaxRate: z
+    .boolean()
+    .optional()
+    .describe("Leave out or true to tax each invoice with that customer's own tax item; false to use taxRateId for all of them."),
+  memo: z.string().nullish().describe('Internal note saved with every invoice.'),
+  classId: zUuid.nullish().describe('Id of a class (class list) for every invoice.'),
+  toBePrinted: z.boolean().optional().describe('True to put every invoice in the queue of forms to print later.'),
+  toBeEmailed: z.boolean().optional().describe('True to put every invoice in the queue of forms to email later.'),
+  overrideCreditLimit: z
+    .boolean()
+    .optional()
+    .describe('True also invoices customers this puts over their credit limit; without it they are skipped and listed in the answer.'),
+});

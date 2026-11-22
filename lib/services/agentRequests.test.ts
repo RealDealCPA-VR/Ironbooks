@@ -19,12 +19,26 @@
  *  - a wait ends when a person decides, and when its time is up;
  *  - an email notice goes out only when nobody is signed in;
  *  - a request copied from an old proposal is settled in both tables, and never runs on the old
- *    path when it needs more than one plain yes.
+ *    path when it needs more than one plain yes;
+ *  - what a view tells (wave 3): the stale mark, what the committed run posted and which entries,
+ *    the standing permission actually given or why none was, a desktop flow's questions, and
+ *    whether THIS window may approve (a teammate's never approves host-only work, nor counts it);
+ *  - the badge: count and newest from one read, nothing for an agent, never crowded out by work
+ *    the person cannot see; it marks what is overdue (masking what it kept) at most once a minute;
+ *  - the standing window offered is the one createGrant accepts (the company's own day, host-only
+ *    and file-Admin work), worked out once per kind of work in a list;
+ *  - batch approval reports one it could not approve as not approved and runs the others;
+ *  - an approval that claimed a request and lost track of its run ends it as failed, outcome unknown;
+ *  - a password the route always takes is typed before anything is claimed;
+ *  - a desktop flow that fails is failed for good and never runs again under the same id.
+ *
+ * Grants are the real grantMinutesFor (wrapped) and a stand-in createGrant; one test uses the real
+ * createGrant to show the card's window is the one it accepts.
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { and, eq, like } from 'drizzle-orm';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { and, eq, like, lte } from 'drizzle-orm';
 
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-agent-requests');
 const TEST_DIR = path.join(ROOT, 'data');
@@ -33,12 +47,17 @@ process.env.BKA_AUTH_SECRET = 'agent-requests-test-secret';
 process.env.IRONBOOKS_AGENT_ENDPOINT_DIR = path.join(ROOT, 'endpoints');
 delete process.env.BKA_DEVICE_VAULT;
 
+type AnyFn = (...args: never[]) => unknown;
+
 const m = vi.hoisted(() => ({
   ops: new Map<string, unknown>(),
   policies: new Map<string, Record<string, unknown>>(),
   runApproved: vi.fn(),
   createGrant: vi.fn(),
+  grantMinutesFor: vi.fn(),
   sendMail: vi.fn(),
+  // The real ones, kept by the mock below: the card's window comes from the real grantMinutesFor.
+  real: {} as { createGrant?: AnyFn; grantMinutesFor?: AnyFn },
 }));
 
 vi.mock('@/lib/agent/operations/registry', async (importOriginal) => ({
@@ -77,13 +96,20 @@ vi.mock('@/lib/services/agentPolicies', () => ({
     ...(m.policies.get(agentId) ?? {}),
   }),
 }));
-vi.mock('@/lib/services/agentGrants', () => ({
-  createGrant: m.createGrant,
-  liveGrants: vi.fn(),
-  revokeGrant: vi.fn(),
-  useGrant: vi.fn(),
-  listGrants: vi.fn(),
-}));
+vi.mock('@/lib/services/agentGrants', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@/lib/services/agentGrants')>();
+  m.real.createGrant = real.createGrant as unknown as AnyFn;
+  m.real.grantMinutesFor = real.grantMinutesFor as unknown as AnyFn;
+  return {
+    ...real,
+    createGrant: m.createGrant,
+    grantMinutesFor: m.grantMinutesFor,
+    liveGrants: vi.fn(),
+    revokeGrant: vi.fn(),
+    useGrant: vi.fn(),
+    listGrants: vi.fn(),
+  };
+});
 vi.mock('@/lib/services/email', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   sendMail: m.sendMail,
@@ -96,6 +122,7 @@ import {
   agents,
   aiProposals,
   auditLogs,
+  companies,
   customers,
   userCompanies,
   userRoleAssignments,
@@ -103,9 +130,10 @@ import {
 } from '@/lib/db/schema';
 import { fullAccess, legacyRoleFor } from '@/lib/permissions/model';
 import { runWithServiceContext } from '@/lib/context';
-import type { BridgeResult, NewAgentRequest } from '@/lib/agent/contract';
+import type { BridgeResult, NewAgentRequest, OperationPreview } from '@/lib/agent/contract';
 import { ASKS_PER_HOUR_BEFORE_PAUSE } from '@/lib/agent/contract';
 import type { ApprovalNeeds, Operation, RequestFacts } from '@/lib/agent/operations/types';
+import { SHELL_OPERATIONS } from '@/lib/agent/operations/shell';
 import { createCompany } from './company';
 import { agentAccess, createAgent } from './agents';
 import { resolveAccess } from './access';
@@ -113,6 +141,7 @@ import { endSession, startSession } from './sessions';
 import { ServiceError, type ServiceContext } from './_base';
 import {
   approveAgentRequest,
+  badgeForPerson,
   batchApprove,
   cancelAgentRequest,
   createAgentRequest,
@@ -123,6 +152,7 @@ import {
   pendingCountForPerson,
   requestForAgent,
   requestForPerson,
+  shownStatus,
   waitForDecision,
 } from './agentRequests';
 
@@ -238,6 +268,37 @@ async function expectError(p: Promise<unknown>, code: string, message?: RegExp):
   throw new Error(`expected ${code}`);
 }
 
+/**
+ * Run with the clock at midday on this computer (the test company has no time zone of its own, so
+ * its day is this computer's): a standing window is the rest of the company's day, and a test that
+ * gives one must not depend on the hour it runs at. The latest midday that is not in the future, so
+ * nothing made meanwhile is dated ahead of what later tests make. Only Date is frozen; timers run
+ * as usual.
+ */
+async function atMidday<T>(fn: () => Promise<T>): Promise<T> {
+  const noon = new Date();
+  if (noon.getHours() < 12) noon.setDate(noon.getDate() - 1);
+  noon.setHours(12, 0, 0, 0);
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(noon);
+  try {
+    return await fn();
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+/** Run with the clock frozen at `at`, moved on with the function handed to `fn`. */
+async function frozenAt<T>(at: Date, fn: (moveTo: (ms: number) => void) => Promise<T>): Promise<T> {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(at);
+  try {
+    return await fn((ms) => vi.setSystemTime(new Date(at.getTime() + ms)));
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 async function rowOf(id: string) {
   const [row] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.id, id));
   return row;
@@ -325,7 +386,22 @@ beforeEach(() => {
   m.runApproved.mockReset();
   m.runApproved.mockResolvedValue(bridge());
   m.createGrant.mockReset();
-  m.createGrant.mockImplementation(async () => ({ id: crypto.randomUUID() }));
+  // A stand-in that answers as createGrant does (an AgentGrant), without writing one.
+  m.createGrant.mockImplementation(
+    async (ctx: ServiceContext, _facts: unknown, g: { agentId: string; operation: string; constraints: object; minutes: number }) => ({
+      id: crypto.randomUUID(),
+      agentId: g.agentId,
+      operation: g.operation,
+      constraints: g.constraints,
+      givenBy: ctx.userId,
+      expiresAt: new Date(Date.now() + g.minutes * 60_000).toISOString(),
+      revokedAt: null,
+      uses: 0,
+    }),
+  );
+  // The real window (the company's day, host-only and file-Admin work, the person's role).
+  m.grantMinutesFor.mockReset();
+  m.grantMinutesFor.mockImplementation((...args: never[]) => m.real.grantMinutesFor!(...args));
   m.sendMail.mockReset();
   m.sendMail.mockResolvedValue({ from: 'books@requests.test', to: 'x' });
 });
@@ -502,8 +578,11 @@ describe('who may approve', () => {
   it('needs.hostOnly: only from the host computer\'s own window', async () => {
     const view = await ask('a', 'test.host');
     expect(view.needs?.hostOnly).toBe(true);
-    // A list cannot tell where the window is: the rule is left to the approval itself.
+    // Left out, the window counts as the host's (the contract's rule); a teammate's says so.
     expect((await requestForPerson(people.bo, view.id)).canApprove).toBe(true);
+    const fromTeammate = await requestForPerson(people.bo, view.id, { atHost: false });
+    expect(fromTeammate.canApprove).toBe(false);
+    expect(fromTeammate.cannotApproveWhy).toMatch(/computer that holds the company file/);
     await expectError(approveAgentRequest(people.bo, view.id, {}, { atHost: false }), 'FORBIDDEN', /computer that holds the company file/);
     expect(m.runApproved).not.toHaveBeenCalled();
     const done = await approveAgentRequest(people.bo, view.id, {}, { atHost: true });
@@ -845,35 +924,42 @@ describe('approving', () => {
     }
   });
 
-  it('gives standing permission after a successful run, within the allowed time', async () => {
-    const view = await ask('a', 'test.enter');
-    const forBo = await requestForPerson(people.bo, view.id);
-    expect(forBo.grantMinutesMax).toBeGreaterThan(0);
-    await expectError(
-      approveAgentRequest(people.bo, view.id, { grant: { minutes: 24 * 60 + 1, constraints: {} } }, { atHost: true }),
-      'VALIDATION',
-    );
-    expect(m.runApproved).not.toHaveBeenCalled();
-    const res = await approveAgentRequest(people.bo, view.id, { grant: { minutes: 1, constraints: { maxAmount: '10.00' } } }, { atHost: true });
-    expect(res.status).toBe('executed');
-    expect(m.createGrant).toHaveBeenCalledTimes(1);
-    const [grantCtx, , newGrant] = m.createGrant.mock.calls[0];
-    expect(grantCtx.userId).toBe(people.bo.userId);
-    expect(newGrant).toMatchObject({ agentId: agentCtx.a.agent!.id, operation: 'test.enter', minutes: 1, requestId: view.id });
-    expect(res.request.grantId).toBeTruthy();
-  });
+  it('gives standing permission after a successful run, within the allowed time', () =>
+    atMidday(async () => {
+      const view = await ask('a', 'test.enter');
+      const forBo = await requestForPerson(people.bo, view.id);
+      expect(forBo.grantMinutesMax).toBeGreaterThan(0);
+      await expectError(
+        approveAgentRequest(people.bo, view.id, { grant: { minutes: 24 * 60 + 1, constraints: {} } }, { atHost: true }),
+        'VALIDATION',
+      );
+      expect(m.runApproved).not.toHaveBeenCalled();
+      const res = await approveAgentRequest(people.bo, view.id, { grant: { minutes: 1, constraints: { maxAmount: '10.00' } } }, { atHost: true });
+      expect(res.status).toBe('executed');
+      expect(m.createGrant).toHaveBeenCalledTimes(1);
+      const [grantCtx, , newGrant] = m.createGrant.mock.calls[0];
+      expect(grantCtx.userId).toBe(people.bo.userId);
+      expect(newGrant).toMatchObject({ agentId: agentCtx.a.agent!.id, operation: 'test.enter', minutes: 1, requestId: view.id });
+      expect(res.request.grantId).toBeTruthy();
+    }));
 
-  it('a request for standing permission only gives the grant', async () => {
-    const view = await ask('a', 'test.enter', { kind: 'grant', input: {}, grantAsked: { constraints: { maxAmount: '50.00' }, minutes: 1 } });
-    expect(view.kind).toBe('grant');
-    expect(view.grantAsked).toEqual({ constraints: { maxAmount: '50.00' }, minutes: 1 });
-    const res = await approveAgentRequest(people.bo, view.id, {}, { atHost: true });
-    expect(res.status).toBe('executed');
-    expect(m.runApproved).not.toHaveBeenCalled();
-    expect(m.createGrant).toHaveBeenCalledTimes(1);
-    expect(m.createGrant.mock.calls[0][2]).toMatchObject({ constraints: { maxAmount: '50.00' }, minutes: 1, requestId: view.id });
-    expect(res.request.grantId).toBeTruthy();
-  });
+  it('a request for standing permission only gives the grant', () =>
+    atMidday(async () => {
+      const view = await ask('a', 'test.enter', { kind: 'grant', input: {}, grantAsked: { constraints: { maxAmount: '50.00' }, minutes: 1 } });
+      expect(view.kind).toBe('grant');
+      expect(view.grantAsked).toEqual({ constraints: { maxAmount: '50.00' }, minutes: 1 });
+      const res = await approveAgentRequest(people.bo, view.id, {}, { atHost: true });
+      expect(res.status).toBe('executed');
+      expect(m.runApproved).not.toHaveBeenCalled();
+      expect(m.createGrant).toHaveBeenCalledTimes(1);
+      expect(m.createGrant.mock.calls[0][2]).toMatchObject({ constraints: { maxAmount: '50.00' }, minutes: 1, requestId: view.id });
+      expect(res.request.grantId).toBeTruthy();
+      // What was given, as createGrant gave it: for the card and for the agent.
+      expect(res.request.grant).toMatchObject({ minutes: 1, constraints: { maxAmount: '50.00' } });
+      expect((await requestForAgent(agentCtx.a, view.id))?.grant).toEqual(res.request.grant);
+      // A grant request posts nothing, and says so.
+      expect(res.request).toMatchObject({ posted: false, entryIds: [], grantError: null });
+    }));
 
   it('a request for standing permission on a class that allows none can only be denied', async () => {
     const view = await ask('a', 'test.enter', { kind: 'grant', input: {}, grantAsked: { constraints: {}, minutes: 1 }, needs: { ...NO_NEEDS, grantable: 'no' } });
@@ -938,7 +1024,8 @@ describe('approving', () => {
     });
     try {
       const results = await batchApprove(people.bo, [one.id, two.id, three.id], { atHost: true });
-      expect(results.map((r) => r.status)).toEqual(['executed', 'executed', 'failed']);
+      // The third was not approved (the agent was paused) and nothing ran for it: not a failed run.
+      expect(results.map((r) => r.status)).toEqual(['executed', 'executed', 'not_approved']);
       expect(results[1].request.decidedByName).toBe('Cy');
       expect(results[2].request.status).toBe('pending');
       expect(results[2].request.error).toMatch(/paused/);
@@ -1300,6 +1387,8 @@ describe('requests copied from old proposals', () => {
     const made = await db.select().from(customers).where(and(eq(customers.companyId, companyId), like(customers.displayName, 'Legacy Approved LLC')));
     expect(made).toHaveLength(1);
     expect((await rowOf(requestId)).status).toBe('executed');
+    // What the old path's run posted is read in its own transaction: a new customer posts nothing.
+    expect(res.request).toMatchObject({ posted: false, entryIds: [], grant: null, grantError: null });
   });
 
   it('denying settles the proposal too', async () => {
@@ -1309,18 +1398,705 @@ describe('requests copied from old proposals', () => {
     expect(p.status).toBe('rejected');
   });
 
-  it('a proposal already decided under Ask AI shows that state here and is not run again', async () => {
-    const { proposalId, requestId } = await copied('Legacy Elsewhere LLC');
-    await db.update(aiProposals).set({ status: 'approved', decidedBy: people.ada.userId, decidedAt: new Date() }).where(eq(aiProposals.id, proposalId));
-    const view = await requestForPerson(people.ada, requestId);
-    expect(view.status).toBe('executed');
-    await expectError(approveAgentRequest(people.ada, requestId, {}, { atHost: true }), 'CONFLICT');
-    const made = await db.select().from(customers).where(like(customers.displayName, 'Legacy Elsewhere LLC'));
-    expect(made).toHaveLength(0);
-  });
+  it('a proposal already decided under Ask AI shows that state here and is not run again', () =>
+    frozenAt(new Date(Date.now() + 10 * 60_000), async (moveTo) => {
+      const { proposalId, requestId } = await copied('Legacy Elsewhere LLC');
+      expect((await badgeForPerson(people.ada, { atHost: true })).newest?.id).toBe(requestId);
+      await db.update(aiProposals).set({ status: 'approved', decidedBy: people.ada.userId, decidedAt: new Date() }).where(eq(aiProposals.id, proposalId));
+      // The badge does not count it, though nothing has marked the request yet (it settled under a minute ago).
+      moveTo(20_000);
+      expect((await badgeForPerson(people.ada, { atHost: true })).newest?.id).not.toBe(requestId);
+      expect((await rowOf(requestId)).status).toBe('pending');
+      const view = await requestForPerson(people.ada, requestId);
+      expect(view.status).toBe('executed');
+      await expectError(approveAgentRequest(people.ada, requestId, {}, { atHost: true }), 'CONFLICT');
+      const made = await db.select().from(customers).where(like(customers.displayName, 'Legacy Elsewhere LLC'));
+      expect(made).toHaveLength(0);
+    }));
 
   it('a person without the route right cannot approve one', async () => {
     const { requestId } = await copied('Legacy Rights LLC');
     await expectError(approveAgentRequest(people.rae, requestId, {}, { atHost: true }), 'NOT_FOUND');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What a view tells (wave 3)
+// ---------------------------------------------------------------------------
+
+const E1 = '11111111-1111-4111-8111-111111111111';
+const E2 = '22222222-2222-4222-8222-222222222222';
+
+/** A preview whose ledger holds these journal entries, in this order. */
+function withLedger(ids: string[]): OperationPreview {
+  return {
+    ledger: {
+      entries: ids.map((journalEntryId, i) => ({ journalEntryId, entryNumber: i + 1, date: '2026-11-20', description: null, status: 'posted', source: null, lines: [] })),
+      changes: [],
+    },
+    records: [],
+    effects: [],
+    warnings: [],
+    loss: null,
+    routePreview: null,
+    truncated: false,
+  };
+}
+
+const NEW_PREVIEW: OperationPreview = { ledger: null, records: [], effects: [], warnings: [], loss: null, routePreview: { total: '20.00' }, truncated: false };
+
+describe('what a view tells', () => {
+  beforeAll(async () => {
+    await makeAgent('w3');
+  });
+
+  it('posted and entryIds are what the committed run posted, for the person and the agent', async () => {
+    const view = await ask('w3', 'test.enter');
+    expect(view).toMatchObject({ posted: false, entryIds: [], stale: false, grant: null, grantError: null });
+    m.runApproved.mockResolvedValue(bridge({ preview: withLedger([E1, E2]) }));
+    const res = await approveAgentRequest(people.bo, view.id, {}, { atHost: true });
+    expect(res.request).toMatchObject({ status: 'executed', posted: true, entryIds: [E1, E2] });
+    expect(await requestForAgent(agentCtx.w3, view.id)).toMatchObject({ posted: true, entryIds: [E1, E2] });
+    expect((await requestForPerson(people.cy, view.id)).entryIds).toEqual([E1, E2]);
+
+    // Asked with a preview that posts, but the run itself only changed records: nothing was posted.
+    const plain = await ask('w3', 'test.enter', { preview: withLedger([E1]) });
+    m.runApproved.mockResolvedValue(bridge({ preview: withLedger([]) }));
+    expect((await approveAgentRequest(people.bo, plain.id, {}, { atHost: true })).request).toMatchObject({ posted: false, entryIds: [] });
+  });
+
+  it('entryIds are only the entries the run made; one it voided or deleted still counts as posting', async () => {
+    // The bridge lists the entries a run made, then those it voided, deleted or changed, marked `touched`.
+    const touched = (p: OperationPreview, how: string) => {
+      const entries = p.ledger!.entries as unknown as Array<Record<string, unknown>>;
+      entries[entries.length - 1] = { ...entries[entries.length - 1], touched: how };
+      return p;
+    };
+    m.runApproved.mockResolvedValueOnce(bridge({ preview: touched(withLedger([E1, E2]), 'deleted') }));
+    const made = await ask('w3', 'test.enter');
+    const res = await approveAgentRequest(people.bo, made.id, {}, { atHost: true });
+    expect(res.request).toMatchObject({ status: 'executed', posted: true, entryIds: [E1] });
+    // Only a void: the ledger moved (the agent's own commit would say 'posted' too), nothing to link to.
+    m.runApproved.mockResolvedValueOnce(bridge({ preview: touched(withLedger([E2]), 'voided') }));
+    const voided = await ask('w3', 'test.enter');
+    expect((await approveAgentRequest(people.bo, voided.id, {}, { atHost: true })).request).toMatchObject({ posted: true, entryIds: [] });
+  });
+
+  it('a run that never read the ledger does not claim to know what it posted', async () => {
+    // An operation whose service opens its own database handle (dryRun 'none'), or a desktop flow,
+    // reports no ledger: no preview at all, or one whose ledger is null.
+    for (const preview of [null, { ...NEW_PREVIEW, routePreview: null }]) {
+      m.runApproved.mockResolvedValueOnce(bridge({ preview }));
+      const view = await ask('w3', 'test.enter');
+      const res = await approveAgentRequest(people.bo, view.id, {}, { atHost: true });
+      expect(res.request.status).toBe('executed');
+      expect(res.request.posted).toBeUndefined();
+      expect(res.request.entryIds).toBeUndefined();
+      const agentSees = await requestForAgent(agentCtx.w3, view.id);
+      expect(agentSees?.posted).toBeUndefined();
+      expect((await rowOf(view.id)).result).not.toHaveProperty('posted');
+    }
+  });
+
+  it('a run that failed, or that the books changed under, posted nothing', async () => {
+    m.runApproved.mockResolvedValueOnce(
+      bridge({ mode: 'dry_run', outcome: 'error', stalenessKey: 'v2', preview: withLedger([E1]), result: null, error: { message: 'Customer is inactive.', code: null, details: null } }),
+    );
+    const view = await ask('w3', 'test.enter');
+    expect((await approveAgentRequest(people.bo, view.id, {}, { atHost: true })).request).toMatchObject({ status: 'failed', posted: false, entryIds: [] });
+  });
+
+  it('a request done before this was kept does not claim to know what it posted', async () => {
+    const view = await ask('w3', 'test.enter');
+    await db
+      .update(agentPermissionRequests)
+      .set({ status: 'executed', result: { answer: { id: 'old-1' }, file: null } })
+      .where(eq(agentPermissionRequests.id, view.id));
+    const seen = await requestForAgent(agentCtx.w3, view.id);
+    expect(seen?.result).toEqual({ id: 'old-1' });
+    expect(seen?.posted).toBeUndefined();
+    expect(seen?.entryIds).toBeUndefined();
+  });
+
+  it('a request waiting in a stale round carries the stale mark for everyone; it goes once done', async () => {
+    const view = await ask('w3', 'test.enter');
+    m.runApproved.mockResolvedValueOnce(bridge({ mode: 'dry_run', preview: NEW_PREVIEW, stalenessKey: 'v2' }));
+    const stale = await approveAgentRequest(people.bo, view.id, {}, { atHost: true });
+    expect(stale.status).toBe('stale');
+    expect(stale.request.stale).toBe(true);
+    expect((await requestForPerson(people.cy, view.id)).stale).toBe(true);
+    expect((await listRequestsForPerson(people.cy, { agentId: agentCtx.w3.agent!.id })).find((r) => r.id === view.id)?.stale).toBe(true);
+    expect((await requestForAgent(agentCtx.w3, view.id))?.stale).toBe(true);
+    const done = await approveAgentRequest(people.bo, view.id, { acceptStale: true }, { atHost: true });
+    expect(done.request).toMatchObject({ status: 'executed', stale: false });
+  });
+
+  it('the standing permission given is on the request: its minutes, limits and end', () =>
+    atMidday(async () => {
+      const view = await ask('w3', 'test.enter');
+      const before = Date.now();
+      const res = await approveAgentRequest(people.bo, view.id, { grant: { minutes: 5, constraints: { maxAmount: '10.00' } } }, { atHost: true });
+      expect(res.status).toBe('executed');
+      expect(res.request.grant).toMatchObject({ minutes: 5, constraints: { maxAmount: '10.00' } });
+      const ends = Date.parse(res.request.grant!.expiresAt);
+      expect(ends).toBeGreaterThanOrEqual(before + 5 * 60_000 - 1000);
+      expect(ends).toBeLessThanOrEqual(Date.now() + 5 * 60_000 + 1000);
+      expect(res.request.grantError).toBeNull();
+      expect((await requestForAgent(agentCtx.w3, view.id))?.grant).toEqual(res.request.grant);
+    }));
+
+  it('standing permission refused with the approval: the work still counts as done, and the person is told why', () =>
+    atMidday(async () => {
+      const WHY = 'Only an Admin can give standing permission for sending things outside this computer. Approve this request on its own, or ask an Admin.';
+      m.createGrant.mockRejectedValueOnce(new ServiceError('FORBIDDEN', WHY));
+      const view = await ask('w3', 'test.enter');
+      const res = await approveAgentRequest(people.bo, view.id, { grant: { minutes: 1, constraints: {} } }, { atHost: true });
+      expect(res.status).toBe('executed');
+      expect(res.request).toMatchObject({ status: 'executed', error: null, grantId: null, grant: null, grantError: WHY });
+      expect((await requestForPerson(people.bo, view.id)).grantError).toBe(WHY);
+      const audit = await db
+        .select()
+        .from(auditLogs)
+        .where(and(eq(auditLogs.entityType, 'agent_permission_request'), eq(auditLogs.entityId, view.id)));
+      expect(audit.some((a) => (a.newValues as { grantNotGiven?: string }).grantNotGiven === WHY)).toBe(true);
+    }));
+
+  it('standing permission that fails for a reason nobody can name: the work is done, and nobody is told to ask again', () =>
+    atMidday(async () => {
+      // A plain error (no ServiceError), then an answer without a grant id: both the same to the person.
+      m.createGrant.mockRejectedValueOnce(new Error('disk I/O error at page 42'));
+      m.createGrant.mockResolvedValueOnce({ id: null });
+      for (const n of [1, 2]) {
+        const view = await ask('w3', 'test.enter', { summary: `Enter test record grant-${n}` });
+        const res = await approveAgentRequest(people.bo, view.id, { grant: { minutes: 1, constraints: {} } }, { atHost: true });
+        expect(res.status).toBe('executed');
+        expect(res.request).toMatchObject({ status: 'executed', error: null, grantId: null, grant: null });
+        expect(res.request.grantError).toMatch(/^Standing permission was not given because of an unexpected problem\. The work itself was done/);
+        // Never the words that would have the work entered twice, never the inner error.
+        expect(res.request.grantError).not.toMatch(/send the request again|could not finish this work/);
+        expect(res.request.grantError).not.toContain('disk I/O');
+      }
+      expect(m.runApproved).toHaveBeenCalledTimes(2);
+    }));
+
+  it('a list works out the standing window once per kind of work, not once per request', () =>
+    atMidday(async () => {
+      await makeAgent('win');
+      for (const amount of ['1.00', '2.00', '3.00']) await ask('win', 'test.enter', { facts: facts({ amount }) });
+      await ask('win', 'test.change', { effectiveClass: 'change' });
+      m.grantMinutesFor.mockClear();
+      const listed = await listRequestsForPerson(people.bo, { agentId: agentCtx.win.agent!.id });
+      expect(listed).toHaveLength(4);
+      expect(listed.every((r) => r.canApprove && r.grantMinutesMax > 0)).toBe(true);
+      // One company-day read for the three entries (amounts differ), one for the change.
+      expect(m.grantMinutesFor).toHaveBeenCalledTimes(2);
+    }));
+
+  it('a route with no permission rule is refused in decide()\'s words: no role can allow it', async () => {
+    op('test.norule', { rule: null });
+    const view = await ask('w3', 'test.norule');
+    const asAda = await requestForPerson(people.ada, view.id);
+    expect(asAda.canApprove).toBe(false);
+    expect(asAda.cannotApproveWhy).toMatch(/^No role can allow this request, not even Admin, because Ironbooks has no permission rule for it\./);
+    expect(asAda.cannotApproveWhy).not.toMatch(/Someone who has that right/);
+    await expectError(approveAgentRequest(people.ada, view.id, {}, { atHost: true }), 'FORBIDDEN', /No role can allow this request/);
+    // Nobody but an Admin even sees it: nobody else's access allows it.
+    await expectError(requestForPerson(people.bo, view.id), 'NOT_FOUND');
+    expect(m.runApproved).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The status as a person sees it (exported for the audit report)
+// ---------------------------------------------------------------------------
+
+describe('shownStatus', () => {
+  const now = new Date('2026-11-20T12:00:00.000Z');
+
+  it('pending past its expiry is expired; settled ones are as stored; an unknown word is withdrawn', () => {
+    expect(shownStatus({ status: 'pending', expiresAt: new Date('2026-11-21T00:00:00.000Z') }, now)).toBe('pending');
+    expect(shownStatus({ status: 'pending', expiresAt: '2026-11-19T00:00:00.000Z' }, now)).toBe('expired');
+    expect(shownStatus({ status: 'pending', expiresAt: now }, now)).toBe('expired');
+    // An expiry that cannot be read can never be approved.
+    expect(shownStatus({ status: 'pending', expiresAt: null }, now)).toBe('expired');
+    expect(shownStatus({ status: 'pending', expiresAt: 'soon' }, now)).toBe('expired');
+    for (const s of ['approved', 'denied', 'executed', 'failed', 'cancelled', 'expired'] as const) {
+      expect(shownStatus({ status: s, expiresAt: '2026-11-19T00:00:00.000Z' }, now)).toBe(s);
+    }
+    expect(shownStatus({ status: 'mystery', expiresAt: null }, now)).toBe('cancelled');
+  });
+
+  it('the first of two approvals leaves the request waiting, for a second person', async () => {
+    await makeAgent('two3');
+    m.policies.set(agentCtx.two3.agent!.id, { twoPersonOver: '1.00' });
+    try {
+      const view = await ask('two3', 'test.enter', { facts: facts({ amount: '99.00' }) });
+      expect((await approveAgentRequest(people.bo, view.id, {}, { atHost: true })).status).toBe('needs_second_approver');
+      const row = await rowOf(view.id);
+      expect(row.decidedBy).toBe(people.bo.userId);
+      expect(shownStatus(row)).toBe('pending');
+    } finally {
+      m.policies.delete(agentCtx.two3.agent!.id);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The title bar's badge
+// ---------------------------------------------------------------------------
+
+describe('the badge', () => {
+  // A moment the badge last settled at more than a minute before, or after (as a clock set back):
+  // either way its first call settles, so "within the minute" is counted from there.
+  const fresh = () => new Date(Date.now() + 10 * 60_000);
+
+  afterEach(async () => {
+    // What these tests made is dated ahead: it must not stay the newest waiting request for later tests.
+    for (const key of ['badge', 'crowd']) {
+      if (!agentCtx[key]) continue;
+      await db
+        .update(agentPermissionRequests)
+        .set({ status: 'cancelled' })
+        .where(and(eq(agentPermissionRequests.agentId, agentCtx[key].agent!.id), eq(agentPermissionRequests.status, 'pending')));
+    }
+  });
+
+  it('counts and names the newest request this person could approve, from one read', () =>
+    frozenAt(fresh(), async (moveTo) => {
+      await makeAgent('badge');
+      const before = await badgeForPerson(people.bo, { atHost: true });
+      const first = await ask('badge', 'test.enter', { summary: 'Enter bill 1 from Staples', reason: 'THE AGENT SAYS THIS' });
+      const second = await ask('badge', 'test.enter', { summary: 'Enter bill 2 from Staples', reason: 'THE AGENT SAYS THIS' });
+      // Newer still, but not Bo's to approve.
+      await ask('badge', 'test.enter', { needs: { ...NO_NEEDS, admin: true } });
+      const after = await badgeForPerson(people.bo, { atHost: true });
+      expect(after.pending).toBe(before.pending + 2);
+      expect(after.newest).toEqual({ id: second.id, agentName: 'Agent badge', summary: 'Enter bill 2 from Staples', createdAt: second.createdAt });
+      expect(JSON.stringify(after)).not.toContain('THE AGENT SAYS THIS');
+      expect(await pendingCountForPerson(people.bo)).toBe(after.pending);
+      expect((await badgeForPerson(people.rae, { atHost: true })).pending).toBe(0);
+
+      // Past its expiry: not counted, though nothing has marked it yet (the badge settled under a minute ago).
+      await db.update(agentPermissionRequests).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(agentPermissionRequests.id, second.id));
+      moveTo(30_000);
+      const later = await badgeForPerson(people.bo, { atHost: true });
+      expect(later.pending).toBe(before.pending + 1);
+      expect(later.newest?.id).toBe(first.id);
+      expect((await rowOf(second.id)).status).toBe('pending');
+      // A minute on, the badge marks it.
+      moveTo(61_000);
+      expect((await badgeForPerson(people.bo, { atHost: true })).pending).toBe(before.pending + 1);
+      expect((await rowOf(second.id)).status).toBe('expired');
+    }));
+
+  it('marks what is overdue at most once a minute, masking for good what the request kept for its run', () =>
+    frozenAt(fresh(), async (moveTo) => {
+      await badgeForPerson(people.bo, { atHost: true });
+      const view = await ask('badge', 'test.vendor', { input: { body: { name: 'V', amount: '1.00', taxId: '987-65-1111', accountNumber: '000999888777' } } });
+      // Kept in the row while it can still run (the run must enter what the agent asked for).
+      expect(JSON.stringify((await rowOf(view.id)).input)).toContain('987-65-1111');
+      await db.update(agentPermissionRequests).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(agentPermissionRequests.id, view.id));
+      moveTo(10_000);
+      await badgeForPerson(people.bo, { atHost: true });
+      expect((await rowOf(view.id)).status).toBe('pending');
+      moveTo(61_000);
+      // Nobody opened the list or the card: the title bar's poll settled it.
+      await badgeForPerson(people.bo, { atHost: true });
+      const row = await rowOf(view.id);
+      expect(row.status).toBe('expired');
+      for (const v of ['987-65-1111', '000999888777']) expect(JSON.stringify(row.input)).not.toContain(v);
+      // Even for someone who sees none of it: settling is the company's, the count is the person's.
+      await db.update(agentPermissionRequests).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(agentPermissionRequests.id, (await ask('badge', 'test.enter')).id));
+      moveTo(130_000);
+      expect((await badgeForPerson(people.rae, { atHost: true })).pending).toBe(0);
+      const stillWaiting = await db
+        .select()
+        .from(agentPermissionRequests)
+        .where(and(eq(agentPermissionRequests.companyId, companyId), eq(agentPermissionRequests.status, 'pending'), lte(agentPermissionRequests.expiresAt, new Date())));
+      expect(stillWaiting).toHaveLength(0);
+    }));
+
+  it('someone who is not an Admin is not crowded out by work they cannot see', () =>
+    frozenAt(fresh(), async () => {
+      // More requests Bo cannot see than the badge judges at once, all newer than his.
+      await makeAgent('crowd');
+      op('test.adminonly', { rule: { area: 'users', action: 'modify' }, area: 'users', action: 'modify', class: 'admin' });
+      const mine = await ask('crowd', 'test.enter', { summary: 'Enter the one Bo can approve' });
+      const now = new Date();
+      const many = Array.from({ length: 520 }, (_, i) => ({
+        companyId,
+        agentId: agentCtx.crowd.agent!.id,
+        requestKey: `crowd-${i}`,
+        operation: 'test.adminonly',
+        class: 'admin',
+        input: {},
+        summary: `Admin work ${i}`,
+        status: 'pending',
+        expiresAt: new Date(now.getTime() + 86_400_000),
+        createdAt: new Date(now.getTime() + 60_000 + i),
+        needs: { ...NO_NEEDS, admin: true },
+      }));
+      const inserted = await db.insert(agentPermissionRequests).values(many).returning({ id: agentPermissionRequests.id });
+      try {
+        await expectError(requestForPerson(people.bo, inserted[0].id), 'NOT_FOUND');
+        const badge = await badgeForPerson(people.bo, { atHost: true });
+        expect(badge.newest?.id).toBe(mine.id);
+        expect(badge.pending).toBeGreaterThanOrEqual(1);
+        // The Admin sees and counts them.
+        expect((await badgeForPerson(people.ada, { atHost: true })).pending).toBeGreaterThanOrEqual(500);
+      } finally {
+        await db.delete(agentPermissionRequests).where(like(agentPermissionRequests.requestKey, 'crowd-%'));
+      }
+    }));
+
+  it('is nothing for an agent, a run inside an agent\'s scope, or a context without a person', async () => {
+    const none = { pending: 0, newest: null };
+    expect(await badgeForPerson(agentCtx.a, { atHost: true })).toEqual(none);
+    expect(await badgeForPerson({ ...people.ada, agent: agentCtx.a.agent }, { atHost: true })).toEqual(none);
+    expect(
+      await runWithServiceContext(agentCtx.a, { path: '/api/estimates', method: 'GET' }, () => badgeForPerson(people.ada, { atHost: true })),
+    ).toEqual(none);
+    expect(await badgeForPerson({ db, companyId, userId: null }, { atHost: true })).toEqual(none);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The window it is approved from, and desktop flows
+// ---------------------------------------------------------------------------
+
+describe('the window it is approved from', () => {
+  beforeAll(async () => {
+    await makeAgent('host');
+  });
+
+  it('a teammate\'s window is told plainly it cannot approve host-only work, and does not count it', async () => {
+    const view = await ask('host', 'test.host');
+    const fromTeammate = await requestForPerson(people.bo, view.id, { atHost: false });
+    expect(fromTeammate).toMatchObject({ canApprove: false, grantMinutesMax: 0 });
+    expect(fromTeammate.cannotApproveWhy).toMatch(/only in Ironbooks on the computer that holds the company file/);
+    const listed = (atHost?: boolean) =>
+      listRequestsForPerson(people.bo, { agentId: agentCtx.host.agent!.id, ...(atHost === undefined ? {} : { atHost }) }).then((l) => l.find((r) => r.id === view.id));
+    expect((await listed(false))?.canApprove).toBe(false);
+    expect((await listed(true))?.canApprove).toBe(true);
+    expect((await listed())?.canApprove).toBe(true);
+
+    const atHost = await badgeForPerson(people.bo, { atHost: true });
+    const teammate = await badgeForPerson(people.bo, { atHost: false });
+    expect(atHost.newest?.id).toBe(view.id);
+    expect(teammate.newest?.id).not.toBe(view.id);
+    expect(teammate.pending).toBeLessThan(atHost.pending);
+    // Saying no works from any window.
+    expect((await denyAgentRequest(people.bo, view.id, null)).status).toBe('denied');
+  });
+
+  it('host-only work offers no standing window, though its class would allow one', () =>
+    atMidday(async () => {
+      // The same class, at the same hour, from the same person: a window is offered.
+      const plain = await ask('host', 'test.enter');
+      expect((await requestForPerson(people.bo, plain.id, { atHost: true })).grantMinutesMax).toBeGreaterThan(0);
+      const view = await ask('host', 'test.host');
+      const card = await requestForPerson(people.bo, view.id, { atHost: true });
+      expect(card.canApprove).toBe(true);
+      expect(card.grantMinutesMax).toBe(0);
+      await expectError(approveAgentRequest(people.bo, view.id, { grant: { minutes: 1, constraints: {} } }, { atHost: true }), 'VALIDATION', /cannot be given/);
+      expect(m.runApproved).not.toHaveBeenCalled();
+      expect((await rowOf(view.id)).status).toBe('pending');
+    }));
+
+  it('file-Admin work offers no standing window either, though its class would allow one', () =>
+    atMidday(async () => {
+      // test.file is everyday entry (class enter), not host-only: only the file-Admin rule is in play.
+      expect((m.ops.get('test.file') as Operation).hostOnly).toBe(false);
+      const plain = await ask('host', 'test.enter');
+      expect((await requestForPerson(people.ada, plain.id, { atHost: true })).grantMinutesMax).toBeGreaterThan(0);
+      const view = await ask('host', 'test.file');
+      expect(view.class).toBe('enter');
+      // Ada is the Admin of every company in the file, so she may approve it, once.
+      const card = await requestForPerson(people.ada, view.id, { atHost: true });
+      expect(card.canApprove).toBe(true);
+      expect(card.grantMinutesMax).toBe(0);
+      await expectError(approveAgentRequest(people.ada, view.id, { grant: { minutes: 1, constraints: {} } }, { atHost: true }), 'VALIDATION', /cannot be given/);
+      expect(m.runApproved).not.toHaveBeenCalled();
+      expect(m.createGrant).not.toHaveBeenCalled();
+      expect((await rowOf(view.id)).status).toBe('pending');
+      expect((await approveAgentRequest(people.ada, view.id, {}, { atHost: true })).status).toBe('executed');
+    }));
+});
+
+describe('a desktop flow', () => {
+  const DEF = SHELL_OPERATIONS.find((d) => d.id === 'shell.company.open')!;
+  const FILE = { body: { file: 'C:\\Books\\Acme.ironbooks' } };
+  const ANSWERS = { temporaryFolder: 'Cancel', readOnlyFile: 'Cancel', cloudFolder: false };
+
+  beforeAll(async () => {
+    await makeAgent('shell');
+    op(DEF.id, {
+      kind: 'shell',
+      route: DEF.flow,
+      rule: null,
+      area: null,
+      action: null,
+      class: DEF.class,
+      hostOnly: true,
+      fileAdmin: true,
+      dryRun: 'none',
+      amountField: null,
+      describe: DEF.describe,
+    });
+  });
+
+  const askShell = (over: Partial<NewAgentRequest> = {}) => ask('shell', DEF.id, { effectiveClass: 'file', input: FILE, facts: facts({ amount: null }), stalenessKey: null, ...over });
+
+  it('its questions are on the card, and each must have an answer the shell can use before anything runs', async () => {
+    const view = await askShell();
+    const card = await requestForPerson(people.ada, view.id, { atHost: true });
+    expect(card.questions).toEqual(DEF.questions);
+    expect(card.questions!.length).toBeGreaterThan(0);
+    expect(card).toMatchObject({ canApprove: true, grantMinutesMax: 0 });
+    // Anything that is not a desktop flow has none.
+    expect((await requestForPerson(people.ada, (await ask('shell', 'test.enter')).id)).questions).toEqual([]);
+
+    await expectError(approveAgentRequest(people.ada, view.id, {}, { atHost: true }), 'VALIDATION', /Answer every question/);
+    await expectError(approveAgentRequest(people.ada, view.id, { answers: { ...ANSWERS, cloudFolder: '' } }, { atHost: true }), 'VALIDATION', /Answer every question/);
+    await expectError(approveAgentRequest(people.ada, view.id, { answers: { ...ANSWERS, temporaryFolder: 'Maybe' } }, { atHost: true }), 'VALIDATION', /one of: Save a Copy and Open It/);
+    await expectError(approveAgentRequest(people.ada, view.id, { answers: { ...ANSWERS, cloudFolder: 'perhaps' } }, { atHost: true }), 'VALIDATION', /yes or no/);
+    await expectError(approveAgentRequest(people.ada, view.id, { answers: ANSWERS }, { atHost: false }), 'FORBIDDEN', /computer that holds the company file/);
+    expect(m.runApproved).not.toHaveBeenCalled();
+    expect((await rowOf(view.id)).status).toBe('pending');
+
+    // The shell's own words are accepted too (any case, yes/no as text).
+    const res = await approveAgentRequest(people.ada, view.id, { answers: { temporaryFolder: 'open it here anyway', readOnlyFile: 'CANCEL', cloudFolder: 'Yes' } }, { atHost: true });
+    expect(res.status).toBe('executed');
+    expect(m.runApproved.mock.calls[0][2].answers).toEqual({ temporaryFolder: 'open it here anyway', readOnlyFile: 'CANCEL', cloudFolder: 'Yes' });
+  });
+
+  it('one that fails is failed for good and never runs again under the same id', async () => {
+    const SAID = 'Ironbooks needed an answer and the approval gave none, so it stopped there. The agent can ask again.';
+    m.runApproved.mockResolvedValue(bridge({ outcome: 'error', httpStatus: 0, result: null, stalenessKey: null, error: { message: SAID, code: null, details: null } }));
+    const view = await askShell({ requestKey: 'shell-open-once' });
+    const res = await approveAgentRequest(people.ada, view.id, { answers: ANSWERS }, { atHost: true });
+    expect(res.status).toBe('failed');
+    expect(res.request).toMatchObject({ status: 'failed', error: SAID, posted: false, stale: false });
+    await expectError(approveAgentRequest(people.ada, view.id, { answers: ANSWERS }, { atHost: true }), 'CONFLICT');
+    await expectError(batchApprove(people.ada, [view.id], { atHost: true }), 'VALIDATION');
+    expect(m.runApproved).toHaveBeenCalledTimes(1);
+    // Asking again with the same request id gives the failed request back: nothing new to approve.
+    expect(await askShell({ requestKey: 'shell-open-once' })).toMatchObject({ id: view.id, status: 'failed' });
+    expect(await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.requestKey, 'shell-open-once'))).toHaveLength(1);
+  });
+
+  it('a flow whose password is needed only for a protected file can be approved without one', async () => {
+    // A portable file saved without a password needs none: the flow asks only when the file is protected.
+    const PORTABLE = SHELL_OPERATIONS.find((d) => d.id === 'shell.portable.open')!;
+    expect(PORTABLE.needsSecret).toEqual(['backup_password']);
+    op(PORTABLE.id, {
+      kind: 'shell',
+      route: PORTABLE.flow,
+      rule: null,
+      area: null,
+      action: null,
+      class: PORTABLE.class,
+      hostOnly: true,
+      fileAdmin: true,
+      dryRun: 'none',
+      amountField: null,
+      describe: PORTABLE.describe,
+      needsSecret: [...PORTABLE.needsSecret],
+    });
+    const view = await ask('shell', PORTABLE.id, {
+      effectiveClass: 'file',
+      input: { body: { file: 'C:\\Books\\Acme.bkp', target: 'C:\\Books\\Acme Restored.ironbooks' } },
+      facts: facts({ amount: null }),
+      stalenessKey: null,
+    });
+    const res = await approveAgentRequest(people.ada, view.id, { answers: { openNow: false } }, { atHost: true });
+    expect(res.status).toBe('executed');
+    expect(m.runApproved).toHaveBeenCalledTimes(1);
+    expect(m.runApproved.mock.calls[0][2].secrets).toEqual({});
+  });
+
+  it('an answer that reads like "the books changed" never sends it back to waiting', async () => {
+    m.runApproved.mockResolvedValueOnce(bridge({ mode: 'dry_run', outcome: 'ok', stalenessKey: 'v2', preview: NEW_PREVIEW }));
+    const view = await askShell();
+    const res = await approveAgentRequest(people.ada, view.id, { answers: ANSWERS }, { atHost: true });
+    expect(res.status).toBe('failed');
+    expect(res.request).toMatchObject({ status: 'failed', stale: false });
+    expect(res.request.error).toMatch(/unexpected problem/);
+    expect((await rowOf(view.id)).status).toBe('failed');
+    await expectError(approveAgentRequest(people.ada, view.id, { answers: ANSWERS }, { atHost: true }), 'CONFLICT');
+    expect(m.runApproved).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The standing window is the one createGrant accepts
+// ---------------------------------------------------------------------------
+
+describe('the standing window offered', () => {
+  it("is the end of the company's own day, not this computer's, and createGrant accepts exactly it", async () => {
+    await makeAgent('tz');
+    const [company] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, companyId));
+    const settings = (company.settings ?? {}) as Record<string, unknown>;
+    await db.update(companies).set({ settings: { ...settings, timezone: 'Asia/Kolkata' } }).where(eq(companies.id, companyId));
+    // 17:45 UTC is 23:15 in Kolkata (no daylight saving): 45 minutes are left of the company's day,
+    // whatever this computer's own zone says. Only Date is frozen; timers run as usual.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-20T17:45:00.000Z'));
+    m.createGrant.mockImplementation((...args: never[]) => m.real.createGrant!(...args));
+    try {
+      const view = await ask('tz', 'test.enter');
+      const card = await requestForPerson(people.bo, view.id, { atHost: true });
+      expect(card.grantMinutesMax).toBe(45);
+      await expectError(approveAgentRequest(people.bo, view.id, { grant: { minutes: 46, constraints: {} } }, { atHost: true }), 'VALIDATION', /at most 45 minutes/);
+      expect(m.runApproved).not.toHaveBeenCalled();
+      const res = await approveAgentRequest(people.bo, view.id, { grant: { minutes: 45, constraints: {} } }, { atHost: true });
+      expect(res.status).toBe('executed');
+      expect(res.request.grantError).toBeNull();
+      expect(res.request.grantId).toBeTruthy();
+      expect(res.request.grant).toEqual({ minutes: 45, constraints: {}, expiresAt: '2026-11-20T18:30:00.000Z' });
+    } finally {
+      vi.useRealTimers();
+      await db.update(companies).set({ settings }).where(eq(companies.id, companyId));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Batch approval reports what it did not approve
+// ---------------------------------------------------------------------------
+
+describe('batch approval, item by item', () => {
+  it('one this person may not approve is reported not approved, nothing runs for it, and the others still run', async () => {
+    await makeAgent('batch3');
+    const one = await ask('batch3', 'test.enter');
+    const adminOnly = await ask('batch3', 'test.enter', { needs: { ...NO_NEEDS, admin: true } });
+    const three = await ask('batch3', 'test.enter');
+    const results = await batchApprove(people.bo, [one.id, adminOnly.id, three.id], { atHost: true });
+    expect(results.map((r) => r.status)).toEqual(['executed', 'not_approved', 'executed']);
+    expect(results[1].request.status).toBe('pending');
+    expect(results[1].request.error).toMatch(/Only an Admin/);
+    expect(m.runApproved).toHaveBeenCalledTimes(2);
+    expect((await rowOf(adminOnly.id)).status).toBe('pending');
+    // Still waiting for someone who may approve it.
+    expect((await approveAgentRequest(people.dee, adminOnly.id, {}, { atHost: true })).status).toBe('executed');
+  });
+
+  it('one someone else denied meanwhile is not approved either, and says so', async () => {
+    const one = await ask('batch3', 'test.enter');
+    const two = await ask('batch3', 'test.enter');
+    let calls = 0;
+    m.runApproved.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) await denyAgentRequest(people.cy, two.id, 'Not this one.');
+      return bridge();
+    });
+    const results = await batchApprove(people.bo, [one.id, two.id], { atHost: true });
+    expect(results.map((r) => r.status)).toEqual(['executed', 'not_approved']);
+    expect(results[1].request).toMatchObject({ status: 'denied', error: 'This request was denied.' });
+    expect(calls).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An approval that claimed a request and then lost track of it
+// ---------------------------------------------------------------------------
+
+describe('an approval that loses track of its run', () => {
+  const LOST = /cannot tell whether it was done\. Check the books before asking the agent to send it again\./;
+  // A run that worked, with an answer that cannot be kept (JSON has no big integers): the approval
+  // stops after the run has ended, before it can record how it went.
+  const unkeepable = () => bridge({ result: { id: 'rec-1', big: BigInt(10) } });
+
+  beforeAll(async () => {
+    await makeAgent('lost');
+  });
+
+  it('ends the request as failed at once, its outcome unknown and its input masked, never "being carried out"', async () => {
+    m.runApproved.mockResolvedValueOnce(unkeepable());
+    const view = await ask('lost', 'test.vendor', { input: { body: { name: 'V', amount: '1.00', taxId: '555-66-7777' } } });
+    const res = await approveAgentRequest(people.bo, view.id, {}, { atHost: true });
+    expect(res.status).toBe('failed');
+    expect(res.request.status).toBe('failed');
+    expect(res.request.error).toMatch(LOST);
+    const row = await rowOf(view.id);
+    expect(row.status).toBe('failed');
+    expect(JSON.stringify(row.input)).not.toContain('555-66-7777');
+    expect((await requestForAgent(agentCtx.lost, view.id))?.status).toBe('failed');
+    const audit = await db
+      .select()
+      .from(auditLogs)
+      .where(and(eq(auditLogs.entityType, 'agent_permission_request'), eq(auditLogs.entityId, view.id)));
+    expect(audit.some((a) => (a.newValues as { outcomeUnknown?: boolean }).outcomeUnknown === true)).toBe(true);
+    expect(m.runApproved).toHaveBeenCalledTimes(1);
+  });
+
+  it('in a batch, one it claimed and lost track of is failed, never "not approved"; the others still run', async () => {
+    const one = await ask('lost', 'test.enter');
+    const two = await ask('lost', 'test.enter');
+    const three = await ask('lost', 'test.enter');
+    let calls = 0;
+    m.runApproved.mockImplementation(async () => {
+      calls += 1;
+      if (calls !== 2) return bridge();
+      // The second run worked, then its record could not be kept, and the request can no longer be
+      // ended as this approval's (it no longer reads as Bo's claim): only the batch knows it claimed it.
+      await db.update(agentPermissionRequests).set({ decidedBy: people.cy.userId }).where(eq(agentPermissionRequests.id, two.id));
+      return unkeepable();
+    });
+    try {
+      const results = await batchApprove(people.bo, [one.id, two.id, three.id], { atHost: true });
+      expect(results.map((r) => r.status)).toEqual(['executed', 'failed', 'executed']);
+      expect(results[1].request.error).toMatch(LOST);
+      expect(calls).toBe(3);
+    } finally {
+      // Left "being carried out" (the stuck-run rule would settle it hours from now).
+      await db.update(agentPermissionRequests).set({ status: 'failed' }).where(eq(agentPermissionRequests.id, two.id));
+    }
+  });
+
+  it('in a batch, one it claimed and ended as failed is reported failed', async () => {
+    const one = await ask('lost', 'test.enter');
+    const two = await ask('lost', 'test.enter');
+    m.runApproved.mockResolvedValueOnce(unkeepable()).mockResolvedValueOnce(bridge());
+    const results = await batchApprove(people.bo, [one.id, two.id], { atHost: true });
+    expect(results.map((r) => r.status)).toEqual(['failed', 'executed']);
+    expect(results[0].request.error).toMatch(LOST);
+    expect((await rowOf(one.id)).status).toBe('failed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A password the run cannot do without
+// ---------------------------------------------------------------------------
+
+describe('a password the run cannot do without', () => {
+  beforeAll(async () => {
+    await makeAgent('pw');
+    // Its route always takes the closing-date password (as moving the closing date does).
+    op('test.secret', { needsSecret: ['closing_password'] });
+  });
+
+  it('a yes without it is sent back to the card: nothing is claimed or run, the request still waits', async () => {
+    const view = await ask('pw', 'test.secret');
+    await expectError(approveAgentRequest(people.bo, view.id, {}, { atHost: true }), 'VALIDATION', /^Type the closing-date password on the card, then approve again\. Nothing was done\.$/);
+    await expectError(approveAgentRequest(people.bo, view.id, { secrets: { closing_password: '' } }, { atHost: true }), 'VALIDATION', /closing-date password/);
+    expect(m.runApproved).not.toHaveBeenCalled();
+    expect((await rowOf(view.id)).status).toBe('pending');
+    const done = await approveAgentRequest(people.bo, view.id, { secrets: { closing_password: 'Close-2026!' } }, { atHost: true });
+    expect(done.status).toBe('executed');
+    expect(m.runApproved.mock.calls[0][2].secrets).toEqual({ closing_password: 'Close-2026!' });
+  });
+
+  it('the first of two approvals types nothing; the second one must', async () => {
+    m.policies.set(agentCtx.pw.agent!.id, { twoPersonOver: '1.00' });
+    try {
+      const view = await ask('pw', 'test.secret', { facts: facts({ amount: '99.00' }) });
+      expect((await approveAgentRequest(people.bo, view.id, {}, { atHost: true })).status).toBe('needs_second_approver');
+      await expectError(approveAgentRequest(people.cy, view.id, {}, { atHost: true }), 'VALIDATION', /closing-date password/);
+      expect(m.runApproved).not.toHaveBeenCalled();
+      expect((await approveAgentRequest(people.cy, view.id, { secrets: { closing_password: 'Close-2026!' } }, { atHost: true })).status).toBe('executed');
+    } finally {
+      m.policies.delete(agentCtx.pw.agent!.id);
+    }
   });
 });

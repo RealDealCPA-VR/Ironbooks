@@ -121,3 +121,31 @@ export const payBillsSchema = z.object({
   },
 );
 export type PayBillsBody = z.infer<typeof payBillsSchema>;
+
+/**
+ * POST /api/bill-payments/journal-items — General Journal A/P items of a vendor in Pay Bills
+ * (QB invariant I11): apply a General Journal vendor credit, or take one application off again.
+ */
+export const billPaymentJournalItemsSchema = z.discriminatedUnion('action', [
+  z.object({
+    action: z
+      .literal('apply_credit')
+      .describe('apply_credit: apply a General Journal credit from this vendor to a bill or to a General Journal amount owed.'),
+    journalLineId: zUuid.describe('Id of the General Journal line that holds the vendor credit (from GET /api/bill-payments/journal-items, credits).'),
+    /** The bill to apply the credit to — or `chargeLineId`, a General Journal amount owed (P1). */
+    billId: zUuid.nullish().describe("Id of the vendor's open bill the credit pays; send exactly one of billId and chargeLineId."),
+    chargeLineId: zUuid
+      .nullish()
+      .describe(
+        'Id of the General Journal line of an amount owed to this vendor (from GET /api/bill-payments/journal-items, charges); send exactly one of billId and chargeLineId.',
+      ),
+    amount: zMoneyPositive.describe('Amount of the credit to apply, as decimal text such as "125.00".'),
+    date: zDate
+      .nullish()
+      .describe('Date of the application, YYYY-MM-DD; leave out for today. It is never earlier than the credit or the document it pays.'),
+  }),
+  z.object({
+    action: z.literal('unapply').describe('unapply: take one earlier credit application off again.'),
+    applicationId: zUuid.describe('Id of the application to remove (from the application list of the credit or bill).'),
+  }),
+]);

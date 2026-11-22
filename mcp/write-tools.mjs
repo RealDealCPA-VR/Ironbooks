@@ -11,7 +11,12 @@
  *                         Nothing is entered until then; wait_for_decision waits for the answer.
  *   - needs_confirmation: Ironbooks raised a warning a person would have been asked about; the
  *                         agent may send it again with the matching flag.
- *   ('proposed' is the older word for 'asked', still answered for requests made before.)
+ *   ('proposed' is the older word for 'asked', still answered for requests made before; it may
+ *   carry a proposalId instead of a requestId, and is read the same way.)
+ *
+ * The newer named tools (entry-tools.mjs, report-tools.mjs) and run_operation send the generic
+ * door's verb instead of a named action. The answers are the same, and are worded here for all of
+ * them (shapeAnswer, settle).
  *
  * Two arguments are the same on every one of these tools:
  *
@@ -83,7 +88,14 @@ const SAID = {
 };
 
 /** Outcomes where nothing happened yet, so a preview shows what WOULD happen. */
-const NOT_YET = new Set(['dry_run', 'asked', 'needs_confirmation']);
+const NOT_YET = new Set(['dry_run', 'asked', 'proposed', 'needs_confirmation']);
+
+/**
+ * Waiting for a person. The curated actions answer 'proposed' (with proposalId) where they still
+ * queue an old-style proposal, and 'asked' (with requestId) once they go through the door
+ * (lib/agent/actions.ts): both are read the same way, by whichever id the answer carries.
+ */
+const WAITING = new Set(['asked', 'proposed']);
 
 /** `allowDuplicateNumber` → `allow_duplicate_number`: the named tools' word for a flag. */
 export const snakeFlag = (/** @type {string} */ flag) => flag.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
@@ -123,14 +135,31 @@ export function whoDecides(needs) {
 }
 
 /**
- * How to send a warning's flag again with this tool. `fields`: the tool's own field names (the
- * named tools), or 'confirm' for run_operation.
+ * How to send a warning's flag again with this tool, or null when it cannot be sent at all.
+ * `opts.confirm`: the flags this tool's confirm argument takes (the entry tools). They are the
+ * operation's own, and the door accepts no other flag, so any other warning is one to change the
+ * request for: pointing at run_operation would only meet the same refusal.
+ * `opts.fields`: the tool's own field names (the named tools), or 'confirm' for run_operation.
+ * @param {string} flag @param {string | undefined} operation
+ * @param {{ fields?: string[] | 'confirm', confirm?: string[] }} opts
+ * @returns {string | null}
  */
-function resendWith(flag, operation, fields) {
+function resendWith(flag, operation, opts) {
+  if (Array.isArray(opts.confirm)) return opts.confirm.includes(flag) ? `confirm: ["${flag}"]` : null;
+  const fields = opts.fields;
   if (fields === 'confirm') return `confirm: ["${flag}"]`;
   const field = snakeFlag(flag);
   if (Array.isArray(fields) && fields.includes(field)) return `${field}: true`;
   return operation ? `run_operation with operation "${operation}" and confirm: ["${flag}"]` : `the flag ${flag}`;
+}
+
+/** A warning no flag accepts (lib/agent/operate.ts needsConfirmationAnswer says the same). */
+const NO_FLAG = 'This warning cannot be accepted with a flag. Change the request so it no longer raises it, or stop and tell the person.';
+
+/** One warning of an answer, with how to accept it when it can be. */
+function warningOf(/** @type {any} */ w, /** @type {string | undefined} */ operation, /** @type {any} */ opts) {
+  const resend = resendWith(w.flag, operation, opts);
+  return { flag: w.flag, message: w.message, ...(resend ? { resend_with: resend } : { instead: NO_FLAG }) };
 }
 
 const MAX_PREVIEW_ROWS = 50;
@@ -139,7 +168,7 @@ const MAX_PREVIEW_ROWS = 50;
  * What Ironbooks said about a change, in the words an agent can act on: what happened, what would
  * happen (a preview), and what to do next.
  * @param {any} answer  lib/agent/contract.ts AgentOperationAnswer (or the older AgentActionAnswer)
- * @param {{ fields?: string[] | 'confirm' }} [opts]  how a warning's flag is sent again
+ * @param {{ fields?: string[] | 'confirm', confirm?: string[] }} [opts]  how a warning's flag is sent again (resendWith)
  */
 export function shapeAnswer(answer, opts = {}) {
   const a = answer ?? {};
@@ -151,19 +180,21 @@ export function shapeAnswer(answer, opts = {}) {
   const effects = Array.isArray(preview?.effects) ? preview.effects : [];
   const records = Array.isArray(preview?.records) ? preview.records : [];
   const done = Array.isArray(a.effects) ? a.effects : [];
-  const who = a.outcome === 'asked' ? whoDecides(a.needs) : null;
+  const waiting = WAITING.has(a.outcome);
+  const who = waiting ? whoDecides(a.needs) : null;
   const file = a.file && a.file.fileId ? { file_id: a.file.fileId, name: a.file.name, type: a.file.type, size: a.file.size } : null;
+  const shapedWarnings = warnings.map((w) => warningOf(w, a.operation, opts));
 
   let next;
-  if (a.outcome === 'asked') {
+  if (waiting) {
     next = a.requestId
       ? `Call wait_for_decision with request_id "${a.requestId}" to wait for the person's answer. Do not send this request again: it is already waiting.`
-      : 'list_my_requests shows this request and, later, what the person decided. Do not send it again.';
-  } else if (a.outcome === 'proposed') {
-    next = 'A person decides in Ironbooks. list_my_requests shows what they decided.';
+      : 'A person decides in Ironbooks. list_my_requests shows this request and, later, what the person decided. Do not send it again.';
   } else if (a.outcome === 'needs_confirmation') {
     next =
-      'Check each warning. Only if it is right to go ahead, send the same request again with what resend_with says and a NEW request_id; a request sent with a confirmation may need a person to approve it. Otherwise stop and tell the person about the warning.';
+      shapedWarnings.length && shapedWarnings.every((w) => !w.resend_with)
+        ? 'No flag accepts these warnings. Change the request so it no longer raises them and send it with a NEW request_id, or stop and tell the person about the warning.'
+        : 'Check each warning. Only if it is right to go ahead, send the same request again with what resend_with says and a NEW request_id; a request sent with a confirmation may need a person to approve it. Otherwise stop and tell the person about the warning.';
   } else if (a.outcome === 'refused') {
     next = 'Do not send it again as it is. get_my_permissions shows what you may do; if the work still needs doing, tell the person what you wanted to do and why.';
   } else if (file) {
@@ -177,8 +208,8 @@ export function shapeAnswer(answer, opts = {}) {
     ...(a.summary ? { summary: a.summary } : {}),
     ...(a.result !== undefined ? { result: a.result } : {}),
     ...(a.proposalId ? { proposal_id: a.proposalId } : {}),
-    ...(a.requestId && (a.outcome === 'asked' || a.outcome === 'proposed') ? { request_id: a.requestId } : {}),
-    ...(a.status && a.outcome === 'asked' ? { status: a.status } : {}),
+    ...(a.requestId && waiting ? { request_id: a.requestId } : {}),
+    ...(a.status && waiting ? { status: a.status } : {}),
     ...(who ? { who_decides: who } : {}),
     ...(notYet ? (a.outcome === 'dry_run' || ledger.length ? { would_post: ledger } : {}) : ledger.length ? { ledger } : {}),
     ...(records.length
@@ -189,7 +220,7 @@ export function shapeAnswer(answer, opts = {}) {
     ...(preview?.loss ? { loss: preview.loss } : {}),
     ...(preview?.routePreview !== undefined && preview?.routePreview !== null ? { route_preview: preview.routePreview } : {}),
     ...(preview?.truncated || records.length > MAX_PREVIEW_ROWS ? { preview_cut_short: true } : {}),
-    ...(warnings.length ? { warnings: warnings.map((w) => ({ flag: w.flag, message: w.message, resend_with: resendWith(w.flag, a.operation, opts.fields) })) } : {}),
+    ...(shapedWarnings.length ? { warnings: shapedWarnings } : {}),
     ...(file ? { file } : {}),
     ...(a.grantId ? { under_standing_permission: a.grantId } : {}),
     ...(a.note ? { note: a.note } : {}),
@@ -200,7 +231,7 @@ export function shapeAnswer(answer, opts = {}) {
 /**
  * shapeAnswer, except that a refusal is a tool error: the agent reads why, and that nothing was done.
  * @param {any} answer
- * @param {{ fields?: string[] | 'confirm' }} [opts]
+ * @param {{ fields?: string[] | 'confirm', confirm?: string[] }} [opts]
  */
 export function settle(answer, opts = {}) {
   const shaped = shapeAnswer(answer, opts);

@@ -115,35 +115,68 @@ export const noteUpdateSchema = z.object({
 });
 
 // ---- Billing rate levels ----
+// Create and edit (PUT) take the same full body: an edit replaces the level, its custom rates included.
 export const billingRateLevelSchema = z.object({
-  name: zName(100),
-  type: z.enum(['fixed_rate', 'custom']).default('fixed_rate'),
-  fixedRate: zDecimal.nullish(),
-  isActive: z.boolean().optional(),
-  items: z.array(z.object({ itemId: zUuid, rate: zDecimal })).max(5000).optional(),
+  name: zName(100).describe('Name of the billing rate level, such as "Senior consultant" (at most 100 characters).'),
+  type: z
+    .enum(['fixed_rate', 'custom'])
+    .default('fixed_rate')
+    .describe('fixed_rate (the default): one hourly rate for every service item; custom: a rate per service item in items.'),
+  fixedRate: zDecimal
+    .nullish()
+    .describe('With type fixed_rate: the hourly rate as decimal text such as "150.00" (required there, not used for custom).'),
+  isActive: z
+    .boolean()
+    .optional()
+    .describe('False hides the level from lists; on a new level leave out for active, and on an edit leave out to keep it.'),
+  items: z
+    .array(
+      z.object({
+        itemId: zUuid.describe('Id of a service item (item list).'),
+        rate: zDecimal.describe('Hourly rate for that item as decimal text such as "150.00".'),
+      }),
+    )
+    .max(5000)
+    .optional()
+    .describe('With type custom: the rate per service item, replacing the saved ones; a service item not listed bills at its sales price.'),
+});
+
+/** POST /api/billing-rate-levels/assign — give an employee, vendor or other name a billing rate level. */
+export const assignBillingRateLevelSchema = z.object({
+  employeeId: zUuid.optional().describe('Id of the employee to assign the level to; send exactly one of employeeId, vendorId and otherNameId.'),
+  vendorId: zUuid.optional().describe('Id of the vendor to assign the level to; send exactly one of employeeId, vendorId and otherNameId.'),
+  otherNameId: zUuid
+    .optional()
+    .describe('Id of the Other Names list entry to assign the level to; send exactly one of employeeId, vendorId and otherNameId.'),
+  levelId: zUuid.nullable().describe('Id of the billing rate level to assign, or null to take the level off.'),
 });
 
 // ---- Unit of measure sets ----
 export const UOM_KINDS = ['count', 'length', 'weight', 'volume', 'area', 'time', 'other'] as const;
+// Create and edit (PUT) take the same full body: an edit replaces the set, its units included.
 export const uomSetSchema = z.object({
-  name: zName(100),
-  kind: z.enum(UOM_KINDS).default('count'),
-  baseUnitName: zName(50, 'Base unit name'),
-  baseUnitAbbrev: zName(20, 'Base unit abbreviation'),
-  defaultPurchaseUnit: zOptText(50),
-  defaultSalesUnit: zOptText(50),
-  defaultShippingUnit: zOptText(50),
-  isActive: z.boolean().optional(),
+  name: zName(100).describe('Name of the unit of measure set, such as "Box of 12" (at most 100 characters).'),
+  kind: z
+    .enum(UOM_KINDS)
+    .default('count')
+    .describe('What the units measure: count (the default), length, weight, volume, area, time or other.'),
+  baseUnitName: zName(50, 'Base unit name').describe('Name of the base unit every other unit is a multiple of, such as "Each".'),
+  baseUnitAbbrev: zName(20, 'Base unit abbreviation').describe('Short name of the base unit, such as "ea".'),
+  defaultPurchaseUnit: zOptText(50).describe("Name of one of the set's units that purchase orders preselect; leave out for none."),
+  defaultSalesUnit: zOptText(50).describe("Name of one of the set's units that sales forms preselect; leave out for none."),
+  defaultShippingUnit: zOptText(50).describe("Name of one of the set's units that packing slips preselect; leave out for none."),
+  isActive: z.boolean().optional().describe('False makes the set inactive; leaving it out makes it active, on an edit too.'),
   units: z
     .array(
       z.object({
-        name: zName(50, 'Unit name'),
-        abbrev: zName(20, 'Unit abbreviation'),
-        factor: zDecimal,
+        name: zName(50, 'Unit name').describe('Name of the unit, such as "Box".'),
+        abbrev: zName(20, 'Unit abbreviation').describe('Short name of the unit, such as "bx".'),
+        factor: zDecimal.describe('How many base units one of this unit holds, as decimal text such as "12".'),
       }),
     )
     .max(50)
-    .default([]),
+    .default([])
+    .describe('The other units of the set besides the base unit, at most 50; leave out for none.'),
 });
 
 // ---- Add/Edit Multiple ----

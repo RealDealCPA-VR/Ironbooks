@@ -7,11 +7,16 @@
  *                           working with the next request. The agent stays in the list as removed,
  *                           and what it did stays in the audit trail under its name.
  *
- * For an Admin (the services check). Changing an agent's permissions or removing it is done on the
- * computer that holds the company file, like making one (app/api/agents/route.ts): the policy
- * decides what may reach the books from outside the app's own window, and its folders are folders
- * of that computer. An agent never sees or changes agents (plan 4.6, D9;
- * app/api/agent-requests/_guards.ts).
+ * Who may (the services check): GET, anyone who may view Users & Roles > Users. PATCH, anyone who
+ * may change it, but loosening a policy (a higher preset, a setting moved toward Allow, a higher
+ * bulk cap, a new folder, a higher or removed two-person amount) needs an Admin (plan 4.4);
+ * tightening stays open to them all. DELETE, an Admin.
+ *
+ * Changing an agent's permissions or removing it is done on the computer that holds the company
+ * file, like making one (app/api/agents/route.ts; 403 with details { hostOnly: true } from a
+ * teammate's window): the policy decides what may reach the books from outside the app's own
+ * window, and its folders are folders of that computer. Pausing works from any person's window
+ * (./pause). An agent never sees or changes agents (plan 4.6, D9; app/api/agent-requests/_guards.ts).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';

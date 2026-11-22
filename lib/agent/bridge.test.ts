@@ -14,7 +14,16 @@
  *    the commit; a dry run only shows it.
  *  - No header outside SERVICE_SCOPE_HEADERS reaches the handler, whatever the input carries.
  *  - Secrets are applied only on a commit, from actor.secrets; a secret the agent put in the body
- *    never reaches the handler; wrong closing-date passwords are rate-limited like a person's.
+ *    never reaches the handler; wrong closing-date passwords are rate-limited like a person's. A
+ *    backup's, a portable file's or a copy's user name, password and recovery key travel in their
+ *    headers only as the approver typed them, never as the agent sent them, and not after the run.
+ *  - The amount is the whole ledger of the run: entries made add up; an entry voided, deleted or
+ *    rewritten in place is shown in the ledger preview and counted; "0.00" when the run moves no
+ *    entry; an amount field that cannot be read stays unknown.
+ *  - The note of a dry run that was not tried out is true, for the agent and the approval card.
+ *  - POST /api/import's tie-out 400 is a warning that needs a yes; a scope that will not open is an
+ *    internal refusal; a folder outside the agent's is never looked at, and a file is saved only
+ *    in the folder that was checked; a dryRun 'none' commit has a 10-minute limit of its own.
  *  - The handler's context is built from the actor, never from base.access.
  *  - The staleness key: two runs over the same books agree; a price the run reads or a record the
  *    input names, changed in between, gives another key.
@@ -33,7 +42,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 
 type Handler = (req: Request, ctx: { params: Promise<Record<string, string | string[]>> }) => Promise<Response>;
 
@@ -69,7 +78,7 @@ vi.mock('./contract', async (orig) => {
 // The real modules, watched.
 vi.mock('./files', async (orig) => {
   const real = await orig<typeof import('./files')>();
-  return { ...real, stageFile: vi.fn(real.stageFile) };
+  return { ...real, stageFile: vi.fn(real.stageFile), allowedFolder: vi.fn(real.allowedFolder) };
 });
 vi.mock('@/lib/services/agentGrants', async (orig) => {
   const real = await orig<typeof import('@/lib/services/agentGrants')>();
@@ -112,10 +121,10 @@ delete process.env.BKA_COMPANY_STATE;
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { READ_ONLY_MESSAGE, isReadOnlyDb, readOnlyDb } from '@/lib/db/readOnly';
 import { agentGrants, agents, auditLogs, companies, customers, estimates, items, purchaseOrders, singleUserMode, timeEntries, userSessions } from '@/lib/db/schema';
-import { SERVICE_ORIGIN_HEADER, SERVICE_SCOPE_HEADERS, getServerContext, requestHeaders } from '@/lib/context';
+import { SERVICE_ORIGIN_HEADER, SERVICE_SCOPE_HEADERS, SERVICE_SCOPE_SECRET_HEADERS, getServerContext, requestHeaders, runWithServiceContext } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
 import { fullAccess, type EffectiveAccess } from '@/lib/permissions/model';
-import { effects } from '@/lib/effects';
+import { PINNED_FOLDER_CHANGED, effects } from '@/lib/effects';
 import { hashPassword } from '@/lib/auth';
 import { attemptKeys, loginLimiter } from '@/lib/net/rateLimit';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
@@ -128,9 +137,10 @@ import { useGrant } from '@/lib/services/agentGrants';
 import { allOperations, operationForRoute } from './operations/registry';
 import type { Operation } from './operations/types';
 import { PREVIEW_ROW_LIMIT, type BridgeActor, type OperationInput } from './contract';
-import { PRODUCED_SECRET_TEXT } from './guards';
-import { stageFile } from './files';
-import { runOperation } from './bridge';
+import { PRODUCED_SECRET_TEXT, SECRET_HEADERS, encodeSecretParts } from './guards';
+import { allowedFolder, stageFile } from './files';
+import { postJournalEntry } from '@/lib/services/posting';
+import { IRREVERSIBLE_COMMIT_TIME_LIMIT_MS, runOperation } from './bridge';
 
 type Out = Record<string, any>;
 let db: DB;
@@ -324,7 +334,7 @@ describe('Phase 0 exit: an estimate, a purchase order and a time entry', () => {
     expect(audit.agentId).toBe(agentId);
   });
 
-  it('a journal entry with no amountField still has its true amount: the largest entry it posts', async () => {
+  it('a journal entry with no amountField still has its true amount: what it posts', async () => {
     const dry = await run(op('journal-entries.create'), { body: journalBody() }, 'dry_run');
     expect(dry.error, JSON.stringify(dry.error)).toBeNull();
     expect(dry.preview!.ledger!.entries.length).toBe(1);
@@ -881,15 +891,107 @@ describe('secrets come only from the approving person, on a commit', () => {
     expect(JSON.stringify(r)).not.toContain('agent-typed');
   });
 
-  it('a secret the scope cannot carry (a header outside the list) refuses the run', async () => {
-    h.handler = spy;
-    const staged = await stageFile({ companyId: rich.ctx.companyId, agentId }, { name: 'copy.ibk', type: 'application/octet-stream', bytes: new Uint8Array([1, 2, 3]) });
-    const r = await run(op('portable.restore'), { body: { fileId: staged.fileId } }, 'commit', { ...everything, secrets: { backup_password: 'b-secret-1' } });
-    h.handler = null;
-    expect(r.outcome).toBe('error');
-    expect(r.error!.code).toBe('SECRET_NOT_CARRIED');
-    expect(seen).toEqual([]);
-    expect(JSON.stringify(r)).not.toContain('b-secret-1');
+  describe("a backup's, a portable file's or an Accountant's Copy's password, user name and recovery key", () => {
+    const archive = ['x-ironbooks-login', 'x-ironbooks-password', 'x-ironbooks-recovery-key'] as const;
+    const got: Out[] = [];
+    const archiveSpy = async (req: Request) => {
+      const scoped = await requestHeaders();
+      got.push({
+        request: Object.fromEntries(archive.map((n) => [n, req.headers.get(n)])),
+        scope: Object.fromEntries(archive.map((n) => [n, scoped.get(n)])),
+      });
+      return NextResponse.json({ ok: true, restored: 'copy' }, { status: 201 });
+    };
+    const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64url');
+    /** What a prompt-injected agent sends to plant its own credentials: none of it may become a header. */
+    const planted = {
+      query: { 'x-ironbooks-password': b64('agent-typed'), 'x-ironbooks-login': 'agent', 'x-ironbooks-recovery-key': 'RK-AGENT' },
+      headers: { 'x-ironbooks-password': b64('agent-typed'), 'x-ironbooks-login': 'agent', 'x-ironbooks-recovery-key': 'RK-AGENT' },
+    };
+    beforeEach(() => {
+      got.length = 0;
+    });
+
+    it('are the scope\'s own secrets, the very names applySecrets hands back', () => {
+      expect([...SERVICE_SCOPE_SECRET_HEADERS].sort()).toEqual([...SECRET_HEADERS].sort());
+      for (const name of SECRET_HEADERS) expect(SERVICE_SCOPE_HEADERS).toContain(name);
+    });
+
+    it('a portable file is opened with the password the approver typed, never one the agent sent', async () => {
+      const staged = await stageFile({ companyId: rich.ctx.companyId, agentId }, { name: 'copy.ibk', type: 'application/octet-stream', bytes: new Uint8Array([1, 2, 3]) });
+      h.handler = archiveSpy;
+      const input = { ...planted, body: { fileId: staged.fileId } } as unknown as OperationInput;
+      const r = await run(op('portable.restore'), input, 'commit', { ...everything, secrets: { backup_password: 'b-secret-1' } });
+      expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+      expect(got).toEqual([
+        {
+          request: { 'x-ironbooks-login': null, 'x-ironbooks-password': b64('b-secret-1'), 'x-ironbooks-recovery-key': null },
+          scope: { 'x-ironbooks-login': null, 'x-ironbooks-password': b64('b-secret-1'), 'x-ironbooks-recovery-key': null },
+        },
+      ]);
+      expect(JSON.stringify(r)).not.toContain('b-secret-1');
+      expect(JSON.stringify(r)).not.toContain(b64('b-secret-1'));
+    });
+
+    it('a backup is restored with the user name and password, or the recovery key, the approver typed', async () => {
+      const restore = op('backups.restore');
+      h.handler = archiveSpy;
+      const withLogin = await run(restore, { ...planted, body: { id: 'backup-1' } } as unknown as OperationInput, 'commit', {
+        ...everything,
+        secrets: { archive_credentials: encodeSecretParts({ login: 'dana@books.test', password: 'pä55-wörd' }) },
+      });
+      expect(withLogin.outcome, JSON.stringify(withLogin.error)).toBe('ok');
+      h.handler = archiveSpy;
+      const withKey = await run(restore, { body: { id: 'backup-1' } }, 'commit', { ...everything, secrets: { archive_credentials: 'RK-7Q2M-44XZ' } });
+      expect(withKey.outcome, JSON.stringify(withKey.error)).toBe('ok');
+      expect(got.map((g) => g.request)).toEqual([
+        { 'x-ironbooks-login': 'dana@books.test', 'x-ironbooks-password': b64('pä55-wörd'), 'x-ironbooks-recovery-key': null },
+        { 'x-ironbooks-login': null, 'x-ironbooks-password': null, 'x-ironbooks-recovery-key': 'RK-7Q2M-44XZ' },
+      ]);
+      expect(got.map((g) => g.scope)).toEqual(got.map((g) => g.request));
+      // The agent's planted values never became a header (a query name is only a query name).
+      for (const g of got) expect(JSON.stringify(g)).not.toMatch(/agent|RK-AGENT/);
+      expect(JSON.stringify([withLogin, withKey])).not.toMatch(/pä55|dana@books\.test|RK-7Q2M/);
+    });
+
+    it('never from the agent alone, never in a dry run, and a commit without them is refused before anything runs', async () => {
+      // A commit with nothing typed: refused, the handler never runs, whatever the agent planted.
+      h.handler = archiveSpy;
+      const refused = await run(op('backups.restore'), { ...planted, body: { id: 'backup-1' } } as unknown as OperationInput, 'commit', everything);
+      h.handler = null;
+      expect(refused.error!.code).toBe('SECRET_NEEDED');
+      expect(refused.error!.details).toEqual({ secrets: ['archive_credentials'] });
+      expect(got).toEqual([]);
+      // A dry run that really runs (a copy of the operation that can be rolled back), with the
+      // approver's secret in hand: still none of them reaches the handler.
+      const tried = edited('portable.restore', { dryRun: 'transaction' });
+      const staged = await stageFile({ companyId: rich.ctx.companyId, agentId }, { name: 'copy.ibk', type: 'application/octet-stream', bytes: new Uint8Array([4]) });
+      h.handler = archiveSpy;
+      const dry = await run(tried, { body: { fileId: staged.fileId } }, 'dry_run', { ...everything, secrets: { backup_password: 'b-secret-2' } });
+      expect(dry.outcome, JSON.stringify(dry.error)).toBe('ok');
+      expect(got).toEqual([
+        { request: { 'x-ironbooks-login': null, 'x-ironbooks-password': null, 'x-ironbooks-recovery-key': null }, scope: { 'x-ironbooks-login': null, 'x-ironbooks-password': null, 'x-ironbooks-recovery-key': null } },
+      ]);
+    });
+
+    it('work the run left behind no longer reads them once it is over', async () => {
+      let late!: Promise<Array<string | null>>;
+      h.handler = async () => {
+        late = new Promise((resolve) => {
+          setTimeout(async () => {
+            const hh = await requestHeaders();
+            resolve(archive.map((n) => hh.get(n)));
+          }, 30);
+        });
+        return NextResponse.json({ ok: true }, { status: 201 });
+      };
+      const r = await run(op('backups.restore'), { body: { id: 'backup-1' } }, 'commit', {
+        ...everything,
+        secrets: { archive_credentials: encodeSecretParts({ login: 'dana@books.test', password: 'pw-late' }) },
+      });
+      expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+      expect(await late).toEqual([null, null, null]);
+    });
   });
 
   it('wrong closing-date passwords are counted by the person\'s own limiter, and a locked one refuses before anything runs', async () => {
@@ -1123,5 +1225,657 @@ describe('staged files in', () => {
     const r = await run(nested, { body: { statement: { id: 'x' } }, confirm: ['statement.acknowledgeDifference'] }, 'dry_run');
     expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
     expect(body).toEqual({ statement: { id: 'x', acknowledgeDifference: true } });
+  });
+});
+
+describe('the amount: the whole of what the run moves in the ledger (factsFor)', () => {
+  const je = (amount: string, description: string) => ({
+    date: '2026-03-03',
+    description,
+    lines: [
+      { accountId: rich.acct['6300'], debit: amount },
+      { accountId: rich.acct['1000'], credit: amount },
+    ],
+  });
+  /** A posted journal entry, made through the bridge itself; its id. */
+  const posted = async (amount: string, description: string) => {
+    const r = await run(op('journal-entries.create'), { body: je(amount, description) }, 'commit');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    return r.preview!.ledger!.entries[0].journalEntryId;
+  };
+  const statusOf = async (id: string) => {
+    const res = (await db.execute(sql`select status::text as s from journal_entries where id = ${id}`)) as unknown as { rows: Array<{ s: string }> };
+    return res.rows[0]?.s;
+  };
+  const jePost = async (amount: string, description: string) => {
+    const { POST } = await import('@/app/api/journal-entries/route');
+    return POST(
+      new NextRequest('http://127.0.0.1/api/journal-entries', {
+        method: 'POST',
+        body: JSON.stringify(je(amount, description)),
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+  };
+
+  it('no amount field and no entry made, voided, deleted or changed: "0.00" after a dry run and a commit', async () => {
+    const t = op('time-entries.create');
+    expect(t.amountField).toBeNull();
+    const dry = await run(t, { body: timeBody() }, 'dry_run');
+    expect(dry.outcome, JSON.stringify(dry.error)).toBe('ok');
+    expect(dry.preview!.ledger!.entries).toEqual([]);
+    expect(dry.facts.amount).toBe('0.00');
+    const done = await run(t, { body: timeBody() }, 'commit');
+    expect(done.outcome, JSON.stringify(done.error)).toBe('ok');
+    expect(done.facts.amount).toBe('0.00');
+    // When the run did not go through, it stays unknown.
+    h.handler = async () => NextResponse.json({ error: 'That did not work. Check the lines and try again.', code: 'VALIDATION' }, { status: 400 });
+    const failedRun = await run(t, { body: timeBody() }, 'dry_run');
+    expect(failedRun.outcome).toBe('error');
+    expect(failedRun.facts.amount).toBeNull();
+  });
+
+  it('an amount field that cannot be read stays unknown, whatever the ledger shows', async () => {
+    expect(op('estimates.create').amountField).toBe('total');
+    h.handler = async () => NextResponse.json({ id: randomUUID(), total: 'a lot' }, { status: 201 });
+    const r = await run(op('estimates.create'), { body: estimateBody() }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.facts.amount).toBeNull();
+  });
+
+  it('the entries one run makes add up: two entries are their sum, not the larger one', async () => {
+    h.handler = async () => {
+      for (const [amount, what] of [
+        ['250.00', 'Paper'],
+        ['400.00', 'Toner'],
+      ]) {
+        const res = await jePost(amount, what);
+        if (res.status !== 201) return res;
+      }
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    const r = await run(op('journal-entries.create'), { body: je('250.00', 'Paper') }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.preview!.ledger!.entries).toHaveLength(2);
+    // Entries the run made carry no touched mark.
+    for (const e of r.preview!.ledger!.entries) expect(e).not.toHaveProperty('touched');
+    expect(r.facts.amount).toBe('650.00');
+  });
+
+  it('an operation with an amount field still takes the larger of its field and the largest single entry', async () => {
+    h.handler = async () => {
+      await jePost('900.00', 'Big');
+      await jePost('800.00', 'Not counted with the other');
+      return NextResponse.json({ id: randomUUID(), total: '300.00' }, { status: 201 });
+    };
+    const r = await run(op('estimates.create'), { body: estimateBody() }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.facts.amount).toBe('900.00');
+  });
+
+  it('voiding an entry: the ledger preview shows it, and it is judged at its total', async () => {
+    const id = await posted('50000.00', 'Check 1042 to Paper Supply');
+    const before = await fingerprint();
+    const dry = await run(op('journal-entries.delete'), { params: { id } }, 'dry_run');
+    expect(dry.outcome, JSON.stringify(dry.error)).toBe('ok');
+    expect(dry.facts.amount).toBe('50000.00');
+    const shown = dry.preview!.ledger!.entries.find((e) => e.journalEntryId === id);
+    expect(shown, JSON.stringify(dry.preview!.ledger)).toMatchObject({
+      status: 'void',
+      touched: 'voided',
+      date: '2026-03-03',
+      description: 'Voided by this request: Check 1042 to Paper Supply',
+      lines: expect.arrayContaining([expect.objectContaining({ accountId: rich.acct['6300'], debit: '50000.00', credit: null })]),
+    });
+    expect(dry.preview!.truncated).toBe(false);
+    // A dry run keeps nothing, and two of them agree on the staleness key.
+    expect(await fingerprint()).toEqual(before);
+    expect(await statusOf(id)).toBe('posted');
+    const again = await run(op('journal-entries.delete'), { params: { id } }, 'dry_run');
+    expect(again.stalenessKey).toBe(dry.stalenessKey);
+
+    const done = await run(op('journal-entries.delete'), { params: { id } }, 'commit');
+    expect(done.outcome, JSON.stringify(done.error)).toBe('ok');
+    expect(done.facts.amount).toBe('50000.00');
+    expect(await statusOf(id)).toBe('void');
+
+    // Void already: a run that only touches it moves no money, so nothing is counted for it.
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      await ctx.db.execute(sql`update journal_entries set updated_at = updated_at where id = ${id}`);
+      return NextResponse.json({ ok: true });
+    };
+    const touchedOnly = await run(op('journal-entries.delete'), { params: { id } }, 'dry_run');
+    expect(touchedOnly.outcome, JSON.stringify(touchedOnly.error)).toBe('ok');
+    expect(touchedOnly.preview!.ledger!.entries).toEqual([
+      expect.objectContaining({ journalEntryId: id, status: 'void', touched: 'changed', description: 'Changed by this request: Check 1042 to Paper Supply' }),
+    ]);
+    expect(touchedOnly.facts.amount).toBe('0.00');
+  });
+
+  it('lines rewritten in place (a reclassify, a merge) are found through the ledger rewrite flag and counted', async () => {
+    const { allowLedgerRewrite } = await import('@/lib/services/posting');
+    const id = await posted('700.00', 'Rent for March');
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      await allowLedgerRewrite(ctx, 'reclassify');
+      await ctx.db.execute(sql`update journal_entry_lines set memo = 'moved' where journal_entry_id = ${id}`);
+      return NextResponse.json({ ok: true });
+    };
+    const r = await run(op('journal-entries.update'), { params: { id }, body: {} }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.preview!.ledger!.entries).toEqual([
+      expect.objectContaining({
+        journalEntryId: id,
+        status: 'posted',
+        touched: 'changed',
+        description: 'Changed by this request: Rent for March',
+        lines: expect.arrayContaining([expect.objectContaining({ memo: 'moved', debit: '700.00' })]),
+      }),
+    ]);
+    expect(r.facts.amount).toBe('700.00');
+  });
+
+  it('an entry deleted outright counts by what its audit row kept; with nothing kept the amount is unknown; a draft counts nothing', async () => {
+    const deleting = (old: Record<string, unknown>) => async () => {
+      const ctx = await getServerContext();
+      await writeAudit(ctx, { action: 'delete', entityType: 'journal_entry', entityId: randomUUID(), oldValues: old });
+      return NextResponse.json({ ok: true });
+    };
+    const lines = [
+      { accountId: rich.acct['6300'], debit: '75.00', credit: null, memo: 'gone' },
+      { accountId: rich.acct['1000'], debit: null, credit: '75.00', memo: null },
+    ];
+    h.handler = deleting({ entryNumber: 99001, date: '2026-03-03', description: 'Gone for good', status: 'posted', total: '75.00', lines });
+    const kept = await run(op('journal-entries.update'), { params: { id: randomUUID() }, body: {} }, 'dry_run');
+    expect(kept.outcome, JSON.stringify(kept.error)).toBe('ok');
+    expect(kept.facts.amount).toBe('75.00');
+    expect(kept.preview!.ledger!.entries).toEqual([
+      expect.objectContaining({
+        status: 'deleted',
+        touched: 'deleted',
+        entryNumber: 99001,
+        description: 'Deleted by this request: Gone for good',
+        lines: [
+          expect.objectContaining({ accountId: rich.acct['6300'], debit: '75.00', credit: null, memo: 'gone' }),
+          expect.objectContaining({ accountId: rich.acct['1000'], debit: null, credit: '75.00' }),
+        ],
+      }),
+    ]);
+    expect(kept.preview!.ledger!.entries[0].lines[0].accountName).not.toBe('An account');
+
+    h.handler = deleting({ status: 'posted', description: 'No figures kept' });
+    const unknown = await run(op('journal-entries.update'), { params: { id: randomUUID() }, body: {} }, 'dry_run');
+    expect(unknown.outcome, JSON.stringify(unknown.error)).toBe('ok');
+    expect(unknown.facts.amount).toBeNull();
+
+    h.handler = deleting({ status: 'draft', total: '75.00', description: 'Never posted' });
+    const draft = await run(op('journal-entries.update'), { params: { id: randomUUID() }, body: {} }, 'dry_run');
+    expect(draft.outcome, JSON.stringify(draft.error)).toBe('ok');
+    expect(draft.facts.amount).toBe('0.00');
+  });
+
+  it('a posted entry only given a new title, number, link or line memo is shown but moves no money: "0.00"', async () => {
+    const id = await posted('3000.00', 'Rent for April');
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      // What assigning a check number, retitling, relinking a merged item and a memo fix do.
+      await ctx.db.execute(sql`update journal_entries set reference = 'CHK-2001', description = 'Rent for April, office', source_ref = 'merged:item' where id = ${id}`);
+      await ctx.db.execute(sql`update journal_entry_lines set memo = 'April' where journal_entry_id = ${id}`);
+      return NextResponse.json({ ok: true });
+    };
+    const r = await run(op('journal-entries.update'), { params: { id }, body: {} }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.preview!.ledger!.entries).toEqual([
+      expect.objectContaining({ journalEntryId: id, status: 'posted', touched: 'changed', description: 'Changed by this request: Rent for April, office' }),
+    ]);
+    expect(r.facts.amount).toBe('0.00');
+  });
+
+  it('a draft the run posts moves its whole total into the books', async () => {
+    const draft = await postJournalEntry(admin, {
+      date: new Date('2026-03-05T00:00:00Z'),
+      description: 'Accrued wages',
+      status: 'draft',
+      lines: [
+        { accountId: rich.acct['6300'], debit: '425.00' },
+        { accountId: rich.acct['1000'], credit: '425.00' },
+      ],
+    });
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      await ctx.db.execute(sql`update journal_entries set status = 'posted' where id = ${draft.id}`);
+      return NextResponse.json({ ok: true });
+    };
+    const r = await run(op('journal-entries.update'), { params: { id: draft.id }, body: {} }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.preview!.ledger!.entries).toEqual([expect.objectContaining({ journalEntryId: draft.id, status: 'posted', touched: 'changed' })]);
+    expect(r.facts.amount).toBe('425.00');
+    expect(await statusOf(draft.id)).toBe('draft');
+
+    // Voiding a draft takes nothing out of the books.
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      await ctx.db.execute(sql`update journal_entries set status = 'void', voided_at = now() where id = ${draft.id}`);
+      return NextResponse.json({ ok: true });
+    };
+    const voided = await run(op('journal-entries.update'), { params: { id: draft.id }, body: {} }, 'dry_run');
+    expect(voided.outcome, JSON.stringify(voided.error)).toBe('ok');
+    expect(voided.preview!.ledger!.entries).toEqual([expect.objectContaining({ journalEntryId: draft.id, touched: 'voided' })]);
+    expect(voided.facts.amount).toBe('0.00');
+  });
+});
+
+describe('the ledger preview masks account numbers in memos and descriptions, as every other reader does', () => {
+  const full = '000123456789';
+  /** An older entry (from before the masking fix): its memo and description hold the full number. */
+  const legacy = async () => {
+    const made = await run(
+      op('journal-entries.create'),
+      {
+        body: {
+          date: '2026-03-06',
+          description: 'Sales tax payment',
+          lines: [
+            { accountId: rich.acct['6300'], debit: '640.00' },
+            { accountId: rich.acct['1000'], credit: '640.00' },
+          ],
+        },
+      },
+      'commit',
+    );
+    expect(made.outcome, JSON.stringify(made.error)).toBe('ok');
+    const id = made.preview!.ledger!.entries[0].journalEntryId;
+    await db.execute(sql`update journal_entry_lines set memo = ${`Acct # ${full}`} where journal_entry_id = ${id}`);
+    await db.execute(sql`update journal_entries set description = ${`Sales tax payment, Acct # ${full}`} where id = ${id}`);
+    return id;
+  };
+
+  it('a void dry run shows the memo and description masked; the audit diff too', async () => {
+    const id = await legacy();
+    const dry = await run(op('journal-entries.delete'), { params: { id } }, 'dry_run');
+    expect(dry.outcome, JSON.stringify(dry.error)).toBe('ok');
+    const shown = dry.preview!.ledger!.entries.find((e) => e.journalEntryId === id)!;
+    expect(shown.description).toBe('Voided by this request: Sales tax payment, Acct # ••••6789');
+    expect(shown.lines.map((l) => l.memo)).toEqual(['Acct # ••••6789', 'Acct # ••••6789']);
+    expect(JSON.stringify(dry.preview)).not.toContain(full);
+  });
+
+  it('an entry deleted outright: the lines its audit row kept are masked too', async () => {
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      await writeAudit(ctx, {
+        action: 'delete',
+        entityType: 'journal_entry',
+        entityId: randomUUID(),
+        oldValues: {
+          status: 'posted',
+          description: `Check, Acct # ${full}`,
+          total: '20.00',
+          lines: [
+            { accountId: rich.acct['6300'], debit: '20.00', credit: null, memo: `Acct # ${full}` },
+            { accountId: rich.acct['1000'], debit: null, credit: '20.00', memo: null },
+          ],
+        },
+      });
+      return NextResponse.json({ ok: true });
+    };
+    const r = await run(op('journal-entries.update'), { params: { id: randomUUID() }, body: {} }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.preview!.ledger!.entries[0]).toMatchObject({ description: 'Deleted by this request: Check, Acct # ••••6789' });
+    expect(r.preview!.ledger!.entries[0].lines[0].memo).toBe('Acct # ••••6789');
+    expect(JSON.stringify(r.preview)).not.toContain(full);
+  });
+
+  it('an entry the run makes (a reversal copying its memos) is masked the same way', async () => {
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      await postJournalEntry(ctx, {
+        date: new Date('2026-03-07T00:00:00Z'),
+        description: `Reversal of Acct # ${full}`,
+        lines: [
+          { accountId: rich.acct['1000'], debit: '640.00', memo: `Acct # ${full}` },
+          { accountId: rich.acct['6300'], credit: '640.00' },
+        ],
+      });
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    const r = await run(op('journal-entries.create'), { body: journalBody() }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.preview!.ledger!.entries[0]).toMatchObject({ description: 'Reversal of Acct # ••••6789' });
+    expect(JSON.stringify(r.preview)).not.toContain(full);
+  });
+
+  it('with a reveal of full account numbers a person approved for this call, the full number shows', async () => {
+    const id = await legacy();
+    // No reveal asked: masked, whatever the actor's own rights.
+    const plain = await run(op('journal-entries.delete'), { params: { id } }, 'dry_run', { access: fullAccess(), role: 'admin' });
+    expect(plain.outcome, JSON.stringify(plain.error)).toBe('ok');
+    expect(JSON.stringify(plain.preview)).not.toContain(full);
+    const revealing = edited('journal-entries.delete', { reveal: 'account_numbers' });
+    const dry = await run(revealing, { params: { id }, reveal: true }, 'dry_run', { access: fullAccess(), role: 'admin', reveal: true });
+    expect(dry.outcome, JSON.stringify(dry.error)).toBe('ok');
+    const shown = dry.preview!.ledger!.entries.find((e) => e.journalEntryId === id)!;
+    expect(shown.lines.map((l) => l.memo)).toEqual([`Acct # ${full}`, `Acct # ${full}`]);
+    expect(shown.description).toBe(`Voided by this request: Sales tax payment, Acct # ${full}`);
+  });
+});
+
+describe('what a dry run that was not tried out says', () => {
+  it('an operation with a preview of its own: its preview is the same operation with its preview option, and may need approval', async () => {
+    const preview = op('items.bulk.save');
+    expect(preview.dryRun).toBe('preview');
+    h.handler = async () => {
+      throw new Error('must not run');
+    };
+    const before = await fingerprint();
+    const r = await run(preview, { body: {} }, 'dry_run');
+    h.handler = null;
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    const note = (r.preview!.routePreview as Out).note as string;
+    expect((r.preview!.routePreview as Out).ran).toBe(false);
+    expect(note).toMatch(/same operation/);
+    expect(note).toMatch(/preview option/);
+    expect(note).toMatch(/may need approval/);
+    expect(note).toMatch(/Nothing was changed/);
+    expect(note).not.toMatch(/separate operation/);
+    // Not every such description names the option (vendors.bulk.save, customers.bulk.save do not),
+    // and the approval card does not show the description: the note does not point there.
+    expect(note).not.toMatch(/description/);
+    // Shown on the card under "Ironbooks did not try this ahead of time": it does not say that again.
+    expect(note).not.toMatch(/not tried|did not try/i);
+    expect(await fingerprint()).toEqual(before);
+  });
+
+  it('an operation that cannot be undone says why, and that the person approving it decides', async () => {
+    h.handler = async () => {
+      throw new Error('must not run');
+    };
+    const r = await run(edited('estimates.create', { dryRun: 'none' }), { body: estimateBody() }, 'dry_run');
+    h.handler = null;
+    const note = (r.preview!.routePreview as Out).note as string;
+    expect(note).toMatch(/cannot be run and then undone/);
+    expect(note).toMatch(/the person approving it decides from its description/);
+    expect(note).not.toMatch(/not tried|did not try/i);
+    expect(note).not.toMatch(/answer/);
+  });
+
+  it('a read the agent may see only once approved says its answer would reach the agent first, never that it cannot be undone', async () => {
+    const users = op('users.list');
+    expect(users).toMatchObject({ method: 'GET', class: 'admin', dryRun: 'none' });
+    h.handler = async () => {
+      throw new Error('must not run');
+    };
+    const r = await run(users, {}, 'dry_run', { access: fullAccess(), role: 'admin' });
+    h.handler = null;
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.result).toBeNull();
+    const note = (r.preview!.routePreview as Out).note as string;
+    expect((r.preview!.routePreview as Out).ran).toBe(false);
+    expect(note).toMatch(/hand its answer to the agent before a person approved it/);
+    expect(note).toMatch(/the person approving it decides from its description/);
+    expect(note).not.toMatch(/undone|outside the books/);
+    expect(note).not.toMatch(/not tried|did not try/i);
+
+    // Fail closed: such a read is never dry run, even if its classification said it could be.
+    const read = allOperations().find((o) => o.kind === 'route' && o.availability === 'agent' && o.method === 'GET' && o.class === 'read' && o.params.length === 0)!;
+    let ran = false;
+    h.handler = async () => {
+      ran = true;
+      return NextResponse.json({ rows: [] });
+    };
+    const leaked = await run(edited(read.id, { class: 'admin', dryRun: 'transaction' }), {}, 'dry_run', { access: fullAccess(), role: 'admin' });
+    h.handler = null;
+    expect(ran).toBe(false);
+    expect(leaked.result).toBeNull();
+    expect((leaked.preview!.routePreview as Out).note).toMatch(/hand its answer to the agent/);
+  });
+});
+
+describe('POST /api/import: a statement that does not tie out is a warning that needs a yes (WAVE1 note 7)', () => {
+  const rowsBody = () => ({
+    bankAccountId: randomUUID(),
+    fileType: 'rows',
+    rows: [{ date: '2026-03-01', description: 'Deposit', amount: '12.50' }],
+    statement: { kind: 'bank', openingBalance: '100.00', closingBalance: '117.50' },
+  });
+
+  it("the route's own 400 with details.tieOut becomes needs_confirmation; the resend with the flag gets past it", async () => {
+    const imp = op('import');
+    expect(imp.confirmFlags).toContain('statement.acknowledgeDifference');
+    const before = await fingerprint();
+    const r = await run(imp, { body: rowsBody() }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('needs_confirmation');
+    expect(r.httpStatus).toBe(400);
+    expect(r.error).toBeNull();
+    expect(r.warnings).toEqual([{ flag: 'statement.acknowledgeDifference', message: expect.stringMatching(/off from the statement by/) }]);
+    const yes = await run(imp, { body: rowsBody(), confirm: ['statement.acknowledgeDifference'] }, 'dry_run');
+    expect(yes.outcome).not.toBe('needs_confirmation');
+    expect(JSON.stringify(yes.error)).not.toMatch(/off from the statement/);
+    expect(await fingerprint()).toEqual(before);
+  });
+
+  it('an ordinary 400, the flag already sent, a tie-out that is fine and an operation that does not list the flag stay errors', async () => {
+    const tieOut400 = async () =>
+      NextResponse.json({ error: 'The rows are off from the statement by -5.00.', code: 'VALIDATION', details: { tieOut: { ok: false, difference: '-5.00' } } }, { status: 400 });
+    h.handler = async () => NextResponse.json({ error: 'bankAccountId is required', code: 'VALIDATION' }, { status: 400 });
+    const plain = await run(op('import'), { body: rowsBody() }, 'dry_run');
+    expect(plain.outcome).toBe('error');
+    expect(plain.warnings).toEqual([]);
+    h.handler = tieOut400;
+    const looped = await run(op('import'), { body: rowsBody(), confirm: ['statement.acknowledgeDifference'] }, 'dry_run');
+    expect(looped.outcome).toBe('error');
+    expect(looped.error!.message).toMatch(/off from the statement/);
+    h.handler = async () => NextResponse.json({ error: 'Something else.', code: 'VALIDATION', details: { tieOut: { ok: true, difference: '0.00' } } }, { status: 400 });
+    const tied = await run(op('import'), { body: rowsBody() }, 'dry_run');
+    expect(tied.outcome).toBe('error');
+    h.handler = tieOut400;
+    const other = await run(op('estimates.create'), { body: estimateBody() }, 'dry_run');
+    expect(other.outcome).toBe('error');
+  });
+});
+
+describe('a scope that will not open is an internal refusal, never a crash', () => {
+  it('a run started inside another agent request', async () => {
+    h.handler = async () => {
+      throw new Error('must not run');
+    };
+    const before = await fingerprint();
+    const r = await runWithServiceContext(agentBase, { path: '/api/estimates', method: 'POST' }, () =>
+      run(op('estimates.create'), { body: estimateBody() }, 'dry_run'),
+    );
+    h.handler = null;
+    expect(r.outcome).toBe('error');
+    expect(r.httpStatus).toBe(0);
+    expect(r.error).toEqual({
+      message: 'Ironbooks did not run this request, and nothing was changed: one agent request cannot run inside another.',
+      code: 'INTERNAL',
+      details: { notRun: true },
+    });
+    expect(await fingerprint()).toEqual(before);
+  });
+
+  it('a context that cannot be checked while it runs', async () => {
+    h.handler = async () => {
+      throw new Error('must not run');
+    };
+    const odd = { ...bookkeeping, extra: BigInt(1) } as unknown as EffectiveAccess;
+    const r = await run(op('estimates.create'), { body: estimateBody() }, 'commit', { access: odd });
+    h.handler = null;
+    expect(r.outcome).toBe('error');
+    expect(r.error!.code).toBe('INTERNAL');
+    expect(r.error!.message).toMatch(/^Ironbooks did not run this request, and nothing was changed: an agent request needs a context that can be checked/);
+  });
+});
+
+describe("files are looked at only inside the agent's folders, and saved only where they were checked", () => {
+  const sender = vi.fn(async () => ({ messageId: 'x' }));
+  const linkFolder = (target: string, at: string) => fs.symlinkSync(target, at, process.platform === 'win32' ? 'junction' : 'dir');
+
+  it('a folder outside them is refused without the bridge or effects.writeFile looking at it on the disk', async () => {
+    const allowed = path.join(outbox, 'looked-allowed');
+    fs.mkdirSync(allowed, { recursive: true });
+    const outside = path.join(outbox, 'never-looked-at', 'deep', 'er');
+    // Every way the disk is looked at: lstat (the walk), stat (writeFile's own look, which follows
+    // links and opens shares), realpath (resolving a folder).
+    const spies = [vi.spyOn(fs.promises, 'lstat'), vi.spyOn(fs.promises, 'stat'), vi.spyOn(fs.promises, 'realpath')];
+    try {
+      for (const mode of ['dry_run', 'commit'] as const) {
+        h.handler = async () => {
+          await effects.writeFile({ dir: outside, name: 'x.txt', bytes: 'x' });
+          return NextResponse.json({ ok: true }, { status: 201 });
+        };
+        const r = await run(op('estimates.create'), { body: estimateBody() }, mode, { folders: [allowed] });
+        expect(r.error!.code, mode).toBe('FOLDER_NOT_ALLOWED');
+      }
+      expect(spies[0]).toHaveBeenCalled(); // the allowed folder itself is looked at
+      const looked = spies.flatMap((s) => s.mock.calls.map(([p]) => String(p)));
+      expect(looked.filter((p) => p.includes('never-looked-at'))).toEqual([]);
+    } finally {
+      for (const s of spies) s.mockRestore();
+    }
+    expect(fs.existsSync(path.join(outbox, 'never-looked-at'))).toBe(false);
+  });
+
+  it('a file the work asks for while the folders are being checked is checked too, and refused outside them', async () => {
+    const allowed = path.join(outbox, 'late-allowed');
+    const outside = path.join(outbox, 'late-outside');
+    fs.mkdirSync(allowed, { recursive: true });
+    let startLate!: () => void;
+    const lateGo = new Promise<void>((r) => (startLate = r));
+    // The first look at a folder (the first round of checks) lets the work's background save go.
+    const realAllowed = (await vi.importActual<typeof import('./files')>('./files')).allowedFolder;
+    vi.mocked(allowedFolder).mockImplementationOnce(async (list, folder) => {
+      startLate();
+      await sleep(20);
+      return realAllowed(list, folder);
+    });
+    h.handler = async () => {
+      await effects.writeFile({ dir: allowed, name: 'a.txt', bytes: 'a' });
+      void lateGo.then(() => effects.writeFile({ dir: outside, name: 'b.txt', bytes: 'b' })).catch(() => undefined);
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    const r = await run(op('estimates.create'), { body: estimateBody() }, 'commit', { folders: [allowed] });
+    expect(r.outcome).toBe('error');
+    expect(r.error).toMatchObject({ code: 'FOLDER_NOT_ALLOWED', details: { folder: outside } });
+    expect(fs.existsSync(path.join(allowed, 'a.txt'))).toBe(false);
+    expect(fs.existsSync(outside)).toBe(false);
+  });
+
+  it('a link made inside an allowed folder after the check cannot lead the save elsewhere', async () => {
+    const allowed = path.join(outbox, 'pin-allowed');
+    const out = path.join(allowed, 'out');
+    const elsewhere = path.join(outbox, 'pin-elsewhere');
+    fs.mkdirSync(out, { recursive: true });
+    fs.mkdirSync(elsewhere, { recursive: true });
+    sender.mockClear();
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      await writeAudit(ctx, { action: 'create', entityType: 'bridge_probe', entityId: randomUUID() });
+      await effects.writeFile({ dir: out, name: 'rows.txt', bytes: 'every customer' });
+      await effects.email({ to: 'ap@acme.test', subject: 'Done' }, sender);
+      return new Response(new Uint8Array([37, 80, 68, 70]), { status: 201, headers: { 'content-type': 'application/pdf' } });
+    };
+    // Staging the answer runs after the check and before the commit: the folder is swapped for a
+    // link to another folder right then.
+    const realFiles = await vi.importActual<typeof import('./files')>('./files');
+    vi.mocked(stageFile).mockImplementationOnce(async (owner, file) => {
+      fs.rmSync(out, { recursive: true, force: true });
+      linkFolder(elsewhere, out);
+      return realFiles.stageFile(owner, file);
+    });
+    const r = await run(op('estimates.create'), { body: estimateBody() }, 'commit', { folders: [allowed] });
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.effects).toEqual([
+      expect.objectContaining({ effect: expect.objectContaining({ kind: 'file' }), status: 'failed', error: PINNED_FOLDER_CHANGED }),
+      expect.objectContaining({ effect: expect.objectContaining({ kind: 'email' }), status: 'sent' }),
+    ]);
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+    expect(sender).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('a commit of work that cannot be undone (dryRun none) has a time limit of its own', () => {
+  const sender = vi.fn(async () => ({ messageId: 'x' }));
+  beforeEach(() => sender.mockClear());
+
+  it("is not held to an entry's ten seconds", async () => {
+    h.limitMs = 50;
+    h.handler = async () => {
+      await sleep(300);
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    const r = await run(edited('estimates.create', { dryRun: 'none' }), { body: estimateBody() }, 'commit');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+  });
+
+  it('past IRREVERSIBLE_COMMIT_TIME_LIMIT_MS (10 minutes) it says the work may still finish, and what it queued is never sent', async () => {
+    expect(IRREVERSIBLE_COMMIT_TIME_LIMIT_MS).toBe(10 * 60 * 1000);
+    let reached!: () => void;
+    const atHandler = new Promise<void>((r) => (reached = r));
+    let finish!: () => void;
+    const gate = new Promise<void>((r) => (finish = r));
+    let finished = false;
+    h.handler = async () => {
+      reached();
+      await gate;
+      await effects.email({ to: 'ap@acme.test', subject: 'Late' }, sender);
+      finished = true;
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+    let r: Awaited<ReturnType<typeof runOperation>>;
+    try {
+      const pending = run(edited('estimates.create', { dryRun: 'none' }), { body: estimateBody() }, 'commit');
+      await atHandler;
+      await vi.advanceTimersByTimeAsync(IRREVERSIBLE_COMMIT_TIME_LIMIT_MS + 1_000);
+      r = await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(r.outcome).toBe('error');
+    expect(r.error).toMatchObject({ code: 'TIMEOUT', details: { seconds: 600, mayStillFinish: true } });
+    expect(r.error!.message).toMatch(/longer than 10 minutes/);
+    expect(r.error!.message).toMatch(/may still finish/);
+    finish();
+    for (let i = 0; i < 50 && !finished; i++) await sleep(10);
+    await sleep(50);
+    expect(finished).toBe(true);
+    expect(sender).not.toHaveBeenCalled();
+  });
+
+  it('work that has not started when the limit passes (still waiting to count its grant) never starts', async () => {
+    let reached!: () => void;
+    const atGrant = new Promise<void>((r) => (reached = r));
+    let finish!: () => void;
+    const gate = new Promise<void>((r) => (finish = r));
+    // The wait the limit exists for: the grant's count stuck on a lock.
+    vi.mocked(useGrant).mockImplementationOnce((async () => {
+      reached();
+      await gate;
+    }) as unknown as typeof useGrant);
+    let started = false;
+    h.handler = async () => {
+      started = true;
+      await effects.email({ to: 'ap@acme.test', subject: 'Should never go' }, sender);
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+    let r: Awaited<ReturnType<typeof runOperation>>;
+    try {
+      const pending = run(edited('estimates.create', { dryRun: 'none' }), { body: estimateBody() }, 'commit', {
+        approval: { approvedBy: null, requestId: null, grantId: randomUUID() },
+      });
+      await atGrant;
+      await vi.advanceTimersByTimeAsync(IRREVERSIBLE_COMMIT_TIME_LIMIT_MS + 1_000);
+      r = await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(r.error).toMatchObject({ code: 'TIMEOUT', details: { mayStillFinish: true } });
+    finish();
+    await sleep(300);
+    expect(started).toBe(false);
+    expect(sender).not.toHaveBeenCalled();
   });
 });

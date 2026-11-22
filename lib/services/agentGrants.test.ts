@@ -9,6 +9,8 @@
  *  - the limits are stored cleaned (known keys only, one shape) and the policy engine reads them;
  *  - a live grant is unexpired, unrevoked, not used up, its agent neither removed nor paused, and
  *    its giver still an active member whose role allows the work (an Admin, for outside sends);
+ *    the live list (listGrants with `live`) shows exactly those, the full list every grant;
+ *  - nothing running inside an agent's bridged run reads, lists or uses a grant;
  *  - a use is counted inside the run's transaction: a rolled-back run gives it back, and two runs
  *    racing for the last use cannot both have it (PGlite runs transactions one after another, so
  *    this shows the outcome, not the locking; Ironbooks runs on PGlite);
@@ -50,6 +52,7 @@ import { runWithServiceContext } from '@/lib/serviceScope';
 import { createCompany } from './company';
 import { ServiceError, inTransaction, type ServiceContext } from './_base';
 import { createGrant, grantMinutesFor, listGrants, liveGrants, revokeGrant, useGrant } from './agentGrants';
+import { loadAgentPolicy } from './agentPolicies';
 
 let db: DB;
 let companyId: string;
@@ -610,26 +613,34 @@ describe('the person who gave it', () => {
     expect(await live(helper)).toEqual([g.id]);
     await inTransaction(helperCtx, (tx) => useGrant(tx, g.id));
 
+    const listedLive = async () => (await listGrants(admin, { agentId: helper, live: true })).map((x) => x.id);
+    const listedAll = async () => (await listGrants(admin, { agentId: helper })).map((x) => x.id);
     await setActive(bookkeeperId, false);
     try {
       expect(await live(helper)).toEqual([]);
       await expectError(inTransaction(helperCtx, (tx) => useGrant(tx, g.id)), 'FORBIDDEN', /has ended/);
+      // The live list shows what the next request could run under: not this one. The full list
+      // still has it, so a person can take it back before the giver is turned back on.
+      expect(await listedLive()).toEqual([]);
+      expect(await listedAll()).toEqual([g.id]);
     } finally {
       await setActive(bookkeeperId, true);
     }
     // Turned back on the same day: it was never taken back, so it stands again.
     expect(await live(helper)).toEqual([g.id]);
+    expect(await listedLive()).toEqual([g.id]);
 
     await db.delete(userCompanies).where(and(eq(userCompanies.userId, bookkeeperId), eq(userCompanies.companyId, companyId)));
     try {
       expect(await live(helper)).toEqual([]);
       await expectError(inTransaction(helperCtx, (tx) => useGrant(tx, g.id)), 'FORBIDDEN', /has ended/);
+      expect(await listedLive()).toEqual([]);
+      expect(await listedAll()).toEqual([g.id]);
     } finally {
       await db.insert(userCompanies).values({ userId: bookkeeperId, companyId });
     }
     expect(await uses(g.id)).toBe(1);
-    // Still listed, so a person can take it back.
-    expect((await listGrants(admin, { agentId: helper, live: true })).map((x) => x.id)).toEqual([g.id]);
+    expect(await listedLive()).toEqual([g.id]);
   });
 
   it('takes it with them when their role no longer allows the work', async () => {
@@ -639,10 +650,12 @@ describe('the person who gave it', () => {
     await setRoles(bookkeeperId, ['ap_clerk']);
     try {
       expect(await live(helper)).toEqual([]);
+      expect(await listGrants(admin, { agentId: helper, live: true })).toEqual([]);
     } finally {
       await setRoles(bookkeeperId, ['bookkeeper']);
     }
     expect(await live(helper)).toEqual([g.id]);
+    expect((await listGrants(admin, { agentId: helper, live: true })).map((x) => x.id)).toEqual([g.id]);
   });
 
   it('keeps an outside send standing only while its giver is an Admin (D5)', async () => {
@@ -773,6 +786,58 @@ describe('using a grant', () => {
   });
 });
 
+describe('inside an agent’s bridged run', () => {
+  it('nothing reads, lists or uses a grant, whatever context it was handed', async () => {
+    const g = await enterGrant();
+    const inside = <T>(fn: () => Promise<T>) => runWithServiceContext(agentCtx, { path: '/api/agents', method: 'GET' }, fn);
+    await expectError(inside(() => liveGrants(agentCtx, agentId)), 'FORBIDDEN', /not looked up from inside an agent's work/);
+    await expectError(inside(() => liveGrants(admin, agentId)), 'FORBIDDEN');
+    await expectError(inside(() => listGrants(admin, { agentId })), 'FORBIDDEN', /Users & Roles > Agents/);
+    await expectError(inside(() => listGrants(agentCtx)), 'FORBIDDEN');
+    await expectError(
+      inside(() => inTransaction(agentCtx, (tx) => useGrant(tx, g.id))),
+      'FORBIDDEN',
+      /counted by Ironbooks itself/,
+    );
+    expect((await row(g.id)).uses).toBe(0);
+    // Outside the run, the same calls work.
+    expect((await liveGrants(agentCtx, agentId)).map((x) => x.id)).toContain(g.id);
+    await inTransaction(agentCtx, (tx) => useGrant(tx, g.id));
+    expect((await row(g.id)).uses).toBe(1);
+  });
+});
+
+describe('the agent’s limits come from the real policy store', () => {
+  it('the bulk limit its preset gives, and an agent the store no longer knows', async () => {
+    // Not a stand-in: the module createGrant reads (lib/services/agentPolicies.ts) is the real one.
+    expect(vi.isMockFunction(loadAgentPolicy)).toBe(false);
+    const helper = await addAgent(companyId, 'Store helper');
+    const bulk = (maxCount: number) =>
+      createGrant(admin, facts({ count: 5 }), { agentId: helper, operation: BULK.id, constraints: { maxCount }, minutes: 60, requestId: null });
+
+    // "Full, with asks" with no limit written: the store gives the usual one, and so does createGrant.
+    await setAgentLimits(helper, { preset: 'full_with_asks', bulkCap: null });
+    expect((await loadAgentPolicy(admin, helper)).bulkCap).toBe(DEFAULT_BULK_CAP);
+    await expectError(bulk(DEFAULT_BULK_CAP + 1), 'VALIDATION', new RegExp(`at most ${DEFAULT_BULK_CAP} records`));
+    expect((await bulk(DEFAULT_BULK_CAP)).constraints.maxCount).toBe(DEFAULT_BULK_CAP);
+    // A limit written on the agent is the one both use.
+    await setAgentLimits(helper, { bulkCap: 30 });
+    expect((await loadAgentPolicy(admin, helper)).bulkCap).toBe(30);
+    await expectError(bulk(31), 'VALIDATION', /at most 30 records/);
+    // A preset that lets no bulk work run unasked, with no limit: the store says none, createGrant holds it to the usual one.
+    await setAgentLimits(helper, { preset: 'read_only', bulkCap: null });
+    expect((await loadAgentPolicy(admin, helper)).bulkCap).toBeNull();
+    await expectError(bulk(DEFAULT_BULK_CAP + 1), 'VALIDATION', new RegExp(`at most ${DEFAULT_BULK_CAP} records`));
+
+    // Removed: the store no longer finds it, and no grant is given.
+    await db.update(agents).set({ revokedAt: new Date() }).where(eq(agents.id, helper));
+    await expectError(loadAgentPolicy(admin, helper), 'NOT_FOUND');
+    const count = await grantCount();
+    await expectError(bulk(10), 'VALIDATION', /has been removed/);
+    expect(await grantCount()).toBe(count);
+  });
+});
+
 describe('taking a grant back', () => {
   const audits = async (id: string) =>
     db.select().from(auditLogs).where(and(eq(auditLogs.entityType, 'agent_grant'), eq(auditLogs.entityId, id), eq(auditLogs.action, 'update')));
@@ -874,12 +939,27 @@ describe('listing grants', () => {
 
     expect((await listGrants(admin, { agentId: helper, live: true })).map((g) => g.id)).toEqual([standing.id]);
     expect(await listGrants(admin, { agentId: helper })).toHaveLength(4);
+    // Live means exactly what the policy engine is handed.
+    expect((await liveGrants(admin, helper)).map((g) => g.id)).toEqual([standing.id]);
 
-    // A paused agent's grants are still listed, to be taken back; a removed agent's are not live.
+    // Changed on purpose (wave 3): while the agent is paused, or every agent of the company is, no
+    // grant of it is in effect, so none is listed live; the full list still has them all.
     await db.update(agents).set({ pausedAt: new Date() }).where(eq(agents.id, helper));
+    expect(await listGrants(admin, { agentId: helper, live: true })).toEqual([]);
+    expect(await listGrants(admin, { agentId: helper })).toHaveLength(4);
+    await db.update(agents).set({ pausedAt: null }).where(eq(agents.id, helper));
+    await setCompanySettings(companyId, { timezone: 'America/New_York', integratedAppsBlocked: true });
+    try {
+      expect(await listGrants(admin, { agentId: helper, live: true })).toEqual([]);
+      expect(await listGrants(admin, { agentId: helper })).toHaveLength(4);
+    } finally {
+      await setCompanySettings(companyId, { timezone: 'America/New_York' });
+    }
     expect(await listGrants(admin, { agentId: helper, live: true })).toHaveLength(1);
+    // A removed agent's are never live.
     await db.update(agents).set({ revokedAt: new Date() }).where(eq(agents.id, helper));
     expect(await listGrants(admin, { agentId: helper, live: true })).toEqual([]);
+    expect(await listGrants(admin, { agentId: helper })).toHaveLength(4);
   });
 
   it('an agent lists only its own; another company sees none', async () => {

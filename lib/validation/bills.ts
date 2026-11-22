@@ -55,7 +55,12 @@ export const createBillSchema = z.object({
     .describe("3-letter currency code of the bill such as \"EUR\"; leave out for the vendor's currency."),
   exchangeRate: zDecimal
     .nullish()
-    .describe('Home-currency units per 1 unit of the bill currency, as decimal text such as "1.10"; leave out for the currency list rate.'),
+    // updateBill (lib/services/bills.ts): an edit for the same vendor that leaves the rate blank
+    // keeps the bill's booked rate; an edit that changes the vendor takes the currency list's
+    // rate, like a new bill.
+    .describe(
+      "Home-currency units per 1 unit of the bill currency, as decimal text such as \"1.10\"; leave it out for the currency list's rate, except on an edit for the same vendor, where leaving it out keeps the saved rate.",
+    ),
   /** The user saw the duplicate vendor reference warning and chose to keep the number. */
   allowDuplicateNumber: z
     .boolean()

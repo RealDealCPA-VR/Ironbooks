@@ -10,35 +10,43 @@
  * runShellOperation, for an 'electron' operation:
  *  1. only for a person's approval: a context with an agent on it, or with no person, is refused;
  *  2. makes the approval ticket (lib/agent/shellTicket.ts) over the request id, the operation, the
- *     input and the approver, good for SHELL_TICKET_SECONDS;
- *  3. sends one JSON line { ticket, operation, input, answers, secrets, folders, file? }: the
- *     approver's answers and secrets are for this one run and are never kept; `folders` are the
- *     ones the Admin allowed for the agent (the shell adds its defaults); `file` is the PDF of a
- *     print request, read from the agent's own staged files;
- *  4. waits for the one-line answer { ok, result, error, restarting } with a time limit, and maps
- *     anything else (no shell, no answer, a garbled one) to a plain message.
+ *     input and the approver, good for SHELL_TICKET_SECONDS, its MAC also covering the answers,
+ *     the folders, the file and which secrets come with it;
+ *  3. sends one JSON line { ticket, operation, input, answers, folders, sealed? }: the approver's
+ *     answers and secrets are for this one run and are never kept or logged; `folders` are the
+ *     ones the Admin allowed for the agent (the shell adds its defaults); `sealed` carries the
+ *     secrets and, for a print request, the PDF read from the agent's own staged files, sealed for
+ *     this ticket so nothing between here and the shell can read or swap them;
+ *  4. waits for the one-line answer { ok, result, error, restarting, mac } with a time limit, takes
+ *     it only when its MAC checks out for this ticket, and maps anything else (no shell, no answer,
+ *     a garbled or unchecked one) to a plain message.
  * The shell checks everything again on its side (ticket, replay, input, folders) before it runs.
  *
+ * Folders: the company file's folder counts only when it is not the top of a drive or share (a USB
+ * stick's E:\, a mapped Q:\, \\server\share): then only Documents\Ironbooks and its Agent Outbox
+ * apply. A folder the Admin added that is such a top, or leads to one, is never used either.
+ *
  * 'files.save' (runner 'server') is done here: one of the agent's staged files saved into a folder
- * agents may use, never over a file that is already there.
+ * agents may use, made new on the disk (an exclusive create: never over a file that is there, even
+ * one that arrives a moment before), and a disk failure answers in plain words without any path.
  *
  * Printing an operation's PDF (plan §5.4, D10): installShellPrinting() registers the effects
  * outbox's print handler (lib/effects.ts setPrintHandler), which sends the job to the shell the
  * same way, as the operation "shell.print.file".
  */
 import { randomUUID } from 'node:crypto';
-import { promises as fsp } from 'node:fs';
+import fs, { promises as fsp } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import type { ServiceContext } from '@/lib/services/_base';
 import { loadAgentPolicy } from '@/lib/services/agentPolicies';
-import { effects, setPrintHandler, type PrintHandler } from '@/lib/effects';
+import { setPrintHandler, type PrintHandler } from '@/lib/effects';
 import { currentServiceScope } from '@/lib/serviceScope';
 import type { ShellOperationDef } from './contract';
 import { allowedFolder, readStagedFile } from './files';
 import { SHELL_OPERATIONS } from './operations/shell';
-import { makeShellTicket } from './shellTicket';
+import { makeShellTicket, sealShellPrivate, shellAnswerChecks, shellFileRef, type ShellPrivate } from './shellTicket';
 
 export interface ShellRunResult {
   ok: boolean;
@@ -88,6 +96,8 @@ const NOT_ANSWERING =
 const TOO_SLOW =
   'Ironbooks did not finish this in time. Look in the Ironbooks window to see whether it was done before asking again.';
 const GARBLED = 'The Ironbooks window gave an answer that could not be read. Look in the window to see whether it was done.';
+const UNCHECKED =
+  'The answer from the Ironbooks window could not be checked, so Ironbooks does not take it as done. Look in the Ironbooks window to see whether it was done before the agent asks again.';
 
 function fail(error: string, restarting = false): ShellRunResult {
   return { ok: false, result: null, error, restarting };
@@ -132,6 +142,29 @@ function cleanSecrets(secrets: Record<string, string> | null | undefined): Recor
   return out;
 }
 
+/**
+ * `p` is the top of a drive or a share ("E:\", "\\server\share", "/"): never a folder agents may
+ * use, which would hand them the whole drive or share (electron/agentShell.js driveOrShareRoot).
+ */
+export function isDriveOrShareRoot(p: string): boolean {
+  if (typeof p !== 'string' || !p.trim()) return false;
+  const resolved = path.resolve(p);
+  return resolved === path.parse(resolved).root;
+}
+
+/** The folders of `list` agents may use: never the top of a drive or share, as written or on the disk. */
+function usableFolders(list: readonly string[]): string[] {
+  return list.filter((f) => {
+    if (isDriveOrShareRoot(f)) return false;
+    try {
+      // A folder that is a link to the top of a drive or share is refused like the top itself.
+      return !isDriveOrShareRoot(fs.realpathSync.native(f));
+    } catch {
+      return true; // not there (yet): allowedFolder refuses a folder that is not there
+    }
+  });
+}
+
 /** The folders the Admin allowed for this agent (none when the policy cannot be read: the defaults still apply). */
 async function policyFolders(approver: ServiceContext, agentId: string): Promise<string[]> {
   try {
@@ -146,19 +179,33 @@ async function policyFolders(approver: ServiceContext, agentId: string): Promise
  * The folders agents may use without the Admin naming them: the open company file's folder, and
  * Documents\Ironbooks with its Agent Outbox. Documents is the one the desktop shell told this
  * server (the same the shell's own check uses); without the shell, the one in this account's home.
+ * A company file at the top of a drive or share adds no folder of its own: only Documents applies.
  */
 export function defaultAgentFolders(): string[] {
   const out: string[] = [];
   const companyFile = process.env.BKA_COMPANY_FILE?.trim();
-  if (companyFile) out.push(path.dirname(path.resolve(companyFile)));
+  if (companyFile) {
+    const dir = path.dirname(path.resolve(companyFile));
+    if (!isDriveOrShareRoot(dir)) out.push(dir);
+  }
   const told = process.env[SHELL_DOCUMENTS_ENV]?.trim();
   const docs = told && path.isAbsolute(told) ? told : path.join(os.homedir(), 'Documents');
   out.push(path.join(docs, 'Ironbooks'), path.join(docs, 'Ironbooks', AGENT_OUTBOX_NAME));
   return out;
 }
 
-/** Read the shell's answer: the four fields, nothing else, or null when it is not one. */
-function readAnswer(text: string): ShellRunResult | null {
+/** How an answer is checked: the launch key and the MAC of the ticket the request carried. */
+export interface ShellAnswerCheck {
+  key: string;
+  ticketMac: string;
+}
+
+/**
+ * Read the shell's answer: the four fields, nothing else, or null when it is not one. An answer
+ * whose MAC is not the shell's for that ticket is a failure (UNCHECKED), never taken as done:
+ * something else may have answered in the shell's place. With no check to make, nothing is taken.
+ */
+function readAnswer(text: string, check: ShellAnswerCheck): ShellRunResult | null {
   let v: unknown;
   try {
     v = JSON.parse(text);
@@ -168,6 +215,9 @@ function readAnswer(text: string): ShellRunResult | null {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
   const a = v as Record<string, unknown>;
   if (typeof a.ok !== 'boolean') return null;
+  if (!check || typeof check.ticketMac !== 'string' || !shellAnswerChecks(check.key, check.ticketMac, { ok: a.ok, result: a.result, error: a.error, restarting: a.restarting }, a.mac)) {
+    return fail(UNCHECKED);
+  }
   const error = typeof a.error === 'string' && a.error ? a.error : null;
   return {
     ok: a.ok,
@@ -179,9 +229,13 @@ function readAnswer(text: string): ShellRunResult | null {
 
 /**
  * Send one request line to the shell and resolve its one-line answer. Never throws: no endpoint,
- * no answer in time or an unreadable answer come back as a plain failure.
+ * no answer in time or an unreadable answer come back as a plain failure. `check` is required: the
+ * answer is taken only when its MAC is the shell's for that ticket (the launch key and the MAC of
+ * the ticket on the line; '' for a line with no readable ticket, as the shell signs it). There is no
+ * way to take an unsigned answer from whatever listens at the endpoint, for tests included.
  */
-export function sendShellLine(line: string, timeLimitMs = DEFAULT_TIME_LIMIT_MS): Promise<ShellRunResult> {
+export function sendShellLine(line: string, timeLimitMs: number | undefined, check: ShellAnswerCheck): Promise<ShellRunResult> {
+  const limit = typeof timeLimitMs === 'number' && timeLimitMs > 0 ? timeLimitMs : DEFAULT_TIME_LIMIT_MS;
   const endpoint = process.env[SHELL_ENDPOINT_ENV]?.trim();
   if (!endpoint) return Promise.resolve(fail(NO_SHELL));
   return new Promise((resolve) => {
@@ -196,7 +250,7 @@ export function sendShellLine(line: string, timeLimitMs = DEFAULT_TIME_LIMIT_MS)
       socket.destroy();
       resolve(r);
     };
-    const timer = setTimeout(() => finish(fail(TOO_SLOW)), timeLimitMs);
+    const timer = setTimeout(() => finish(fail(TOO_SLOW)), limit);
     socket.on('connect', () => {
       socket.write(line.endsWith('\n') ? line : `${line}\n`);
     });
@@ -206,11 +260,11 @@ export function sendShellLine(line: string, timeLimitMs = DEFAULT_TIME_LIMIT_MS)
       size += part.length;
       if (size > MAX_ANSWER_BYTES) return finish(fail(GARBLED));
       chunks.push(part);
-      if (nl >= 0) finish(readAnswer(Buffer.concat(chunks).toString('utf8')) ?? fail(GARBLED));
+      if (nl >= 0) finish(readAnswer(Buffer.concat(chunks).toString('utf8'), check) ?? fail(GARBLED));
     });
     socket.on('end', () => {
       if (!chunks.length) return finish(fail(NOT_ANSWERING));
-      finish(readAnswer(Buffer.concat(chunks).toString('utf8')) ?? fail(GARBLED));
+      finish(readAnswer(Buffer.concat(chunks).toString('utf8'), check) ?? fail(GARBLED));
     });
     socket.on('error', () => finish(fail(NOT_ANSWERING)));
   });
@@ -235,22 +289,34 @@ async function sendToShell(
   t: { requestId: string; approverId: string; input: Record<string, unknown>; answers: Record<string, unknown>; secrets: Record<string, string>; folders: string[]; file?: { name: string; type: string; base64: string } },
 ): Promise<ShellRunResult> {
   if (!shellAvailable()) return fail(NO_SHELL);
+  const key = shellKey();
+  const kinds = Object.keys(t.secrets);
   let ticket;
   try {
-    ticket = makeShellTicket(shellKey(), { requestId: t.requestId, operation: def.id, input: t.input, approverId: t.approverId });
+    ticket = makeShellTicket(key, {
+      requestId: t.requestId,
+      operation: def.id,
+      input: t.input,
+      approverId: t.approverId,
+      // Everything else the shell acts on: changed on the way, the MAC no longer checks out.
+      bound: { answers: t.answers, folders: t.folders, file: shellFileRef(t.file ?? null), secrets: kinds },
+    });
   } catch (err) {
     return fail(err instanceof Error ? err.message : NO_SHELL);
   }
+  // The approver's secrets and a print job's PDF travel sealed for this ticket, never in the open.
+  const priv: ShellPrivate = {};
+  if (kinds.length) priv.secrets = t.secrets;
+  if (t.file) priv.file = t.file;
   const line = JSON.stringify({
     ticket,
     operation: def.id,
     input: t.input,
     answers: t.answers,
-    secrets: t.secrets,
     folders: t.folders,
-    ...(t.file ? { file: t.file } : {}),
+    ...(priv.secrets || priv.file ? { sealed: sealShellPrivate(key, ticket.mac, priv) } : {}),
   });
-  const answer = await sendShellLine(line, TIME_LIMIT_MS[def.id] ?? DEFAULT_TIME_LIMIT_MS);
+  const answer = await sendShellLine(line, TIME_LIMIT_MS[def.id] ?? DEFAULT_TIME_LIMIT_MS, { key, ticketMac: ticket.mac });
   // The shell never answers with a secret; this keeps it so even if a message ever quoted one.
   return scrub(answer, t.secrets);
 }
@@ -259,6 +325,54 @@ async function sendToShell(
 // files.save: done by the server itself
 // ---------------------------------------------------------------------------
 
+/** Characters a file name on Windows cannot hold, and invisible ones (lib/effects.ts checkFile). */
+const BAD_NAME = /[\\/:*?"<>|\p{Cc}\p{Cf}]/u;
+/** Names Windows keeps for devices, with or without an extension ("CON", "nul.txt", "COM1.pdf"). */
+const DEVICE_NAME = /^(con|prn|aux|nul|conin\$|conout\$|clock\$|com[0-9¹²³]|lpt[0-9¹²³]) *(\.|$)/iu;
+
+/** Why `name` cannot be a file's name in a folder, or null. Never a path: only a name. */
+function nameProblem(name: string): string | null {
+  const shown = name.length > 80 ? `${name.slice(0, 79)}…` : name;
+  if (!name) return 'The file needs a name.';
+  // Windows drops a trailing dot or space, so such a file would be saved under another name.
+  if (BAD_NAME.test(name) || name !== name.trim() || name.endsWith('.')) {
+    return `"${shown.replace(/[\p{Cc}\p{Cf}]/gu, '')}" cannot be used as a file name. Give only the name (the folder separately), leave out \\ / : * ? " < > | and invisible characters, and do not end it with a dot or a space.`;
+  }
+  if (DEVICE_NAME.test(name)) return `"${shown}" cannot be used as a file name: Windows keeps that name for a device. Choose another name.`;
+  if (name.length > 255) return 'The file name is too long. Use at most 255 characters.';
+  return null;
+}
+
+/** A disk failure in plain words, never with a path (the system's message names the file). */
+function diskTrouble(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  const again = 'then have the agent ask again.';
+  switch (code) {
+    case 'ENOSPC':
+    case 'EDQUOT':
+      return `There is no room left on that disk, so nothing was saved. Free some space, ${again}`;
+    case 'EACCES':
+    case 'EPERM':
+      return `Ironbooks may not write in that folder, so nothing was saved. Check the folder's permissions or choose another folder, ${again}`;
+    case 'EROFS':
+      return `That folder is on a disk that cannot be written to, so nothing was saved. Choose another folder, ${again}`;
+    case 'ENOENT':
+    case 'ENOTDIR':
+      return `That folder is no longer there, so nothing was saved. Check the folder, ${again}`;
+    case 'ENAMETOOLONG':
+      return `The folder and the name together are too long, so nothing was saved. Use a shorter name, ${again}`;
+    case 'EBUSY':
+    case 'ETXTBSY':
+      return `Another program is using that file or folder, so nothing was saved. Close it, ${again}`;
+    default:
+      return `The file could not be saved in that folder. Check that the folder is there and has room, ${again}`;
+  }
+}
+
+function alreadyThere(fileName: string): string {
+  return `There is already a file called "${fileName}" in that folder. Choose another name: Ironbooks never replaces a file for an agent.`;
+}
+
 async function saveStagedFile(approver: ServiceContext, request: { agentId: string; input: Record<string, unknown> }): Promise<ShellRunResult> {
   const { fileId, folder, name } = request.input ?? {};
   if (typeof fileId !== 'string' || !fileId) return fail('Say which staged file to save (its fileId).');
@@ -266,31 +380,57 @@ async function saveStagedFile(approver: ServiceContext, request: { agentId: stri
   if (name !== undefined && name !== null && typeof name !== 'string') return fail('The name must be text.');
   const staged = await readStagedFile({ companyId: approver.companyId, agentId: request.agentId }, fileId).catch(() => null);
   if (!staged) return fail('There is no staged file with that id for this agent (staged files are kept for 24 hours). Stage it again first.');
-  const allowed = [...defaultAgentFolders(), ...(await policyFolders(approver, request.agentId))];
+  const allowed = usableFolders([...defaultAgentFolders(), ...(await policyFolders(approver, request.agentId))]);
   const dir = await allowedFolder(allowed, folder);
-  if (!dir) {
+  if (!dir || isDriveOrShareRoot(dir)) {
     return fail(
       `"${folder}" is not a folder agents may save in, or it does not exist. Use the company file's folder, Documents\\Ironbooks\\${AGENT_OUTBOX_NAME}, ` +
         "or a folder the Admin added in the agent's settings.",
     );
   }
   const fileName = typeof name === 'string' && name.trim() ? name.trim() : staged.file.name;
+  const wrongName = nameProblem(fileName);
+  if (wrongName) return fail(wrongName);
   const target = path.join(dir, fileName);
-  const there = await fsp.lstat(target).then(
-    () => true,
-    () => false,
-  );
-  if (there) return fail(`There is already a file called "${fileName}" in that folder. Choose another name: Ironbooks never replaces a file for an agent.`);
+  // Anything at that name (a file, a folder, a link even to nowhere) and nothing is saved. Windows
+  // creates a new file THROUGH a link that leads nowhere, so a link is looked for first.
   try {
-    const written = await effects.writeFile({ dir, name: fileName, bytes: staged.bytes });
+    await fsp.lstat(target);
+    return fail(alreadyThere(fileName));
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code !== 'ENOENT') return fail(diskTrouble(err));
+  }
+  // Made new on the disk (an exclusive create): a file that arrived a moment ago makes the save
+  // fail. Nothing is ever replaced for an agent.
+  let handle: Awaited<ReturnType<typeof fsp.open>> | null = null;
+  let made = false;
+  try {
+    handle = await fsp.open(target, 'wx');
+    made = true;
+    // The file made is the one at that name, not one a link planted meanwhile led elsewhere.
+    const [opened, atName] = await Promise.all([handle.stat({ bigint: true }), fsp.lstat(target, { bigint: true })]);
+    if (atName.isSymbolicLink() || opened.ino !== atName.ino || opened.dev !== atName.dev) {
+      made = false; // not this save's to take away: it is wherever the link led
+      await handle.close().catch(() => undefined);
+      handle = null;
+      return fail('Something in that folder changed while the file was being saved (a link appeared at its name), so nothing was saved. Have the agent ask again.');
+    }
+    await handle.writeFile(staged.bytes);
+    await handle.sync().catch(() => undefined);
+    await handle.close();
+    handle = null;
     return {
       ok: true,
-      result: { path: written.path, name: fileName, size: written.size, saved: written.written, status: written.status },
+      result: { path: target, name: fileName, size: staged.bytes.byteLength, saved: true, status: 'done' },
       error: null,
       restarting: false,
     };
   } catch (err) {
-    return fail(err instanceof Error && err.message ? err.message : 'The file could not be saved.');
+    if (handle) await handle.close().catch(() => undefined);
+    if (!made && (err as { code?: unknown } | null)?.code === 'EEXIST') return fail(alreadyThere(fileName));
+    // Only a file this save made itself is taken away again (half written: the disk filled up).
+    if (made) await fsp.unlink(target).catch(() => undefined);
+    return fail(diskTrouble(err));
   }
 }
 

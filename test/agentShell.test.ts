@@ -1,30 +1,53 @@
 /**
  * Agent full access: the shell bridge (plan 5.5, 5.7, 5.8, 7.2; D9, D10).
  *
- *  - lib/agent/shellTicket.ts: the approval ticket's HMAC, its expiry, the operation and the input
- *    it is good for; electron/agentShell.js checks tickets with the same algorithm.
+ *  - lib/agent/shellTicket.ts: the approval ticket's HMAC, its expiry, the operation, the input and
+ *    everything else it covers (answers, folders, file, secret kinds), the sealed part and the
+ *    signed answer; electron/agentShell.js does the same, byte for byte.
  *  - electron/agentShell.js: the replay memory, the folders agents may use ("..", another drive, a
- *    share, device paths, links), the scripted dialogs (a question without an answer stops the flow
- *    cleanly, naming the question; nothing ever waits on screen), the endpoint itself over a real
- *    named pipe or Unix socket with fake flows, printing from a hidden window, the desktop notice.
- *  - lib/agent/shell.ts: the server's side over that endpoint, files.save, the print handler of
- *    the effects outbox. No secret the approver typed ever comes back in an answer.
- *  - lib/agent/operations/shell.ts agrees with the shell's own table, and electron/main.js and
- *    preload.js are wired as described (read as text, like the other shell tests: main.js starts
- *    the app when it is loaded).
+ *    share, device paths, links, never the top of a drive or share), the host an agent may join
+ *    (never this computer, nor a virtual machine or container it runs), the scripted dialogs (a
+ *    question without an answer stops the flow cleanly, naming the question; nothing ever waits on
+ *    screen), the endpoint itself over a real named pipe or Unix socket with fake flows (nothing
+ *    else can listen on its name, nothing private goes on it in the open or into the log, a silent
+ *    connection is let go quickly), printing from a hidden window, the desktop notice.
+ *  - lib/agent/shell.ts: the server's side over that endpoint (an answer that does not check out is
+ *    never "done", and there is no way to take one unchecked), files.save (an exclusive create; a
+ *    disk error in plain words, no path), the print handler of the effects outbox. No secret the
+ *    approver typed ever comes back in an answer.
+ *  - electron/companySession.js: agents' staged files in a working copy are a cache entry, go a
+ *    day after a crash left them, and are cleared when the company file opens and closes; those a
+ *    company folder kept in the app data folder are cleared on quit and at start (marked ones only).
+ *  - electron/agentService.js reads a dialog's options as Electron does.
+ *  - lib/agent/operations/shell.ts is pure data and agrees with the shell's own table, and
+ *    electron/main.js and preload.js are wired as described (read as text, like the other shell
+ *    tests: main.js starts the app when it is loaded).
  */
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServiceContext } from '@/lib/services/_base';
 import { SHELL_TICKET_SECONDS, type ShellOperationDef, type ShellTicket } from '@/lib/agent/contract';
-import { makeShellTicket, shellInputHash, shellTicketProblem, stableJson } from '@/lib/agent/shellTicket';
+import {
+  makeShellTicket,
+  openShellPrivate,
+  sealShellPrivate,
+  shellAnswerChecks,
+  shellAnswerMac,
+  shellBoundHash,
+  shellFileRef,
+  shellInputHash,
+  shellTicketProblem,
+  stableJson,
+} from '@/lib/agent/shellTicket';
 import { SHELL_OPERATIONS } from '@/lib/agent/operations/shell';
 import {
   AGENT_OUTBOX_NAME,
   defaultAgentFolders,
   installShellPrinting,
+  isDriveOrShareRoot,
   printThroughShell,
   runShellOperation,
   sendShellLine,
@@ -61,6 +84,9 @@ vi.mock('@/lib/serviceScope', () => ({ currentServiceScope: () => mocks.scope })
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const agentShell = require('../electron/agentShell.js');
+const agentService = require('../electron/agentService.js');
+const companySession = require('../electron/companySession.js');
+const companyFileFormat = require('../electron/companyFileFormat.js');
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 /** Electron's dialog module as the flows use it. */
@@ -197,6 +223,68 @@ describe('the approval ticket (lib/agent/shellTicket.ts)', () => {
     expect(memory.use(other, other.expiresAt + 1)).toBe(true);
     expect(memory.size).toBe(2);
   });
+
+  it('covers everything the shell acts on: the answers, the folders, the file and which secrets come with it', () => {
+    const now = Date.now();
+    const pdf = { name: 'Checks.pdf', type: 'application/pdf', base64: PDF.toString('base64') };
+    const bound = { answers: { openNow: true }, folders: ['C:\\Books'], file: shellFileRef(pdf), secrets: ['backup_password'] };
+    const t = makeShellTicket(KEY, { requestId: 'req-9', operation: 'shell.portable.open', input, approverId: PERSON, now, bound });
+    expect(shellTicketProblem(KEY, t, 'shell.portable.open', input, now, bound)).toBeNull();
+    // As it travels (JSON) and as the shell checks it.
+    const sent = JSON.parse(JSON.stringify({ t, bound }));
+    expect(agentShell.ticketProblem(KEY, sent.t, 'shell.portable.open', input, now, sent.bound)).toBeNull();
+    const other = { ...pdf, base64: Buffer.from('%PDF-1.7 other checks').toString('base64') };
+    for (const changed of [
+      { ...bound, answers: { openNow: false } },
+      { ...bound, answers: {} },
+      { ...bound, folders: ['C:\\Books', 'C:\\Windows'] },
+      { ...bound, folders: [] },
+      { ...bound, file: shellFileRef(other) },
+      { ...bound, file: shellFileRef({ ...pdf, name: 'Other.pdf' }) },
+      { ...bound, file: null },
+      { ...bound, secrets: [] },
+    ]) {
+      expect(shellTicketProblem(KEY, t, 'shell.portable.open', input, now, changed), JSON.stringify(changed)).toMatch(/not made by this Ironbooks for exactly what came with it/);
+      expect(agentShell.ticketProblem(KEY, t, 'shell.portable.open', input, now, changed)).toMatch(/not made by this Ironbooks for exactly what came with it/);
+    }
+    // Both ends hash it the same way, with the same defaults.
+    expect(agentShell.boundHash(bound)).toBe(shellBoundHash(bound));
+    expect(agentShell.boundHash({})).toBe(shellBoundHash(undefined));
+    expect(agentShell.boundHash(null)).toBe(shellBoundHash({ answers: {}, folders: [], file: null, secrets: [] }));
+    expect(agentShell.boundHash({ secrets: ['b', 'a'] })).toBe(shellBoundHash({ secrets: ['a', 'b'] }));
+    expect(agentShell.fileRef(pdf)).toEqual(shellFileRef(pdf));
+    expect(shellFileRef(pdf)).toEqual({ name: 'Checks.pdf', type: 'application/pdf', sha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(agentShell.fileRef(null)).toBeNull();
+  });
+
+  it('what must stay private travels sealed for one ticket, and the answer is signed for it', () => {
+    const t = make();
+    const priv = { secrets: { backup_password: SECRET }, file: { name: 'a.pdf', type: 'application/pdf', base64: PDF.toString('base64') } };
+    const sealed = sealShellPrivate(KEY, t.mac, priv);
+    expect(JSON.stringify(sealed)).not.toContain(SECRET);
+    expect(JSON.stringify(sealed)).not.toContain(PDF.toString('base64'));
+    // Sealed here, opened there, and back.
+    expect(agentShell.openPrivate(KEY, t.mac, JSON.parse(JSON.stringify(sealed)))).toEqual(priv);
+    expect(openShellPrivate(KEY, t.mac, agentShell.sealPrivate(KEY, t.mac, priv))).toEqual(priv);
+    // Another key, another ticket, one changed byte, or no sealed part at all: nothing comes out.
+    expect(agentShell.openPrivate(OTHER_KEY, t.mac, sealed)).toBeNull();
+    expect(agentShell.openPrivate(KEY, make({ now: Date.now() + 5000 }).mac, sealed)).toBeNull();
+    const bytes = Buffer.from(sealed.data, 'base64');
+    bytes[0] ^= 1;
+    expect(agentShell.openPrivate(KEY, t.mac, { ...sealed, data: bytes.toString('base64') })).toBeNull();
+    expect(openShellPrivate(KEY, t.mac, { iv: 'x' })).toBeNull();
+    expect(openShellPrivate(KEY, t.mac, null)).toBeNull();
+    // The answer: only the shell, with this launch's key, can sign it for this ticket.
+    const answer = { ok: true, result: { file: 'C:\\x.ironbooks', n: [1, { b: 2, a: undefined }] }, error: null, restarting: false };
+    const back = JSON.parse(JSON.stringify(agentShell.signAnswer(KEY, t.mac, answer)));
+    expect(shellAnswerChecks(KEY, t.mac, back, back.mac)).toBe(true);
+    expect(agentShell.answerMac(KEY, t.mac, back)).toBe(shellAnswerMac(KEY, t.mac, back));
+    expect(shellAnswerChecks(KEY, 'f'.repeat(64), back, back.mac)).toBe(false);
+    expect(shellAnswerChecks(OTHER_KEY, t.mac, back, back.mac)).toBe(false);
+    expect(shellAnswerChecks(KEY, t.mac, { ...back, ok: false }, back.mac)).toBe(false);
+    expect(shellAnswerChecks(KEY, t.mac, { ...back, result: { file: 'C:\\y.ironbooks' } }, back.mac)).toBe(false);
+    expect(shellAnswerChecks(KEY, t.mac, back, undefined)).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -318,6 +406,217 @@ describe('the folders agents may use', () => {
     expect(folders).toEqual([path.join(TMP, 'Books'), ALLOWED, path.join(ALLOWED, AGENT_OUTBOX_NAME)]);
     expect(agentShell.OUTBOX_NAME).toBe(AGENT_OUTBOX_NAME);
     expect(agentShell.defaultFolders({ companyFile: null, documents: null })).toEqual([]);
+  });
+
+  it('a company file at the top of a drive or share adds no folder of its own: only Documents applies', () => {
+    const docs = 'C:\\Users\\Dana\\Documents';
+    const onlyDocuments = [`${docs}\\Ironbooks`, `${docs}\\Ironbooks\\${AGENT_OUTBOX_NAME}`];
+    for (const [companyFile, what] of [
+      ['E:\\Books.ironbooks', 'a USB stick'],
+      ['Q:\\Acme.ironbooks', 'a mapped drive'],
+      ['\\\\office\\books\\Acme.ironbooks', "a share's top folder"],
+      ['C:\\Acme.ironbooks', 'the system drive'],
+    ]) {
+      expect(agentShell.defaultFolders({ companyFile, documents: docs, platform: 'win32' }), what).toEqual(onlyDocuments);
+    }
+    // One folder down is a folder of its own, on a mapped drive or a share alike.
+    expect(agentShell.defaultFolders({ companyFile: 'Q:\\Clients\\Acme.ironbooks', documents: docs, platform: 'win32' })[0]).toBe('Q:\\Clients');
+    expect(agentShell.defaultFolders({ companyFile: '\\\\office\\books\\Clients\\Acme.ironbooks', documents: docs, platform: 'win32' })[0]).toBe('\\\\office\\books\\Clients');
+    expect(agentShell.defaultFolders({ companyFile: '/Acme.ironbooks', documents: '/home/dana/Documents', platform: 'linux' })).toEqual([
+      '/home/dana/Documents/Ironbooks',
+      `/home/dana/Documents/Ironbooks/${AGENT_OUTBOX_NAME}`,
+    ]);
+    // The finding's probe: the whole USB stick is no longer a place agents may write.
+    const usb = agentShell.defaultFolders({ companyFile: 'E:\\Books.ironbooks', documents: docs, platform: 'win32' });
+    expect(agentShell.pathProblem('E:\\Windows\\System32\\x.ironbooks', usb, win)).toMatch(/not in a folder agents may use/);
+    expect(agentShell.pathProblem('E:\\Copy.ironbooks', usb, win)).toMatch(/not in a folder agents may use/);
+    expect(agentShell.pathProblem(`${docs}\\Ironbooks\\Copy.ironbooks`, usb, win)).toBeNull();
+  });
+
+  it('the top of a drive or share is never a folder agents may use, even when the Admin names it or a folder links to it', () => {
+    for (const [root, p] of [
+      ['E:\\', 'E:\\Books\\x.ironbooks'],
+      ['Q:', 'Q:\\x.ironbooks'],
+      ['\\\\office\\books', '\\\\office\\books\\x.ironbooks'],
+      ['\\\\office\\books\\', '\\\\office\\books\\Clients\\x.ironbooks'],
+    ]) {
+      expect(agentShell.pathProblem(p, [root], win), root).toMatch(/not in a folder agents may use/);
+    }
+    for (const root of ['E:\\', 'Q:\\', '\\\\office\\books', '\\\\office\\books\\']) expect(agentShell.driveOrShareRoot(root, 'win32'), root).toBe(true);
+    for (const folder of ['\\\\office\\books\\Clients', 'E:\\Books', 'C:\\Users']) expect(agentShell.driveOrShareRoot(folder, 'win32'), folder).toBe(false);
+    expect(agentShell.driveOrShareRoot('/', 'linux')).toBe(true);
+    expect(agentShell.driveOrShareRoot('/home', 'linux')).toBe(false);
+    // C:\Docs\Ironbooks is a link to the top of E: on this disk: refused like E:\ itself.
+    const enoent = () => Object.assign(new Error('not there'), { code: 'ENOENT' });
+    const linked = {
+      lstat: (p: string) => {
+        if (!['C:\\', 'C:\\Docs', 'C:\\Docs\\Ironbooks'].includes(p)) throw enoent();
+      },
+      realpath: (p: string) => (p === 'C:\\Docs\\Ironbooks' ? 'E:\\' : p),
+    };
+    expect(agentShell.pathProblem('C:\\Docs\\Ironbooks\\Books\\x.ironbooks', ['C:\\Docs\\Ironbooks'], { platform: 'win32', fs: linked })).toMatch(/leads outside/);
+  });
+
+  it('the server’s own folders follow the same rule (files.save, the ask-time check)', () => {
+    const keep = process.env.BKA_COMPANY_FILE;
+    const top = path.parse(TMP).root;
+    try {
+      process.env.BKA_COMPANY_FILE = path.join(top, 'Books.ironbooks');
+      expect(defaultAgentFolders()).not.toContain(top);
+      expect(defaultAgentFolders()).toHaveLength(2);
+      process.env.BKA_COMPANY_FILE = path.join(TMP, 'Books', 'Acme.ironbooks');
+      expect(defaultAgentFolders()[0]).toBe(path.join(TMP, 'Books'));
+    } finally {
+      if (keep === undefined) delete process.env.BKA_COMPANY_FILE;
+      else process.env.BKA_COMPANY_FILE = keep;
+    }
+    expect(isDriveOrShareRoot(top)).toBe(true);
+    expect(isDriveOrShareRoot(TMP)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The host an agent asks to join
+// ---------------------------------------------------------------------------
+
+/** This computer as the join check sees it: its adapters, its name, and what names lead to. */
+const NETWORK = {
+  interfaces: () => ({
+    Ethernet: [
+      { address: '192.168.1.202', family: 'IPv4', internal: false },
+      { address: 'fe80::1df0:60eb:dfcd:1bc6%12', family: 'IPv6', internal: false },
+    ],
+    Tailscale: [
+      { address: '100.114.92.33', family: 'IPv4', internal: false },
+      { address: 'fd7a:115c:a1e0::9c35:5c21', family: 'IPv6', internal: false },
+    ],
+    Loopback: [
+      { address: '127.0.0.1', family: 'IPv4', internal: true },
+      { address: '::1', family: 'IPv6', internal: true },
+    ],
+    // The virtual machines and containers this computer runs, as os.networkInterfaces() shows them.
+    'vEthernet (WSL (Hyper-V firewall))': [
+      { address: '172.29.144.1', netmask: '255.255.240.0', family: 'IPv4', mac: '00:15:5d:8a:01:02', internal: false, cidr: '172.29.144.1/20' },
+      { address: 'fe80::9a3c:1b2d:4e5f:6a7b%41', netmask: 'ffff:ffff:ffff:ffff::', family: 'IPv6', mac: '00:15:5d:8a:01:02', internal: false, cidr: 'fe80::9a3c:1b2d:4e5f:6a7b/64' },
+    ],
+    docker0: [
+      { address: '172.17.0.1', netmask: '255.255.0.0', family: 'IPv4', mac: '02:42:6b:11:22:33', internal: false, cidr: '172.17.0.1/16' },
+      { address: 'fd42:4242:4242:1::1', netmask: 'ffff:ffff:ffff:ffff::', family: 'IPv6', mac: '02:42:6b:11:22:33', internal: false, cidr: 'fd42:4242:4242:1::1/64' },
+    ],
+    // A Hyper-V switch someone named: known by its hardware address.
+    'Ethernet 3': [{ address: '10.99.0.1', netmask: '255.255.255.0', family: 'IPv4', mac: '00-15-5D-01-02-03', internal: false, cidr: '10.99.0.1/24' }],
+    // No mask the shell can read: a /24 is assumed.
+    vboxnet0: [{ address: '192.168.56.1', family: 'IPv4', mac: '0a:00:27:00:00:00', internal: false }],
+    // A mask wider than any virtual network uses: taken as a /16, never a whole private range.
+    'vEthernet (Odd Switch)': [{ address: '10.200.0.1', netmask: '255.0.0.0', family: 'IPv4', mac: '00:15:5d:aa:bb:cc', internal: false, cidr: '10.200.0.1/8' }],
+  }),
+  hostname: () => 'FRONT-DESK',
+  lookup: async (name: string) => {
+    const known: Record<string, string[]> = {
+      'office.tail1234.ts.net': ['100.101.102.103'],
+      'me.tail1234.ts.net': ['100.114.92.33'],
+      'loop.tail1234.ts.net': ['127.0.0.1'],
+      'both.tail1234.ts.net': ['100.101.102.103', 'fd7a:115c:a1e0::9c35:5c21'],
+      'wsl-box.tail1234.ts.net': ['172.29.150.7'],
+    };
+    const found = known[name];
+    if (!found) throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${name}`), { code: 'ENOTFOUND' });
+    return found.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+  },
+};
+
+describe('the host an agent asks to join (shell.hosting.connect)', () => {
+  const join = (host: string) => agentShell.joinProblem(host, NETWORK);
+
+  it('is never this computer itself: localhost, any loopback, its own addresses and name, a name that leads here', async () => {
+    for (const host of [
+      'localhost',
+      'LOCALHOST',
+      'localhost.',
+      'http://localhost:47800',
+      '127.0.0.1',
+      '127.1',
+      '127.255.0.9:47800',
+      '0x7f000001',
+      '[::1]',
+      'http://[::1]:47800/',
+      '192.168.1.202',
+      'https://192.168.1.202:47800',
+      '100.114.92.33',
+      '[fd7a:115c:a1e0::9c35:5c21]:47800',
+      'front-desk.tail1234.ts.net',
+      'me.tail1234.ts.net',
+      'loop.tail1234.ts.net',
+      'both.tail1234.ts.net',
+    ]) {
+      expect(await join(host), host).toMatch(/is this computer itself, so Ironbooks did not join it/);
+    }
+    // An IPv4 address written the IPv6 way is refused too (the window takes no such address).
+    expect(await join('[::ffff:127.0.0.1]')).toBeTruthy();
+  });
+
+  it('another computer on this office network or tailnet is fine', async () => {
+    for (const host of ['192.168.1.20', '10.0.0.5:47800', '100.101.102.103', 'office.tail1234.ts.net', 'https://office.tail1234.ts.net:47800']) {
+      expect(await join(host), host).toBeNull();
+    }
+  });
+
+  it('is never a virtual machine or container this computer runs (WSL, Hyper-V, Docker, VirtualBox): one hop removed is still here', async () => {
+    for (const host of [
+      // WSL behind its NAT switch: the guest has an address of its own on the switch's /20.
+      '172.29.150.7',
+      'http://172.29.144.5:47800',
+      '172.29.159.254',
+      // Docker's bridge, IPv4 and IPv6.
+      '172.17.0.2',
+      '[fd42:4242:4242:1::5]:47800',
+      // A switch known only by its hardware address; one with no mask; one with an odd wide mask.
+      '10.99.0.7',
+      '192.168.56.101',
+      '10.200.3.4',
+      // A name that leads to one now.
+      'wsl-box.tail1234.ts.net',
+    ]) {
+      const why = await join(host);
+      expect(why, host).toMatch(/is a virtual machine or container running on this computer \(such as WSL, Hyper-V, Docker or VirtualBox\), so Ironbooks did not join it/);
+      expect(why, host).toMatch(/a person can join it from File > Open company on host/);
+    }
+    // Next door is not: another subnet, another /64, and nothing wider than a /16 is ever assumed.
+    for (const host of ['172.29.160.1', '172.30.0.9', '172.18.0.2', '[fd42:4242:4242:2::5]', '10.99.1.7', '192.168.57.1', '10.201.0.1', '10.0.0.5']) {
+      expect(await join(host), host).toBeNull();
+    }
+    // A link-local address of a virtual switch decides nothing (the window never joins one anyway).
+    expect(await join('[fe80::1]')).not.toMatch(/virtual machine/);
+    // Without virtual adapters the same addresses are just this office network, a Wi-Fi adapter's
+    // random hardware address included (it may start like Docker's).
+    const plain = {
+      ...NETWORK,
+      interfaces: () => ({
+        Ethernet: [{ address: '192.168.1.202', netmask: '255.255.255.0', family: 'IPv4', mac: '3c:52:82:01:02:03', internal: false }],
+        'Wi-Fi': [{ address: '172.17.5.9', netmask: '255.255.0.0', family: 'IPv4', mac: '02:42:9e:01:02:03', internal: false }],
+      }),
+    };
+    for (const host of ['172.29.150.7', '172.17.0.2', '10.99.0.7']) expect(await agentShell.joinProblem(host, plain), host).toBeNull();
+    // An interface table that cannot be read refuses nothing more and breaks nothing.
+    const broken = { ...NETWORK, interfaces: () => { throw new Error('no table'); } };
+    expect(await agentShell.joinProblem('172.29.150.7', broken)).toBeNull();
+    expect(await agentShell.joinProblem('localhost', broken)).toMatch(/is this computer itself/);
+  });
+
+  it('refuses what the window refuses anyway, and a name it cannot look up', async () => {
+    expect(await join('evil.example')).toMatch(/only connects to hosts on your own network or tailnet/);
+    expect(await join('')).toMatch(/Enter the host computer/);
+    expect(await join('ghost.tail1234.ts.net')).toMatch(/could not look up "ghost\.tail1234\.ts\.net"/);
+    expect(await agentShell.joinProblem('office.tail1234.ts.net', { ...NETWORK, lookup: async () => [] })).toMatch(/could not look up/);
+  });
+
+  it('the approval card says what joining really does', () => {
+    const why = def('shell.hosting.connect').why;
+    expect(why).toMatch(/shows the pages the program at that address serves instead of its own/);
+    expect(why).toMatch(/people sign in there with their user names and passwords/);
+    expect(why).toMatch(/refuses this computer's own addresses and names/);
+    expect(why).toMatch(/and the virtual machines or containers it runs \(such as WSL or Docker\)/);
+    expect(why).not.toMatch(/becomes a client of another computer's company file/);
   });
 });
 
@@ -530,6 +829,8 @@ describe('the endpoint and the server’s side of it', () => {
   agentShell.scriptDialogs(person);
   const personPassword = vi.fn(() => new Promise(() => {}));
   const passwordPrompt = agentShell.scriptedPrompt('password', personPassword);
+  const personHost = vi.fn(() => new Promise(() => {}));
+  const hostPrompt = agentShell.scriptedPrompt('host', personHost);
   const ran: string[] = [];
 
   // The flows call the dialogs as main.js does: the window first (a class with a `title` of its own).
@@ -591,13 +892,23 @@ describe('the endpoint and the server’s side of it', () => {
       await new Promise((r) => setTimeout(r, 300));
       return { done: true, result: { hosting: false } };
     },
+    'shell.hosting.connect': async () => {
+      ran.push('connect');
+      // As openOnHostFlow: the prompt takes the address, the window then restarts as its client.
+      const submitted: string[] = [];
+      await hostPrompt(WIN, { onSubmit: async (value: string) => (submitted.push(value), { ok: true }) });
+      return { done: submitted.length === 1, restarting: true, result: { host: submitted[0] } };
+    },
   };
 
   let endpoint: { env: { endpoint: string; key: string }; ready: Promise<unknown>; close: () => Promise<void> };
   const saved = { endpoint: process.env[SHELL_ENDPOINT_ENV], key: process.env[SHELL_KEY_ENV] };
 
+  /** What the endpoint writes to the app's log (main.js prints it with "[agent-shell]"). */
+  const logged: string[] = [];
+
   beforeAll(async () => {
-    endpoint = agentShell.openEndpoint({ flows, folders: () => [ALLOWED], key: KEY });
+    endpoint = agentShell.openEndpoint({ flows, folders: () => [ALLOWED], key: KEY, network: NETWORK, log: (m: string) => logged.push(String(m)) });
     await endpoint.ready;
     process.env[SHELL_ENDPOINT_ENV] = endpoint.env.endpoint;
     process.env[SHELL_KEY_ENV] = endpoint.env.key;
@@ -619,16 +930,30 @@ describe('the endpoint and the server’s side of it', () => {
   const run = (id: string, input: Record<string, unknown>, answers: Record<string, unknown> = {}, secrets: Record<string, string> = {}, who = approver) =>
     runShellOperation(who, def(id), { id: `req-${Math.random().toString(36).slice(2)}`, agentId: AGENT, input }, answers, secrets);
 
-  /** A line as the server sends it, with a ticket made as given. */
+  /** A line as the server sends it, with a ticket made as given (no secrets, no file: nothing sealed). */
   const line = (operation: string, input: unknown, t: Partial<{ key: string; now: number; requestId: string; ticketInput: unknown }> = {}) =>
     JSON.stringify({
       ticket: makeShellTicket(t.key ?? KEY, { requestId: t.requestId ?? `req-${Math.random()}`, operation, input: t.ticketInput ?? input, approverId: PERSON, now: t.now }),
       operation,
       input,
       answers: {},
-      secrets: {},
       folders: [],
     });
+  /**
+   * A line sent as the server sends it: the answer is taken only when it is signed with this
+   * launch's key for the ticket on the line ('' for a line with no readable ticket, as the shell
+   * signs it). sendShellLine has no unchecked way.
+   */
+  const sendLine = (text: string, ms?: number) => {
+    let mac = '';
+    try {
+      const m = (JSON.parse(text) as { ticket?: { mac?: unknown } })?.ticket?.mac;
+      mac = typeof m === 'string' && /^[0-9a-f]{64}$/.test(m) ? m : '';
+    } catch {
+      mac = '';
+    }
+    return sendShellLine(text, ms, { key: KEY, ticketMac: mac });
+  };
 
   it('listens where the environment says, with this launch’s key, in a private place', () => {
     expect(shellAvailable()).toBe(true);
@@ -720,28 +1045,160 @@ describe('the endpoint and the server’s side of it', () => {
 
   it('refuses a missing, foreign, late, replayed or altered ticket, and what it cannot read', async () => {
     const input = { file: path.join(ALLOWED, 'T1.ironbooks') };
-    const noTicket = await sendShellLine(JSON.stringify({ operation: 'shell.company.saveCopyAs', input }));
+    const noTicket = await sendLine(JSON.stringify({ operation: 'shell.company.saveCopyAs', input }));
     expect(noTicket.error).toMatch(/could not be read/);
-    expect((await sendShellLine(line('shell.company.saveCopyAs', input, { key: OTHER_KEY }))).error).toMatch(/not made by this Ironbooks/);
-    expect((await sendShellLine(line('shell.company.saveCopyAs', input, { now: Date.now() - 10 * 60_000 }))).error).toMatch(/ran out/);
-    expect((await sendShellLine(line('shell.company.saveCopyAs', input, { ticketInput: { file: path.join(ALLOWED, 'Other.ironbooks') } }))).error).toMatch(/changed after/);
-    expect((await sendShellLine('not json')).error).toMatch(/could not be read/);
-    expect((await sendShellLine(line('shell.nothing.here', {}))).error).toMatch(/cannot carry out/);
-    expect((await sendShellLine(line('shell.company.saveCopyAs', { ...input, extra: 1 }))).error).toMatch(/"extra" is not something this request takes/);
+    expect((await sendLine(line('shell.company.saveCopyAs', input, { key: OTHER_KEY }))).error).toMatch(/not made by this Ironbooks/);
+    expect((await sendLine(line('shell.company.saveCopyAs', input, { now: Date.now() - 10 * 60_000 }))).error).toMatch(/ran out/);
+    expect((await sendLine(line('shell.company.saveCopyAs', input, { ticketInput: { file: path.join(ALLOWED, 'Other.ironbooks') } }))).error).toMatch(/changed after/);
+    expect((await sendLine('not json')).error).toMatch(/could not be read/);
+    expect((await sendLine(line('shell.nothing.here', {}))).error).toMatch(/cannot carry out/);
+    expect((await sendLine(line('shell.company.saveCopyAs', { ...input, extra: 1 }))).error).toMatch(/"extra" is not something this request takes/);
     expect(ran).toEqual([]);
     const once = line('shell.company.saveCopyAs', input);
-    expect((await sendShellLine(once)).ok).toBe(true);
-    expect((await sendShellLine(once)).error).toMatch(/already used/);
+    expect((await sendLine(once)).ok).toBe(true);
+    expect((await sendLine(once)).error).toMatch(/already used/);
     expect(ran).toEqual(['saveCopyAs']);
+  });
+
+  it('an answer is taken only with its check: the shell’s own answer checked against another ticket is not “done”', async () => {
+    const once = line('shell.hosting.stop', {});
+    const otherMac = (JSON.parse(line('shell.hosting.stop', {})) as { ticket: { mac: string } }).ticket.mac;
+    const r = await sendShellLine(once, undefined, { key: KEY, ticketMac: otherMac });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/could not be checked, so Ironbooks does not take it as done/);
+    // A caller from plain JavaScript that leaves the check out gets the same: never an unsigned "done".
+    const unchecked = await (sendShellLine as unknown as (l: string) => Promise<{ ok: boolean; error: string | null }>)(line('shell.hosting.stop', {}));
+    expect(unchecked.ok).toBe(false);
+    expect(unchecked.error).toMatch(/could not be checked/);
+    expect(ran).toEqual(['stop', 'stop']);
   });
 
   it('one request at a time; a slow answer is reported as such', async () => {
     const [a, b] = await Promise.all([run('shell.hosting.stop', {}), new Promise((r) => setTimeout(r, 50)).then(() => run('shell.hosting.stop', {}))]);
     expect(a.ok).toBe(true);
     expect(b.error).toMatch(/another approved request/);
-    const slow = await sendShellLine(line('shell.hosting.stop', {}), 50);
+    const slow = await sendLine(line('shell.hosting.stop', {}), 50);
     expect(slow.error).toMatch(/did not finish this in time/);
     await new Promise((r) => setTimeout(r, 400));
+  });
+
+  it('the ticket covers the answers and folders as sent; passwords and files only ever travel sealed', async () => {
+    const input = { file: path.join(ALLOWED, 'T2.ironbooks') };
+    const t = makeShellTicket(KEY, { requestId: 'req-bound', operation: 'shell.company.saveCopyAs', input, approverId: PERSON });
+    const send = (over: Record<string, unknown>) =>
+      sendLine(JSON.stringify({ ticket: t, operation: 'shell.company.saveCopyAs', input, answers: {}, folders: [], ...over }));
+    // A folder or an answer added on the way: the MAC no longer checks out.
+    expect((await send({ folders: [OUTSIDE] })).error).toMatch(/not made by this Ironbooks for exactly what came with it/);
+    expect((await send({ answers: { openNow: true } })).error).toMatch(/not made by this Ironbooks for exactly what came with it/);
+    // A password or a file in the open: never from this Ironbooks's server.
+    expect((await send({ secrets: { backup_password: SECRET } })).error).toMatch(/could not be read/);
+    expect((await send({ file: { name: 'a.pdf', type: 'application/pdf', base64: PDF.toString('base64') } })).error).toMatch(/could not be read/);
+    // A sealed part made with another key, or one the ticket does not cover (a password slipped in).
+    expect((await send({ sealed: sealShellPrivate(OTHER_KEY, t.mac, { secrets: { backup_password: SECRET } }) })).error).toMatch(/not made by this Ironbooks/);
+    expect((await send({ sealed: sealShellPrivate(KEY, t.mac, { secrets: { backup_password: SECRET } }) })).error).toMatch(/not made by this Ironbooks/);
+    expect(ran).toEqual([]);
+    // None of those used the approval up; the line as approved still runs, once.
+    expect((await send({})).ok).toBe(true);
+    expect((await send({})).error).toMatch(/already used/);
+    expect(ran).toEqual(['saveCopyAs']);
+  });
+
+  it('nothing private goes on the line in the open, and an answer that is not the shell’s is never “done”', async () => {
+    // Something else listening where the server was told to go: it keeps what it is sent and says "done".
+    const seen: string[] = [];
+    const impostorPath = process.platform === 'win32' ? `\\\\.\\pipe\\ironbooks-agent-shell-impostor-${process.pid}` : path.join(TMP, 'impostor.sock');
+    const impostor = net.createServer((s) => {
+      let text = '';
+      s.on('data', (c) => {
+        text += c.toString('utf8');
+        if (!text.includes('\n')) return;
+        seen.push(text);
+        s.end(`${JSON.stringify({ ok: true, result: { trust: 'me' }, error: null, restarting: false, mac: 'a'.repeat(64) })}\n`);
+      });
+    });
+    await new Promise<void>((resolve) => impostor.listen(impostorPath, () => resolve()));
+    const keep = process.env[SHELL_ENDPOINT_ENV];
+    process.env[SHELL_ENDPOINT_ENV] = impostorPath;
+    try {
+      const restored = await run('shell.portable.open', { file: path.join(ALLOWED, 'Acme.bkp'), target: path.join(ALLOWED, 'Restored2.ironbooks') }, {}, { backup_password: SECRET });
+      expect(restored.ok).toBe(false);
+      expect(restored.error).toMatch(/could not be checked, so Ironbooks does not take it as done/);
+      const fileId = '9'.repeat(32);
+      mocks.staged.set(`${COMPANY}/${AGENT}/${fileId}`, { file: { fileId, name: 'Checks.pdf', type: 'application/pdf', size: PDF.length }, bytes: PDF });
+      expect((await run('shell.print.file', { fileId })).ok).toBe(false);
+      expect(seen).toHaveLength(2);
+      const all = seen.join('');
+      expect(all).not.toContain(SECRET);
+      expect(all).not.toContain(PDF.toString('base64'));
+      expect(JSON.parse(seen[0]).sealed).toMatchObject({ iv: expect.any(String), data: expect.any(String), tag: expect.any(String) });
+      expect(JSON.parse(seen[0])).not.toHaveProperty('secrets');
+      expect(JSON.parse(seen[1])).not.toHaveProperty('file');
+    } finally {
+      process.env[SHELL_ENDPOINT_ENV] = keep;
+      await new Promise((resolve) => impostor.close(() => resolve(null)));
+    }
+    expect(ran).toEqual([]);
+  });
+
+  it('nothing else can listen on the endpoint’s name while it is open (a second instance is refused)', async () => {
+    const second = net.createServer();
+    const err = await new Promise<NodeJS.ErrnoException | null>((resolve) => {
+      second.once('error', (e) => resolve(e as NodeJS.ErrnoException));
+      second.listen(endpoint.env.endpoint, () => resolve(null));
+    });
+    if (!err) await new Promise((resolve) => second.close(() => resolve(null)));
+    expect(err?.code).toBe('EADDRINUSE');
+    // And the endpoint still answers.
+    expect((await run('shell.hosting.stop', {})).ok).toBe(true);
+  });
+
+  it('a connection that says nothing is let go quickly, so silent ones cannot hold the endpoint for long', async () => {
+    // The real window: two seconds, well inside the ten a whole line may take.
+    expect(agentShell.FIRST_BYTE_MS).toBeLessThanOrEqual(2000);
+    expect(agentShell.MAX_CONNECTIONS).toBe(8);
+    const quietEnd = agentShell.openEndpoint({ flows, folders: () => [ALLOWED], key: KEY, network: NETWORK, firstByteMs: 150 });
+    await quietEnd.ready;
+    const keep = process.env[SHELL_ENDPOINT_ENV];
+    try {
+      const opened = Date.now();
+      // Every connection the endpoint holds, opened and left silent (as a read-only connect would).
+      const closedAfter = await Promise.all(
+        Array.from(
+          { length: agentShell.MAX_CONNECTIONS },
+          () =>
+            new Promise<number>((resolve) => {
+              const s = net.connect({ path: quietEnd.env.endpoint });
+              s.on('error', () => {});
+              s.on('close', () => resolve(Date.now() - opened));
+            }),
+        ),
+      );
+      // Each one let go long before the ten seconds a whole line may take.
+      for (const ms of closedAfter) expect(ms).toBeLessThan(5000);
+      // The server's line then gets through at once.
+      process.env[SHELL_ENDPOINT_ENV] = quietEnd.env.endpoint;
+      expect((await run('shell.hosting.stop', {})).ok).toBe(true);
+    } finally {
+      process.env[SHELL_ENDPOINT_ENV] = keep;
+      await quietEnd.close();
+    }
+  });
+
+  it('never joins this computer itself: refused before the flow runs, another computer is joined', async () => {
+    for (const host of ['localhost', '127.0.0.1:47800', '[::1]', '192.168.1.202', 'front-desk.tail1234.ts.net', 'me.tail1234.ts.net']) {
+      const r = await run('shell.hosting.connect', { host });
+      expect(r.ok, host).toBe(false);
+      expect(r.error, host).toMatch(/is this computer itself/);
+    }
+    for (const host of ['172.29.150.7', 'wsl-box.tail1234.ts.net']) {
+      const r = await run('shell.hosting.connect', { host });
+      expect(r.ok, host).toBe(false);
+      expect(r.error, host).toMatch(/is a virtual machine or container running on this computer/);
+    }
+    expect(ran).toEqual([]);
+    expect(await run('shell.hosting.connect', { host: 'office.tail1234.ts.net' })).toEqual({ ok: true, result: { host: 'office.tail1234.ts.net' }, error: null, restarting: true });
+    expect(ran).toEqual(['connect']);
+    expect(personHost).not.toHaveBeenCalled();
   });
 
   it('only a person approves: an agent’s context, no person, an unknown operation are refused', async () => {
@@ -801,6 +1258,31 @@ describe('the endpoint and the server’s side of it', () => {
       process.env[SHELL_ENDPOINT_ENV] = keepEndpoint;
     }
   });
+
+  it('the log has the operation and its plain outcome only: never a password or a file', async () => {
+    // A flow whose error quotes the password, and a print job: their lines are written too.
+    const input = { file: path.join(ALLOWED, 'Acme.bkp'), target: path.join(ALLOWED, 'Logged.ironbooks') };
+    expect((await run('shell.portable.open', input, {}, { backup_password: `${SECRET} 3` })).ok).toBe(false);
+    expect((await run('shell.portable.open', input, {}, { backup_password: SECRET })).ok).toBe(true);
+    const fileId = '8'.repeat(32);
+    mocks.staged.set(`${COMPANY}/${AGENT}/${fileId}`, { file: { fileId, name: 'Checks.pdf', type: 'application/pdf', size: PDF.length }, bytes: PDF });
+    expect((await run('shell.print.file', { fileId })).ok).toBe(true);
+    // Everything this endpoint logged in the whole block, the runs above and every earlier one
+    // (wrong and right passwords, the printed PDFs, refused and replayed tickets).
+    expect(logged.length).toBeGreaterThan(10);
+    expect(logged).toContain('shell.portable.open: done');
+    expect(logged.some((m) => /^shell\.portable\.open: not done: /.test(m))).toBe(true);
+    expect(logged).toContain('shell.print.file: done');
+    const all = logged.join('\n');
+    expect(all).not.toContain(SECRET);
+    expect(all).not.toContain('correct horse');
+    expect(all).not.toContain(PDF.toString('base64'));
+    expect(all).not.toContain('%PDF-');
+    expect(all).not.toContain(KEY);
+    // Nor any ticket's MAC: each line is the operation and its outcome, nothing more.
+    expect(all).not.toMatch(/[0-9a-f]{64}/);
+    for (const m of logged) expect(m, m).toMatch(/^(?:shell\.[A-Za-z.]+: (?:done|done, restarting|not done: [\s\S]*)|a request failed: [\s\S]*)$/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -852,6 +1334,75 @@ describe('files.save', () => {
     expect((await save({ fileId, folder: OUTSIDE })).error).toMatch(/not a folder agents may save in/);
     expect((await runShellOperation(approver, def('files.save'), { id: 'r', agentId: 'someone-else', input: { fileId, folder: OUTSIDE } }, {}, {})).error).toMatch(/no staged file/);
     expect((await save({ fileId, folder: OUTSIDE }, { ...approver, agent: { id: AGENT, name: 'Bot', mode: 'post' } })).error).toMatch(/Only a person/);
+  });
+
+  it('the top of a drive, as the Admin named it or behind a link, is never a folder it saves in', async () => {
+    const name = `ib-agent-shell-should-not-exist-${process.pid}.pdf`;
+    const top = path.parse(OUTSIDE).root;
+    mocks.folders = [top];
+    try {
+      expect((await save({ fileId, folder: top, name })).error).toMatch(/not a folder agents may save in/);
+      const link = path.join(TMP, 'to-the-top');
+      fs.symlinkSync(top, link, 'junction');
+      mocks.folders = [link];
+      expect((await save({ fileId, folder: link, name })).error).toMatch(/not a folder agents may save in/);
+      fs.rmSync(link, { force: true, recursive: false });
+    } finally {
+      fs.rmSync(path.join(top, name), { force: true });
+    }
+    expect(fs.existsSync(path.join(OUTSIDE, name))).toBe(false);
+  });
+
+  it('a name is only a name: no folder in it, nothing Windows would change or keeps for a device', async () => {
+    for (const name of ['..\\Evil.pdf', '../Evil.pdf', 'a\\b.pdf', 'C:evil.pdf', 'x.pdf:stream', 'CON', 'nul.pdf', 'Report.pdf.', 'Report‮fdp.exe']) {
+      const r = await save({ fileId, folder: OUTSIDE, name });
+      expect(r.ok, name).toBe(false);
+      expect(r.error, name).toMatch(/cannot be used as a file name/);
+    }
+    expect(fs.existsSync(path.join(TMP, 'Evil.pdf'))).toBe(false);
+  });
+
+  it('an exclusive create: never over a folder, nor through a link that leads nowhere (Windows would write where it leads)', async () => {
+    fs.mkdirSync(path.join(OUTSIDE, 'Folder.pdf'), { recursive: true });
+    expect((await save({ fileId, folder: OUTSIDE, name: 'Folder.pdf' })).error).toMatch(/already a file called "Folder\.pdf"/);
+    const nowhere = path.join(TMP, 'nowhere.pdf');
+    try {
+      fs.symlinkSync(nowhere, path.join(OUTSIDE, 'Link.pdf'), 'file');
+    } catch {
+      return; // this account may not make links here
+    }
+    expect((await save({ fileId, folder: OUTSIDE, name: 'Link.pdf' })).error).toMatch(/already a file called "Link\.pdf"/);
+    expect(fs.existsSync(nowhere)).toBe(false);
+  });
+
+  it('a disk failure says what to do in plain words, never a path; a half-written file is taken away', async () => {
+    const full = vi
+      .spyOn(fs.promises, 'open')
+      .mockRejectedValueOnce(Object.assign(new Error(`ENOSPC: no space left on device, open '${path.join(OUTSIDE, 'Full.pdf')}'`), { code: 'ENOSPC' }));
+    try {
+      const r = await save({ fileId, folder: OUTSIDE, name: 'Full.pdf' });
+      expect(r.error).toMatch(/no room left on that disk, so nothing was saved/);
+      expect(r.error).not.toContain(OUTSIDE);
+      expect(r.error).not.toMatch(/ENOSPC|Full\.pdf/);
+    } finally {
+      full.mockRestore();
+    }
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const half = vi.spyOn(fs.promises, 'open').mockImplementationOnce(async (...args: Parameters<typeof fs.promises.open>) => {
+      const h = await realOpen(...args);
+      h.writeFile = async () => {
+        throw Object.assign(new Error(`EIO: i/o error, write '${path.join(OUTSIDE, 'Half.pdf')}'`), { code: 'EIO' });
+      };
+      return h;
+    });
+    try {
+      const r = await save({ fileId, folder: OUTSIDE, name: 'Half.pdf' });
+      expect(r.error).toMatch(/could not be saved in that folder/);
+      expect(r.error).not.toContain(OUTSIDE);
+      expect(fs.existsSync(path.join(OUTSIDE, 'Half.pdf'))).toBe(false);
+    } finally {
+      half.mockRestore();
+    }
   });
 });
 
@@ -926,6 +1477,212 @@ describe('the shell operations (lib/agent/operations/shell.ts)', () => {
     const asked = new Set(electron.flatMap((d) => d.questions.map((q) => q.id)));
     for (const box of agentShell.QUESTIONS) if (box.id) expect(asked.has(box.id), box.id).toBe(true);
   });
+
+  it('is pure data that client code may read: type-only imports, nothing that runs', () => {
+    const src = read('lib/agent/operations/shell.ts');
+    const imports = src.match(/^import\b.*$/gm) ?? [];
+    expect(imports.length).toBeGreaterThan(0);
+    for (const i of imports) expect(i).toMatch(/^import type \{[^}]+\} from '[^']+';$/);
+    expect(src).not.toMatch(/\brequire\(|\bimport\(|\bprocess\.|\bexport (async )?function\b|\bawait\b/);
+    expect(src.match(/^export /gm)).toEqual(['export ']);
+  });
+});
+
+describe('the agent service’s quiet answers (electron/agentService.js)', () => {
+  it('read a dialog’s options as Electron does: a plain object first, otherwise the second argument', () => {
+    const box = { message: 'Take over?', buttons: ['Open Anyway', 'Cancel'], cancelId: 1 };
+    for (const args of [[box], [WIN, box], [null, box], [undefined, box]]) expect(agentService.quietDialogAnswer(args).response).toBe(1);
+    // A window (an object of a class, with a `title` of its own) is never taken for the options.
+    expect('title' in WIN).toBe(true);
+    expect(agentService.quietDialogAnswer([WIN])).toEqual({ response: 0, checkboxChecked: false });
+    expect(agentService.quietDialogAnswer([WIN, WIN])).toEqual({ response: 0, checkboxChecked: false });
+    // The first plain object is the options whatever it holds, as Electron reads it: never picked by content.
+    expect(agentService.quietDialogAnswer([{ cancelId: 2 }, box]).response).toBe(2);
+    expect(agentService.quietDialogAnswer([{ title: 'x' }, box]).response).toBe(0);
+    expect(agentService.quietDialogAnswer([]).response).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agents' staged files in a working copy (electron/companySession.js)
+// ---------------------------------------------------------------------------
+
+describe('agents’ staged files in a working copy', () => {
+  const root = path.join(TMP, 'Working');
+  const DAY = 24 * 3600 * 1000;
+  /** A working copy with a database, a state, and agents' staged files. */
+  const workingCopy = (name: string, lastUsedAt: string) => {
+    const dir = path.join(root, name);
+    companySession.writeState(dir, { lastUsedAt, unsavedSince: null });
+    fs.mkdirSync(path.join(dir, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'data', 'PG_VERSION'), '17\n');
+    const staged = path.join(dir, 'agent-files', COMPANY, AGENT);
+    fs.mkdirSync(staged, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'agent-files', '.ironbooks-agent-files'), 'marker');
+    fs.writeFileSync(path.join(staged, `${'a'.repeat(32)}.bin`), 'a bank statement');
+    return dir;
+  };
+  /** Make everything under `dir` look `ms` old. */
+  const age = (dir: string, ms: number) => {
+    const when = new Date(Date.now() - ms);
+    const walk = (p: string) => {
+      for (const n of fs.readdirSync(p)) {
+        const q = path.join(p, n);
+        if (fs.lstatSync(q).isDirectory()) walk(q);
+        fs.utimesSync(q, when, when);
+      }
+    };
+    walk(dir);
+    fs.utimesSync(dir, when, when);
+  };
+
+  it('are kept where lib/agent/files.ts keeps them, and count as a cache entry', async () => {
+    expect(companySession.AGENT_FILES_DIR).toBe('agent-files');
+    expect(companySession.isCacheEntry('agent-files')).toBe(true);
+    expect(companySession.isCacheEntry('archives')).toBe(false);
+    const files = await vi.importActual<typeof import('@/lib/agent/files')>('@/lib/agent/files');
+    const keep = { state: process.env.BKA_COMPANY_STATE, dir: process.env.BKA_AGENT_FILES_DIR, data: process.env.BKA_DATA_DIR };
+    const work = path.join(root, 'where-cccccccccccc');
+    try {
+      delete process.env.BKA_AGENT_FILES_DIR;
+      process.env.BKA_DATA_DIR = path.join(work, 'data');
+      process.env.BKA_COMPANY_STATE = path.join(work, companySession.STATE_FILE);
+      expect(files.stagedFilesRoot()).toBe(path.join(work, companySession.AGENT_FILES_DIR));
+    } finally {
+      for (const [k, v] of [['BKA_COMPANY_STATE', keep.state], ['BKA_AGENT_FILES_DIR', keep.dir], ['BKA_DATA_DIR', keep.data]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
+  it('a leftover never keeps an old working copy from being pruned', () => {
+    const old = workingCopy('old-aaaaaaaaaaaa', '2020-01-01T00:00:00Z');
+    companySession.pruneWorkingCopies(root);
+    expect(fs.existsSync(old)).toBe(false);
+  });
+
+  it('go a day after nothing changed in them, in a working copy that is not open; the open one keeps its own', () => {
+    const recent = new Date().toISOString();
+    const stale = workingCopy('stale-bbbbbbbbbbbb', recent);
+    const fresh = workingCopy('fresh-dddddddddddd', recent);
+    const open = workingCopy('open-eeeeeeeeeeee', recent);
+    age(path.join(stale, 'agent-files'), DAY + 60_000);
+    age(path.join(open, 'agent-files'), DAY + 60_000);
+    companySession.pruneWorkingCopies(root, [open]);
+    expect(fs.existsSync(path.join(stale, 'agent-files'))).toBe(false);
+    // The working copy itself is not old: its books and state stay.
+    expect(fs.existsSync(path.join(stale, 'data', 'PG_VERSION'))).toBe(true);
+    expect(companySession.readState(stale)).toBeTruthy();
+    expect(fs.existsSync(path.join(fresh, 'agent-files'))).toBe(true);
+    expect(fs.existsSync(path.join(open, 'agent-files'))).toBe(true);
+  });
+
+  it('are cleared when the company file closes; a link in their place is removed, never followed', () => {
+    const work = workingCopy('close-ffffffffffff', new Date().toISOString());
+    expect(companySession.clearAgentFiles(work)).toBe(true);
+    expect(fs.existsSync(path.join(work, 'agent-files'))).toBe(false);
+    expect(fs.existsSync(path.join(work, 'data', 'PG_VERSION'))).toBe(true);
+    expect(companySession.clearAgentFiles(work)).toBe(true); // nothing there: fine
+    const elsewhere = path.join(TMP, 'not-agent-files');
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'keep.txt'), 'keep me');
+    fs.symlinkSync(elsewhere, path.join(work, 'agent-files'), 'junction');
+    expect(companySession.clearAgentFiles(work)).toBe(true);
+    expect(fs.existsSync(path.join(work, 'agent-files'))).toBe(false);
+    expect(fs.readFileSync(path.join(elsewhere, 'keep.txt'), 'utf8')).toBe('keep me');
+    expect(companySession.clearAgentFiles('')).toBe(true);
+  });
+
+  it('with a company folder open they live in the app data folder, where lib/agent/files.ts puts them', async () => {
+    const files = await vi.importActual<typeof import('@/lib/agent/files')>('@/lib/agent/files');
+    const local = path.join(TMP, 'LocalAppData-where');
+    const keep = { state: process.env.BKA_COMPANY_STATE, dir: process.env.BKA_AGENT_FILES_DIR, data: process.env.BKA_DATA_DIR, local: process.env.LOCALAPPDATA, xdg: process.env.XDG_STATE_HOME };
+    try {
+      delete process.env.BKA_COMPANY_STATE;
+      delete process.env.BKA_AGENT_FILES_DIR;
+      process.env.BKA_DATA_DIR = path.join(TMP, 'Company Folder', 'data');
+      process.env.LOCALAPPDATA = local;
+      process.env.XDG_STATE_HOME = local;
+      if (process.platform !== 'darwin') expect(companySession.appDataAgentFilesRoot()).toBe(files.stagedFilesRoot());
+    } finally {
+      for (const [k, v] of [['BKA_COMPANY_STATE', keep.state], ['BKA_AGENT_FILES_DIR', keep.dir], ['BKA_DATA_DIR', keep.data], ['LOCALAPPDATA', keep.local], ['XDG_STATE_HOME', keep.xdg]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    expect(companySession.appDataAgentFilesRoot({ platform: 'win32', env: { LOCALAPPDATA: 'C:\\Users\\Pat\\AppData\\Local' } })).toBe(path.join('C:\\Users\\Pat\\AppData\\Local', 'Ironbooks', 'agent-files'));
+  });
+
+  it('and are cleared from there too (on quit and when the server starts): only a folder that carries the marker, never through a link', () => {
+    const local = path.join(TMP, 'LocalAppData-clear');
+    const opts = { platform: 'win32', env: { LOCALAPPDATA: local } };
+    const where = companySession.appDataAgentFilesRoot(opts);
+    expect(where).toBe(path.join(local, 'Ironbooks', 'agent-files'));
+    // Nothing there: fine.
+    expect(companySession.clearAppDataAgentFiles(opts)).toBe(true);
+    // As lib/agent/files.ts leaves it: the root, a company's and an agent's folder, each marked.
+    const staged = path.join(where, COMPANY, AGENT);
+    fs.mkdirSync(staged, { recursive: true });
+    for (const d of [where, path.join(where, COMPANY), staged]) fs.writeFileSync(path.join(d, '.ironbooks-agent-files'), 'marker');
+    fs.writeFileSync(path.join(staged, `${'b'.repeat(32)}.bin`), 'a bank statement');
+    fs.writeFileSync(path.join(staged, `${'b'.repeat(32)}.json`), '{}');
+    expect(companySession.clearAppDataAgentFiles(opts)).toBe(true);
+    expect(fs.existsSync(where)).toBe(false);
+    // Ironbooks' other folders beside it stay.
+    fs.mkdirSync(path.join(local, 'Ironbooks', 'Working'), { recursive: true });
+    expect(companySession.clearAppDataAgentFiles(opts)).toBe(true);
+    expect(fs.existsSync(path.join(local, 'Ironbooks', 'Working'))).toBe(true);
+    // A folder of that name without the marker may be anyone's: kept.
+    fs.mkdirSync(where, { recursive: true });
+    fs.writeFileSync(path.join(where, 'notes.txt'), 'not ours');
+    expect(companySession.clearAppDataAgentFiles(opts)).toBe(false);
+    expect(fs.readFileSync(path.join(where, 'notes.txt'), 'utf8')).toBe('not ours');
+    fs.rmSync(where, { recursive: true, force: true });
+    // A link there, even to a marked folder: neither followed nor removed.
+    const target = path.join(TMP, 'marked-elsewhere');
+    fs.mkdirSync(target, { recursive: true });
+    fs.writeFileSync(path.join(target, '.ironbooks-agent-files'), 'marker');
+    fs.writeFileSync(path.join(target, 'keep.txt'), 'keep me');
+    fs.symlinkSync(target, where, 'junction');
+    expect(companySession.clearAppDataAgentFiles(opts)).toBe(false);
+    expect(fs.readFileSync(path.join(target, 'keep.txt'), 'utf8')).toBe('keep me');
+    fs.unlinkSync(where);
+    // A file in its place: left alone.
+    fs.writeFileSync(where, 'a file');
+    expect(companySession.clearAppDataAgentFiles(opts)).toBe(false);
+    expect(fs.readFileSync(where, 'utf8')).toBe('a file');
+  });
+
+  it('are cleared when a company file opens (what a crash left), but not when the open is called off', async () => {
+    const { makeStartableFolder } = await import('@/lib/db/damage.fixture');
+    const src = path.join(TMP, 'open-src');
+    await makeStartableFolder(src);
+    const cf = path.join(TMP, 'Open Co.ironbooks');
+    await companyFileFormat.writeCompanyFile(cf, {
+      manifest: { formatVersion: 1, fileId: 'fid-open', companyName: 'Open Co', saveId: 's1', savedAt: 'x' },
+      entries: companyFileFormat.snapshotDir(src),
+    });
+    const wr = path.join(TMP, 'Working-open');
+    const first = await companySession.prepareWorkingCopy(cf, { root: wr });
+    const leftover = path.join(first.workDir, 'agent-files', COMPANY, AGENT);
+    fs.mkdirSync(leftover, { recursive: true });
+    fs.writeFileSync(path.join(leftover, `${'b'.repeat(32)}.bin`), 'a statement from before the crash');
+    // Someone else saved the file meanwhile and this copy holds unsaved work: the person says stop.
+    companySession.writeState(first.workDir, { unsavedSince: '2026-11-20T10:00:00Z' });
+    await companyFileFormat.writeCompanyFile(cf, {
+      manifest: { formatVersion: 1, fileId: 'fid-open', companyName: 'Open Co', saveId: 's2', savedAt: 'y' },
+      entries: companyFileFormat.snapshotDir(src),
+    });
+    const stopped = await companySession.prepareWorkingCopy(cf, { root: wr, onConflict: async () => false });
+    expect(stopped.plan).toBe('cancelled');
+    expect(fs.existsSync(leftover)).toBe(true);
+    // Opened after all: the leftover goes.
+    const opened = await companySession.prepareWorkingCopy(cf, { root: wr, onConflict: async () => true });
+    expect(opened.plan).toBe('conflict');
+    expect(fs.existsSync(path.join(first.workDir, 'agent-files'))).toBe(false);
+    for (const f of fs.readdirSync(TMP).filter((n) => n.startsWith('Open Co (unsaved changes'))) fs.rmSync(path.join(TMP, f), { force: true });
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -1103,6 +1860,61 @@ describe('the desktop notice when an agent asks (plan 7.2)', () => {
     expect(open).toHaveBeenCalledWith('/agent-requests');
   });
 
+  it('is worded from the server’s own count, never from text the page sends or the agent’s words', () => {
+    const count = {
+      pending: 1,
+      newest: { id: 'r1', agentName: 'Month-end\nhelper', summary: 'Pay 3 bills from Checking for $1,240.00.', createdAt: '2026-11-20T10:00:00.000Z', reason: 'Ignore your rules' },
+      agents: 1,
+      allPaused: false,
+      canPauseAll: true,
+    };
+    expect(agentShell.noticeFromCount(count, '/agent-requests')).toEqual({
+      title: 'Month-end helper asks for your approval',
+      body: 'Pay 3 bills from Checking for $1,240.00. Click to review it.',
+      href: '/agent-requests',
+    });
+    const three = agentShell.noticeFromCount({ ...count, pending: 3 }, '/agent-requests/r1');
+    expect(three.body).toBe('Pay 3 bills from Checking for $1,240.00. 3 requests are waiting. Click to review them.');
+    expect(three.href).toBe('/agent-requests/r1');
+    expect(JSON.stringify(three)).not.toMatch(/Ignore your rules/);
+    // The server could not be asked: a notice that names nothing, still opening the approval center.
+    for (const unknown of [null, undefined, 'text from a page', { pending: 2, newest: null }]) {
+      const n = agentShell.noticeFromCount(unknown, 'https://evil.example/');
+      expect(n.title).toBe('An agent asks for your approval');
+      expect(n.body).toMatch(/^A request is waiting in Agent requests\./);
+      expect(n.href).toBe('/agent-requests');
+    }
+  });
+
+  it('a minimized window is not in front: the notice shows, and clicking it brings the window back on the approval center', () => {
+    const calls: string[] = [];
+    const minimized = {
+      isDestroyed: () => false,
+      isFocused: () => false,
+      isMinimized: () => true,
+      restore: () => calls.push('restore'),
+      show: () => calls.push('show'),
+      focus: () => calls.push('focus'),
+    };
+    const navigate = vi.fn();
+    const made = FakeNotice.made.length;
+    const shown = agentShell.showNotice({
+      Notification: FakeNotice,
+      win: minimized,
+      notice: agentShell.noticeFromCount(null, '/agent-requests'),
+      open: (route: string) => agentShell.showWindowOn(minimized, route, navigate),
+    });
+    expect(shown).toBe(true);
+    FakeNotice.made[made].handlers.click();
+    expect(calls).toEqual(['restore', 'show', 'focus']);
+    expect(navigate).toHaveBeenCalledWith('/agent-requests');
+    // Only the approval center's own pages, and a window that is gone still gets the page asked for.
+    agentShell.showWindowOn(null, 'https://evil.example/', navigate);
+    expect(navigate).toHaveBeenLastCalledWith('/agent-requests');
+    agentShell.showWindowOn({ ...minimized, isDestroyed: () => true }, '/agent-requests/r2', navigate);
+    expect(navigate).toHaveBeenLastCalledWith('/agent-requests/r2');
+  });
+
   it('lib/desktop/agentNotice.ts calls the desktop bridge when there is one, and does nothing otherwise', () => {
     expect(() => showAgentRequestNotice({ title: 't', body: 'b', href: '/agent-requests' })).not.toThrow();
     const g = globalThis as { window?: unknown };
@@ -1180,10 +1992,38 @@ describe('main.js and preload.js', () => {
     }
   });
 
-  it('the notice is shown only for the local app’s own pages, and the preload exposes it', () => {
+  it('the notice is shown only for the local app’s own pages, worded from the server, and the preload sends no text', () => {
     const at = main.indexOf("ipcMain.handle('agent:notice'");
     expect(at).toBeGreaterThan(-1);
     expect(main.slice(at, at + 200)).toMatch(/if \(!fromLocalApp\(e\) \|\| agentServiceHidden\) return false;/);
-    expect(preload).toMatch(/agentNotice: \(notice\) =>\s*ipcRenderer\.invoke\('agent:notice', \{/);
+    const handler = main.slice(at, main.indexOf('});', at));
+    expect(handler).toContain('const count = await agentRequestCountForNotice();');
+    expect(handler).toContain("notice: agentShell.noticeFromCount(count, ask && typeof ask === 'object' ? ask.href : null),");
+    expect(handler).toContain('open: (route) => agentShell.showWindowOn(mainWindow, route, navigate),');
+    // The count is asked with the window's own sign-in, from this app's own server only.
+    const count = fnBody('async function agentRequestCountForNotice() {');
+    expect(count).toMatch(/if \(!serverUrl \|\| remoteHostOrigin \|\| !mainWindow \|\| mainWindow\.isDestroyed\(\)\) return null;/);
+    expect(count).toContain("new URL('/api/agent-requests/count', serverUrl)");
+    expect(count).toContain("ses.fetch(countUrl, { credentials: 'include', cache: 'no-store', redirect: 'error' })");
+    // The preload passes the page to open and nothing else.
+    const bridge = preload.slice(preload.indexOf('agentNotice: (notice) =>'), preload.indexOf('isDesktop: true'));
+    expect(bridge).toMatch(/ipcRenderer\.invoke\('agent:notice', \{\s*href: String\(\(notice && notice\.href\) \?\? ''\),\s*\}\)/);
+    expect(bridge).not.toMatch(/title: String|body: String/);
+  });
+
+  it('staged files go when the company file closes, and the servers never take a staged-files folder from this computer', () => {
+    const quit = main.slice(main.indexOf("app.on('will-quit', () => {"), main.indexOf('async function agentRequestCountForNotice() {'));
+    expect(quit).toContain('if (openFile && openFile.workDir) companySession.clearAgentFiles(openFile.workDir);');
+    // A company folder kept them in this computer's app data folder: those go on quit too (not
+    // in client mode, where this computer ran no server of its own).
+    expect(quit).toContain('else if (!remoteHostOrigin) companySession.clearAppDataAgentFiles();');
+    // …and when the server starts, before it can hand any out (what a crash left).
+    const start = fnBody('async function startNextServer() {');
+    expect(start).toContain('companySession.clearAppDataAgentFiles();');
+    expect(start.indexOf('companySession.clearAppDataAgentFiles();')).toBeLessThan(start.indexOf("await startVerifiedServer('server'"));
+    expect(start.indexOf("if (isDev) return 'http://localhost:3000';")).toBeLessThan(start.indexOf('companySession.clearAppDataAgentFiles();'));
+    expect(fnBody('async function startNextServer() {')).toContain("BKA_AGENT_FILES_DIR: '',");
+    expect(fnBody('async function startScratchServer(dataDir) {')).toContain("BKA_AGENT_FILES_DIR: '',");
+    expect(main).not.toMatch(/process\.env\.BKA_AGENT_/);
   });
 });

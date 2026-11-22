@@ -24,6 +24,16 @@
  * the AI settings (lib/services/aiSettings.ts loadSettings) does that lookup for every *.ts.net AI
  * server, so every GET that loads them is 'outside' with no dry run (a rolled-back preview would
  * still look the names up). A GET with another, lighter side effect too takes the stricter class.
+ * The settings PUTs that look names up while saving keep their class ('settings') but have no dry
+ * run either, for the same reason: saving the AI settings and the receipt settings loads the AI
+ * settings before and after, and saving the mail server checks whether its name is on this
+ * network. The approval card then shows the request itself instead of a before-and-after preview.
+ * One write keeps its dry run although it looks names up: POST /api/import, whose lookups are only
+ * of the AI addresses already saved (its "why" says so).
+ *
+ * A GET classed above 'read' (a document download, a File Utilities read, one that saves derived
+ * data) is dryRun 'none' too: a dry run hands the route's answer back to the agent
+ * (lib/agent/operate.ts tryOnly), and for a read that answer is what a person is asked about.
  *
  * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
  * ".post" or a word that misleads, with a short verb: POST /api/errors scans (errors.scan), it does
@@ -41,7 +51,15 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     dryRun: 'none',
     why: 'Writes the file to the company data folder before the database row, so a rolled-back preview would leave the file behind.',
   },
-  'GET /api/attachments/[id]': { class: 'read', describe: 'Download document {id}', output: 'file' },
+  'GET /api/attachments/[id]': {
+    class: 'read_sensitive',
+    describe: 'Download document {id}',
+    why: "The file exactly as it was filed: a scanned W-9, W-4 or I-9 shows a full SSN or tax ID, a bank statement or a voided check full account numbers, and masking cannot hide anything inside a picture or a PDF. So it is protected data, asked for one at a time. reveal names SSNs and sensitiveFields names account numbers (no field of the answer is masked: they are there so whoever approves holds both View flags, as the file may show either). Described only, never dry run: a dry run would hand the agent the file before anyone approved it.",
+    output: 'file',
+    reveal: 'ssn',
+    sensitiveFields: ['accountNumber'],
+    dryRun: 'none',
+  },
   'PATCH /api/attachments/[id]': { class: 'change', describe: 'File or describe document {id}' },
   'DELETE /api/attachments/[id]': {
     class: 'remove',
@@ -52,7 +70,12 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   },
 
   // receipts: receipt capture (inbox, reading, saving as a transaction, phone upload links)
-  'GET /api/receipts': { class: 'read', describe: 'List receipts in the receipt inbox' },
+  'GET /api/receipts': {
+    class: 'read',
+    describe: 'List receipts in the receipt inbox',
+    sensitiveFields: ['receipts.*.rawText'],
+    why: "Everyday agent work, so a plain read. Each receipt carries rawText, up to 20,000 characters of the text read off the file, and a phone upload link takes any file: a bank statement or a W-9 dropped into the inbox would show its full numbers there, which masking by field name never reaches and the masking of labelled account numbers in text only partly does. So rawText is listed here and hidden in every answer that goes through the door (shown only on a reveal, which an Admin approves since it cannot be told what the text holds). A direct read of this list is not masked by the registry: leaving rawText out of an agent's answer is for the receipts service.",
+  },
   'POST /api/receipts': {
     class: 'outside',
     describe: 'Add a receipt file to the receipt inbox and read it (offline OCR or the company\'s vision model)',
@@ -64,7 +87,9 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'GET /api/receipts/[id]': {
     class: 'prepare',
     describe: 'Show receipt {id} with suggestions',
-    why: 'Suggesting the expense account brings the learned categorizer up to date, which saves its model (derived data, never the ledger). A read must not write at all.',
+    why: 'Suggesting the expense account brings the learned categorizer up to date, which saves its model (derived data, never the ledger). A read must not write at all. Described only, never dry run: a dry run would hand the agent the receipt before anyone approved it, where the policy asks. rawText, the text read off the file, is hidden in the answer for the reason given at GET /api/receipts; vendor, date, amounts and the card\'s last 4 still show.',
+    dryRun: 'none',
+    sensitiveFields: ['receipt.rawText'],
   },
   'DELETE /api/receipts/[id]': {
     class: 'remove',
@@ -82,7 +107,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   },
   'POST /api/receipts/[id]/save': {
     class: 'enter',
-    describe: 'Save receipt {id} as a {kind} for {total}',
+    describe: 'Save receipt {id} as a transaction ({kind}) for {total}',
     confirmFlags: ['allowDuplicateNumber'],
     amountField: 'total',
   },
@@ -96,7 +121,8 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'PUT /api/receipts/settings': {
     class: 'settings',
     describe: 'Change receipt reading settings',
-    why: 'A company setting: which local AI model reads receipts and the date order.',
+    why: 'A company setting: which local AI model reads receipts and the date order. No dry run: saving loads the AI settings (lib/services/receipts.ts setReceiptSettings calls loadSettings), which looks up every *.ts.net AI server address in DNS and refreshes the tailnet trust, and a rolled-back preview would still make those lookups (the rule in this file\'s header).',
+    dryRun: 'none',
   },
   'GET /api/receipts/upload-links': { class: 'read', describe: 'List phone upload links that still work' },
   'POST /api/receipts/upload-links': {
@@ -179,19 +205,19 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'DELETE /api/letters/templates/[id]': { class: 'remove', describe: 'Delete letter template {id}' },
   'POST /api/letters/prepare': {
     class: 'read',
-    describe: 'Prepare letters to {recipientType} recipients as a PDF',
+    describe: 'Prepare letters to the recipients as a PDF ({recipientType})',
     output: 'pdf',
     why: 'Merges the letters into one PDF; nothing is saved or printed. With preview: true the answer is the merged text as JSON instead of a PDF, so the output kind depends on the request.',
   },
   'POST /api/letters/labels': {
     class: 'read',
-    describe: 'Make mailing labels for {recipientType} recipients',
+    describe: 'Make mailing labels for the recipients ({recipientType})',
     output: 'pdf',
     why: 'Makes a PDF of labels; nothing is saved or printed.',
   },
   'POST /api/letters/envelopes': {
     class: 'read',
-    describe: 'Make envelopes for {recipientType} recipients',
+    describe: 'Make envelopes for the recipients ({recipientType})',
     output: 'pdf',
     why: 'Makes a PDF of envelopes; nothing is saved or printed.',
   },
@@ -208,7 +234,8 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     hostOnly: true,
     needsSecret: ['mail_password'],
     sensitiveFields: ['password'],
-    why: 'A company setting, changed only at the computer that holds the company file. The mail password is typed by the approver, never sent by the agent; the route reads it from the body field "password", so that is where the bridge puts it.',
+    why: 'A company setting, changed only at the computer that holds the company file. The mail password is typed by the approver, never sent by the agent; the route reads it from the body field "password", so that is where the bridge puts it. No dry run: for a server that signs in without encryption, the service looks the server\'s name up in DNS before saving, to check that it is on this network (lib/services/emailSettings.ts assertPlainMailAllowed, mailServerIsLocal), and a rolled-back preview would still make that lookup (the rule in this file\'s header).',
+    dryRun: 'none',
   },
   'DELETE /api/email/settings': {
     class: 'settings',
@@ -223,13 +250,15 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   },
   'POST /api/email/test': {
     class: 'outside',
-    describe: 'Send a test email to {to}',
+    // The server the typed password is sent to is on the line itself: the agent writes the draft,
+    // so without it a test against the agent's own server would collect the approver's password.
+    describe: 'Send a test email to {to} through {draft.host}',
     effects: ['email'],
     hostOnly: true,
     dryRun: 'none',
     needsSecret: ['mail_password'],
     sensitiveFields: ['draft.password'],
-    why: 'Sends a real email through the mail server. Only testing typed (unsaved) settings in "draft" is host-only; the saved settings can be tested from anywhere, and that test remembers its result. A typed password is typed by the approver and goes in the body field "draft.password".',
+    why: 'Sends a real email through the mail server. Only testing typed (unsaved) settings in "draft" is host-only; the saved settings can be tested from anywhere, and that test remembers its result. A typed password is typed by the approver and goes in the body field "draft.password", and the test connects to draft.host with it: the line names that server, so the approver sees where the password goes (with no draft, the saved set-up is tested and no typed password is used).',
   },
 
   // ai: the app's own AI features (assistant, suggestions, auto-posting) and AI settings
@@ -250,7 +279,8 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'POST /api/ai/bank-suggestions': {
     class: 'outside',
     id: 'ai.bank-suggestions.run',
-    describe: 'Bank feed AI: {action} (auto-apply posts every feed line of account {bankAccountId} the learned model is sure of; llm sends feed line {bankTransactionId} to the AI)',
+    describe:
+      'Run bank feed AI action {action} (account: {bankAccountId}) (feed line: {bankTransactionId}); auto-apply posts every line the learned model is sure of, llm sends one line to the AI',
     effects: ['network'],
     dryRun: 'none',
     why: 'One route, two actions. Action "llm" sends one bank line to the company\'s AI (a cloud AI when allowed) and posts nothing. Action "auto-apply" sends nothing out but posts a journal entry for every feed line at or above the company threshold (lib/services/aiCategorizer.ts autoApplyBankSuggestions): really bulk, dry run "transaction", count = lines posted. Classed "outside" (never Allow, at most a short grant) until the bridge splits it by action; no preview, because a preview of "llm" would already send.',
@@ -271,7 +301,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'POST /api/ai/chatgpt': {
     class: 'outside',
     id: 'ai.chatgpt.sign-in',
-    describe: 'ChatGPT sign-in: {action}',
+    describe: 'Start, cancel or disconnect the ChatGPT sign-in ({action})',
     availability: 'person_only',
     effects: ['network'],
     dryRun: 'none',
@@ -310,9 +340,11 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'POST /api/ai/recurring': {
     class: 'enter',
     id: 'ai.recurring.memorize',
+    // autoEnter shows as "yes" or "no" in its own aside; left out, the aside goes and the template
+    // only reminds (the default), so the line never reads as if it would post on its own.
     describe:
-      'Memorize {docType} {sourceDocId} as recurring {frequency} from {nextRunDate}; enter automatically: {autoEnter} (true posts it on its own schedule with nobody reviewing it; otherwise only a reminder)',
-    why: 'Makes a memorized transaction (lib/services/aiRecurring.ts memorizeSuggestion). With autoEnter: true it is set to post on its own schedule, standing automation like a bank rule set to "Add automatically", so making one always asks; without it the template only reminds.',
+      'Memorize {docType} {sourceDocId} as a recurring transaction ({frequency}, from {nextRunDate}) (enters itself with nobody reviewing it: {autoEnter})',
+    why: 'Makes a memorized transaction (lib/services/aiRecurring.ts memorizeSuggestion). With autoEnter: true it is set to post on its own schedule, standing automation like a bank rule set to "Add automatically", so making one always asks; without it (or with false) the template only reminds.',
     alwaysAsk: true,
   },
   'GET /api/ai/settings': {
@@ -326,13 +358,14 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     class: 'settings',
     // The card line is cut at 200 characters (lib/agent/describe.ts) and a placeholder cannot name
     // a list's items, so the AI servers, their addresses and the cloud-or-local choice per task
-    // (providers, taskPolicies) are named as changing and shown by the preview, whose record diff
-    // lists them old and new (the ai_settings audit row). A "(label: )" left empty is removed.
+    // (providers, taskPolicies) are named as changing and shown by the request itself, which the
+    // approval card shows (masked). A "(label: )" left empty is removed.
     describe:
-      'Change AI settings: AI servers, addresses, cloud use per task (see preview) (cloud AI on: {cloudEnabled}) (cloud calls a day: {cloudDailyCap}) (bank auto-post: {autoApplyEnabled}) (confidence: {autoApplyThreshold}) (AI suggestions: {llmSuggestEnabled})',
+      'Change AI settings: AI servers, addresses, cloud use per task (see the request) (cloud AI on: {cloudEnabled}) (cloud calls a day: {cloudDailyCap}) (bank auto-post: {autoApplyEnabled}) (confidence: {autoApplyThreshold}) (AI suggestions: {llmSuggestEnabled})',
     hostOnly: true,
     sensitiveFields: ['providers.*.apiKey'],
-    why: 'Company AI settings. A save can point an AI at a new server address, add one, or send a task (bank line suggestions, the assistant, error correction) to cloud AI while the cloud switch stays as it was; the preview shows each AI server and each task\'s choice before and after. Adding an AI, changing its address or turning cloud AI on is refused away from the computer that holds the company file. Turning cloud AI on also opens Privacy & Network to cloud AI. bank auto-post is "post bank lines automatically" at that confidence. providers[].apiKey is a typed secret, but there is no secret kind for an AI key yet, so it is only masked here: an agent should not be the one sending it.',
+    dryRun: 'none',
+    why: 'Company AI settings. A save can point an AI at a new server address, add one, or send a task (bank line suggestions, the assistant, error correction) to cloud AI while the cloud switch stays as it was; the request on the card shows each AI server and each task\'s choice as it would be saved. Adding an AI, changing its address or turning cloud AI on is refused away from the computer that holds the company file. Turning cloud AI on also opens Privacy & Network to cloud AI. bank auto-post is "post bank lines automatically" at that confidence. No dry run: saving loads the AI settings before and after (lib/services/aiSettings.ts updateSettings, getPublicSettings), which looks up every *.ts.net AI server address in DNS, a new one the agent typed included, and refreshes the tailnet trust; a rolled-back preview would still make those lookups (the rule in this file\'s header). providers[].apiKey is a typed secret, but there is no secret kind for an AI key yet, so it is only masked here: an agent should not be the one sending it.',
   },
   'GET /api/ai/tailnet': {
     class: 'outside',
@@ -344,7 +377,9 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   },
   'POST /api/ai/test': {
     class: 'settings',
-    describe: 'Test AI server {baseUrl} ({kind}); allow cloud AI: {allowCloud}',
+    // allowCloud is a person's choice (lib/agent/guards.ts takes it out of an agent's input), so on
+    // an agent's card its aside is always left out: the line never reads as "allow cloud AI".
+    describe: 'Test AI server {baseUrl} ({kind}) (and turn cloud AI on: {allowCloud})',
     effects: ['network'],
     hostOnly: true,
     dryRun: 'none',
@@ -391,7 +426,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     describe: 'Import bank lines ({fileType}) into the feed of {bankAccountId}',
     countField: 'rows',
     confirmFlags: ['statement.acknowledgeDifference'],
-    why: 'Stages every line of the file in the bank feed, and when AI auto-apply is on (the default for new companies) also posts each line the learned model is sure of. countField counts reviewed statement rows (fileType "rows"); for an OFX, QBO or CSV file the number of lines is known only after reading it. The confirm flag is the nested field statement.acknowledgeDifference, and a statement that does not tie out answers 400 VALIDATION with details.tieOut, not a 409 warning; it is listed so a request that sends it counts as confirmed and cannot ride on a standing grant.',
+    why: 'Stages every line of the file in the bank feed, and when AI auto-apply is on (the default for new companies) also posts each line the learned model is sure of. countField counts reviewed statement rows (fileType "rows"); for an OFX, QBO or CSV file the number of lines is known only after reading it. The confirm flag is the nested field statement.acknowledgeDifference, and a statement that does not tie out answers 400 VALIDATION with details.tieOut, not a 409 warning; it is listed so a request that sends it counts as confirmed and cannot ride on a standing grant. The dry run is kept although it makes name lookups (the exception to the rule in this file\'s header): when lines come in, the import service loads the AI settings to see whether auto-apply is on (lib/services/import.ts, unless skipAutoPost, which this route never sets), and that looks up only the *.ts.net AI addresses already saved in the company, never a name the agent typed. A preview of what the file brings in and posts is worth more here than avoiding those lookups.',
   },
   'POST /api/import/csv-preview': {
     class: 'read',
@@ -417,7 +452,12 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     describe: 'Import QuickBooks {format} data',
     why: 'QuickBooks import into the books: lists, opening balances and transactions, many records at once. Owner or Admin only, with nobody else working in the company.',
   },
-  'GET /api/import/rebuild': { class: 'read', describe: 'Preview Rebuild Data {action}' },
+  'GET /api/import/rebuild': {
+    class: 'file',
+    describe: 'Preview Rebuild Data {action}',
+    why: 'A File Utilities read (plan 4.2): the preview of Rebuild Data, the file utility that rewrites saved balances across the books, lists every record it would repair. Class file, like the repair it previews: an Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.',
+    dryRun: 'none',
+  },
   'POST /api/import/rebuild': {
     class: 'file',
     id: 'import.rebuild.run',
@@ -431,20 +471,30 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     describe: 'Import QuickBooks {format} lists',
     why: 'QuickBooks import into the books (IIF or customer and vendor CSV), many records at once. Owner or Admin only, with nobody else working in the company.',
   },
-  'GET /api/qb-import/gl': { class: 'read', describe: 'List past QuickBooks general ledger imports' },
+  'GET /api/qb-import/gl': {
+    class: 'file',
+    describe: 'List past QuickBooks general ledger imports',
+    why: 'A File Utilities read (plan 4.2): each past import of the QuickBooks conversion is listed with the name of the report file it came from and its stored proof. Class file: an Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.',
+    dryRun: 'none',
+  },
   'POST /api/qb-import/gl': {
     class: 'file',
     id: 'qb-import.gl.run',
-    describe: 'QuickBooks general ledger import: {action}',
+    describe: 'Bring in QuickBooks general ledger history ({action})',
     dryRun: 'preview',
     confirmFlags: ['acceptVariance', 'acceptExistingEntries'],
     why: 'Brings years of QuickBooks history into the books. Its own "preview" and "dry-run" actions show what an import would do; the accept flags answer its warnings (the warning comes back as ok: false, not a 409).',
   },
-  'GET /api/qb-import/open-items': { class: 'read', describe: 'Compare A/R and A/P with their aging' },
+  'GET /api/qb-import/open-items': {
+    class: 'file',
+    describe: 'Compare A/R and A/P with their aging',
+    why: "A File Utilities read (plan 4.2): the proof page of the QuickBooks cutover, part of the conversion that plan 4.2 files under class file, so an Admin approves it, as for the import it proves. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.",
+    dryRun: 'none',
+  },
   'POST /api/qb-import/open-items': {
     class: 'file',
     id: 'qb-import.open-items.run',
-    describe: 'QuickBooks open invoices and bills: {action}',
+    describe: 'Bring in open QuickBooks invoices and bills ({action})',
     dryRun: 'preview',
     why: 'QuickBooks cutover: action "import" creates the open invoices, credit memos, bills and vendor credits. Action "preview" is its own preview and saves nothing.',
   },

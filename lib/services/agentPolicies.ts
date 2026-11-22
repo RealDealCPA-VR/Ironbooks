@@ -15,12 +15,18 @@
  *  - The Agents tab's screens (getAgentPolicyView, getAgentDetail, listAgentActivity) are for a
  *    person who may see Users & Roles.
  *  - Changing anything (saveAgentPolicy, pauseAgent, pauseAllAgents) is for a person signed in to
- *    Ironbooks whose own access may modify Users & Roles. A context that carries an agent, and any
- *    work running inside an agent's bridged run (lib/serviceScope.ts), is refused whatever else it
- *    holds: an agent never changes an agent, its own settings included (plan 4.6, D9).
- *  - As for people (lib/services/users.ts), a person who is not an Admin may not change the
- *    settings of, or turn back on, an agent whose access reaches beyond their own. Anyone who may
- *    manage agents may pause one: stopping is never held back.
+ *    Ironbooks whose own access may modify Users & Roles > Users. A context that carries an agent,
+ *    and any work running inside an agent's bridged run (lib/serviceScope.ts), is refused whatever
+ *    else it holds: an agent never changes an agent, its own settings included (plan 4.6, D9).
+ *  - Letting an agent do more is for an Admin (plan 4.4: "Always allow this class here" changes the
+ *    policy, and only an Admin can do it). A save by anyone else that loosens anything is refused
+ *    whole: a higher preset, a cell moved toward Allow, a higher or removed bulk cap, a folder it
+ *    could not reach before, a higher or removed two-person amount, a longer wait for its requests,
+ *    or the email notice turned on (an outside send). Tightening stays open to everyone who may
+ *    manage agents, whatever the agent's own access: it can only take room away.
+ *  - Anyone who may manage agents may pause one: stopping is never held back. As for people
+ *    (lib/services/users.ts), a person who is not an Admin may not turn back on an agent whose
+ *    access reaches beyond their own.
  *
  * Every change is one transaction and one audit row naming what changed, with the person as the
  * one who did it. "Pause all agents" is the company's Integrated Applications switch and goes
@@ -43,21 +49,26 @@ import {
   isPolicySetting,
   policyProblems,
   resolvePolicy,
+  settingFor,
   type PolicyLimits,
 } from '@/lib/agent/policy';
 import {
   ADMIN_APPROVAL_CLASSES,
+  AGENT_PRESETS,
+  AGENT_PRESET_LABELS,
   NEVER_ALLOW_CLASSES,
   REQUEST_STATUSES,
   RISK_CLASSES,
   RISK_CLASS_LABELS,
   isRiskClass,
+  type AgentPolicy,
   type AgentPreset,
   type PolicyOverride,
   type PolicySetting,
   type RequestStatus,
   type RiskClass,
 } from '@/lib/agent/operations/types';
+import { Money } from '@/lib/money';
 import type {
   AgentActivityRow,
   AgentCeiling,
@@ -106,12 +117,10 @@ const AGENT_NO_VIEW =
 const SIGN_IN_FIRST = 'Only a person signed in to Ironbooks can change what an agent may do.';
 const NO_ACCESS = 'You do not have access to this company.';
 const REMOVED = 'This agent has been removed, so its settings can no longer be changed.';
-const MORE_THAN_YOU_SETTINGS =
-  'Only an Admin can change the settings of an agent that has more access than you. You can still pause it.';
 const MORE_THAN_YOU_RESUME = 'Only an Admin can turn back on an agent that has more access than you.';
-const ADMIN_AGENT_SETTINGS =
-  'Only an Admin can change the settings of an agent that holds the Admin role. You can still pause it.';
 const ADMIN_AGENT_RESUME = 'Only an Admin can turn back on an agent that holds the Admin role.';
+/** Most loosened settings a refusal names; the rest are counted. */
+const LOOSER_SHOWN = 3;
 const PAUSE_ALL_FOR_ADMIN =
   'Only an Admin can pause or resume every agent at once. You can pause one agent at a time in Users & Roles > Agents.';
 const PRESET_CHOICE =
@@ -156,8 +165,9 @@ async function assertMaySeeAgents(ctx: ServiceContext): Promise<void> {
 }
 
 /**
- * A person who is not an Admin may change only an agent whose ceiling is within their own access,
- * and never one that holds the Admin role (as lib/services/users.ts holds user managers).
+ * A person who is not an Admin may turn back on only an agent whose ceiling is within their own
+ * access, and never one that holds the Admin role (as lib/services/users.ts holds user managers).
+ * (A save needs no such check: a non-Admin's save may only tighten, see loosenings.)
  */
 async function assertWithinYourAccess(
   ctx: ServiceContext,
@@ -253,13 +263,16 @@ function limitsOf(row: AgentRow): PolicyLimits {
  * in ./agents).
  *
  * The time is that of the company save that switched it: Preferences and "Pause all agents" both
- * go through updateCompany, whose audit row holds what the save set and what it was before. Not the
- * company's last change (companies.updated_at), which any later Preferences save moves. A file with
- * no such row (switched by an older version, or by hand) falls back to that last change.
+ * go through updateCompany, whose audit row holds what the save set and what it was before (a
+ * later save that sends the switch again unchanged, or changes something else, is not one). Never
+ * the company's last change (companies.updated_at), which any later Preferences save moves. A file
+ * with no such row (switched by an older version, or by hand) cannot say when, so it gives a time
+ * nothing moves: when the company was made, the earliest the switch can have been turned. Only
+ * "paused" matters to every decision (isPaused); the time is for showing.
  */
 async function appsBlockedSince(ctx: ServiceContext): Promise<string | null> {
   const [c] = await ctx.db
-    .select({ settings: companies.settings, updatedAt: companies.updatedAt })
+    .select({ settings: companies.settings, createdAt: companies.createdAt })
     .from(companies)
     .where(eq(companies.id, ctx.companyId));
   const s = c?.settings && typeof c.settings === 'object' ? (c.settings as Record<string, unknown>) : null;
@@ -278,7 +291,8 @@ async function appsBlockedSince(ctx: ServiceContext): Promise<string | null> {
     )
     .orderBy(desc(auditLogs.createdAt))
     .limit(1);
-  return (switched?.at ?? c?.updatedAt ?? new Date()).toISOString();
+  // Not `new Date()` either when nothing is found: the time would move on every read.
+  return (switched?.at ?? c?.createdAt ?? new Date(0)).toISOString();
 }
 
 /**
@@ -688,17 +702,26 @@ function ironbooksPlaces(): string[] {
   const env = process.env;
   const home = os.homedir();
   const out: string[] = [];
+  // Where staged files really are (lib/agent/files.ts decides: the open file's working folder, or
+  // this computer's local app data). Null when that setup is refused and nothing is kept; the
+  // usual places are below either way.
   const staged = stagedFilesRoot();
   if (staged) out.push(staged);
   out.push(endpointDir());
   if (env.IRONBOOKS_USER_DATA) out.push(path.resolve(env.IRONBOOKS_USER_DATA));
   if (env.BKA_SANDBOX_ROOT) out.push(path.resolve(env.BKA_SANDBOX_ROOT));
+  // Every company file's working folder, not only the open one's: they all sit in one folder
+  // (electron/companySession.js workingRoot), the one that holds the open file's working folder.
+  const state = env.BKA_COMPANY_STATE?.trim();
+  if (state) out.push(path.dirname(path.dirname(path.resolve(state))));
   // Where Electron keeps the settings folder (app.getPath('appData')), and the local folder beside it.
   let settingsParent: string;
   if (WIN) {
     out.push(path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'Ironbooks'));
     settingsParent = env.APPDATA || path.join(home, 'AppData', 'Roaming');
   } else if (process.platform === 'darwin') {
+    // workingRoot's fallback when the shell names no settings folder.
+    out.push(path.join(home, '.ironbooks'));
     settingsParent = path.join(home, 'Library', 'Application Support');
   } else {
     out.push(path.join(env.XDG_STATE_HOME || path.join(home, '.local', 'state'), 'ironbooks'));
@@ -708,6 +731,119 @@ function ironbooksPlaces(): string[] {
   for (const name of APP_FOLDER_NAMES) out.push(path.join(settingsParent, name));
   out.push(...backupFoldersHere(), preOpFolder());
   return withLinks(out);
+}
+
+/**
+ * A whole drive (C:\, /), a network share (\\server\share) or another volume mounted as a folder
+ * (/Volumes/USB, a disk mounted into a folder): never an agent's folder. It holds everything on
+ * it, the books and Ironbooks' own folders included when they are on it, and other people's
+ * files when it is a share.
+ */
+function isDriveOrShareRoot(real: string): boolean {
+  return isRootByWords(real) || isMountedVolume(real) === true;
+}
+
+/** A whole drive ("C:\", "/") or a share's own folder ("\\server\share"), by the words alone. */
+function isRootByWords(p: string): boolean {
+  const r = path.resolve(p);
+  // Compared without the trailing separator: "C:\" and "C:", "\\server\share\" and "\\server\share".
+  const key = (s: string) => (WIN ? s.replace(/[\\/]+$/, '').toLowerCase() : s.replace(/\/+$/, ''));
+  if (key(r) === key(path.parse(r).root)) return true;
+  // A share's own folder, with or without the trailing separator.
+  return WIN && /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+[\\/]*$/.test(r);
+}
+
+/**
+ * Mounted somewhere inside another drive: the folder is on another device than the folder it sits
+ * in. Null when the disk will not say (the folder or its parent cannot be read).
+ */
+function isMountedVolume(p: string): boolean | null {
+  try {
+    const r = path.resolve(p);
+    const here = fs.statSync(r);
+    const parent = fs.statSync(path.dirname(r));
+    return Boolean(here.dev && parent.dev && here.dev !== parent.dev);
+  } catch {
+    return null;
+  }
+}
+
+/** A network path (\\server\share\...): never looked at again here, only by the words. */
+function isSharePath(p: string): boolean {
+  return WIN && /^[\\/]{2}/.test(p);
+}
+
+/** No link anywhere along `p`, each part looked at without following it (false when one cannot be read). */
+function noLinksAlong(p: string): boolean {
+  const r = path.resolve(p);
+  const { root } = path.parse(r);
+  let current = root;
+  for (const part of r.slice(root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function wholeDriveRefusal(typed: string): ServiceError {
+  return validation(`"${shown(typed, 200)}" is a whole drive or network share. Choose a folder on it for the agent, like ${EXAMPLE_FOLDER}.`);
+}
+
+/** `folder` is one of the books' or Ironbooks' own folders, inside one, or holds one. */
+function touchesOwnPlaces(folder: string, places: string[]): boolean {
+  return places.some((b) => within(folder, b) || within(b, folder));
+}
+
+/**
+ * A stored folder (`had`) really lets the agent at `chosen`, a folder the person has just chosen
+ * that sits inside it by the words: it is a full path, not a whole drive or share, not one of the
+ * books' or Ironbooks' own folders (`places`), and the save check itself lets the agent at
+ * `chosen` through it (allowedFolder, which also skips a mounted volume and a link that leads off to
+ * another share). Fails closed: a folder the disk will not answer for reaches nothing.
+ * The words are judged first, so the disk is asked only of a folder that holds `chosen`: the only
+ * network share it can look at is the one `chosen` is on, which the folder check has just looked
+ * at for the person who typed it.
+ */
+async function storedFolderReaches(had: string, chosen: string, places: string[]): Promise<boolean> {
+  if (!looksAbsolute(had) || isRootByWords(had) || !within(chosen, had)) return false;
+  if (touchesOwnPlaces(had, places)) return false;
+  return (await allowedFolder([had], chosen)) !== null;
+}
+
+/** The key of "`had` holds `chosen` and really reaches it" in heldBy. */
+function holdsKey(chosen: string, had: string): string {
+  return `${samePathKey(chosen)}\n${samePathKey(had)}`;
+}
+
+/**
+ * Which folders the agent has (`had`) really hold which of the folders a person has just chosen
+ * (`chosen`, as checkFolders returns them), by holdsKey. Asked of the disk before the save's
+ * transaction, and only for a chosen folder that is new: one the agent already has is never looked
+ * at again, whatever the disk says of it today (deleted, an unplugged drive, a share offline), and
+ * neither is a stored folder that holds no chosen one.
+ */
+async function heldBy(chosen: readonly string[], had: readonly string[]): Promise<Set<string>> {
+  const out = new Set<string>();
+  const kept = new Set(had.map(samePathKey));
+  let places: string[] | null = null;
+  for (const folder of chosen) {
+    if (kept.has(samePathKey(folder))) continue;
+    for (const h of had) {
+      if (samePathKey(h) === samePathKey(folder) || !within(folder, h)) continue;
+      places ??= [...booksPlaces(), ...ironbooksPlaces()];
+      if (await storedFolderReaches(h, folder, places)) out.add(holdsKey(folder, h));
+    }
+  }
+  return out;
+}
+
+/** The folders on an agent's row as the engine reads them (resolvePolicy). */
+function storedFolders(row: AgentRow): string[] {
+  return Array.isArray(row.folders) ? row.folders.filter((f): f is string => typeof f === 'string' && f.trim() !== '') : [];
 }
 
 /**
@@ -723,16 +859,24 @@ async function checkFolders(list: string[]): Promise<string[]> {
     if (!looksAbsolute(typed)) {
       throw validation(`"${shown(typed, 200)}" is not a full folder path. Type the whole path, like ${EXAMPLE_FOLDER}.`);
     }
+    // By the words first: allowedFolder never takes a whole drive or share and answers null for
+    // one, as for a folder that is not there, so the person would be told the wrong thing.
+    if (isRootByWords(typed)) throw wholeDriveRefusal(typed);
     const real = await allowedFolder([typed], typed);
     if (!real) {
+      // A volume mounted as a folder (/Volumes/USB) is skipped by allowedFolder too: say what it
+      // is. Asked only of a local path with no link along it, so the disk is the only thing looked
+      // at (looking at a network path, or a link to one, is a sign-in to that server).
+      if (!isSharePath(typed) && noLinksAlong(typed) && isMountedVolume(typed) === true) throw wholeDriveRefusal(typed);
       throw validation(`The folder "${shown(typed, 200)}" was not found on this computer. Check the path, or make the folder first.`);
     }
-    if (books.some((b) => within(real, b) || within(b, real))) {
+    if (isDriveOrShareRoot(real)) throw wholeDriveRefusal(typed);
+    if (touchesOwnPlaces(real, books)) {
       throw validation(
         `The folder "${shown(typed, 200)}" holds the company file or its working data, or is inside them. Choose another folder for the agent.`,
       );
     }
-    if (own.some((b) => within(real, b) || within(b, real))) {
+    if (touchesOwnPlaces(real, own)) {
       throw validation(
         `The folder "${shown(typed, 200)}" is one of the folders Ironbooks keeps its own data in (settings, working copies, backups or agents' files), or is inside or holds one. Choose another folder for the agent.`,
       );
@@ -755,21 +899,129 @@ function overridesKey(list: PolicyOverride[]): string {
   return JSON.stringify(sortOverrides(list).map((o) => [o.class, o.area ?? null, o.setting]));
 }
 
+// ---------------------------------------------------------------------------
+// Loosening (an Admin's)
+// ---------------------------------------------------------------------------
+
+const STRICTNESS: Record<PolicySetting, number> = { allow: 0, ask: 1, never: 2 };
+const SETTING_WORD: Record<PolicySetting, string> = { allow: 'Allow', ask: 'Ask', never: 'Never' };
+
+/** AGENT_PRESETS runs from the least an agent may do to the most (plan 4.2's table, left to right). */
+function presetRank(preset: AgentPreset): number {
+  return (AGENT_PRESETS as readonly string[]).indexOf(preset);
+}
+
+/** A two-person amount for comparing: decimal text, or null when it cannot be read (counts as off). */
+function amountOrNull(v: string | null): string | null {
+  if (v === null) return null;
+  try {
+    return Money.of(v).toFixed(2);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Everything a save would let the agent do that it could not before, in plain words, read from
+ * the policy before and after as the engine resolves them (so a cell is judged by the setting the
+ * decisions really use, its area's own or everywhere's). Empty when the save only tightens or
+ * changes nothing. Field by field: the preset, every cell everywhere and in each area, the bulk
+ * cap (removing one is more; where there was none, a cap above the usual DEFAULT_BULK_CAP is more),
+ * the two-person amount (off is the most), the folders (a new one, not inside a folder it already
+ * had that really reaches it: `held`, from heldBy), the days a request waits, and the email notice
+ * (an outside send). Nothing here looks at the disk.
+ */
+function loosenings(before: AgentPolicy, after: AgentPolicy, held: ReadonlySet<string>): string[] {
+  const out: string[] = [];
+  if (presetRank(after.preset) > presetRank(before.preset)) {
+    out.push(`move it from "${AGENT_PRESET_LABELS[before.preset]}" to "${AGENT_PRESET_LABELS[after.preset]}"`);
+  }
+  for (const cls of RISK_CLASSES) {
+    const wasAll = settingFor(before, null, cls);
+    const nowAll = settingFor(after, null, cls);
+    if (STRICTNESS[nowAll] < STRICTNESS[wasAll]) {
+      out.push(`set ${cellWords(cls, null)} from ${SETTING_WORD[wasAll]} to ${SETTING_WORD[nowAll]}`);
+    }
+    for (const area of AREA_KEYS) {
+      const was = settingFor(before, area, cls);
+      const now = settingFor(after, area, cls);
+      if (STRICTNESS[now] >= STRICTNESS[was]) continue;
+      // Already said for everywhere: an area that simply follows it is the same change.
+      if (was === wasAll && now === nowAll && STRICTNESS[nowAll] < STRICTNESS[wasAll]) continue;
+      out.push(`set ${cellWords(cls, area)} from ${SETTING_WORD[was]} to ${SETTING_WORD[now]}`);
+    }
+  }
+  // No cap is not "unlimited" everywhere: a standing permission for bulk work is held to the usual
+  // cap then (createGrant in ./agentGrants). So a cap above the usual one, where there was none,
+  // lets grants cover more records per request: an Admin's. A cap at or below it only tightens.
+  const capWas = before.bulkCap ?? DEFAULT_BULK_CAP;
+  if (after.bulkCap === null ? before.bulkCap !== null : after.bulkCap > capWas) {
+    out.push(
+      after.bulkCap === null
+        ? `remove the limit of ${before.bulkCap} records one request may change`
+        : before.bulkCap === null
+          ? `raise the most records one request may change from the usual ${DEFAULT_BULK_CAP} to ${after.bulkCap}`
+          : `raise the most records one request may change from ${before.bulkCap} to ${after.bulkCap}`,
+    );
+  }
+  const twoBefore = amountOrNull(before.twoPersonOver);
+  const twoAfter = amountOrNull(after.twoPersonOver);
+  if (twoBefore !== null && (twoAfter === null || Money.gt(twoAfter, twoBefore))) {
+    out.push(
+      twoAfter === null
+        ? `turn off two-person approval (now needed above ${twoBefore})`
+        : `raise the amount that needs two people from ${twoBefore} to ${twoAfter}`,
+    );
+  }
+  // A folder it already has is not new, whatever the disk says of it today: keeping one that has
+  // since been deleted, or sits on a drive that is unplugged, lets the agent do nothing more. A new
+  // one is more unless a folder it already had really reaches it (heldBy): a stored whole drive,
+  // mounted volume or own folder (an older version's save, a hand edit) gives it nothing. Judged
+  // on the stored folders read inside the transaction, so a pair heldBy checked against a list that
+  // has changed since counts only while that stored folder is still there.
+  const kept = new Set(before.folders.map(samePathKey));
+  for (const folder of after.folders) {
+    if (kept.has(samePathKey(folder))) continue;
+    if (!before.folders.some((had) => held.has(holdsKey(folder, had)))) out.push(`let it use the folder "${shown(folder, 200)}"`);
+  }
+  if (after.requestExpiryDays > before.requestExpiryDays) {
+    out.push(`let its requests wait ${after.requestExpiryDays} days instead of ${before.requestExpiryDays}`);
+  }
+  if (after.notifyEmail && !before.notifyEmail) out.push('turn on the email notice, which sends email outside this computer');
+  return out;
+}
+
+/** The refusal a non-Admin gets for a save that loosens anything: what it would loosen, and what they can do. */
+function onlyAnAdminLoosens(list: string[]): ServiceError {
+  const named = list.slice(0, LOOSER_SHOWN);
+  const more = list.length - named.length;
+  const what = more > 0 ? `${named.join('; ')}; and ${more} more` : named.join('; ');
+  return new ServiceError(
+    'FORBIDDEN',
+    `Only an Admin can let an agent do more. This change would ${what}. Ask an Admin to make it. You can still tighten this agent's settings or pause it.`,
+    { looser: list },
+  );
+}
+
 /**
  * Save an agent's policy: its preset, its overrides (replacing every stored one when sent) and its
  * limits. Checked against the policy engine's own rules and refused, with what to change, at the
- * first problem: nothing is saved in a form the engine would read differently. The older mode is
- * kept in step with the preset. One transaction, one audit row naming what changed.
+ * first problem: nothing is saved in a form the engine would read differently. A person who is not
+ * an Admin may only tighten (loosenings): a save that would let the agent do anything more is
+ * refused whole, naming what it would loosen. The older mode is kept in step with the preset. One
+ * transaction, one audit row naming what changed.
  */
 export const saveAgentPolicy: SaveAgentPolicy = async (ctx, agentId, input) => {
   const person = await personWhoManagesAgents(ctx);
   const before = await agentRowFor(ctx, agentId);
   if (!before) throw notFound('Agent');
   if (before.revokedAt) throw validation(REMOVED);
-  await assertWithinYourAccess(ctx, person, before, { admin: ADMIN_AGENT_SETTINGS, more: MORE_THAN_YOU_SETTINGS });
   const asked = readPolicyInput(input);
-  // On the disk, so outside the transaction.
+  // On the disk, so outside the transaction: the folders sent, and, for a person who may not let
+  // the agent do more, which of them a folder it already has really holds (heldBy). A save that
+  // sends no folders looks at none.
   const folders = asked.folders === undefined ? undefined : await checkFolders(asked.folders);
+  const held = folders === undefined || person.isAdmin ? new Set<string>() : await heldBy(folders, storedFolders(before));
 
   await inTransaction(ctx, async (tx) => {
     const row = await agentRowFor(tx, agentId);
@@ -800,6 +1052,22 @@ export const saveAgentPolicy: SaveAgentPolicy = async (ctx, agentId, input) => {
       folders: folders ?? (Array.isArray(row.folders) ? row.folders : []),
       notifyEmail: asked.notifyEmail ?? row.notifyEmail === true,
     };
+
+    // Letting the agent do more is an Admin's (plan 4.4). Judged on the policy as the engine reads
+    // it before and after, from the row read inside this transaction, so a save racing another
+    // cannot slip a loosening past the comparison.
+    if (!person.isAdmin) {
+      const was = resolvePolicy(presetOfRow(row), stored, limitsOf(row));
+      const will = resolvePolicy(preset, overrides, {
+        bulkCap: next.bulkCap,
+        twoPersonOver: next.twoPersonOver,
+        requestExpiryDays: next.requestExpiryDays,
+        folders: next.folders,
+        notifyEmail: next.notifyEmail,
+      });
+      const looser = loosenings(was, will, held);
+      if (looser.length) throw onlyAnAdminLoosens(looser);
+    }
 
     // The engine's own rules have the last word (pause is not part of a save: it is left out).
     // What this save sent was checked above, so what can still fail here is what it keeps from
@@ -882,7 +1150,8 @@ function readStoredAmount(v: string | null): string | null {
 /**
  * Pause one agent, or turn it back on. A paused agent is refused everything until a person turns
  * it back on; its token and settings stay. Pausing is open to everyone who may manage agents;
- * turning back on follows the same rule as changing its settings. Already so: nothing is written.
+ * turning back on, for a person who is not an Admin, only an agent within their own access
+ * (assertWithinYourAccess). Already so: nothing is written.
  */
 export const pauseAgent: PauseAgent = async (ctx, agentId, paused) => {
   const person = await personWhoManagesAgents(ctx);

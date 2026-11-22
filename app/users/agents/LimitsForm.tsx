@@ -6,12 +6,29 @@
  *
  * The folder being typed is held by the detail page, not here, so Save changes adds a path that
  * was typed but not added (withTypedFolder) instead of dropping it without a word.
+ *
+ * A person who is not an Admin may only tighten (plan 4.4): lower the limit, lower or turn on
+ * two-person approval, shorten the wait, turn the email notice off, take folders off. A raise is
+ * said under the field (and Save holds it, on the detail page); adding a folder and turning the
+ * notice on are not offered to them, and the reason is shown instead.
  */
 import { FolderPlus, X } from 'lucide-react';
 import { AmountInput, Button, Input, Label, toast } from '@/components/ui';
 import { RISK_CLASS_LABELS } from '@/lib/agent/operations/types';
 import { DEFAULT_BULK_CAP } from '@/lib/agent/policy';
-import { BULK_CAP_MAX, EXPIRY_DAYS_MAX, addFolder, allowsBulk, capThatApplies, removeFolder, type PolicyDraft } from './policyDraft';
+import {
+  BULK_CAP_MAX,
+  EXPIRY_DAYS_MAX,
+  addFolder,
+  allowsBulk,
+  capLoosened,
+  capThatApplies,
+  expiryLoosened,
+  removeFolder,
+  twoPersonLoosened,
+  type PolicyDraft,
+} from './policyDraft';
+import { ADMIN_TO_ADD_FOLDER, ADMIN_TO_NOTIFY, ADMIN_TO_RAISE_CAP, ADMIN_TO_RAISE_DAYS, ADMIN_TO_RAISE_TWO_PERSON, adminToRaiseUsualCap } from './words';
 
 export default function LimitsForm({
   draft,
@@ -20,6 +37,8 @@ export default function LimitsForm({
   unattended,
   folder,
   onFolderChange,
+  saved,
+  mayLoosen = true,
 }: {
   draft: PolicyDraft;
   onChange: (next: PolicyDraft) => void;
@@ -28,8 +47,16 @@ export default function LimitsForm({
   /** The folder path being typed, not yet on the list. */
   folder: string;
   onFolderChange: (typed: string) => void;
+  /** What was saved: a raise is measured against it. */
+  saved?: PolicyDraft;
+  /** This person is an Admin and may let the agent do more (plan 4.4). */
+  mayLoosen?: boolean;
 }) {
   function add() {
+    if (!mayLoosen) {
+      toast(ADMIN_TO_ADD_FOLDER, 'danger');
+      return;
+    }
     const r = addFolder(draft, folder);
     if (r.error !== null) {
       toast(r.error, 'danger');
@@ -41,6 +68,11 @@ export default function LimitsForm({
 
   const bulkAllowed = allowsBulk(draft);
   const cap = capThatApplies(draft);
+  const capRaised = !mayLoosen && saved ? capLoosened(saved, draft) : null;
+  const twoRaised = !mayLoosen && saved ? twoPersonLoosened(saved, draft) : null;
+  const daysRaised = !mayLoosen && saved ? expiryLoosened(saved, draft) : null;
+  // The notice may be turned off by anyone, and on only by an Admin (it is an outside send).
+  const notifyLocked = !mayLoosen && !(saved?.notifyEmail ?? false) && !draft.notifyEmail;
 
   return (
     <div className="grid gap-4 sm:grid-cols-2">
@@ -55,8 +87,10 @@ export default function LimitsForm({
           placeholder={bulkAllowed ? String(DEFAULT_BULK_CAP) : 'No limit'}
         />
         <p className="mt-1 text-xs text-navy/50">
-          A request that would change more is refused. Up to {BULK_CAP_MAX.toLocaleString('en-US')}. Empty means no limit, except while
-          &quot;{RISK_CLASS_LABELS.bulk}&quot; is Allow anywhere: then there is always one, and empty means {DEFAULT_BULK_CAP}.
+          A request that would change more is refused. Up to {BULK_CAP_MAX.toLocaleString('en-US')}.{' '}
+          {bulkAllowed
+            ? `Empty means ${DEFAULT_BULK_CAP}: while "${RISK_CLASS_LABELS.bulk}" is Allow anywhere, there is always a limit.`
+            : `Empty means no limit. Once "${RISK_CLASS_LABELS.bulk}" is Allow anywhere, there is always one, and empty means ${DEFAULT_BULK_CAP}.`}
         </p>
         <p className="mt-1 text-xs font-medium text-navy/70" data-cap-applies="">
           {cap !== null
@@ -65,6 +99,11 @@ export default function LimitsForm({
               ? 'Once saved: no limit.'
               : `Type a whole number from 1 to ${BULK_CAP_MAX.toLocaleString('en-US')}.`}
         </p>
+        {capRaised && (
+          <p className="mt-1 text-xs text-amber-800" data-admin-only="bulkCap">
+            {capRaised.usual ? adminToRaiseUsualCap(DEFAULT_BULK_CAP) : ADMIN_TO_RAISE_CAP}
+          </p>
+        )}
       </div>
       <div>
         <Label htmlFor="ag-two-person">Two people approve above this amount</Label>
@@ -78,6 +117,11 @@ export default function LimitsForm({
         <p className="mt-1 text-xs text-navy/50">
           A request for more than this needs a yes from two different people. 0: every amount does. Empty: one person is enough.
         </p>
+        {twoRaised && (
+          <p className="mt-1 text-xs text-amber-800" data-admin-only="twoPersonOver">
+            {ADMIN_TO_RAISE_TWO_PERSON}
+          </p>
+        )}
       </div>
       <div>
         <Label htmlFor="ag-expiry">Days a request waits for an answer</Label>
@@ -91,15 +135,24 @@ export default function LimitsForm({
         <p className="mt-1 text-xs text-navy/50">
           After that it expires and the agent is told. From 1 to {EXPIRY_DAYS_MAX} days.
         </p>
+        {daysRaised && (
+          <p className="mt-1 text-xs text-amber-800" data-admin-only="requestExpiryDays">
+            {ADMIN_TO_RAISE_DAYS}
+          </p>
+        )}
       </div>
       <div>
         <Label>Email notice</Label>
-        <label className={`flex items-start gap-2 rounded p-1.5 ${disabled ? 'opacity-70' : 'cursor-pointer hover:bg-electric/5'}`}>
+        <label
+          className={`flex items-start gap-2 rounded p-1.5 ${disabled || notifyLocked ? 'opacity-70' : 'cursor-pointer hover:bg-electric/5'}`}
+          title={notifyLocked ? ADMIN_TO_NOTIFY : undefined}
+        >
           <input
             type="checkbox"
             className="mt-1"
             checked={draft.notifyEmail}
-            disabled={disabled}
+            disabled={disabled || notifyLocked}
+            data-admin-only={notifyLocked ? 'true' : undefined}
             onChange={(e) => onChange({ ...draft, notifyEmail: e.target.checked })}
           />
           <span>
@@ -109,6 +162,7 @@ export default function LimitsForm({
               nothing is ever approved by email.
               {!unattended && ' This agent works only while someone is signed in, so it is rarely needed.'}
             </span>
+            {notifyLocked && <span className="block text-xs text-amber-800">{ADMIN_TO_NOTIFY}</span>}
           </span>
         </label>
       </div>
@@ -135,6 +189,8 @@ export default function LimitsForm({
             <Input
               id="ag-folder"
               value={folder}
+              disabled={!mayLoosen}
+              title={mayLoosen ? undefined : ADMIN_TO_ADD_FOLDER}
               onChange={(e) => onFolderChange(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
@@ -144,14 +200,19 @@ export default function LimitsForm({
               }}
               placeholder="C:\Users\you\Documents\Receipts"
             />
-            <Button variant="secondary" onClick={add}>
+            <Button variant="secondary" onClick={add} disabled={!mayLoosen} title={mayLoosen ? undefined : ADMIN_TO_ADD_FOLDER}>
               <FolderPlus className="mr-1 h-4 w-4" /> Add folder
             </Button>
           </div>
         )}
+        {!disabled && !mayLoosen && (
+          <p className="mt-1 text-xs text-amber-800" data-admin-only="folders">
+            {ADMIN_TO_ADD_FOLDER}
+          </p>
+        )}
         {!disabled && folder.trim() !== '' && (
           <p className="mt-1 text-xs text-amber-800" data-folder-pending="">
-            Not on the list yet. Add folder puts it there now; Save changes adds it too.
+            {mayLoosen ? 'Not on the list yet. Add folder puts it there now; Save changes adds it too.' : `Not on the list. ${ADMIN_TO_ADD_FOLDER}`}
           </p>
         )}
         <p className="mt-1 text-xs text-navy/50">

@@ -304,11 +304,12 @@ describe('audit trail and transaction log hide what the reader may not view (sec
     };
     walk(path.resolve(process.cwd(), 'lib'));
     walk(path.resolve(process.cwd(), 'app'));
-    // Kinds written through a variable (simple lists, type lists, budgets, Batch Delete, open items).
+    // Kinds written through a variable (simple lists, type lists, budgets, Batch Delete, open items,
+    // standing permission: agentGrants.ts AUDIT_ENTITY).
     for (const k of [
       'other_name', 'job_type', 'payment_terms', 'ship_via', 'payment_method', 'customer_message', 'sales_tax_code', 'vehicle',
       'customer_type', 'vendor_type', 'billing_rate_level', 'uom_set', 'class', 'budget', 'forecast', 'budgetLine',
-      'batch_deleted_txn', 'qb_open_item_document', 'qb_open_item_total',
+      'batch_deleted_txn', 'qb_open_item_document', 'qb_open_item_total', 'agent_grant',
     ]) {
       written.add(k);
     }

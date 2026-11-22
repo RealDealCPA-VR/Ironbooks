@@ -13,11 +13,15 @@
  *    company file when it is saved, so staged files never travel with the books;
  *  - else (a company folder, the browser version) this computer's app data folder for Ironbooks,
  *    never the company's own folder or the folder it sits in, which a person chose.
- * A root inside the company's database folder, or one that holds the database folder, the working
- * folder or the company file, is refused (fail closed), and so is one on a share or a device path.
- * The root carries a marker file (MARKER) once this module made or took it: clearing, which removes
- * empty folders, only ever works in a marked root, and a folder already holding other things is
- * never taken over.
+ * A root inside the company's database folder is refused (fail closed), and so is one that holds
+ * the database folder, the working folder, the folder of every working folder, the company file or
+ * Ironbooks' own local folder; and one on a share or a device path, by its words or as the disk has
+ * it (a link to a share, a mapped drive). Each is judged by the words and, where the folder exists,
+ * as the disk has it (links and short names resolved), and a near match (another case, another
+ * Unicode form) counts: a refusal errs on the side of refusing.
+ * Every folder this module makes (the root, each company's and each agent's) carries a marker file
+ * (MARKER). Clearing only ever looks in, and removes, a folder that carries it: never one that
+ * merely has a name like an id. A root that already holds other things is never taken over.
  *
  * Rules that keep agents apart and the disk safe:
  *  - A file id is 32 lowercase hex characters from crypto.randomBytes. Any other shape is refused
@@ -29,8 +33,11 @@
  *    half a file. An unfinished upload is `<uploadId>.part`, renamed to `<fileId>.bin` at the end.
  *  - One agent keeps at most AGENT_MAX_BYTES and AGENT_MAX_FILES here at once, and at most
  *    UPLOADS_PER_AGENT unfinished uploads, so it cannot fill the disk the books are on.
- *  - Writes for one agent happen one at a time (its lock); making or removing a folder also takes
- *    the root's lock, so a clear never removes a folder a write is about to use.
+ *  - One lock, the root's gate, is taken by every write (shared: agents write side by side) and by
+ *    every clear (alone). A clear waits for the writes already going and the writes asked for after
+ *    it wait for the clear, so it never removes a folder a write is using, and never a file staged
+ *    after it began. Writes for one agent also happen one at a time (its own lock), so parts are
+ *    appended in turn and the limits hold.
  *  - Nothing here logs, and no error passes on a path or a file's content: a disk failure becomes
  *    one plain message (diskTrouble).
  *  - Files and unfinished uploads go after STAGED_FILE_HOURS (clearStagedFiles, also run lazily at
@@ -38,7 +45,11 @@
  *    when the company file closes.
  *
  * allowedFolder is the check behind save_file and the shell's paths: is this folder inside one the
- * Admin allowed for the agent, once links and ".." are resolved.
+ * Admin allowed for the agent, once links and ".." are resolved, compared exactly as the disk spells
+ * the names. A whole drive or share is never an agent's folder, and neither is a share on this very
+ * computer (isThisComputerShare: \\localhost\c$, \\127.1\…, its own name), through which the app's
+ * own folders are there under another name. overlapsAppData is the check other units use before
+ * they let a folder be an agent's at all.
  */
 import { randomBytes } from 'node:crypto';
 import fs, { type Dirent, type Stats } from 'node:fs';
@@ -46,6 +57,7 @@ import fsp, { type FileHandle } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { ServiceError } from '@/lib/services/errors';
+import { endpointDir } from './endpointFile';
 import {
   STAGED_FILE_HOURS,
   UPLOAD_CHUNK_BYTES,
@@ -64,8 +76,8 @@ import {
 export const AGENT_FILES_DIR_ENV = 'BKA_AGENT_FILES_DIR';
 const FOLDER_NAME = 'agent-files';
 /**
- * The file that marks a root as this module's own. Its name is never a company or agent id, so a
- * clear never takes it for one.
+ * The file that marks a folder as this module's own (the root, and each company's and agent's
+ * folder in it). Its name is never a company or agent id, so a clear never takes it for one.
  */
 const MARKER = '.ironbooks-agent-files';
 const MARKER_TEXT = 'Ironbooks keeps files for its agents in this folder, each for a day at most. It is safe to delete while Ironbooks is closed.\n';
@@ -75,10 +87,10 @@ const STAGED_MS = STAGED_FILE_HOURS * HOUR_MS;
 /** Unfinished uploads one agent may have at once. */
 const UPLOADS_PER_AGENT = 5;
 /** Most one agent may keep here at once, staged files and unfinished uploads together (500 MB). */
-const AGENT_MAX_BYTES = 10 * UPLOAD_MAX_BYTES;
+export const AGENT_MAX_BYTES = 10 * UPLOAD_MAX_BYTES;
 /** Most files one agent may keep here at once; also keeps the look through its folder short. */
-const AGENT_MAX_FILES = 1000;
-/** Longest name kept for a staged file, in characters, extension included. */
+export const AGENT_MAX_FILES = 1000;
+/** Longest name kept for a staged file, in characters, extension and any "_" in front included. */
 const NAME_MAX = 120;
 const FALLBACK_NAME = 'file';
 const FALLBACK_TYPE = 'application/octet-stream';
@@ -103,9 +115,122 @@ interface Meta {
   created: string;
 }
 
+/** A root's gate: writes share it, a clear has it alone; first come, first served. */
+interface Gate {
+  readers: number;
+  writer: boolean;
+  queue: Array<{ alone: boolean; go: () => void }>;
+}
+
 // Process-wide, like the open databases (Next.js loads a module once per route bundle in dev).
-const g = globalThis as typeof globalThis & { __bkaAgentFiles?: { clearedAt: number; locks: Map<string, Promise<void>> } };
-const state = (g.__bkaAgentFiles ??= { clearedAt: 0, locks: new Map() });
+interface FilesState {
+  clearedAt: number;
+  locks: Map<string, Promise<void>>;
+  /** Missing in a state an older copy of this module made (a reload in development). */
+  gates?: Map<string, Gate>;
+}
+const g = globalThis as typeof globalThis & { __bkaAgentFiles?: FilesState };
+const state: FilesState = (g.__bkaAgentFiles ??= { clearedAt: 0, locks: new Map() });
+const gates: Map<string, Gate> = (state.gates ??= new Map());
+
+// ---------------------------------------------------------------------------
+// Comparing paths
+// ---------------------------------------------------------------------------
+
+/**
+ * A name as Windows compares names (electron/agentShell.js windowsFold): each character in upper
+ * case when that is still one character, as NTFS does, character by character. Not lower case:
+ * "K" (the Kelvin sign) lowers to "k" but is a name of its own on the disk.
+ */
+function windowsFold(s: string): string {
+  let out = '';
+  for (const ch of s) {
+    const up = ch.toUpperCase();
+    out += Array.from(up).length === 1 ? up : ch;
+  }
+  return out;
+}
+
+/** `child` is `parent` or inside it, both spelled the same way. */
+function withinAsWritten(child: string, parent: string): boolean {
+  if (child === parent) return true;
+  return child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
+}
+
+/**
+ * For a refusal only: `child` may be `parent` or inside it, as written, as Windows folds case, or
+ * without case and Unicode form at all (macOS folds both). A near match counts, so a refusal never
+ * misses a place over a spelling. Never used to allow anything.
+ */
+function mayBeWithin(child: string, parent: string): boolean {
+  const loose = (p: string) => p.normalize('NFC').toLowerCase();
+  return withinAsWritten(child, parent) || withinAsWritten(windowsFold(child), windowsFold(parent)) || withinAsWritten(loose(child), loose(parent));
+}
+
+/** For a refusal only: one of the two may be, hold or lie inside the other. */
+function mayOverlap(a: string, b: string): boolean {
+  return mayBeWithin(a, b) || mayBeWithin(b, a);
+}
+
+/**
+ * To allow: `child` is `parent` or inside it, both real paths from the disk (realpath spells every
+ * name as the disk does), compared exactly: a sibling "IronbooKs" (with the Kelvin sign) is not
+ * "Ironbooks". Only the drive or share in front is compared the way Windows compares names
+ * (per character in upper case), since the system answers it as typed.
+ */
+function realWithin(child: string, parent: string): boolean {
+  const split = (p: string) => {
+    const root = path.parse(p).root;
+    return { root: WIN ? windowsFold(root) : root, rest: p.slice(root.length).replace(/[\\/]+$/, '') };
+  };
+  const c = split(child);
+  const p = split(parent);
+  if (c.root !== p.root) return false;
+  if (!p.rest) return true;
+  return c.rest === p.rest || c.rest.startsWith(p.rest + path.sep);
+}
+
+function errCode(err: unknown): string {
+  return String((err as { code?: unknown } | null)?.code ?? '');
+}
+
+/**
+ * `p` as the disk has it: the real path of its nearest part that exists (every link followed,
+ * every name spelled as the disk spells it, short names expanded), with the parts below it that do
+ * not exist yet as written. Null when the disk will not say. A share or device path is never looked
+ * at here: merely looking makes Windows offer the person's sign-in to that computer.
+ */
+function onDiskSync(p: string): string | null {
+  if (isDevicePath(p) || uncShare(p) !== null) return null;
+  const below: string[] = [];
+  let current = p;
+  for (let i = 0; i < 512; i++) {
+    try {
+      fs.lstatSync(current);
+    } catch (err) {
+      // Only "not there" lets the look go up a level; anything else (no access) is unknown.
+      if (errCode(err) !== 'ENOENT' && errCode(err) !== 'ENOTDIR') return null;
+      const parent = path.dirname(current);
+      if (parent === current) return null;
+      below.push(path.basename(current));
+      current = parent;
+      continue;
+    }
+    try {
+      return path.join(fs.realpathSync.native(current), ...below.reverse());
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** A place as written (made absolute) and, where the disk says, as it really is. */
+function placeForms(p: string): string[] {
+  const written = path.resolve(p);
+  const real = onDiskSync(written);
+  return real && real !== written ? [written, real] : [written];
+}
 
 // ---------------------------------------------------------------------------
 // Where the files are
@@ -115,6 +240,17 @@ const state = (g.__bkaAgentFiles ??= { clearedAt: 0, locks: new Map() });
 function companyDataDir(): string {
   if (process.env.BKA_DATA_DIR) return path.resolve(process.env.BKA_DATA_DIR);
   return path.resolve(process.cwd(), '.bookkeeper-data', 'default');
+}
+
+/** The open company file's working folder (the folder of BKA_COMPANY_STATE), or null. */
+function workingFolder(): string | null {
+  const stateFile = process.env.BKA_COMPANY_STATE?.trim();
+  return stateFile ? path.dirname(path.resolve(stateFile)) : null;
+}
+
+function companyFile(): string | null {
+  const file = process.env.BKA_COMPANY_FILE?.trim();
+  return file ? path.resolve(file) : null;
 }
 
 /** This computer's app data folder for Ironbooks (as lib/agent/endpointFile.ts finds its own). */
@@ -137,25 +273,31 @@ function overrideRoot(): string | null {
   return dir ? path.resolve(dir) : null;
 }
 
+function keptElsewhere(): ServiceError {
+  return new ServiceError('INTERNAL', 'Ironbooks is set up to keep agent files on another computer, which it never does. Ask a person to check how Ironbooks was started.');
+}
+
 /** The folder all staged files live under (see the module comment). Throws when it is refused. */
 function stagingRoot(): string {
-  const stateFile = process.env.BKA_COMPANY_STATE?.trim();
-  const workDir = stateFile ? path.dirname(path.resolve(stateFile)) : null;
+  const workDir = workingFolder();
   const root = overrideRoot() ?? (workDir ? path.join(workDir, FOLDER_NAME) : appDataRoot());
-  // Staged files stay on this computer: never on a network share or a device path.
-  if (isDevicePath(root) || uncShare(root) !== null) {
-    throw new ServiceError('INTERNAL', 'Ironbooks is set up to keep agent files on another computer, which it never does. Ask a person to check how Ironbooks was started.');
-  }
+  // Staged files stay on this computer: never on a network share or a device path. Said by the
+  // words first, before the disk is looked at (looking at a share offers it the person's sign-in).
+  if (isDevicePath(root) || uncShare(root) !== null) throw keptElsewhere();
+  const roots = placeForms(root);
+  // Then as the disk has it: a local-looking folder may be a link to a share, or on a mapped drive
+  // (the system answers both as \\server\share\…).
+  if (roots.some((r) => isDevicePath(r) || uncShare(r) !== null)) throw keptElsewhere();
   // Never inside the database folder, and never a folder that holds the books (the database
-  // folder, the open file's working folder, the company file): clearing removes empty folders,
-  // and the database has empty folders of its own.
+  // folder, the open file's working folder and the folder of them all, the company file) or
+  // Ironbooks' own local folder: they keep things of their own, empty folders included.
   const dataDir = companyDataDir();
-  const companyFile = process.env.BKA_COMPANY_FILE?.trim();
-  const books = [dataDir, workDir, companyFile ? path.resolve(companyFile) : null].filter((p): p is string => !!p);
-  if (within(root, dataDir) || books.some((b) => within(b, root))) {
+  const held = [dataDir, workDir, workDir ? path.dirname(workDir) : null, companyFile(), path.dirname(appDataRoot())].filter((p): p is string => !!p);
+  const inside = placeForms(dataDir).some((d) => roots.some((r) => mayBeWithin(r, d)));
+  if (inside || held.some((h) => placeForms(h).some((hf) => roots.some((r) => mayBeWithin(hf, r))))) {
     throw new ServiceError(
       'INTERNAL',
-      'Ironbooks is set up to keep agent files inside the company file, or in a folder that holds it, which it never does. Ask a person to check how Ironbooks was started.',
+      "Ironbooks is set up to keep agent files inside the company's data, or in a folder that holds the company file or Ironbooks' own folders, which it never does. Ask a person to check how Ironbooks was started.",
     );
   }
   return root;
@@ -165,7 +307,7 @@ function stagingRoot(): string {
  * Where staged files are kept on this computer (the folder may not exist yet), or null when the
  * setup is refused and nothing is kept at all. Nothing is made here. For the folder rules of other
  * units: a folder an agent may use must never hold this one or lie inside it, or the agent's own
- * file access would reach other agents' staged files.
+ * file access would reach other agents' staged files (overlapsAppData says so for every such place).
  */
 export function stagedFilesRoot(): string | null {
   try {
@@ -175,27 +317,123 @@ export function stagedFilesRoot(): string | null {
   }
 }
 
-function segment(id: unknown): string | null {
-  return typeof id === 'string' && SEGMENT_RE.test(id) ? id.toLowerCase() : null;
+/**
+ * The names the desktop app's settings folder has had (electron/main.js useLegacyUserDataIfPresent):
+ * the product name, the package name a development run uses, and the two from before the rename.
+ * lib/services/agentPolicies.ts and mcp/files-tools.mjs list the same four.
+ */
+const SETTINGS_FOLDER_NAMES = ['Ironbooks', 'ironbooks', 'BookKeeper AI', 'bookkeeper-ai'];
+
+/** A path the server was started with (an environment value), made absolute; null when not set. */
+function envPlace(name: string): string | null {
+  const v = process.env[name]?.trim();
+  return v ? path.resolve(v) : null;
 }
 
-/** The owner's own folder, or null when the owner is not a plain company and agent id. */
-function ownerDirOrNull(owner: FileOwner): string | null {
+/**
+ * Every place on this computer where agents' staged files or Ironbooks' own data may be, as far as
+ * this server can tell. The folders may not exist. Nothing is made or looked at here.
+ *  - each staging root this module may use (the open file's, this computer's app data one, the
+ *    test override), and Ironbooks' own local folder that holds the app data one (on Windows
+ *    %LOCALAPPDATA%\Ironbooks: the working copies of company files in plain form, sandboxes, the
+ *    agent connection files);
+ *  - the folder of every company file's working folder (each keeps its own staged files);
+ *  - the open company's database folder, working folder and company file, the backups beside the
+ *    database folder (backups, pre-op-backups, archives: whole copies of the books) and the
+ *    archives beside the company file; while a sandbox is open, the real company's as well;
+ *  - the desktop app's settings folder under every name it has had (Windows %APPDATA%\Ironbooks:
+ *    config.json, the sealed device secret, the TLS keys, the quit-time backups, the companies\
+ *    folders of company-folder mode), or the one IRONBOOKS_USER_DATA names; ~/.ironbooks, where
+ *    working copies go when the shell names no settings folder;
+ *  - the folders the shell named for backups and sandboxes (BKA_BACKUP_DIR, BKA_SANDBOX_ROOT), and
+ *    the agent connection files' folder (lib/agent/endpointFile.ts endpointDir, overridden or not).
+ * Backup folders a person chose are the folder rules' own concern (lib/services/agentPolicies.ts
+ * reads them with the books' settings).
+ */
+export function appDataPlaces(): string[] {
+  const env = process.env;
+  const home = os.homedir();
+  const out: Array<string | null> = [appDataRoot(), path.dirname(appDataRoot())];
+  out.push(overrideRoot());
+  const workDir = workingFolder();
+  if (workDir) out.push(path.join(workDir, FOLDER_NAME), workDir, path.dirname(workDir));
+  // The books, and the copies of them Ironbooks writes beside them (lib/services/backupHistory.ts
+  // defaultBackupFolder and preOpFolder, lib/services/condense.ts condenseArchiveDir).
+  for (const dataDir of [companyDataDir(), envPlace('BKA_SANDBOX_REAL_DIR')]) {
+    if (!dataDir) continue;
+    out.push(dataDir, ...['backups', 'pre-op-backups', 'archives'].map((n) => path.join(path.dirname(dataDir), n)));
+  }
+  for (const file of [companyFile(), envPlace('BKA_REAL_COMPANY_FILE')]) {
+    if (file) out.push(file, path.join(path.dirname(file), 'archives'));
+  }
+  // The desktop app's settings folder (electron/main.js userData), as Electron names it
+  // (app.getPath('appData') joined with the app's name), and the one the shell may be told to use.
+  const settingsParent = WIN
+    ? env.APPDATA || path.join(home, 'AppData', 'Roaming')
+    : process.platform === 'darwin'
+      ? path.join(home, 'Library', 'Application Support')
+      : env.XDG_CONFIG_HOME || path.join(home, '.config');
+  for (const name of SETTINGS_FOLDER_NAMES) out.push(path.join(settingsParent, name));
+  out.push(envPlace('IRONBOOKS_USER_DATA'), path.join(home, '.ironbooks'));
+  out.push(envPlace('BKA_BACKUP_DIR'), envPlace('BKA_SANDBOX_ROOT'));
+  try {
+    out.push(endpointDir());
+  } catch {
+    /* the usual place is in Ironbooks' own local folder, listed above */
+  }
+  return [...new Set(out.filter((p): p is string => !!p).map((p) => path.resolve(p)))];
+}
+
+/**
+ * Whether `folder` is, lies inside, or holds one of appDataPlaces: then it is never a folder an
+ * agent may use, or its file access would reach the books, Ironbooks' own state or other agents'
+ * staged files. Judged by the words and, where the folders exist, as the disk has them (links and
+ * short names resolved); a near match (another case, another Unicode form) counts. True as well when
+ * `folder` is no full path, or a device path, or a share on this very computer (isThisComputerShare:
+ * the app's own folders are there under another name), by its words or as the disk has it (a mapped
+ * drive): fail closed. A share is judged by the words alone and never looked at.
+ */
+export function overlapsAppData(folder: string): boolean {
+  if (typeof folder !== 'string') return true;
+  const typed = folder.trim();
+  if (!typed || typed.length > PATH_MAX || /[\p{Cc}]/u.test(typed) || isDevicePath(typed) || !path.isAbsolute(typed)) return true;
+  if (isThisComputerShare(typed)) return true;
+  try {
+    const mine = placeForms(typed);
+    if (mine.some(isThisComputerShare)) return true;
+    return appDataPlaces().some((place) => placeForms(place).some((p) => mine.some((m) => mayOverlap(m, p))));
+  } catch {
+    return true;
+  }
+}
+
+/** The company and agent ids as folder names, or null when the owner is not a plain pair of ids. */
+function ownerSegments(owner: FileOwner): [string, string] | null {
+  const segment = (id: unknown) => (typeof id === 'string' && SEGMENT_RE.test(id) ? id.toLowerCase() : null);
   const company = segment(owner?.companyId);
   const agent = segment(owner?.agentId);
-  if (!company || !agent) return null;
+  return company && agent ? [company, agent] : null;
+}
+
+/** The owner's own folder, or null when the owner is not a plain company and agent id or nothing is kept. */
+function ownerDirOrNull(owner: FileOwner): string | null {
+  const ids = ownerSegments(owner);
+  if (!ids) return null;
   try {
-    return path.join(stagingRoot(), company, agent);
+    return path.join(stagingRoot(), ...ids);
   } catch {
     return null;
   }
 }
 
+function notForAnAgent(): ServiceError {
+  return new ServiceError('FORBIDDEN', 'Ironbooks could not tell which agent this file is for, so it was not kept.');
+}
+
 function ownerDir(owner: FileOwner): string {
-  const company = segment(owner?.companyId);
-  const agent = segment(owner?.agentId);
-  if (!company || !agent) throw new ServiceError('FORBIDDEN', 'Ironbooks could not tell which agent this file is for, so it was not kept.');
-  return path.join(stagingRoot(), company, agent);
+  const ids = ownerSegments(owner);
+  if (!ids) throw notForAnAgent();
+  return path.join(stagingRoot(), ...ids);
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +454,9 @@ const EXTENSION = /\.[A-Za-z0-9]{1,16}$/;
 
 /**
  * A name safe to show and to save under later (lib/effects.ts checkFile accepts it): the last part
- * of a path only, no control or direction-mark characters, nothing Windows refuses, no device
- * name, no trailing dot or space, at most NAME_MAX characters with the extension kept.
+ * of a path only, no control or direction-mark characters and no half of a character pair, nothing
+ * Windows refuses, no device name, no trailing dot or space, at most NAME_MAX characters with the
+ * extension kept and the "_" a device name gets in front counted.
  */
 function cleanName(raw: unknown): string {
   let name = typeof raw === 'string' ? raw.normalize('NFC') : '';
@@ -270,7 +509,8 @@ function tooManyUploads(): ServiceError {
 function agentFull(): ServiceError {
   return new ServiceError(
     'VALIDATION',
-    `This agent already keeps as much here as one agent may at once (${AGENT_MAX_BYTES / MB} MB, or ${AGENT_MAX_FILES} files). Each file is cleared a day after it was made: work with the files it already has, or try again later.`,
+    `This agent already keeps as much here as one agent may at once (${AGENT_MAX_BYTES / MB} MB, or ${AGENT_MAX_FILES} files). ` +
+      'Work with the files it already has and wait for older ones to be cleared (each goes a day after it was made), or ask a person for help.',
   );
 }
 
@@ -296,12 +536,78 @@ async function onDisk<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-function errCode(err: unknown): string {
-  return String((err as { code?: unknown } | null)?.code ?? '');
-}
-
 function newId(): string {
   return randomBytes(16).toString('hex');
+}
+
+// ---------------------------------------------------------------------------
+// Locks
+// ---------------------------------------------------------------------------
+
+function lockKey(key: string): string {
+  return WIN ? windowsFold(key) : key;
+}
+
+/**
+ * The root's gate, the one lock every write and every clear takes: writes share it (`alone`
+ * false), a clear has it alone. First come, first served: a write asked for after a clear waits
+ * for that clear, and a clear waits for the writes already going. Not re-entrant: a clear is never
+ * started while the gate is held.
+ */
+async function withGate<T>(root: string, alone: boolean, fn: () => Promise<T>): Promise<T> {
+  const k = lockKey(root);
+  let gate = gates.get(k);
+  if (!gate) gates.set(k, (gate = { readers: 0, writer: false, queue: [] }));
+  const gt = gate;
+  // Joins the queue at once (in the caller's own turn), so the order of asking is the order served.
+  await new Promise<void>((go) => {
+    gt.queue.push({ alone, go });
+    letIn(gt);
+  });
+  try {
+    return await fn();
+  } finally {
+    if (alone) gt.writer = false;
+    else gt.readers--;
+    letIn(gt);
+    if (!gt.writer && !gt.readers && !gt.queue.length && gates.get(k) === gt) gates.delete(k);
+  }
+}
+
+function letIn(gt: Gate): void {
+  while (gt.queue.length && !gt.writer) {
+    const next = gt.queue[0];
+    if (next.alone && gt.readers) return;
+    gt.queue.shift();
+    if (next.alone) gt.writer = true;
+    else gt.readers++;
+    next.go();
+  }
+}
+
+/**
+ * One at a time per key: an agent's writes (its folder), and the marking of a new root. Taken
+ * inside the gate, never around it. Not re-entrant: never take the same key twice.
+ */
+async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const k = lockKey(key);
+  const prev = state.locks.get(k) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((r) => (release = r));
+  const chained = prev.then(() => mine);
+  state.locks.set(k, chained);
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    release();
+    if (state.locks.get(k) === chained) state.locks.delete(k);
+  }
+}
+
+/** A write for the owner folder `dir`: in the root's gate (shared), then under the owner's lock. */
+function asWrite<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  return withGate(rootOf(dir), false, () => withLock(dir, () => onDisk(fn)));
 }
 
 // ---------------------------------------------------------------------------
@@ -313,43 +619,47 @@ function rootOf(dir: string): string {
   return path.dirname(path.dirname(dir));
 }
 
-/** The root carries the marker: this module made it, or took it over while it was empty. */
-async function ownRoot(root: string): Promise<boolean> {
+/** The folder carries the marker: this module made it, or took it over while it was empty. */
+async function marked(dir: string): Promise<boolean> {
   try {
-    return (await fsp.lstat(path.join(root, MARKER))).isFile();
+    return (await fsp.lstat(path.join(dir, MARKER))).isFile();
   } catch {
     return false;
   }
 }
 
-/** Make the root when it is missing, and mark it. A folder that already holds other things is refused. Under the root's lock. */
-async function claimRoot(root: string): Promise<void> {
-  if (await ownRoot(root)) return;
-  await fsp.mkdir(root, { recursive: true, mode: DIR_MODE });
-  if ((await fsp.readdir(root)).length) throw notOurFolder();
+async function mark(dir: string): Promise<void> {
   try {
-    await fsp.writeFile(path.join(root, MARKER), MARKER_TEXT, { flag: 'wx', mode: FILE_MODE });
+    await fsp.writeFile(path.join(dir, MARKER), MARKER_TEXT, { flag: 'wx', mode: FILE_MODE });
   } catch (err) {
     if (errCode(err) !== 'EEXIST') throw err;
   }
 }
 
+/** Make the root when it is missing, and mark it. A folder that already holds other things is refused. */
+async function claimRoot(root: string): Promise<void> {
+  if (await marked(root)) return;
+  await fsp.mkdir(root, { recursive: true, mode: DIR_MODE });
+  if ((await fsp.readdir(root)).length) throw notOurFolder();
+  await mark(root);
+}
+
 /**
- * Make the owner's folder, in a marked root. The caller holds the owner's lock and this takes the
- * root's: a clear removes an empty folder only under both, so it never takes the folder away
- * between its making and the first file in it. Lock order is always owner, then root.
+ * Make the owner's folder in a marked root, and mark it and its company's folder: a clear only
+ * ever removes a marked folder. In the gate (so no clear runs meanwhile) and under the owner's
+ * lock; marking a new root takes a lock of its own, as two agents may start at the same time.
  */
 async function ownerReady(dir: string): Promise<void> {
   const root = rootOf(dir);
-  await withLock(root, async () => {
-    await claimRoot(root);
-    await fsp.mkdir(dir, { recursive: true, mode: DIR_MODE });
-  });
+  await withLock(`${root}${path.sep}${MARKER}`, () => claimRoot(root));
+  await fsp.mkdir(dir, { recursive: true, mode: DIR_MODE });
+  await mark(path.dirname(dir));
+  await mark(dir);
 }
 
 /**
  * Write `final` so it appears whole or not at all: a temporary file next to it, renamed into place.
- * The folder is made again when it went meanwhile (a person removed it). Under the owner's lock.
+ * The folder is made again when it went meanwhile (a person removed it). A write (asWrite).
  */
 async function writeAtomic(dir: string, final: string, data: Uint8Array | string): Promise<void> {
   const tmp = `${final}.${randomBytes(6).toString('hex')}.tmp`;
@@ -372,6 +682,7 @@ async function writeMeta(dir: string, fileId: string, meta: Meta): Promise<void>
   await writeAtomic(dir, path.join(dir, `${fileId}.json`), JSON.stringify(meta));
 }
 
+/** What a .json says, its name and type cleaned again (a hand-edited one cannot pass on another). */
 function parseMeta(text: string): Meta | null {
   try {
     const m = JSON.parse(text) as Partial<Meta> | null;
@@ -385,7 +696,7 @@ function parseMeta(text: string): Meta | null {
       typeof m.created === 'string' &&
       !Number.isNaN(Date.parse(m.created))
     ) {
-      return { name: m.name, type: m.type, size: m.size, created: m.created };
+      return { name: cleanName(m.name), type: cleanType(m.type), size: m.size, created: m.created };
     }
   } catch {
     /* not ours, or damaged: treated as no file */
@@ -400,30 +711,9 @@ function bornAt(meta: Meta | null, ...mtimes: number[]): number {
 }
 
 /**
- * One write or clear at a time per agent folder, so parts are appended in turn and the limits
- * hold; the root's lock guards making and removing folders. Not re-entrant: never take the same
- * key twice, and never an owner's lock while holding the root's.
- */
-async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const k = WIN ? key.toLowerCase() : key;
-  const prev = state.locks.get(k) ?? Promise.resolve();
-  let release!: () => void;
-  const mine = new Promise<void>((r) => (release = r));
-  const chained = prev.then(() => mine);
-  state.locks.set(k, chained);
-  try {
-    await prev;
-    return await fn();
-  } finally {
-    release();
-    if (state.locks.get(k) === chained) state.locks.delete(k);
-  }
-}
-
-/**
  * Clear old files now and then (at most once an hour), from the calls here that take a file id or
  * add a file, so files of a crash are not kept long by a busy agent. Never fails the call. Called
- * outside every lock (a clear takes them all in turn).
+ * outside the gate (a clear takes it alone).
  */
 async function clearNowAndThen(): Promise<void> {
   const now = Date.now();
@@ -477,7 +767,7 @@ async function checkRoom(dir: string, add: { bytes: number; file: boolean; uploa
 
 /**
  * Keep `bytes` as a new staged file in `dir`. The .bin goes first: a .json always has its bytes.
- * Under the owner's lock, after checkRoom.
+ * A write (asWrite), after checkRoom.
  */
 async function writeStaged(dir: string, name: string, type: string, bytes: Uint8Array): Promise<StagedFile> {
   const fileId = newId();
@@ -528,12 +818,10 @@ export const stageFile: StageFile = async (owner, file) => {
   const type = cleanType(file.type);
   const bytes = file.bytes;
   await clearNowAndThen();
-  return withLock(dir, () =>
-    onDisk(async () => {
-      await checkRoom(dir, { bytes: bytes.byteLength, file: true, upload: false });
-      return writeStaged(dir, name, type, bytes);
-    }),
-  );
+  return asWrite(dir, async () => {
+    await checkRoom(dir, { bytes: bytes.byteLength, file: true, upload: false });
+    return writeStaged(dir, name, type, bytes);
+  });
 };
 
 /** A plain file id and owner: only then is the disk looked at, the lazy clear included. */
@@ -587,114 +875,141 @@ function decodeChunk(raw: unknown): Buffer {
 }
 
 export const uploadChunk: UploadChunk = async (owner, part) => {
-  const dir = ownerDir(owner);
+  if (!ownerSegments(owner)) throw notForAnAgent();
   if (!part || typeof part !== 'object') throw new ServiceError('VALIDATION', 'Send the upload part with its name, type, chunkBase64 and last.');
   const given = part.uploadId === undefined || part.uploadId === null || part.uploadId === '' ? null : part.uploadId;
-  // A malformed id is refused like an unknown one, before anything is read from the disk.
-  if (given !== null && (typeof given !== 'string' || !ID_RE.test(given))) throw unknownUpload();
+  // A malformed id is refused like an unknown one, and a malformed part too, before the disk is looked at.
+  if (given !== null && !validId(given)) throw unknownUpload();
   const bytes = decodeChunk(part.chunkBase64);
   const last = part.last === true;
+  const dir = ownerDir(owner);
   await clearNowAndThen();
 
-  return withLock(dir, () =>
-    onDisk(async () => {
-      if (given === null) {
-        const uploadId = newId();
-        // All in one part needs no place among the unfinished uploads.
-        await checkRoom(dir, { bytes: bytes.byteLength, file: true, upload: !last });
-        // All in one part: kept at once, nothing unfinished left behind.
-        if (last) return { uploadId, received: bytes.byteLength, file: await writeStaged(dir, cleanName(part.name), cleanType(part.type), bytes) };
-        await ownerReady(dir);
-        const p = path.join(dir, `${uploadId}.part`);
-        try {
-          await fsp.writeFile(p, bytes, { flag: 'wx', mode: FILE_MODE });
-        } catch (err) {
-          await fsp.rm(p, { force: true }).catch(() => undefined);
-          throw err;
-        }
-        return { uploadId, received: bytes.byteLength, file: null };
-      }
-
-      const uploadId = given;
+  return asWrite(dir, async () => {
+    if (given === null) {
+      const uploadId = newId();
+      // All in one part needs no place among the unfinished uploads.
+      await checkRoom(dir, { bytes: bytes.byteLength, file: true, upload: !last });
+      // All in one part: kept at once, nothing unfinished left behind.
+      if (last) return { uploadId, received: bytes.byteLength, file: await writeStaged(dir, cleanName(part.name), cleanType(part.type), bytes) };
+      await ownerReady(dir);
       const p = path.join(dir, `${uploadId}.part`);
-      // 'r+': the part must already be there. A part cleared meanwhile is never made again from a later piece.
-      let handle: FileHandle;
       try {
-        handle = await fsp.open(p, 'r+');
+        await fsp.writeFile(p, bytes, { flag: 'wx', mode: FILE_MODE });
       } catch (err) {
-        if (errCode(err) === 'ENOENT' || errCode(err) === 'EISDIR') throw unknownUpload();
+        await fsp.rm(p, { force: true }).catch(() => undefined);
         throw err;
       }
-      let received: number;
-      try {
-        const st = await handle.stat();
-        if (!st.isFile()) throw unknownUpload();
-        if (Date.now() - st.mtimeMs > STAGED_MS) {
-          await handle.close();
-          await fsp.rm(p, { force: true });
-          throw unknownUpload();
-        }
-        if (st.size + bytes.byteLength > UPLOAD_MAX_BYTES) {
-          // It can never be finished: stop it, so it does not hold one of the agent's places.
-          await handle.close();
-          await fsp.rm(p, { force: true });
-          throw new ServiceError(
-            'VALIDATION',
-            `The upload was stopped: its parts come to more than ${UPLOAD_MAX_BYTES / MB} MB, the most a file can be here. Send a smaller file, or split it into several.`,
-          );
-        }
-        // The part already on the disk counts in the usage; only the new bytes are added.
-        await checkRoom(dir, { bytes: bytes.byteLength, file: false, upload: false });
-        try {
-          if (bytes.byteLength) await handle.write(bytes, 0, bytes.byteLength, st.size);
-        } catch (err) {
-          // Leave the upload as it was before this part, so the agent can send the part again.
-          await handle.truncate(st.size).catch(() => undefined);
-          throw err;
-        }
-        received = st.size + bytes.byteLength;
-      } finally {
-        await handle.close().catch(() => undefined);
-      }
-      if (!last) return { uploadId, received, file: null };
+      return { uploadId, received: bytes.byteLength, file: null };
+    }
 
-      const name = cleanName(part.name);
-      const type = cleanType(part.type);
-      const fileId = newId();
-      const bin = path.join(dir, `${fileId}.bin`);
+    const uploadId = given;
+    const p = path.join(dir, `${uploadId}.part`);
+    // 'r+': the part must already be there. A part cleared meanwhile is never made again from a later piece.
+    let handle: FileHandle;
+    try {
+      handle = await fsp.open(p, 'r+');
+    } catch (err) {
+      if (errCode(err) === 'ENOENT' || errCode(err) === 'EISDIR') throw unknownUpload();
+      throw err;
+    }
+    let received: number;
+    try {
+      const st = await handle.stat();
+      if (!st.isFile()) throw unknownUpload();
+      if (Date.now() - st.mtimeMs > STAGED_MS) {
+        await handle.close();
+        await fsp.rm(p, { force: true });
+        throw unknownUpload();
+      }
+      if (st.size + bytes.byteLength > UPLOAD_MAX_BYTES) {
+        // It can never be finished: stop it, so it does not hold one of the agent's places.
+        await handle.close();
+        await fsp.rm(p, { force: true });
+        throw new ServiceError(
+          'VALIDATION',
+          `The upload was stopped: its parts come to more than ${UPLOAD_MAX_BYTES / MB} MB, the most a file can be here. Send a smaller file, or split it into several.`,
+        );
+      }
+      // The part already on the disk counts in the usage; only the new bytes are added.
+      await checkRoom(dir, { bytes: bytes.byteLength, file: false, upload: false });
       try {
-        await fsp.rename(p, bin);
+        if (bytes.byteLength) await handle.write(bytes, 0, bytes.byteLength, st.size);
       } catch (err) {
-        if (errCode(err) === 'ENOENT') throw unknownUpload();
+        // Leave the upload as it was before this part, so the agent can send the part again.
+        await handle.truncate(st.size).catch(() => undefined);
         throw err;
       }
-      try {
-        await writeMeta(dir, fileId, { name, type, size: received, created: new Date().toISOString() });
-      } catch (err) {
-        await fsp.rm(bin, { force: true }).catch(() => undefined);
-        throw err;
-      }
-      return { uploadId, received, file: { fileId, name, type, size: received } };
-    }),
-  );
+      received = st.size + bytes.byteLength;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+    if (!last) return { uploadId, received, file: null };
+
+    const name = cleanName(part.name);
+    const type = cleanType(part.type);
+    const fileId = newId();
+    const bin = path.join(dir, `${fileId}.bin`);
+    try {
+      await fsp.rename(p, bin);
+    } catch (err) {
+      if (errCode(err) === 'ENOENT') throw unknownUpload();
+      throw err;
+    }
+    try {
+      await writeMeta(dir, fileId, { name, type, size: received, created: new Date().toISOString() });
+    } catch (err) {
+      await fsp.rm(bin, { force: true }).catch(() => undefined);
+      throw err;
+    }
+    return { uploadId, received, file: { fileId, name, type, size: received } };
+  });
 };
 
 // ---------------------------------------------------------------------------
 // Clearing
 // ---------------------------------------------------------------------------
 
-/** Sub-folders named like a company or agent id; links are never followed. */
-async function idFolders(dir: string): Promise<string[]> {
+/** Sub-folders this module made: named like a company or agent id, and marked. Links are never followed. */
+async function ourFolders(dir: string): Promise<string[]> {
+  let entries: Dirent[];
   try {
-    const entries = await fsp.readdir(dir, { withFileTypes: true });
-    return entries.filter((e) => e.isDirectory() && SEGMENT_RE.test(e.name)).map((e) => path.join(dir, e.name));
+    entries = await fsp.readdir(dir, { withFileTypes: true });
   } catch {
     return [];
   }
+  const out: string[] = [];
+  for (const e of entries) {
+    if (!e.isDirectory() || !SEGMENT_RE.test(e.name)) continue;
+    const sub = path.join(dir, e.name);
+    if (await marked(sub)) out.push(sub);
+  }
+  return out;
 }
 
-async function removeIfEmpty(dir: string): Promise<void> {
-  await fsp.rmdir(dir).catch(() => undefined);
+/**
+ * A folder this module made goes when nothing but its marker is left. The marker comes back when
+ * the folder stays after all (something else was put in it meanwhile).
+ */
+async function removeIfOnlyMarker(dir: string): Promise<void> {
+  let names: string[];
+  try {
+    names = await fsp.readdir(dir);
+  } catch {
+    return;
+  }
+  if (names.length !== 1 || names[0] !== MARKER || !(await marked(dir))) return;
+  const marker = path.join(dir, MARKER);
+  try {
+    await fsp.rm(marker, { force: true });
+  } catch {
+    return;
+  }
+  try {
+    await fsp.rmdir(dir);
+  } catch {
+    await fsp.writeFile(marker, MARKER_TEXT, { flag: 'wx', mode: FILE_MODE }).catch(() => undefined);
+  }
 }
 
 /** Clear one agent's folder. Only names this module makes are touched. Returns staged files and uploads removed. */
@@ -739,7 +1054,6 @@ async function clearOwner(dir: string, all: boolean, cutoff: number): Promise<nu
     let meta: Meta | null = null;
     if (s.json) meta = parseMeta(await fsp.readFile(s.json, 'utf8').catch(() => ''));
     const born = bornAt(meta, binTime, jsonTime);
-    // A .bin whose .json is still being written is young: left alone unless everything goes.
     if (!old(born)) continue;
     await Promise.all([s.bin, s.json].filter((p): p is string => !!p).map((p) => fsp.rm(p, { force: true }).catch(() => undefined)));
     removed++;
@@ -755,50 +1069,29 @@ async function clearOwner(dir: string, all: boolean, cutoff: number): Promise<nu
   return removed;
 }
 
-/** The root goes when nothing but its marker is left. The marker comes back when the folder stays after all. */
-async function removeRootIfEmpty(root: string): Promise<void> {
-  let names: string[];
-  try {
-    names = await fsp.readdir(root);
-  } catch {
-    return;
-  }
-  if (names.length !== 1 || names[0] !== MARKER) return;
-  const marker = path.join(root, MARKER);
-  try {
-    await fsp.rm(marker, { force: true });
-  } catch {
-    return;
-  }
-  try {
-    await fsp.rmdir(root);
-  } catch {
-    await fsp.writeFile(marker, MARKER_TEXT, { flag: 'wx', mode: FILE_MODE }).catch(() => undefined);
-  }
-}
-
 export const clearStagedFiles: ClearStagedFiles = async (opts) => {
   const all = opts?.all === true;
   const root = stagingRoot();
-  // Only a root this module made is ever cleared: a folder without the marker may be anyone's,
-  // and its empty folders may matter to them.
-  if (!(await ownRoot(root))) return 0;
-  const cutoff = Date.now() - STAGED_MS;
-  let removed = 0;
-  for (const company of await idFolders(root)) {
-    for (const agent of await idFolders(company)) {
-      removed += await withLock(agent, async () => {
-        const n = await clearOwner(agent, all, cutoff);
-        await withLock(root, () => removeIfEmpty(agent));
-        return n;
-      });
+  // Alone in the gate, asked for in this same turn: the writes already going finish first, and
+  // the ones asked for after this wait for it, so it never takes a file staged after it began.
+  return withGate(root, true, async () => {
+    // Only a root this module made is ever cleared: a folder without the marker may be anyone's,
+    // and its empty folders may matter to them. The same holds for every folder in it.
+    if (!(await marked(root))) return 0;
+    const cutoff = Date.now() - STAGED_MS;
+    let removed = 0;
+    for (const company of await ourFolders(root)) {
+      for (const agent of await ourFolders(company)) {
+        removed += await clearOwner(agent, all, cutoff);
+        await removeIfOnlyMarker(agent);
+      }
+      await removeIfOnlyMarker(company);
     }
-    await withLock(root, () => removeIfEmpty(company));
-  }
-  // An empty root goes too: the working folder of a company file is pruned only when it holds
-  // nothing but its cache (electron/companySession.js pruneWorkingCopies).
-  await withLock(root, () => removeRootIfEmpty(root));
-  return removed;
+    // An empty root goes too: the working folder of a company file is pruned only when it holds
+    // nothing but its cache (electron/companySession.js pruneWorkingCopies).
+    await removeIfOnlyMarker(root);
+    return removed;
+  });
 };
 
 // ---------------------------------------------------------------------------
@@ -815,23 +1108,179 @@ function isDevicePath(p: string): boolean {
 }
 
 /**
- * On Windows, the share a UNC path is on, as "\\server\share" in lower case; '' for a UNC path
+ * On Windows, the share a UNC path is on, as "\\SERVER\SHARE" folded the way Windows compares
+ * names (windowsFold: a server named with a Kelvin sign is another server); '' for a UNC path
  * without a share; null for any other path (and always on other systems).
  */
 function uncShare(p: string): string | null {
   if (!WIN || !/^[\\/]{2}/.test(p) || isDevicePath(p)) return null;
   const m = /^[\\/]{2}([^\\/]+)[\\/]+([^\\/]+)/.exec(p);
-  return m ? `\\\\${m[1]}\\${m[2]}`.toLowerCase() : '';
+  return m ? windowsFold(`\\\\${m[1]}\\${m[2]}`) : '';
 }
 
-/** `child` is `parent` or inside it (case-insensitive on Windows). */
-function within(child: string, parent: string): boolean {
-  const key = (p: string) => (WIN ? p.toLowerCase() : p);
-  const c = key(child);
-  let p = key(parent);
-  if (c === p) return true;
-  if (!p.endsWith(path.sep)) p += path.sep;
-  return c.startsWith(p);
+/** The server a UNC path names ("\\SERVER\share\…" gives "SERVER"), as written; null for any other path, and always on other systems. */
+function uncServer(p: string): string | null {
+  if (!WIN || isDevicePath(p)) return null;
+  const m = /^[\\/]{2}([^\\/]*)/.exec(p);
+  return m ? m[1] : null;
+}
+
+/**
+ * A server name as the name service may take it, for a refusal only: compatibility forms folded
+ * (a full-width "ｌｏｃａｌｈｏｓｔ" is "localhost" once the system maps it, as IDNA does), the other
+ * full stops a name may be written with as ".", lower case.
+ */
+function looseHost(s: string): string {
+  return s.normalize('NFKC').replace(/[\u3002\uff0e\uff61]/g, '.').toLowerCase();
+}
+
+/**
+ * An IPv4 address in any spelling the system takes ("127.0.0.1", "127.1", "0x7f.1", "0177.0.0.1",
+ * "2130706433": one to four parts, each decimal, octal or hex, the last filling the bytes left), as
+ * its 32-bit number; null for anything else.
+ */
+function ipv4Number(s: string): number | null {
+  const parts = s.split('.');
+  if (parts.length > 4) return null;
+  const nums: number[] = [];
+  for (const part of parts) {
+    let n: number;
+    if (/^0x[0-9a-f]*$/i.test(part)) n = part.length === 2 ? 0 : parseInt(part.slice(2), 16);
+    else if (/^0[0-7]*$/.test(part)) n = part.length === 1 ? 0 : parseInt(part.slice(1), 8);
+    else if (/^[1-9][0-9]*$/.test(part)) n = parseInt(part, 10);
+    else return null;
+    if (!Number.isSafeInteger(n)) return null;
+    nums.push(n);
+  }
+  const last = nums.pop()!;
+  if (nums.some((n) => n > 255)) return null;
+  const room = 2 ** (8 * (4 - nums.length));
+  if (last >= room) return null;
+  return nums.reduce((v, n) => v * 256 + n, 0) * room + last;
+}
+
+/**
+ * An IPv6 address as its eight 16-bit groups: "::1", "[::1]", "0:0:0:0:0:0:0:1", with a zone
+ * ("%4") or an IPv4 tail ("::ffff:127.0.0.1"), and Windows' own UNC spelling of one
+ * ("0--1.ipv6-literal.net", "-" for ":" and "s" for "%"). Null for anything else.
+ */
+function ipv6Groups(s: string): number[] | null {
+  let h = s.startsWith('[') && s.endsWith(']') ? s.slice(1, -1) : s;
+  const literal = /^(.+)\.ipv6-literal\.net$/.exec(h);
+  if (literal) h = literal[1].replace(/-/g, ':').replace(/s/g, '%');
+  h = h.replace(/%.*$/, '');
+  if (!h.includes(':')) return null;
+  const tail = /^(.*:)([^:]*\.[^:]*)$/.exec(h);
+  if (tail) {
+    const v4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(tail[2]) ? ipv4Number(tail[2].replace(/(^|\.)0+(?=\d)/g, '$1')) : null;
+    if (v4 === null) return null;
+    h = `${tail[1]}${Math.floor(v4 / 65536).toString(16)}:${(v4 % 65536).toString(16)}`;
+  }
+  const halves = h.split('::');
+  if (halves.length > 2) return null;
+  const groups = (x: string) => (x === '' ? [] : x.split(':'));
+  const head = groups(halves[0]);
+  const rest = halves.length === 2 ? groups(halves[1]) : [];
+  if (![...head, ...rest].every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  const missing = 8 - head.length - rest.length;
+  if (missing < 0 || (halves.length === 1 && missing !== 0)) return null;
+  return [...head, ...Array<string>(missing).fill('0'), ...rest].map((g) => parseInt(g, 16));
+}
+
+/**
+ * An address in one spelling for comparing ("v4:2130706433", "v6:0:0:0:0:0:0:0:1"), or null for a
+ * name. An IPv4 address carried in IPv6 (::ffff:127.0.0.1, ::127.0.0.1) is the IPv4 one.
+ */
+function addressKey(host: string): string | null {
+  const v4 = ipv4Number(host);
+  if (v4 !== null) return `v4:${v4}`;
+  const g = ipv6Groups(host);
+  if (!g) return null;
+  if (g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || (g[5] === 0 && g[6] !== 0))) return `v4:${g[6] * 65536 + g[7]}`;
+  return `v6:${g.join(':')}`;
+}
+
+/** This computer itself: 127.0.0.0/8, 0.0.0.0/8 (the system connects 0.0.0.0 here), ::1 and ::. */
+function isLoopbackKey(key: string): boolean {
+  if (key.startsWith('v4:')) {
+    const first = Math.floor(Number(key.slice(3)) / 2 ** 24);
+    return first === 127 || first === 0;
+  }
+  return key === 'v6:0:0:0:0:0:0:0:1' || key === 'v6:0:0:0:0:0:0:0:0';
+}
+
+/** This computer's own addresses (every network card's), as addressKey spells them. Nothing is sent. */
+function ownAddressKeys(): Set<string> {
+  const out = new Set<string>();
+  try {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const a of list ?? []) {
+        const key = addressKey(looseHost(a.address));
+        if (key) out.add(key);
+      }
+    }
+  } catch {
+    /* none known: names and loopback still count */
+  }
+  return out;
+}
+
+/** This computer's own names (its host name and its Windows computer name), first label only, as looseHost spells them. */
+function ownNames(): string[] {
+  const names: Array<string | undefined> = [process.env.COMPUTERNAME];
+  try {
+    names.push(os.hostname());
+  } catch {
+    /* the computer name from the environment still counts */
+  }
+  return names.map((n) => looseHost(n?.trim() ?? '').split('.')[0]).filter((n) => !!n);
+}
+
+/**
+ * On Windows, a UNC path whose server is this very computer: "localhost" and every name under
+ * ".localhost" (WSL's "wsl.localhost" too), "wsl$" (WSL reaches this computer's drives under
+ * /mnt), a loopback address in any spelling (127.1, 0x7f000001, ::1, [::1],
+ * 0--1.ipv6-literal.net), one of this computer's own addresses, or its own name (with any domain
+ * after it, a near match counting). Through such a share the app's own folders, the books and other
+ * agents' staged files are there under another name, so it is never an agent's folder (the hosting
+ * rule is the same: a join to this same computer is refused for agents). Judged by the words alone:
+ * nothing is looked up and nothing is looked at. A server that is not named in the words (a name in
+ * the hosts file that leads here) is not caught. False for every path that is no UNC path.
+ */
+export function isThisComputerShare(folder: string): boolean {
+  if (typeof folder !== 'string') return false;
+  const raw = uncServer(folder.trim());
+  if (raw === null) return false;
+  // "server@SSL@443" (a WebDAV share) is on that same server; a trailing dot is the same name.
+  const host = looseHost(raw.split('@')[0]).replace(/\.+$/, '');
+  // No server at all is no share anyone can name: refused as well.
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.localhost') || host === 'wsl$') return true;
+  const key = addressKey(host);
+  if (key) return isLoopbackKey(key) || ownAddressKeys().has(key);
+  return ownNames().includes(host.split('.')[0]);
+}
+
+/** A whole drive ("C:\", "/") or a share's own folder ("\\server\share"), by the words alone. */
+function isRootByWords(p: string): boolean {
+  const trim = (s: string) => s.replace(/[\\/]+$/, '');
+  if (trim(p) === trim(path.parse(p).root)) return true;
+  return WIN && /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+[\\/]*$/.test(p);
+}
+
+/**
+ * A whole drive, a share, or another volume mounted as a folder (/Volumes/USB, a disk mounted into
+ * a folder: it is on another device than the folder it sits in). `real` is a real path. True as
+ * well when the disk will not say (fail closed).
+ */
+async function isVolumeRoot(real: string): Promise<boolean> {
+  if (isRootByWords(real)) return true;
+  try {
+    const [here, parent] = await Promise.all([fsp.stat(real), fsp.stat(path.dirname(real))]);
+    return Boolean(here.dev && parent.dev && here.dev !== parent.dev);
+  } catch {
+    return true;
+  }
 }
 
 /** A folder as typed, made absolute and normalised (".." resolved), or null when it is no plain folder path. */
@@ -908,7 +1357,8 @@ async function resolveFolder(p: string, shares: ReadonlySet<string>): Promise<st
   if (!(await linksStayHere(p, shares))) return null;
   let real: string;
   try {
-    // The system's own answer (Windows: true case, short names expanded); the plain one where it fails.
+    // The system's own answer (Windows: true case, short names expanded); the plain one where it
+    // fails, whose spelling may differ from the disk's and then only ever refuses more.
     real = await realpathNative(p);
   } catch {
     try {
@@ -917,7 +1367,9 @@ async function resolveFolder(p: string, shares: ReadonlySet<string>): Promise<st
       return null;
     }
   }
-  if (isDevicePath(real) || uncShare(real) === '') return null;
+  // As the disk has it, a folder may be on a share of this very computer (a drive mapped to
+  // \\localhost\c$): refused like one typed that way, before that share is looked at.
+  if (isDevicePath(real) || uncShare(real) === '' || isThisComputerShare(real)) return null;
   try {
     return (await fsp.stat(real)).isDirectory() ? real : null;
   } catch {
@@ -928,8 +1380,13 @@ async function resolveFolder(p: string, shares: ReadonlySet<string>): Promise<st
 export const allowedFolder: AllowedFolder = async (allowed, folder) => {
   try {
     const want = folderPath(folder);
-    if (!want) return null;
-    const entries = (Array.isArray(allowed) ? allowed : []).map(folderPath).filter((p): p is string => !!p);
+    // A share on this very computer is never an agent's folder, nor allows one (isThisComputerShare):
+    // by the words, so it is never looked at, and so never in `shares` below, which keeps a link
+    // that leads to it out too.
+    if (!want || isThisComputerShare(want)) return null;
+    const entries = (Array.isArray(allowed) ? allowed : [])
+      .map(folderPath)
+      .filter((p): p is string => !!p && !isThisComputerShare(p));
     if (!entries.length) return null;
     // Network shares an allowed folder names itself: the only ones ever looked at.
     const shares = new Set(entries.map(uncShare).filter((s): s is string => !!s));
@@ -942,8 +1399,12 @@ export const allowedFolder: AllowedFolder = async (allowed, folder) => {
       // An allowed share is looked at only when the folder is on it.
       const entryShare = uncShare(entry);
       if (entryShare !== null && entryShare !== realShare) continue;
+      // A whole drive or share is never an agent's folder: a company file at E:\ does not make
+      // all of E: one. Said by the words first, then as the disk has it (a mounted volume).
+      if (isRootByWords(entry)) continue;
       const base = await resolveFolder(entry, shares);
-      if (base && within(real, base)) return real;
+      if (!base || (await isVolumeRoot(base))) continue;
+      if (realWithin(real, base)) return real;
     }
     return null;
   } catch {

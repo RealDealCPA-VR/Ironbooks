@@ -39,13 +39,22 @@ import { localDateISO } from '@/lib/dates';
 import { balanceSheet, notFiscalCloseEntry, type BalanceSheet } from '@/lib/services/reports';
 import type { ServiceContext } from './_base';
 import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
-import { journalCreditsAppliedAfter, journalOpenItems, onOrBeforeDay, resolveEntityNames } from './journal';
+import {
+  ilikeMatches,
+  journalCreditsAppliedAfter,
+  journalOpenItems,
+  lineMemoFor,
+  memoMayHoldAccountNumber,
+  onOrBeforeDay,
+  resolveEntityNames,
+  searchesShownMemos,
+} from './journal';
 import { docRef } from './docNumbers';
 import { unappliedCustomerPayments } from './customerCredits';
 import { vendorCreditHomeByBill, vendorCreditRefundsAfter } from './vendorCreditsFx';
 import { foreignInvoiceHomeOpen } from './fxSubledger';
 import { foreignCode, homeCode } from './fxLines';
-import { inIds } from './reportEngine';
+import { GL_LIMITS, inIds } from './reportEngine';
 import { bankAccounts, bankTransactions } from '@/lib/db/schema';
 
 /**
@@ -2120,6 +2129,10 @@ export async function checkDetail(
   rows.sort(
     (a, b) => a.date.localeCompare(b.date) || (a.checkNumber ?? '').localeCompare(b.checkNumber ?? ''),
   );
+  // The memo column as this caller may see it: a Sales Tax Payment check left blank stores the
+  // agency's full account number ("Acct # …", liabilityPayments.ts), and journal line memos can
+  // hold one too (journal.ts lineMemoFor). The printed check keeps it; this report does not.
+  for (const r of rows) for (const l of r.lines) l.description = lineMemoFor(ctx, l.description);
 
   // Home currency: a foreign bank account's check counts at its own rate (its row keeps its currency).
   let total = Money.zero();
@@ -2497,7 +2510,9 @@ async function bankFeedRows(ctx: ServiceContext, dir: 'out' | 'in', range?: { fr
       amount: Money.of(h.amount).abs(),
       homeAmount: bankSide,
       voided: h.status === 'void',
-      lines: lines.filter((l) => l.accountId !== h.bankAccountId).map((l) => ({ ...l, memo: l.memo && l.memo !== memo ? l.memo : null })),
+      lines: lines
+        .filter((l) => l.accountId !== h.bankAccountId)
+        .map((l) => ({ ...l, memo: l.memo && l.memo !== memo ? lineMemoFor(ctx, l.memo) : null })),
     };
   });
 }
@@ -2752,14 +2767,25 @@ export async function transactionDetail(
   if (filters.to) conds.push(onOrBeforeDay(filters.to));
   if (filters.accountId) conds.push(eq(journalEntryLines.accountId, filters.accountId));
   if (filters.classId) conds.push(eq(journalEntryLines.classId, filters.classId));
-  if (filters.search) {
-    const like = `%${filters.search}%`;
+  // A caller who sees protected numbers in memos masked (journal.ts lineMemoFor) is matched against
+  // the memo as shown: a line whose memo may hold one is read whatever its text and matched below.
+  const like = filters.search ? `%${filters.search}%` : null;
+  const shownMemoSearch = like !== null && searchesShownMemos(ctx);
+  const memoHit = like ? sql<boolean>`(${journalEntryLines.memo} ILIKE ${like})` : sql<boolean>`false`;
+  const otherHit = like
+    ? sql<boolean>`(${journalEntries.description} ILIKE ${like} OR ${journalEntries.sourceRef} ILIKE ${like})`
+    : sql<boolean>`false`;
+  if (like) {
     conds.push(
-      sql`(${journalEntries.description} ILIKE ${like} OR ${journalEntryLines.memo} ILIKE ${like} OR ${journalEntries.sourceRef} ILIKE ${like})`,
+      shownMemoSearch
+        ? sql`(${otherHit} OR ${memoHit} OR ${memoMayHoldAccountNumber()})`
+        : sql`(${journalEntries.description} ILIKE ${like} OR ${journalEntryLines.memo} ILIKE ${like} OR ${journalEntries.sourceRef} ILIKE ${like})`,
     );
   }
+  // Matched in code: read past the lines the memo check may drop (the General Ledger's scan cap).
+  const readCap = shownMemoSearch ? Math.max(limit + 1, GL_LIMITS.postFilterScan) : limit + 1;
 
-  const lineRows = await ctx.db
+  const read = await ctx.db
     .select({
       lineId: journalEntryLines.id,
       entryId: journalEntries.id,
@@ -2774,15 +2800,26 @@ export async function transactionDetail(
       accountName: accounts.name,
       debit: journalEntryLines.debit,
       credit: journalEntryLines.credit,
+      memoHit,
+      otherHit,
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
     .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
     .where(and(...conds))
     .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber), asc(journalEntryLines.createdAt))
-    .limit(limit + 1);
+    .limit(readCap);
+  // A memo the mask changes is matched as shown; any other line as the database matched it.
+  const isTrue = (v: unknown) => v === true || v === 't';
+  const lineRows = shownMemoSearch
+    ? read.filter((r) => {
+        if (isTrue(r.otherHit)) return true;
+        const shown = lineMemoFor(ctx, r.memo);
+        return shown === r.memo ? isTrue(r.memoHit) : ilikeMatches(shown, like!);
+      })
+    : read;
 
-  const truncated = lineRows.length > limit;
+  const truncated = lineRows.length > limit || (shownMemoSearch && read.length >= readCap);
   const slice = truncated ? lineRows.slice(0, limit) : lineRows;
 
   let running = Money.zero();
@@ -2801,7 +2838,7 @@ export async function transactionDetail(
       entryNumber: r.entryNumber,
       date: r.date.toISOString(),
       description: r.description,
-      memo: r.memo,
+      memo: lineMemoFor(ctx, r.memo),
       reference: r.reference,
       sourceRef: r.sourceRef,
       accountId: r.accountId,

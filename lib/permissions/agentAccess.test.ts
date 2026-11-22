@@ -15,8 +15,9 @@
  *  - the same rule over the real registry: every GET it allows is such a read, and every change
  *    route is refused;
  *  - through the door, an Admin-role agent on the widest preset is asked about every operation of
- *    Users & Roles and File Utilities, except a known list of GETs the registry classes 'read'
- *    (pinned here so it can only shrink; it is for the registry to class them admin or file).
+ *    Users & Roles and File Utilities, except a short list of GETs the registry classes 'read' on
+ *    purpose, each with its reason (pinned here so it can only shrink), and every read of Users &
+ *    Roles is among the asked ones.
  */
 import { describe, expect, it, vi } from 'vitest';
 
@@ -52,7 +53,7 @@ import {
 import { AREA_KEYS, FLAGS, builtinRole, can, canActivity, fullAccess, unionRoles, type EffectiveAccess } from './model';
 import { activitiesOf } from './activities';
 import { RISK_CLASSES, type Operation, type RequestFacts } from '@/lib/agent/operations/types';
-import { allOperations, operationForPath } from '@/lib/agent/operations/registry';
+import { allOperations, operationById, operationForPath } from '@/lib/agent/operations/registry';
 import { decide, resolvePolicy } from '@/lib/agent/policy';
 
 const ID = '11111111-2222-4333-8444-555555555555';
@@ -353,37 +354,33 @@ describe('the same rule over the real registry', () => {
 
 describe('Users & Roles and File Utilities through the door (the policy, with an Admin ceiling)', () => {
   /**
-   * Operations of these areas that the door runs WITHOUT asking anyone today, on any preset (read
-   * is Allow in all four), for an agent whose role holds the view right: the Admin role holds both
-   * areas, and Full Access, Accountant and External Accountant hold File Utilities. They are GETs
-   * the registry (lib/agent/operations/classes/*.ts) classes 'read', and the policy asks by class,
-   * not by area; plan 4.2 files them under admin and file. A known gap, handed to the registry's
-   * owner: this list may only shrink. Take an entry out once its operation is classed admin or
-   * file; a new operation of these areas that runs unasked fails the test below.
+   * Operations of these areas that the door runs WITHOUT asking anyone, on any preset (read is
+   * Allow in all four), for an agent whose role holds the view right: the Admin role holds both
+   * areas, and Full Access, Accountant and External Accountant hold File Utilities. The policy asks
+   * by class, not by area, so these are the GETs the registry (lib/agent/operations/classes/*.ts)
+   * classes 'read'. Plan 4.2 files the reads of Users & Roles under admin and the File Utilities
+   * reads that show file names, folders or backups, or produce a file, under file; what is left
+   * here is left on purpose, each with its reason. The list may only shrink: a new operation of
+   * these areas that runs unasked fails the test below.
    */
-  const KNOWN_UNASKED: readonly string[] = [
-    // Users & Roles (classes/admin.ts)
-    'roles.get',
-    'roles.list',
-    'users.get',
-    'users.list',
-    'users.password-policy',
-    'users.permissions-report',
-    // File Utilities (classes/admin.ts, documents.ts, lists.ts, reports.ts)
-    'backups',
-    'backups.status',
-    'cleanup',
-    'condense.archives',
-    'export.get',
-    'import.rebuild',
-    'integrity',
-    'integrity.books-in-balance',
-    'portable.shareable',
-    'qb-import.gl',
-    'qb-import.open-items',
-    'report-schedules.list',
-    'sandbox',
-  ];
+  const KNOWN_UNASKED: Readonly<Record<string, string>> = {
+    // classes/admin.ts: pure checks of the books (plan 4.2 lets them stay read). They answer pass
+    // or fail per check and show no file name, folder or backup. Deliberate: an entry here that no
+    // longer runs unasked fails too, so the list says what really happens.
+    integrity: 'a pure check of the books',
+    'integrity.books-in-balance': 'a pure check of the books',
+  };
+  /**
+   * Still unasked in a classification file another unit owns, waiting on its owner. Allowed to run
+   * unasked here, but never required to: classing it file just takes it out of the way.
+   */
+  const OTHERS_OPEN: Readonly<Record<string, string>> = {
+    // classes/lists.ts: Clean Up Company Data's preview (GET /api/cleanup). Its owner has classed
+    // it read, with the reason written there (it lists inactive, unused list entries, never a file,
+    // folder or backup). It moves to KNOWN_UNASKED once that file settles; until then this list
+    // tolerates either class, so this test does not break while another unit edits its own file.
+    cleanup: "classed read in classes/lists.ts: lists unused list entries, no file",
+  };
 
   const PLAIN: RequestFacts = { confirm: [], reveal: false, amount: null, count: null, entityIds: [], accountIds: [], date: null, closedPeriod: false };
   const doorOnly = (op: Operation) =>
@@ -413,10 +410,33 @@ describe('Users & Roles and File Utilities through the door (the policy, with an
       expect(op.class, op.id).toBe('read');
       expect(op.kind === 'route' ? op.method : 'GET', op.id).toBe('GET');
     }
-    expect(unasked.filter((id) => !KNOWN_UNASKED.includes(id)), 'operations of Users & Roles or File Utilities that run without asking').toEqual([]);
+    expect(
+      unasked.filter((id) => !(id in KNOWN_UNASKED) && !(id in OTHERS_OPEN)),
+      'operations of Users & Roles or File Utilities that run without asking',
+    ).toEqual([]);
+    // What is deliberately left is still what happens: an entry asked about now, or gone, comes out.
+    expect(Object.keys(KNOWN_UNASKED).filter((id) => !unasked.includes(id)), 'entries of KNOWN_UNASKED that no longer run unasked').toEqual([]);
     // What is classed admin, file or secret is always asked about (never Allow).
     for (const op of ops.filter((o) => o.classified && ['admin', 'file', 'secret'].includes(o.class))) {
       expect(['ask', 'refuse'], op.id).toContain(outcome(op));
+    }
+  });
+
+  it('every read of Users & Roles asks an Admin, and so does every File Utilities read but the pure checks', () => {
+    const reads = allOperations().filter((op) => op.kind === 'route' && op.method === 'GET' && doorOnly(op));
+    expect(reads.length).toBeGreaterThan(10);
+    for (const op of reads) {
+      if (op.id in KNOWN_UNASKED || op.id in OTHERS_OPEN) continue;
+      const users = op.area === 'users' || (typeof op.rule === 'object' && op.rule?.area === 'users');
+      expect(op.class, op.id).toBe(users ? 'admin' : 'file');
+      expect(['ask', 'refuse'], op.id).toContain(outcome(op));
+    }
+    // The ones the old gap named, by id.
+    for (const id of ['users.list', 'users.get', 'users.password-policy', 'users.permissions-report', 'roles.list', 'roles.get']) {
+      expect(operationById(id)?.class, id).toBe('admin');
+    }
+    for (const id of ['backups', 'backups.status', 'condense.archives', 'export.get', 'import.rebuild', 'portable.shareable', 'qb-import.gl', 'qb-import.open-items', 'report-schedules.list', 'sandbox']) {
+      expect(operationById(id)?.class, id).toBe('file');
     }
   });
 });

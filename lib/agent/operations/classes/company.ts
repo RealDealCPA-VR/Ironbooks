@@ -6,7 +6,9 @@
  * GET that can look up a *.ts.net address in DNS or refresh the tailnet trust is 'outside', not
  * 'read', even when that lookup is its only side effect and it happens only when such an address is
  * set up. GET /api/network-policy is one; GET /api/network-policy/check makes no lookup and stays
- * 'read'.
+ * 'read'. Saving the policy (PUT, PATCH) keeps its class ('settings') but has no dry run for the
+ * same reason: its answer is worked out the way the GET's is, lookups included, so a rolled-back
+ * preview would still make them. The approval card then shows the request itself.
  *
  * Closed periods: the Accountant Center's batch routes (batch enter, batch void and restore,
  * reclassify) carry their dates on each row or on the transactions they name, not in one body date
@@ -130,18 +132,23 @@ export const COMPANY_CLASSES: ClassificationMap = {
     why:
       'Decides where this computer may connect (network mode, cloud opt-ins, vendor lookup address). Owner or ' +
       'Admin only, and only from the computer that holds the company file. { allowOnThisComputer: true } instead ' +
-      "approves the company file's internet services on this computer.",
+      "approves the company file's internet services on this computer. No dry run: after saving, the " +
+      'answer lists the internet services the file is held from (lib/net/fileTrust.ts holdStatus), which looks ' +
+      'up every configured *.ts.net address in DNS, a vendor lookup address the agent typed included (the rule ' +
+      "in this file's header).",
     hostOnly: true,
+    dryRun: 'none',
   },
   'PATCH /api/network-policy': {
     class: 'settings',
     describe: 'Change the Privacy & Network policy',
-    why: 'Same handler as PUT /api/network-policy (an alias for the shared api client).',
+    why: 'Same handler as PUT /api/network-policy (an alias for the shared api client), so no dry run either.',
     hostOnly: true,
+    dryRun: 'none',
   },
   'GET /api/network-policy/check': {
     class: 'read',
-    describe: 'Check whether the network policy lets {purpose} reach {url}',
+    describe: 'Check whether the network policy allows a connection (purpose: {purpose}) (address: {url})',
     why:
       'Only asks the policy; it makes no connection, looks nothing up in DNS and adds nothing to the outbound log.',
   },
@@ -172,7 +179,8 @@ export const COMPANY_CLASSES: ClassificationMap = {
   'POST /api/accountant/batch-void': {
     class: 'remove',
     id: 'accountant.batch-void.apply',
-    describe: 'Batch void or delete the selected transactions (action: {action}; empty means void)',
+    // No action means void, so the line says void first and the aside shows any action sent.
+    describe: 'Batch void the selected transactions, or delete them with action delete (action: {action})',
     why:
       'Voids or deletes up to 500 transactions at once, and voids the sales tax corrections that depended on ' +
       'them. Voids cannot be taken back. The dates are on the transactions named, so the closed-period check ' +
@@ -190,12 +198,12 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'GET /api/accountant/reclassify': {
     class: 'read',
-    describe: 'List the lines on account {accountId} that can be reclassified',
+    describe: 'List the ledger lines that can be reclassified (account: {accountId})',
   },
   'POST /api/accountant/reclassify': {
     class: 'bulk',
     id: 'accountant.reclassify.apply',
-    describe: 'Move the selected ledger lines to account {newAccountId} or class {newClassId}',
+    describe: 'Move the selected ledger lines to a new account or class (account: {newAccountId}) (class: {newClassId})',
     why:
       'Rewrites the account or class of up to 2,000 posted lines in place, and of their source documents. The ' +
       'dates are on the lines named, so the closed-period check cannot see them; the service checks each ' +
@@ -222,13 +230,13 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'PUT /api/accountant/working-trial-balance': {
     class: 'prepare',
-    describe: 'Save the workpaper reference or note of account {accountId} for {periodEnd}',
+    describe: 'Save the workpaper reference or note of an account (account: {accountId}) for {periodEnd}',
     why: 'A workpaper note on the working trial balance; it never reaches the ledger.',
   },
   'POST /api/accountant/working-trial-balance': {
     class: 'enter',
     id: 'accountant.working-trial-balance.adjust',
-    describe: 'Post an adjusting journal entry dated {date}: {description}',
+    describe: 'Post an adjusting journal entry on {date} ({description})',
   },
   'GET /api/accountant/list-changes': {
     class: 'read',
@@ -252,7 +260,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   'POST /api/accountant/client-data-review': {
     class: 'change',
     id: 'accountant.client-data-review.run',
-    describe: 'Client Data Review: {action}',
+    describe: 'Run a Client Data Review fix or sign-off ({action})',
     why:
       'One route for several fixes: apply_customer_credit and apply_vendor_credit apply credits, ' +
       'clear_undeposited changes a deposit. task_status and snapshot are the reviewer\'s sign-off: task_status ' +
@@ -293,7 +301,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant/sales-tax/adjustments': {
     class: 'enter',
-    describe: 'Enter a sales tax adjustment of {amount} dated {date}',
+    describe: 'Enter a sales tax adjustment of {amount} on {date}',
     amountField: 'amount',
   },
   'GET /api/accountant/sales-tax/fix': {
@@ -303,7 +311,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   'POST /api/accountant/sales-tax/fix': {
     class: 'change',
     id: 'accountant.sales-tax.fix.run',
-    describe: 'Fix incorrectly recorded sales tax: {action}',
+    describe: 'Fix incorrectly recorded sales tax ({action})',
     why:
       'Corrects existing records: link or unlink a ledger line to an agency, post a correcting entry that moves ' +
       'an expense-coded payment to sales tax, or void such a correction (undo_fix).',
@@ -414,7 +422,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'PATCH /api/month-end-close/steps': {
     class: 'prepare',
-    describe: 'Month-end step {stepKey} for {periodEnd}: {action}',
+    describe: 'Mark month-end step {stepKey} for {periodEnd} ({action})',
     why:
       'Saves checklist progress (review or skip a step); it never reaches the ledger. Closing the month after it ' +
       'is its own request, class period. But reviewing or skipping a step that needs attention is the sign-off ' +
@@ -442,7 +450,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   // year-end-close: the closing entry that moves the year's profit or loss into retained earnings
   'POST /api/year-end-close': {
     class: 'period',
-    describe: 'Run the year-end close for fiscal year {fiscalYear}',
+    describe: 'Run the year-end close (fiscal year {fiscalYear})',
     why:
       "Posts the closing entry that zeros the year's income and expense accounts into retained earnings, dated " +
       'on the fiscal year end, which is usually already on or before the closing date. The body only carries ' +
@@ -477,17 +485,17 @@ export const COMPANY_CLASSES: ClassificationMap = {
   // undo: the 30-second Undo behind the toast
   'POST /api/undo/prepare': {
     class: 'prepare',
-    describe: 'Save a snapshot of {resource} {id} so the next change to it can be undone',
+    describe: 'Save a snapshot of a record so its next change can be undone ({resource} {id})',
     why: 'Only stores a snapshot of the record for the Undo button; the record itself is not changed.',
   },
   'POST /api/undo/commit': {
     class: 'prepare',
-    describe: 'Turn on the 30-second Undo for the change to {resource} {id}',
+    describe: 'Turn on the 30-second Undo for a change ({resource} {id})',
     why: 'Only arms the undo token after the change was saved; no record is changed.',
   },
   'POST /api/undo/[id]': {
     class: 'remove',
-    describe: 'Undo the change held by undo token {id}',
+    describe: 'Undo a change (undo token {id})',
     why:
       'Applies the opposite of the last change: voids a new transaction, puts back the old values, or enters a ' +
       'voided document again as a new copy.',

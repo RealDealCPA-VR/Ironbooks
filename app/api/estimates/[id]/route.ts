@@ -28,8 +28,8 @@ import {
 } from '@/lib/services/estimates';
 import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
 import { ServiceError } from '@/lib/services/_base';
-import { zodErrorBody } from '@/lib/validation/helpers';
-import { createEstimateSchema } from '@/lib/validation/estimates';
+import { bodyValidationError, zodErrorBody } from '@/lib/validation/helpers';
+import { createEstimateSchema, estimateActionSchema } from '@/lib/validation/estimates';
 import { requireJsonObject } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
@@ -44,6 +44,15 @@ function errorResponse(err: unknown) {
     );
   }
   return routeErrorWithWarnings(err, 'estimates/[id]');
+}
+
+/**
+ * The POST body as agents read it described (lib/validation/estimates.ts estimateActionSchema).
+ * Called once the checks of the action answered, so it refuses nothing they let through.
+ */
+function checkActionBody(body: unknown): void {
+  const checked = estimateActionSchema.safeParse(body);
+  if (!checked.success) throw bodyValidationError(checked.error);
 }
 
 type Num = string | number;
@@ -98,6 +107,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const { action } = body;
 
     if (action === 'convert') {
+      checkActionBody(body);
       // A stale tab must not convert an estimate another user just changed.
       const invoice = await withVersionCheck(ctx, 'estimate', id, expectedVersion(req), (c) =>
         convertToInvoice(c, id, { overrideCreditLimit: body.overrideCreditLimit === true }),
@@ -116,6 +126,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       if (date && isNaN(date.getTime())) {
         return NextResponse.json({ error: 'Invalid invoice date.', code: 'VALIDATION' }, { status: 400 });
       }
+      checkActionBody(body);
       const result = await createProgressInvoice(ctx, id, {
         percent: numOrNull(body.percent),
         remaining: body.remaining === true,
@@ -141,6 +152,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     if (action === 'void') {
+      checkActionBody(body);
       // QB Edit > Void Estimate; a stale tab must not void an estimate another user just changed.
       return NextResponse.json(await withVersionCheck(ctx, 'estimate', id, expectedVersion(req), (c) => voidEstimate(c, id)));
     }

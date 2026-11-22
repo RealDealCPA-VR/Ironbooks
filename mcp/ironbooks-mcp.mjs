@@ -8,9 +8,10 @@
  * opens no port and reaches nothing but 127.0.0.1. What the agent may do (run on its own, ask a
  * person, or not at all) is decided by Ironbooks, by the agent's role and policy, not here.
  *
- * Besides its tools it serves the guide for the agent (resource ironbooks://guide, prompt
- * ironbooks_guide), the agent's requests and staged files as resources, and a notice when a
- * request it waited for is decided.
+ * Its tools (mcp/tools.mjs TOOLS): the named reads and changes, every standard report by its key,
+ * and the generic door to every other operation. Besides them it serves the guide for the agent
+ * (resource ironbooks://guide, prompt ironbooks_guide), the agent's requests and staged files as
+ * resources, and a notice when a request it waited for is decided.
  *
  * Run it with Node 18 or newer:        node mcp/ironbooks-mcp.mjs
  * or with the installed app's program: Ironbooks.exe <resources>\mcp\ironbooks-mcp.mjs
@@ -24,7 +25,8 @@ import { IronbooksClient } from './client.mjs';
 import { createServer, serve } from './protocol.mjs';
 import { INSTRUCTIONS, PROMPTS, RESOURCES, TOOLS } from './tools.mjs';
 
-export const SERVER_INFO = { name: 'ironbooks', version: '1.1.0' };
+/** 1.2.0: the entry tools (estimates, purchase orders, receiving, credits, time, inventory, sales tax) and every report by key. */
+export const SERVER_INFO = { name: 'ironbooks', version: '1.2.0' };
 
 /** The server as shipped: the tools, the guide (resource and prompt), the agent's requests and files. */
 export function createIronbooksServer(client) {

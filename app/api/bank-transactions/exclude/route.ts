@@ -17,6 +17,8 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { excludeTransaction, restoreExcluded } from '@/lib/services/bankCategorize';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { excludeBankLineSchema } from '@/lib/validation/bankTransactions';
 
 function errResponse(err: ServiceError): NextResponse {
   return NextResponse.json(
@@ -34,6 +36,10 @@ export async function POST(req: NextRequest) {
     if (!bankTransactionId) {
       return NextResponse.json({ error: 'bankTransactionId is required.' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/bankTransactions.ts). The check above
+    // answers first, so this refuses only a value the service could not have used.
+    const checked = excludeBankLineSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const updated = restore
       ? await restoreExcluded(ctx, bankTransactionId)

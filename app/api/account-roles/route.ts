@@ -7,16 +7,11 @@
  *       automatic choice). Needs Company & Preferences: modify (checked by the service too).
  */
 import { type NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getServerContext } from '@/lib/context';
 import { routeError } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
-import { ACCOUNT_ROLE_KEYS, listAccountRoles, setAccountRole, type AccountRole } from '@/lib/services/accountRoles';
-
-const patchSchema = z.object({
-  role: z.enum(ACCOUNT_ROLE_KEYS as [AccountRole, ...AccountRole[]]),
-  accountId: z.string().uuid().nullable(),
-});
+import { setAccountRoleSchema } from '@/lib/validation/accountRoles';
+import { listAccountRoles, setAccountRole } from '@/lib/services/accountRoles';
 
 export async function GET() {
   try {
@@ -30,7 +25,7 @@ export async function GET() {
 export async function PATCH(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = patchSchema.safeParse(await req.json().catch(() => ({})));
+    const parsed = setAccountRoleSchema.safeParse(await req.json().catch(() => ({})));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     return NextResponse.json(await setAccountRole(ctx, parsed.data.role, parsed.data.accountId));
   } catch (err) {

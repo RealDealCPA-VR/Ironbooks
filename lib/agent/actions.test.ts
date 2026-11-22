@@ -1,18 +1,23 @@
 /**
- * Agent access: changing the books (lib/agent/actions.ts, lib/agent/catalog.ts,
- * app/api/agent/actions/route.ts).
+ * Agent access: the curated actions (lib/agent/actions.ts, lib/agent/catalog.ts, banking.ts,
+ * app/api/agent/actions/route.ts), on the one path through the agent's door (lib/agent/operate.ts).
  *
  * Every request goes the way an agent's would: the real route handler, the real getServerContext,
  * a token, the path and method middleware stamps. What is proved:
  *
- *  - Read only refuses every change. Propose queues it for a person and enters nothing. Post
- *    enters it, within the agent's role.
+ *  - Each action is its route's registry operation: the policy decides it exactly as it decides
+ *    run_operation. Read only is refused every change; "Ask for every change" asks a person, and a
+ *    person's approval in the approval center enters it, named "agent, approved by person";
+ *    "Trusted bookkeeper" enters it, within the agent's role.
  *  - A dry run really runs the change and keeps nothing: the books are exactly as they were.
  *  - A change that is kept needs a request id; the same id again returns the first answer and
  *    enters nothing twice; the same id with other input is refused.
  *  - Entries an agent makes name the agent, and the person answerable for it.
- *  - The closing date is never open to an agent. The ledger's own rules still apply.
- *  - A person's approval enters a proposal under that person's permissions.
+ *  - The closing date is never open to an agent's own run. The ledger's own rules still apply.
+ *  - Nothing new goes to the old approval queue (ai_proposals); a request copied from it is still
+ *    entered the old way.
+ *  - An agent with the Admin role gets nothing through a curated action that run_operation would
+ *    not give it.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -35,7 +40,18 @@ delete process.env.BKA_DEVICE_VAULT;
 delete process.env.BKA_LAUNCH_PASS;
 
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { agentRequests, aiProposals, auditLogs, companies, invoices, journalEntries, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
+import {
+  agentPermissionRequests,
+  agentRequests,
+  aiProposals,
+  auditLogs,
+  companies,
+  invoices,
+  journalEntries,
+  userCompanies,
+  userRoleAssignments,
+  users,
+} from '@/lib/db/schema';
 import { createSessionToken, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE, getServerContext } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
@@ -43,12 +59,16 @@ import { builtinRole, fullAccess, unionRoles } from '@/lib/permissions/model';
 import { resetAgentEndpointState } from '@/lib/agent/endpointFile';
 import { seedRichCompany, type RichCompany } from '@/lib/services/companyFile.fixture';
 import { createAgent } from '@/lib/services/agents';
-import { approveProposal, listProposals, rejectProposal } from '@/lib/services/aiAssistant';
+import { createBankAccount } from '@/lib/services/bankAccounts';
+import { createAccount } from '@/lib/services/accounts';
+import { approveAgentRequest, denyAgentRequest } from '@/lib/services/agentRequests';
 import { listAuditLogs } from '@/lib/services/auditTrail';
 import { readAllTransactionLog } from '@/lib/services/transactionLog';
-import { ServiceError, type ServiceContext } from '@/lib/services/_base';
+import type { ServiceContext } from '@/lib/services/_base';
+import type { AgentPreset } from '@/lib/agent/operations/types';
+import { AGENT_CALLS_PER_MINUTE, AGENT_RUNS_AT_ONCE, resetAgentRateLimits } from './operate';
 import { ALL_AGENT_ACTIONS as AGENT_ACTIONS, AGENT_TRANSACTION_TYPES } from './catalog';
-import { READ_ONLY_AGENT_MESSAGE, agentActionNames, agentInputHash } from './actions';
+import { AGENT_PROPOSAL_KIND, actionOperation, agentActionNames, agentInputHash } from './actions';
 import { API_ROUTE_PERMISSIONS, matchRoutePattern } from '@/lib/permissions/routes';
 import { POST as actionsPOST } from '@/app/api/agent/actions/route';
 
@@ -60,8 +80,8 @@ let acct: Record<string, string>;
 const tokens: Record<string, string> = {};
 const agentIds: Record<string, string> = {};
 
-/** Send one action as the agent holding `token`, the way the connector does. */
-async function act(token: string, body: Out, extraHeaders: Record<string, string> = {}): Promise<{ status: number; json: Out }> {
+/** Send one request as the agent holding `token`, the way the connector does. */
+async function act(token: string, body: Out, extraHeaders: Record<string, string> = {}): Promise<{ status: number; json: Out; retryAfter: string | null }> {
   h.cookies.clear();
   h.headers.clear();
   h.headers.set(ROUTE_PATH_HEADER, '/api/agent/actions');
@@ -76,11 +96,11 @@ async function act(token: string, body: Out, extraHeaders: Record<string, string
       body: JSON.stringify(body),
     }),
   );
-  return { status: res.status, json: (await res.json()) as Out };
+  return { status: res.status, json: (await res.json()) as Out, retryAfter: res.headers.get('retry-after') };
 }
 async function ok(token: string, body: Out): Promise<Out> {
   const r = await act(token, body);
-  expect(r.status, `${body.action}: ${JSON.stringify(r.json).slice(0, 400)}`).toBe(200);
+  expect(r.status, `${body.action ?? body.verb}: ${JSON.stringify(r.json).slice(0, 600)}`).toBe(200);
   return r.json;
 }
 
@@ -100,6 +120,12 @@ async function fingerprint(ignore: string[] = []) {
   return { counts, ledger: ledger.rows[0], balances: balances.rows[0].b, log: readAllTransactionLog(TEST_DIR).records.length };
 }
 
+/** Just the books: the ledger, the balances and the journal entries. */
+async function books() {
+  const f = await fingerprint();
+  return { ledger: f.ledger, balances: f.balances, entries: f.counts.journal_entries };
+}
+
 const journal = (date: string, amount: string, description = 'Office supplies bought with cash') => ({
   date,
   description,
@@ -109,22 +135,49 @@ const journal = (date: string, amount: string, description = 'Office supplies bo
   ],
 });
 
+/** A new ledger bank account linked to a bank, as a person sets it up in the app. */
+async function newBank(name: string): Promise<string> {
+  const account = await createAccount(admin, { name, qbType: 'Bank' } as Parameters<typeof createAccount>[1]);
+  return (await createBankAccount(admin, { accountId: (account as { id: string }).id, bankName: `${name} Bank`, accountNumber: '000444555' })).id;
+}
+
+/** The refusal of a class the agent's preset sets to Never (lib/agent/policy.ts). */
+const NEVER = /An Admin has not allowed agents to/;
+/** The refusal of a right the agent's role lacks. */
+const ROLE = /Your role does not allow this/;
+/** A version older than any record: the record was changed since the agent "read" it. */
+const STALE = '2020-01-01T00:00:00.000Z';
+/** What a stale-version answer says about the record (lib/services/concurrency.ts assertCurrentVersion). */
+const RECORD_FACTS = /changedBy|changedAt|currentUpdatedAt|staleVersion|was changed by/;
+
+/** An invoice of the fixture company, to edit or void. */
+async function someInvoice(): Promise<string> {
+  const [row] = await db.select({ id: invoices.id }).from(invoices).where(eq(invoices.companyId, admin.companyId)).limit(1);
+  expect(row?.id).toBeTruthy();
+  return row.id;
+}
+
 beforeAll(async () => {
   fs.rmSync(ROOT, { recursive: true, force: true });
   resetAgentEndpointState();
+  resetAgentRateLimits();
   db = await getDb(TEST_DIR);
   rich = await seedRichCompany(db, TEST_DIR, 'Actions Co');
   acct = rich.acct;
   admin = { ...rich.ctx, role: 'owner', access: fullAccess() };
-  for (const [key, roleKeys, mode] of [
+  for (const [key, roleKeys, preset] of [
     ['reader', ['bookkeeper'], 'read_only'],
-    ['proposer', ['bookkeeper'], 'propose'],
-    ['poster', ['bookkeeper'], 'post'],
-    ['apClerk', ['ap_clerk'], 'post'],
-    ['reportsPoster', ['reports_only'], 'post'],
-    ['fullPoster', ['full_access'], 'post'],
-  ] as const) {
-    const made = await createAgent(admin, { name: `Agent ${key}`, roleKeys: [...roleKeys], mode });
+    ['proposer', ['bookkeeper'], 'ask_every_change'],
+    ['poster', ['bookkeeper'], 'trusted_bookkeeper'],
+    ['apClerk', ['ap_clerk'], 'trusted_bookkeeper'],
+    ['reportsPoster', ['reports_only'], 'trusted_bookkeeper'],
+    ['fullPoster', ['full_access'], 'trusted_bookkeeper'],
+    ['adminReader', ['admin'], 'read_only'],
+    ['adminAsks', ['admin'], 'ask_every_change'],
+    ['adminTrusted', ['admin'], 'trusted_bookkeeper'],
+    ['adminFull', ['admin'], 'full_with_asks'],
+  ] as Array<[string, string[], AgentPreset]>) {
+    const made = await createAgent(admin, { name: `Agent ${key}`, roleKeys, preset });
     tokens[key] = made.token;
     agentIds[key] = made.agent.id;
   }
@@ -140,13 +193,15 @@ beforeAll(async () => {
 
 afterAll(async () => {
   resetAgentEndpointState();
+  resetAgentRateLimits();
   await closeDb(TEST_DIR);
   fs.rmSync(ROOT, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 describe('the catalog', () => {
-  it('every action names a real route of the app, and no action is for anything an agent never does', () => {
+  it('every action names a real route of the app, which is one registry operation, and none is for anything an agent never does', () => {
     expect(agentActionNames().length).toBe(AGENT_ACTIONS.length);
+    expect(AGENT_ACTIONS.length).toBe(55);
     for (const a of AGENT_ACTIONS) {
       const pattern = matchRoutePattern(a.route.path.replace(/\[[^\]]+\]/g, '11111111-2222-4333-8444-555555555555'));
       expect(pattern, a.name).not.toBeNull();
@@ -157,11 +212,20 @@ describe('the catalog', () => {
       // Never Users & Roles or File Utilities, and nothing is deleted for good.
       if (rule && typeof rule === 'object') expect(['users', 'file_utilities'], a.name).not.toContain(rule.area);
       expect(a.name).not.toMatch(/^delete_|password|backup|restore|user|role|setting|preference/);
+      // The policy decides each by its route's operation: one that is open to agents, classified.
+      const op = actionOperation(a);
+      expect(op.route, a.name).toBe(a.route.path);
+      expect(op.method, a.name).toBe(a.route.method);
+      expect(op.classified, a.name).toBe(true);
+      expect(op.availability, a.name).toBe('agent');
     }
     for (const t of AGENT_TRANSACTION_TYPES) {
       expect(agentActionNames()).toContain(`edit_${t}`);
       expect(agentActionNames()).toContain(`void_${t}`);
     }
+    // Only the agent's own requests, the rules-only suggestions and the staging-only import run
+    // themselves; every other action is its route's operation through the door.
+    expect(AGENT_ACTIONS.filter((a) => a.runs && a.runs !== 'door').map((a) => a.name).sort()).toEqual(['bank_feed_suggestions', 'import_statement_lines', 'list_my_proposals']);
   });
 
   it('an unknown action, or input that is not what the screen would accept, is a plain refusal', async () => {
@@ -193,17 +257,47 @@ describe('Read only', () => {
       { action: 'enter_journal_entry', input: journal('2026-03-01', '10.00'), dryRun: true },
       { action: 'add_customer', input: { displayName: 'Sneaky' }, requestId: 'ro-2' },
       { action: 'void_invoice', input: { id: '11111111-2222-4333-8444-555555555555' }, requestId: 'ro-3' },
+      { action: 'start_reconciliation', input: { bankAccountId: '11111111-2222-4333-8444-555555555555', statementDate: '2026-03-31', statementBalance: '10.00' }, requestId: 'ro-4' },
     ]) {
-      const r = await act(tokens.reader, body);
-      expect(r.status, body.action).toBe(403);
-      expect(r.json.error).toBe(READ_ONLY_AGENT_MESSAGE);
+      const out = await ok(tokens.reader, body);
+      expect(out.outcome, body.action).toBe('refused');
+      // The role is looked at first: a right the Bookkeeper role lacks is said as that.
+      expect(out.note, body.action).toMatch(body.action === 'void_invoice' ? ROLE : NEVER);
+      expect(out.action).toBe(body.action);
     }
     expect(await fingerprint()).toEqual(before);
   });
 
-  it('can still see what it proposed (nothing)', async () => {
+  it('is refused an edit or a void before the record is looked at: nothing says who changed it last, or whether it exists', async () => {
+    const invoiceId = await someInvoice();
+    const before = await fingerprint();
+    const invoiceBody = { customerId: rich.customerId, date: '2026-03-13', lines: [{ accountId: acct['4000'], quantity: '1', rate: '10' }] };
+    for (const body of [
+      { action: 'edit_invoice', input: { id: invoiceId, expectedUpdatedAt: STALE, changes: invoiceBody }, requestId: 'ro-stale-1' },
+      { action: 'edit_customer', input: { id: rich.customerId, expectedUpdatedAt: STALE, changes: { phone: '555-0101' } }, requestId: 'ro-stale-2' },
+      { action: 'void_invoice', input: { id: invoiceId, expectedUpdatedAt: STALE }, requestId: 'ro-stale-3' },
+      { action: 'edit_customer', input: { id: rich.customerId, expectedUpdatedAt: STALE, changes: { phone: '555-0101' } }, dryRun: true },
+      // A record that does not exist is refused the same way: not a "not found".
+      { action: 'deactivate_customer', input: { id: '11111111-2222-4333-8444-555555555555', expectedUpdatedAt: STALE }, requestId: 'ro-stale-4' },
+      // The action's own check on a new item comes after the policy too.
+      { action: 'add_item', input: { name: 'Stocked Widget', type: 'inventory', openingQuantity: '5', openingValue: '50' }, requestId: 'ro-stock' },
+    ]) {
+      const r = await act(tokens.reader, body);
+      const label = `${body.action}: ${JSON.stringify(r.json).slice(0, 400)}`;
+      expect(r.status, label).toBe(200);
+      expect(r.json.outcome, label).toBe('refused');
+      expect(r.json.note, label).toMatch(body.action === 'void_invoice' || body.action === 'deactivate_customer' ? ROLE : NEVER);
+      expect(JSON.stringify(r.json), label).not.toMatch(RECORD_FACTS);
+      expect(JSON.stringify(r.json), label).not.toMatch(/Opening stock/);
+      expect(r.json.summary, label).toBeUndefined();
+    }
+    expect(await fingerprint()).toEqual(before);
+  });
+
+  it('can still see what it asked for (nothing), as list_my_requests answers', async () => {
     const out = await ok(tokens.reader, { action: 'list_my_proposals', input: {} });
-    expect(out).toMatchObject({ outcome: 'read', result: { proposals: [] } });
+    expect(out).toMatchObject({ outcome: 'read', result: { count: 0, requests: [] } });
+    expect((await ok(tokens.reader, { verb: 'list_my_requests' })).requests).toEqual([]);
   });
 });
 
@@ -212,6 +306,7 @@ describe('a dry run', () => {
     const before = await fingerprint();
     const out = await ok(tokens.poster, { action: 'enter_journal_entry', input: journal('2026-03-02', '45.10'), dryRun: true });
     expect(out.outcome).toBe('dry_run');
+    expect(out.operation).toBe('journal-entries.create');
     expect(out.summary).toBe('Journal entry 2026-03-02: Office supplies bought with cash ($45.10)');
     expect(out.ledger.entries).toHaveLength(1);
     expect(out.ledger.entries[0]).toMatchObject({ date: '2026-03-02', status: 'posted' });
@@ -220,7 +315,9 @@ describe('a dry run', () => {
       expect.objectContaining({ accountCode: '1000', accountName: 'Checking', debit: null, credit: '45.10' }),
     ]);
     expect(out.ledger.changes).toContainEqual(expect.objectContaining({ action: 'create', kind: 'journal_entry' }));
+    expect(out.result).toMatchObject({ type: 'journal_entry', date: '2026-03-02', status: 'posted' });
     expect(out.note).toMatch(/Nothing was kept/);
+    expect(out.note).toMatch(/done straight away/);
     expect(await fingerprint()).toEqual(before);
   });
 
@@ -250,13 +347,13 @@ describe('a dry run', () => {
   });
 });
 
-describe('Post', () => {
+describe('Trusted bookkeeper', () => {
   let entryId: string;
   let first: Out;
 
   it('needs a request id for anything that is kept', async () => {
     const before = await fingerprint();
-    for (const requestId of [undefined, '', 'x', 'has spaces in it', 'a'.repeat(200)]) {
+    for (const requestId of [undefined, '', 'x', 'has spaces in it', 'a'.repeat(200), 'a'.repeat(400), 42]) {
       const r = await act(tokens.poster, { action: 'enter_journal_entry', input: journal('2026-03-03', '12.00'), ...(requestId === undefined ? {} : { requestId }) });
       expect(r.status, String(requestId)).toBe(400);
       expect(r.json.error).toMatch(/request_id/);
@@ -264,9 +361,10 @@ describe('Post', () => {
     expect(await fingerprint()).toEqual(before);
   });
 
-  it('enters the change, under the agent\'s name', async () => {
+  it("enters the change, under the agent's name", async () => {
     first = await ok(tokens.poster, { action: 'enter_journal_entry', input: journal('2026-03-03', '12.00'), requestId: 'je-2026-03-03-supplies' });
     expect(first.outcome).toBe('posted');
+    expect(first.operation).toBe('journal-entries.create');
     expect(first.result).toMatchObject({ type: 'journal_entry', date: '2026-03-03', status: 'posted' });
     entryId = first.result.id;
     expect(first.ledger.entries[0].journalEntryId).toBe(entryId);
@@ -278,7 +376,7 @@ describe('Post', () => {
 
     const audit = await db.select().from(auditLogs).where(and(eq(auditLogs.entityId, entryId), eq(auditLogs.entityType, 'journal_entry')));
     expect(audit.length).toBeGreaterThan(0);
-    expect(audit.every((a) => a.userId === null && a.agentId === agentIds.poster)).toBe(true);
+    expect(audit.every((a) => a.userId === null && a.agentId === agentIds.poster && a.approvedBy === null)).toBe(true);
     const trail = await listAuditLogs(admin, { entityType: 'journal_entry', limit: 200 });
     expect(trail.rows.find((r) => r.entityId === entryId)).toMatchObject({ actorName: 'Agent poster (agent)', actorId: null });
     const logged = readAllTransactionLog(TEST_DIR).records.find((r) => r.entityId === entryId);
@@ -294,6 +392,9 @@ describe('Post', () => {
     // Key order and spacing of the input do not matter.
     const reordered = { lines: journal('2026-03-03', '12.00').lines.map((l) => ({ ...l })), description: 'Office supplies bought with cash', date: '2026-03-03' };
     expect((await ok(tokens.poster, { action: 'enter_journal_entry', input: reordered, requestId: 'je-2026-03-03-supplies' })).replayed).toBe(true);
+    // The id is the operation's: run_operation cannot use it for a request of its own either.
+    const generic = await act(tokens.poster, { verb: 'run_operation', operation: 'journal-entries.create', body: journal('2026-03-03', '19.00'), requestId: 'je-2026-03-03-supplies' });
+    expect(generic.status).toBe(409);
     expect(await fingerprint()).toEqual(before);
     expect(agentInputHash('x', { a: 1, b: [1, { c: 2, d: 3 }] })).toBe(agentInputHash('x', { b: [1, { d: 3, c: 2 }], a: 1 }));
     expect(agentInputHash('x', { a: 1 })).not.toBe(agentInputHash('x', { a: 2 }));
@@ -303,13 +404,26 @@ describe('Post', () => {
     const before = await fingerprint();
     const other = await act(tokens.poster, { action: 'enter_journal_entry', input: journal('2026-03-03', '13.00'), requestId: 'je-2026-03-03-supplies' });
     expect(other.status).toBe(409);
-    expect(other.json.error).toMatch(/already used for a different change/);
+    expect(other.json.error).toMatch(/already used for a different/);
     const otherAction = await act(tokens.poster, { action: 'add_customer', input: { displayName: 'Collision' }, requestId: 'je-2026-03-03-supplies' });
     expect(otherAction.status).toBe(409);
     expect(await fingerprint()).toEqual(before);
     // Another agent's ids are its own.
     const mine = await ok(tokens.apClerk, { action: 'add_vendor', input: { displayName: 'Shared Id Vendor' }, requestId: 'je-2026-03-03-supplies' });
-    expect(mine.outcome).toBe('posted');
+    expect(mine.outcome).toBe('done');
+  });
+
+  it('an answer kept under a request id before the one path is given again as it was', async () => {
+    const input = journal('2026-03-03', '14.00', 'Entered by the old runner');
+    const stored = { action: 'enter_journal_entry', outcome: 'posted', summary: 'old', result: { type: 'journal_entry', id: 'old-id' } };
+    // The old runner hashed the input as its schema read it.
+    const parsed = AGENT_ACTIONS.find((a) => a.name === 'enter_journal_entry')!.schema.parse(input);
+    await db.insert(agentRequests).values({ companyId: admin.companyId, agentId: agentIds.poster, requestKey: 'old-runner-1', action: 'enter_journal_entry', inputHash: agentInputHash('enter_journal_entry', parsed), outcome: 'posted', result: stored });
+    const before = await fingerprint();
+    expect(await ok(tokens.poster, { action: 'enter_journal_entry', input, requestId: 'old-runner-1' })).toEqual({ ...stored, replayed: true });
+    const other = await act(tokens.poster, { action: 'enter_journal_entry', input: journal('2026-03-03', '15.00'), requestId: 'old-runner-1' });
+    expect(other.status).toBe(409);
+    expect(await fingerprint()).toEqual(before);
   });
 
   it('a change that is refused keeps nothing, and its request id is free to use again', async () => {
@@ -325,7 +439,7 @@ describe('Post', () => {
     expect(fixed.outcome).toBe('posted');
   });
 
-  it('enters each kind of transaction through its own service', async () => {
+  it('enters each kind of transaction through its own route', async () => {
     const customer = (await ok(tokens.poster, { action: 'add_customer', input: { displayName: 'Agent Made Customer', email: 'ap@made.test' }, requestId: 'cust-1' })).result;
     expect(customer).toMatchObject({ type: 'customer', name: 'Agent Made Customer', active: true });
     const vendor = (await ok(tokens.poster, { action: 'add_vendor', input: { displayName: 'Agent Made Vendor' }, requestId: 'vend-1' })).result;
@@ -370,6 +484,7 @@ describe('Post', () => {
       input: { vendorId: vendor.id, date: '2026-03-09', method: 'check', paymentAccountId: acct['1000'], applications: [{ billId: bill.result.id, amountApplied: '310.00' }] },
     });
     expect(paidBill.result.type).toBe('bill_payment');
+    expect(paidBill.summary).toBe('Pay 1 bill(s) of Agent Made Vendor 2026-03-09 ($310.00)');
     expect(paidBill.ledger.entries[0].lines).toEqual(expect.arrayContaining([expect.objectContaining({ accountCode: '2000', debit: '310.00' }), expect.objectContaining({ accountCode: '1000', credit: '310.00' })]));
 
     const check = await ok(tokens.poster, { action: 'write_check', requestId: 'chk-1', input: { vendorId: vendor.id, date: '2026-03-10', method: 'check', paymentAccountId: acct['1000'], lines: [{ accountId: acct['6400'], amount: '1200.00', description: 'March rent' }] } });
@@ -385,8 +500,20 @@ describe('Post', () => {
     expect(mine.every((e) => e.createdBy === rich.ctx.userId)).toBe(true);
   });
 
+  it('a duplicate bill number is a warning the agent may accept, not an error', async () => {
+    const vendorId = rich.vendorId;
+    const input = { vendorId, billNumber: 'DUP-1', date: '2026-03-08', lines: [{ accountId: acct['6300'], amount: '10.00' }] };
+    expect((await ok(tokens.poster, { action: 'enter_bill', requestId: 'dup-bill-1', input })).outcome).toBe('posted');
+    const warned = await ok(tokens.poster, { action: 'enter_bill', requestId: 'dup-bill-2', input });
+    expect(warned.outcome).toBe('needs_confirmation');
+    expect(warned.warnings.map((w: Out) => w.flag)).toContain('allowDuplicateNumber');
+    const accepted = await ok(tokens.poster, { action: 'enter_bill', requestId: 'dup-bill-2', input: { ...input, allowDuplicateNumber: true } });
+    expect(accepted.outcome).toBe('posted');
+  });
+
   it('edits and voids, and will not overwrite a change made since it last looked', async () => {
     const made = await ok(tokens.poster, { action: 'enter_journal_entry', requestId: 'je-edit-1', input: journal('2026-03-12', '30.00', 'To be edited') });
+    const before = await fingerprint();
     const stale = await act(tokens.poster, {
       action: 'edit_journal_entry',
       requestId: 'je-edit-1-stale',
@@ -394,6 +521,7 @@ describe('Post', () => {
     });
     expect(stale.status).toBe(409);
     expect(stale.json.details).toMatchObject({ staleVersion: true });
+    expect(await fingerprint()).toEqual(before);
 
     const edited = await ok(tokens.poster, {
       action: 'edit_journal_entry',
@@ -401,40 +529,52 @@ describe('Post', () => {
       input: { id: made.result.id, expectedUpdatedAt: made.result.updated_at, changes: journal('2026-03-12', '30.00', 'Edited description') },
     });
     expect(edited.outcome).toBe('posted');
+    expect(edited.operation).toBe('journal-entries.update');
     const [row] = await db.select().from(journalEntries).where(eq(journalEntries.id, edited.result.id));
     expect(row.description).toBe('Edited description');
 
     // Voiding a journal entry needs the Delete right there, which the Bookkeeper role does not have
     // (for a person either). An agent with Full Access may.
-    const denied = await act(tokens.poster, { action: 'void_journal_entry', requestId: 'je-edit-1-void', input: { id: edited.result.id } });
-    expect(denied.status).toBe(403);
-    expect(denied.json.error).toMatch(/You do not have permission to delete/);
+    const denied = await ok(tokens.poster, { action: 'void_journal_entry', requestId: 'je-edit-1-void', input: { id: edited.result.id } });
+    expect(denied.outcome).toBe('refused');
+    expect(denied.note).toMatch(ROLE);
     const voided = await ok(tokens.fullPoster, { action: 'void_journal_entry', requestId: 'je-edit-1-void', input: { id: edited.result.id } });
     expect(voided.result.status).toBe('void');
-    // Full Access carries the closed-period flag for people; an agent never has it.
+    // Full Access carries the closed-period flag for people; an agent's own run never has it.
     const check = await ok(tokens.fullPoster, { action: 'write_check', requestId: 'chk-void-1', input: { payeeName: 'Petty Cash', date: '2026-03-12', method: 'check', paymentAccountId: acct['1000'], lines: [{ accountId: acct['6300'], amount: '15.00' }] } });
     expect((await ok(tokens.fullPoster, { action: 'void_check', requestId: 'chk-void-1-void', input: { id: check.result.id, expectedUpdatedAt: check.result.updated_at } })).result.status).toBe('void');
     const gone = await act(tokens.fullPoster, { action: 'void_invoice', requestId: 'no-such-invoice', input: { id: '11111111-2222-4333-8444-555555555555' } });
     expect(gone.status).toBe(404);
   });
 
-  it('never posts on or before the closing date, whatever it sends', async () => {
+  it('never posts on or before the closing date on its own: it asks a person, and a closing password it sends is ignored', async () => {
     await db.update(companies).set({ settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || '{"closingDate":"2026-01-31"}'::jsonb` }).where(eq(companies.id, admin.companyId));
     try {
-      const before = await fingerprint();
-      for (const dryRun of [true, false]) {
-        const r = await act(
-          tokens.poster,
-          { action: 'enter_journal_entry', input: journal('2026-01-15', '10.00', 'Into a closed period'), ...(dryRun ? { dryRun } : { requestId: 'closed-period-1' }) },
-          { 'x-closing-password': 'anything' },
-        );
-        expect(r.status).toBeGreaterThanOrEqual(400);
-        expect(r.json.code).toBe('PERIOD_CLOSED');
-        expect(r.json.error).toMatch(/closed through 2026-01-31/);
+      const before = await books();
+      const closed = journal('2026-01-15', '10.00', 'Into a closed period');
+      // The Bookkeeper role has no closed-period right, so it cannot even ask.
+      for (const how of [{ dryRun: true }, { requestId: 'closed-period-0' }]) {
+        const out = await ok(tokens.poster, { action: 'enter_journal_entry', input: closed, ...how });
+        expect(out.outcome).toBe('refused');
+        expect(out.note).toMatch(ROLE);
       }
-      expect(await fingerprint()).toEqual(before);
-      // After the closing date it still works.
-      expect((await ok(tokens.poster, { action: 'enter_journal_entry', input: journal('2026-02-01', '10.00', 'Open period'), dryRun: true })).outcome).toBe('dry_run');
+      // Full Access has it: the agent asks, and a person (who types any closing password) decides.
+      const dry = await ok(tokens.fullPoster, { action: 'enter_journal_entry', input: closed, dryRun: true });
+      expect(dry.outcome).toBe('dry_run');
+      expect(dry.note).toMatch(/ask a person first/);
+      const real = await act(
+        tokens.fullPoster,
+        { action: 'enter_journal_entry', input: closed, requestId: 'closed-period-1', reason: 'The January supplies were missed.' },
+        { 'x-closing-password': 'anything' },
+      );
+      expect(real.status).toBe(200);
+      expect(real.json.outcome).toBe('asked');
+      expect(real.json.needs.flags ?? [real.json.needs.flag]).toContain('closedPeriod');
+      expect(await books()).toEqual(before);
+      const [asked] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.id, real.json.requestId));
+      expect(asked).toMatchObject({ status: 'pending', reason: 'The January supplies were missed.', agentId: agentIds.fullPoster });
+      // After the closing date it is the agent's own work again.
+      expect((await ok(tokens.poster, { action: 'enter_journal_entry', input: journal('2026-02-01', '10.00', 'Open period'), dryRun: true })).note).toMatch(/done straight away/);
     } finally {
       await db.update(companies).set({ settings: sql`${companies.settings} - 'closingDate'` }).where(eq(companies.id, admin.companyId));
     }
@@ -451,20 +591,42 @@ describe('Post', () => {
       { action: 'add_account', input: { name: 'Not Mine', qbType: 'Expense' } },
     ]) {
       for (const how of [{ dryRun: true }, { requestId: `denied-${body.action}` }]) {
-        const r = await act(tokens.apClerk, { ...body, ...how });
-        expect(r.status, body.action).toBe(403);
-        expect(r.json.error).toMatch(/You do not have permission/);
+        const out = await ok(tokens.apClerk, { ...body, ...how });
+        expect(out.outcome, body.action).toBe('refused');
+        expect(out.note, body.action).toMatch(ROLE);
+        // The refusal says nothing it read from the books: not the name of the customer the
+        // invoice was for (A/P Clerk has no Customers), nor an account's.
+        expect(JSON.stringify(out), body.action).not.toMatch(/Acme|Checking|Office Supplies/);
+        expect(out.summary, body.action).toBeUndefined();
       }
     }
-    // Reports Only in Post mode: the mode allows changes, the role allows none.
+    // Editing or voiding an invoice is outside the role: refused before the version it names is
+    // compared, so the answer never says who changed the invoice last, or when.
+    const invoiceId = await someInvoice();
+    for (const body of [
+      { action: 'void_invoice', input: { id: invoiceId, expectedUpdatedAt: STALE } },
+      { action: 'edit_invoice', input: { id: invoiceId, expectedUpdatedAt: STALE, changes: { customerId: rich.customerId, date: '2026-03-13', lines: [{ accountId: acct['4000'], quantity: '1', rate: '10' }] } } },
+      { action: 'void_invoice', input: { id: '11111111-2222-4333-8444-555555555555', expectedUpdatedAt: STALE } },
+    ]) {
+      for (const how of [{ dryRun: true }, { requestId: `denied-stale-${body.action}` }]) {
+        const r = await act(tokens.apClerk, { ...body, ...how });
+        const label = `${body.action}: ${JSON.stringify(r.json).slice(0, 400)}`;
+        expect(r.status, label).toBe(200);
+        expect(r.json.outcome, label).toBe('refused');
+        expect(r.json.note, label).toMatch(ROLE);
+        expect(JSON.stringify(r.json), label).not.toMatch(RECORD_FACTS);
+      }
+    }
+    // Reports Only on Trusted bookkeeper: the policy allows changes, the role allows none.
     for (const body of [
       { action: 'enter_journal_entry', input: journal('2026-03-13', '10.00') },
       { action: 'enter_bill', input: { vendorId: rich.vendorId, date: '2026-03-13', lines: [{ accountId: acct['6300'], amount: '40.00' }] } },
       { action: 'add_customer', input: { displayName: 'Nope' } },
       { action: 'void_invoice', input: { id: '11111111-2222-4333-8444-555555555555' } },
     ]) {
-      const r = await act(tokens.reportsPoster, { ...body, requestId: `reports-${body.action}` });
-      expect(r.status, body.action).toBe(403);
+      const out = await ok(tokens.reportsPoster, { ...body, requestId: `reports-${body.action}` });
+      expect(out.outcome, body.action).toBe('refused');
+      expect(out.note, body.action).toMatch(ROLE);
     }
     expect(await fingerprint(['agent_requests'])).toEqual(before);
   });
@@ -474,54 +636,62 @@ describe('Post', () => {
     expect(r.status).toBe(400);
     expect(r.json.error).toMatch(/Opening stock is entered in Ironbooks/);
   });
+
+  it('making a customer inactive is treated like a delete: it always asks a person', async () => {
+    const out = await ok(tokens.fullPoster, { action: 'deactivate_customer', input: { id: rich.customerId }, requestId: 'cust-off-1' });
+    expect(out).toMatchObject({ outcome: 'asked', operation: 'customers.delete', status: 'pending' });
+    // The reason the tools cannot send yet is said as such on the card, never made up.
+    const [asked] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.id, out.requestId));
+    expect(asked.reason).toMatch(/No reason given: the agent used the "deactivate_customer" tool/);
+  });
 });
 
-describe('Propose', () => {
-  let proposalId: string;
+describe('Ask for every change', () => {
+  let requestId: string;
+  let proposalsBefore: number;
   const input = () => journal('2026-03-14', '77.00', 'Proposed supplies');
 
-  it('checks the change, queues it for a person, and enters nothing', async () => {
-    const before = await fingerprint(['ai_proposals', 'audit_logs', 'agent_requests']);
-    const ledgerBefore = (await fingerprint()).ledger;
-    const out = await ok(tokens.proposer, { action: 'enter_journal_entry', input: input(), requestId: 'prop-1' });
-    expect(out.outcome).toBe('proposed');
-    expect(out.note).toMatch(/Nothing was entered/);
-    proposalId = out.proposalId;
-    expect(out.ledger.entries[0].lines).toHaveLength(2);
-    expect(await fingerprint(['ai_proposals', 'audit_logs', 'agent_requests'])).toEqual({ ...before, log: before.log + 1 });
-    expect((await fingerprint()).ledger).toEqual(ledgerBefore);
+  it('checks the change, asks a person, and enters nothing', async () => {
+    proposalsBefore = (await db.select().from(aiProposals)).length;
+    const before = await books();
+    const out = await ok(tokens.proposer, { action: 'enter_journal_entry', input: input(), requestId: 'prop-1', reason: 'Supplies bought on the 14th.' });
+    expect(out).toMatchObject({ action: 'enter_journal_entry', operation: 'journal-entries.create', outcome: 'asked', status: 'pending' });
+    expect(out.summary).toBe('Journal entry 2026-03-14: Proposed supplies ($77.00)');
+    expect(out.note).toMatch(/Nothing is done yet/);
+    requestId = out.requestId;
+    expect(requestId).toMatch(/^[0-9a-f-]{36}$/);
+    // What the approval card shows: the ledger lines of the preview.
+    expect(out.ledger.entries[0].lines.map((l: Out) => [l.accountCode, l.debit, l.credit])).toEqual([['6300', '77.00', null], ['1000', null, '77.00']]);
+    expect(await books()).toEqual(before);
 
-    const [row] = await db.select().from(aiProposals).where(eq(aiProposals.id, proposalId));
-    expect(row).toMatchObject({ kind: 'agent_action', status: 'pending', agentId: agentIds.proposer, createdBy: null, summary: 'Journal entry 2026-03-14: Proposed supplies ($77.00)' });
-    // What the approval card shows: the date, the words, the ledger lines, the total.
-    const payload = row.payload as Out;
-    expect(payload).toMatchObject({ date: '2026-03-14', description: row.summary, totalDebit: '77.00', action: 'enter_journal_entry', agent: { id: agentIds.proposer, name: 'Agent proposer' } });
-    expect(payload.lines.map((l: Out) => [l.accountCode, l.debit, l.credit])).toEqual([['6300', '77.00', null], ['1000', null, '77.00']]);
-    // It shows in the app's own list of proposals waiting for approval.
-    expect((await listProposals(admin, 'pending')).map((p) => p.id)).toContain(proposalId);
+    const [row] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.id, requestId));
+    expect(row).toMatchObject({ status: 'pending', agentId: agentIds.proposer, operation: 'journal-entries.create', reason: 'Supplies bought on the 14th.' });
+    // Nothing goes to the old approval queue any more.
+    expect((await db.select().from(aiProposals)).length).toBe(proposalsBefore);
   });
 
-  it('the same request again is the same proposal, not a second one', async () => {
+  it('the same request again is the same request, not a second one', async () => {
     const again = await ok(tokens.proposer, { action: 'enter_journal_entry', input: input(), requestId: 'prop-1' });
-    expect(again).toMatchObject({ replayed: true, outcome: 'proposed', proposalId });
-    expect(await db.select().from(aiProposals).where(eq(aiProposals.agentId, agentIds.proposer))).toHaveLength(1);
+    expect(again).toMatchObject({ replayed: true, outcome: 'asked', requestId });
+    expect(await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.agentId, agentIds.proposer))).toHaveLength(1);
   });
 
-  it('something that would be refused is refused now, not queued', async () => {
+  it('something that would be refused is refused now, not asked', async () => {
     const r = await act(tokens.proposer, {
       action: 'enter_journal_entry',
       requestId: 'prop-bad',
       input: { date: '2026-03-14', description: 'Unbalanced proposal', lines: [{ accountId: acct['6300'], debit: '10.00' }, { accountId: acct['1000'], credit: '9.00' }] },
     });
     expect(r.status).toBe(400);
-    expect(await db.select().from(aiProposals).where(eq(aiProposals.agentId, agentIds.proposer))).toHaveLength(1);
+    expect(await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.agentId, agentIds.proposer))).toHaveLength(1);
   });
 
-  it('the agent can see its proposal waiting', async () => {
+  it('the agent can see its request waiting', async () => {
     const out = await ok(tokens.proposer, { action: 'list_my_proposals', input: {} });
-    expect(out.result.proposals).toEqual([expect.objectContaining({ proposal_id: proposalId, action: 'enter_journal_entry', status: 'pending', decided_at: null })]);
+    expect(out.result.count).toBe(1);
+    expect(out.result.requests).toEqual([expect.objectContaining({ id: requestId, operation: 'journal-entries.create', status: 'pending', decidedAt: null })]);
     // Another agent sees none of it.
-    expect((await ok(tokens.poster, { action: 'list_my_proposals', input: {} })).result.proposals).toEqual([]);
+    expect((await ok(tokens.poster, { action: 'list_my_proposals', input: {} })).result.requests.map((r: Out) => r.id)).not.toContain(requestId);
   });
 
   it('a person without the right cannot approve it', async () => {
@@ -530,50 +700,255 @@ describe('Propose', () => {
     await db.insert(userRoleAssignments).values({ userId: viewer.id, companyId: admin.companyId, roleKey: 'ar_clerk' });
     // A/R Clerk: no journal entries. The approval runs under the approver's own permissions.
     const clerk: ServiceContext = { db, companyId: admin.companyId, userId: viewer.id, role: 'accountant', access: unionRoles([builtinRole('ar_clerk')!]) };
-    await expect(approveProposal(clerk, proposalId)).rejects.toMatchObject({ code: 'FORBIDDEN' });
-    const [row] = await db.select().from(aiProposals).where(eq(aiProposals.id, proposalId));
+    // Refused (or not even shown to them): either way nothing is approved.
+    await expect(approveAgentRequest(clerk, requestId, {}, { atHost: true })).rejects.toMatchObject({ code: expect.stringMatching(/^(FORBIDDEN|NOT_FOUND)$/) });
+    const [row] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.id, requestId));
     expect(row.status).toBe('pending');
   });
 
-  it('a person approves it: entered under their permissions, named as the agent\'s and approved by them', async () => {
-    const approved = await approveProposal(admin, proposalId);
-    expect(approved.status).toBe('approved');
+  it("a person approves it: entered, named as the agent's and approved by them", async () => {
+    const approved = await approveAgentRequest(admin, requestId, {}, { atHost: true });
+    expect(approved.status).toBe('executed');
     const [entry] = await db.select().from(journalEntries).where(and(eq(journalEntries.agentId, agentIds.proposer), eq(journalEntries.description, 'Proposed supplies')));
-    expect(entry).toMatchObject({ createdBy: rich.ctx.userId, status: 'posted' });
+    expect(entry).toMatchObject({ status: 'posted' });
+    const audit = await db.select().from(auditLogs).where(and(eq(auditLogs.entityId, entry.id), eq(auditLogs.entityType, 'journal_entry')));
+    expect(audit.every((a) => a.agentId === agentIds.proposer && a.approvedBy === rich.ctx.userId && a.agentRequestId === requestId)).toBe(true);
     const trail = await listAuditLogs(admin, { entityType: 'journal_entry', limit: 300 });
     expect(trail.rows.find((r) => r.entityId === entry.id)?.actorName).toBe('Agent proposer (agent), approved by Owner Person');
     expect(readAllTransactionLog(TEST_DIR).records.find((r) => r.entityId === entry.id)?.userName).toBe('Agent proposer (agent), approved by Owner Person');
     // Approving twice does nothing more.
-    await expect(approveProposal(admin, proposalId)).rejects.toBeInstanceOf(ServiceError);
+    await expect(approveAgentRequest(admin, requestId, {}, { atHost: true })).rejects.toMatchObject({ code: expect.stringMatching(/CONFLICT|VALIDATION/) });
     const out = await ok(tokens.proposer, { action: 'list_my_proposals', input: {} });
-    expect(out.result.proposals[0]).toMatchObject({ status: 'approved' });
-    expect(out.result.proposals[0].decided_at).toMatch(/^\d{4}-/);
+    expect(out.result.requests[0]).toMatchObject({ id: requestId, status: 'executed' });
+    // Asking again with its request id says what became of it, in the action's words.
+    const again = await ok(tokens.proposer, { action: 'enter_journal_entry', input: input(), requestId: 'prop-1' });
+    expect(again).toMatchObject({ replayed: true, outcome: 'posted', result: { type: 'journal_entry', id: entry.id, status: 'posted' } });
   });
 
-  it('a person rejects one: nothing is entered', async () => {
-    const out = await ok(tokens.proposer, { action: 'enter_journal_entry', input: journal('2026-03-15', '5.00', 'To be rejected'), requestId: 'prop-2' });
-    const before = (await fingerprint()).ledger;
-    expect((await rejectProposal(admin, out.proposalId)).status).toBe('rejected');
-    expect((await fingerprint()).ledger).toEqual(before);
-    const mine = (await ok(tokens.proposer, { action: 'list_my_proposals', input: {} })).result.proposals;
-    expect(mine.find((p: Out) => p.proposal_id === out.proposalId)).toMatchObject({ status: 'rejected' });
+  it('a person says no: nothing is entered', async () => {
+    const out = await ok(tokens.proposer, { action: 'enter_journal_entry', input: journal('2026-03-15', '5.00', 'To be denied'), requestId: 'prop-2' });
+    expect(out.outcome).toBe('asked');
+    const before = await books();
+    expect((await denyAgentRequest(admin, out.requestId, 'Not this one')).status).toBe('denied');
+    expect(await books()).toEqual(before);
+    const again = await ok(tokens.proposer, { action: 'enter_journal_entry', input: journal('2026-03-15', '5.00', 'To be denied'), requestId: 'prop-2' });
+    expect(again).toMatchObject({ outcome: 'refused', replayed: true });
+    expect(again.note).toMatch(/Not this one/);
   });
 
-  it('a dry run in Propose mode queues nothing', async () => {
-    const count = (await db.select().from(aiProposals).where(eq(aiProposals.agentId, agentIds.proposer))).length;
+  it('prepare work is done at once; a dry run asks nothing', async () => {
+    const count = (await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.agentId, agentIds.proposer))).length;
     const out = await ok(tokens.proposer, { action: 'enter_journal_entry', input: journal('2026-03-16', '9.00'), dryRun: true });
     expect(out.outcome).toBe('dry_run');
-    expect(out.note).toMatch(/approval queue/);
-    expect(await db.select().from(aiProposals).where(eq(aiProposals.agentId, agentIds.proposer))).toHaveLength(count);
+    expect(out.note).toMatch(/ask a person first/);
+    // Starting a reconciliation is prepare work, which this preset allows.
+    const bank = await newBank('Ask Test');
+    const started = await ok(tokens.proposer, { action: 'start_reconciliation', input: { bankAccountId: bank, statementDate: '2026-03-31', statementBalance: '100.00' }, requestId: 'prop-recon-1' });
+    expect(started).toMatchObject({ outcome: 'done', operation: 'reconciliations.create', result: { status: 'in_progress', statement_date: '2026-03-31', statement_balance: '100.00' } });
+    expect(started.result.reconciliation_id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(started.result.difference).toMatch(/^-?\d+\.\d{2}$/);
+    expect(await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.agentId, agentIds.proposer))).toHaveLength(count);
+    // Cancelling it removes it for good: that asks, for every preset.
+    const cancel = await ok(tokens.proposer, { action: 'cancel_reconciliation', input: { reconciliationId: started.result.reconciliation_id }, requestId: 'prop-recon-1-off' });
+    expect(cancel.outcome).toBe('refused');
+    expect(cancel.note).toMatch(ROLE);
+    expect((await ok(tokens.fullPoster, { action: 'cancel_reconciliation', input: { reconciliationId: started.result.reconciliation_id }, requestId: 'recon-1-off' })).outcome).toBe('asked');
+    // Nothing went to the old approval queue on the way.
+    expect((await db.select().from(aiProposals)).length).toBe(proposalsBefore);
+  });
+});
+
+describe('a proposal still waiting in the old approval queue', () => {
+  it('is entered the old way when a person approves its copy, named as the agent\'s and approved by them', async () => {
+    const input = journal('2026-03-17', '21.00', 'Proposed before the upgrade');
+    const [proposal] = await db
+      .insert(aiProposals)
+      .values({
+        companyId: admin.companyId,
+        createdBy: null,
+        agentId: agentIds.proposer,
+        kind: AGENT_PROPOSAL_KIND,
+        summary: 'Journal entry 2026-03-17: Proposed before the upgrade ($21.00)',
+        payload: { date: '2026-03-17', description: 'old', reference: null, lines: [], totalDebit: '21.00', rationale: null, agent: { id: agentIds.proposer, name: 'Agent proposer' }, action: 'enter_journal_entry', input, changes: [] },
+        status: 'pending',
+      })
+      .returning();
+    // What the upgrade (drizzle/0097) does with each one: a request named by the proposal.
+    await db.insert(agentPermissionRequests).values({
+      companyId: admin.companyId,
+      agentId: agentIds.proposer,
+      requestKey: `proposal:${proposal.id}`,
+      operation: 'action:enter_journal_entry',
+      class: 'change',
+      input: input as unknown as Record<string, unknown>,
+      summary: proposal.summary,
+      status: 'pending',
+      expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
+      proposalId: proposal.id,
+    });
+    const [copy] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.proposalId, proposal.id));
+    expect((await approveAgentRequest(admin, copy.id, {}, { atHost: true })).status).toBe('executed');
+    const [entry] = await db.select().from(journalEntries).where(eq(journalEntries.description, 'Proposed before the upgrade'));
+    expect(entry).toMatchObject({ agentId: agentIds.proposer, createdBy: rich.ctx.userId, status: 'posted' });
+    const trail = await listAuditLogs(admin, { entityType: 'journal_entry', limit: 300 });
+    expect(trail.rows.find((r) => r.entityId === entry.id)?.actorName).toBe('Agent proposer (agent), approved by Owner Person');
+    const [settled] = await db.select().from(aiProposals).where(eq(aiProposals.id, proposal.id));
+    expect(settled.status).toBe('approved');
+  });
+});
+
+describe('an agent with the Admin role', () => {
+  let bankId: string;
+  let invoiceId: string;
+
+  /**
+   * Each curated action next to the same request sent to run_operation. `stale`: the action names
+   * a version older than the record's, which run_operation has no way to send.
+   */
+  const pairs = (): Array<{ action: string; input: Out; operation: string; request: Out; stale?: true }> => [
+    { action: 'enter_journal_entry', input: journal('2026-03-18', '11.00'), operation: 'journal-entries.create', request: { body: journal('2026-03-18', '11.00') } },
+    { action: 'add_customer', input: { displayName: 'Admin Agent Customer' }, operation: 'customers.create', request: { body: { displayName: 'Admin Agent Customer' } } },
+    { action: 'edit_customer', input: { id: rich.customerId, changes: { phone: '555-0199' } }, operation: 'customers.update', request: { params: { id: rich.customerId }, body: { phone: '555-0199' } } },
+    { action: 'deactivate_customer', input: { id: rich.customerId }, operation: 'customers.delete', request: { params: { id: rich.customerId } } },
+    { action: 'deactivate_vendor', input: { id: rich.vendorId }, operation: 'vendors.delete', request: { params: { id: rich.vendorId } } },
+    { action: 'undo_last_reconciliation', input: { bankAccountId: bankId }, operation: 'reconciliations.undo', request: { body: { bankAccountId: bankId, expectStatementDate: null } } },
+    {
+      action: 'import_statement_lines',
+      input: { bankAccountId: bankId, kind: 'bank', openingBalance: '0.00', closingBalance: '-12.00', rows: [{ date: '2026-03-18', description: 'FEE', amount: '-12.00' }] },
+      operation: 'import',
+      request: { body: { bankAccountId: bankId, fileType: 'rows', rows: [{ date: '2026-03-18', description: 'FEE', amount: '-12.00' }], statement: { kind: 'bank', openingBalance: '0.00', closingBalance: '-12.00' }, filename: 'statement lines from an agent' } },
+    },
+    { action: 'edit_customer', input: { id: rich.customerId, expectedUpdatedAt: STALE, changes: { phone: '555-0199' } }, operation: 'customers.update', request: { params: { id: rich.customerId }, body: { phone: '555-0199' } }, stale: true },
+    { action: 'void_invoice', input: { id: invoiceId, expectedUpdatedAt: STALE }, operation: 'invoices.delete', request: { params: { id: invoiceId } }, stale: true },
+    // The one action decided by another route than its window's (lib/agent/banking.ts): it is
+    // given exactly what the bank feed read is given.
+    { action: 'bank_feed_suggestions', input: { bankAccountId: bankId }, operation: 'bank-transactions', request: { query: { bankAccountId: bankId } } },
+  ];
+
+  it('gets nothing through a curated action that run_operation would not give it', async () => {
+    bankId = await newBank('Admin Agent');
+    invoiceId = await someInvoice();
+    resetAgentRateLimits();
+    const before = await fingerprint(['agent_requests']);
+    const seen = new Map<string, Set<string>>();
+    for (const who of ['adminReader', 'adminAsks', 'adminTrusted', 'adminFull']) {
+      for (const p of pairs()) {
+        const curated = await act(tokens[who], { action: p.action, input: p.input, dryRun: true });
+        const generic = await act(tokens[who], { verb: 'run_operation', operation: p.operation, ...p.request, dryRun: true });
+        const label = `${who} ${p.action}: ${JSON.stringify(curated.json).slice(0, 300)} / ${JSON.stringify(generic.json).slice(0, 300)}`;
+        if (p.stale && generic.json.outcome !== 'refused') {
+          // run_operation cannot carry the version the agent last read, so it goes on; the action
+          // compares it and refuses a stale one. Less than run_operation gives, never more.
+          expect(curated.status, label).toBe(409);
+          expect(curated.json.details, label).toMatchObject({ staleVersion: true });
+          seen.set(who, (seen.get(who) ?? new Set()).add(`${p.action}:stale`));
+          continue;
+        }
+        // Refused, the action says what run_operation says, and nothing of the record.
+        if (p.stale) expect(JSON.stringify(curated.json), label).not.toMatch(RECORD_FACTS);
+        expect(curated.status, label).toBe(generic.status);
+        expect(curated.json.outcome, label).toBe(generic.json.outcome);
+        expect(curated.json.note, label).toBe(generic.json.note);
+        expect(curated.json.error, label).toBe(generic.json.error);
+        if (curated.status === 200) expect(curated.json.operation, label).toBe(p.operation);
+        const treatment = String(curated.json.outcome === 'refused' ? 'refused' : /ask a person first/.test(curated.json.note ?? '') ? 'ask' : curated.status === 200 ? 'run' : 'error');
+        seen.set(who, (seen.get(who) ?? new Set()).add(`${p.action}:${treatment}`));
+      }
+    }
+    // Read only refuses every change (the stale ones included, in the policy's words); it may read
+    // the bank feed, so it is given the suggestions too. Removals always ask, whatever the preset.
+    const readerSaw = [...seen.get('adminReader')!];
+    expect(readerSaw.filter((s) => !s.startsWith('bank_feed_suggestions:')).every((s) => s.endsWith(':refused')), readerSaw.join(' ')).toBe(true);
+    expect(readerSaw).toContain('bank_feed_suggestions:run');
+    for (const who of ['adminAsks', 'adminTrusted', 'adminFull']) {
+      expect(seen.get(who), who).toContain('deactivate_customer:ask');
+      expect(seen.get(who), who).toContain('deactivate_vendor:ask');
+      expect(seen.get(who), who).toContain('edit_customer:stale');
+      expect(seen.get(who), who).toContain('void_invoice:stale');
+      expect(seen.get(who), who).toContain('bank_feed_suggestions:run');
+    }
+    expect(seen.get('adminTrusted')).toContain('enter_journal_entry:run');
+    expect(seen.get('adminAsks')).toContain('enter_journal_entry:ask');
+    // Statement lines are bulk work: asked, unless the policy allows bulk within its cap.
+    expect(seen.get('adminTrusted')).toContain('import_statement_lines:ask');
+    expect(seen.get('adminFull')).toContain('import_statement_lines:run');
+    expect(await fingerprint(['agent_requests'])).toEqual(before);
+  });
+
+  it('a real request it may not make on its own asks, exactly as run_operation does', async () => {
+    const curated = await ok(tokens.adminTrusted, { action: 'deactivate_vendor', input: { id: rich.vendorId }, requestId: 'admin-vendor-off', reason: 'Vendor closed.' });
+    const generic = await ok(tokens.adminTrusted, { verb: 'run_operation', operation: 'vendors.delete', params: { id: rich.vendorId }, requestId: 'admin-vendor-off-2', reason: 'Vendor closed.' });
+    expect(curated).toMatchObject({ outcome: 'asked', operation: 'vendors.delete', status: 'pending' });
+    expect(generic).toMatchObject({ outcome: 'asked', operation: 'vendors.delete', status: 'pending' });
+    expect(curated.needs).toEqual(generic.needs);
+    // The Admin-role agent's own statement import, within its cap, is staged and posts nothing.
+    const ledger = (await books()).ledger;
+    const imported = await ok(tokens.adminFull, { action: 'import_statement_lines', input: pairs()[6].input, requestId: 'admin-import-1' });
+    expect(imported).toMatchObject({ outcome: 'done', operation: 'import', result: { added_to_feed: 1, tied_out: true, difference: '0.00' } });
+    expect((await books()).ledger).toEqual(ledger);
+    // Asked again, through either door, it is the same request.
+    expect(await ok(tokens.adminFull, { action: 'import_statement_lines', input: pairs()[6].input, requestId: 'admin-import-1' })).toMatchObject({ replayed: true, outcome: 'done' });
+    expect(await ok(tokens.adminFull, { verb: 'run_operation', operation: 'import', ...pairs()[6].request, requestId: 'admin-import-1' })).toMatchObject({ replayed: true, outcome: 'done' });
+  });
+});
+
+describe('too much at once', () => {
+  /** The door's own process-wide counts (lib/agent/operate.ts rateLimited and inRunSlot). */
+  const store = globalThis as typeof globalThis & { __bkaAgentDoorRate?: Map<string, number[]>; __bkaAgentDoorRuns?: Map<string, number> };
+
+  it('a curated action is slowed down exactly as run_operation is: 429 with Retry-After, never a refusal of the work', async () => {
+    const bank = await newBank('Rate Test');
+    const lines = { bankAccountId: bank, kind: 'bank', openingBalance: '0.00', closingBalance: '-3.00', rows: [{ date: '2026-03-21', description: 'FEE', amount: '-3.00' }] };
+    // Through the door, its own run (import and suggestions, which "Full, with asks" does itself),
+    // a refusal (Read only), the agent's own requests, and run_operation itself.
+    const sent: Array<[string, Out]> = [
+      ['adminFull', { action: 'enter_journal_entry', input: journal('2026-03-21', '3.00'), dryRun: true }],
+      ['adminFull', { action: 'import_statement_lines', input: lines, dryRun: true }],
+      ['adminFull', { action: 'import_statement_lines', input: lines, requestId: 'rate-import-1' }],
+      ['adminFull', { action: 'bank_feed_suggestions', input: { bankAccountId: bank } }],
+      ['adminReader', { action: 'import_statement_lines', input: lines, requestId: 'rate-import-2' }],
+      ['adminReader', { action: 'edit_customer', input: { id: rich.customerId, expectedUpdatedAt: STALE, changes: { phone: '555-0102' } }, requestId: 'rate-edit-1' }],
+      ['adminFull', { verb: 'run_operation', operation: 'journal-entries.create', body: journal('2026-03-21', '3.00'), dryRun: true }],
+    ];
+    const before = await fingerprint();
+    try {
+      for (const [who, body] of [...sent, ['adminFull', { action: 'list_my_proposals', input: {} }] as [string, Out]]) {
+        resetAgentRateLimits();
+        store.__bkaAgentDoorRate!.set(agentIds[who], Array.from({ length: AGENT_CALLS_PER_MINUTE }, () => Date.now()));
+        const r = await act(tokens[who], body);
+        const label = `${who} ${body.action ?? body.verb}: ${JSON.stringify(r.json).slice(0, 300)}`;
+        expect(r.status, label).toBe(429);
+        expect(r.json.code, label).toBe('RATE_LIMITED');
+        expect(Number(r.retryAfter), label).toBeGreaterThan(0);
+        expect(r.json.error, label).toMatch(/more than \d+ requests in the last minute/);
+      }
+      for (const [who, body] of sent) {
+        resetAgentRateLimits();
+        store.__bkaAgentDoorRuns!.set(agentIds[who], AGENT_RUNS_AT_ONCE);
+        const r = await act(tokens[who], body);
+        const label = `${who} ${body.action ?? body.verb}: ${JSON.stringify(r.json).slice(0, 300)}`;
+        expect(r.status, label).toBe(429);
+        expect(r.json.code, label).toBe('RATE_LIMITED');
+        expect(r.retryAfter, label).toBe('2');
+        expect(r.json.error, label).toMatch(/requests under way/);
+      }
+      // A run of the action's own gives its place back, however it ends.
+      resetAgentRateLimits();
+      expect((await act(tokens.adminFull, { action: 'import_statement_lines', input: { ...lines, closingBalance: '-9.00' }, dryRun: true })).status).toBe(400);
+      expect(store.__bkaAgentDoorRuns!.get(agentIds.adminFull) ?? 0).toBe(0);
+    } finally {
+      resetAgentRateLimits();
+    }
+    expect(await fingerprint()).toEqual(before);
   });
 });
 
 describe('request ids are kept per agent and never travel', () => {
-  it('each kept change has one row; refused and dry-run requests have none', async () => {
+  it('each kept change or ask has one row; refused and dry-run requests have none', async () => {
     const rows = await db.select().from(agentRequests);
     expect(rows.length).toBeGreaterThan(10);
-    expect(rows.every((r) => ['posted', 'proposed'].includes(r.outcome) && r.result !== null)).toBe(true);
-    expect(rows.filter((r) => r.requestKey.startsWith('denied-') || r.requestKey.startsWith('reports-') || r.requestKey === 'closed-period-1')).toEqual([]);
+    expect(rows.every((r) => ['posted', 'done', 'asked', 'failed'].includes(r.outcome) && r.result !== null)).toBe(true);
+    expect(rows.filter((r) => r.requestKey.startsWith('denied-') || r.requestKey.startsWith('reports-') || r.requestKey.startsWith('ro-'))).toEqual([]);
     expect(new Set(rows.map((r) => `${r.agentId}:${r.requestKey}`)).size).toBe(rows.length);
   });
 });

@@ -7,9 +7,29 @@
  * its files to the people listed in "Email to" (QB "Send report as e-mail"): the email goes out
  * through the company's Send Forms / email settings, only with the company's network opt-in for
  * an outside mail server, and never from a sandbox copy. Without recipients files stay here.
+ *
+ * Agent full access: a schedule an agent set up or changed (or whose report an agent changed) does
+ * not run until a person has looked at it, because it would run unattended with its creator's full
+ * access and email whoever is on it (lib/services/memorizedReports.ts, AGENT_SCHEDULE_HELD_MESSAGE).
+ * Such a row says "Waiting for you: an agent set this up" and offers "Confirm recipients": saving
+ * the recipients is the one step that ends that wait. Pause and Resume do not, and the row says so.
+ *
+ * Whether a schedule waits for a person is to be the server's call, made from the audit trail each
+ * time the list is loaded (`waitingForAPerson`), so that it is the same after a reload, in another
+ * window and for another person; the page never guesses it from what happened on this page. The
+ * page reads that answer when the listing carries it, but today's server does not send it yet:
+ * GET /api/report-schedules returns listReportSchedules, a plain select of the stored rows, and
+ * runDueSchedules' internet branch writes its message only when the schedule is not already held,
+ * so a stored agent message is never replaced by the internet reason. Until both change
+ * (lib/services/memorizedReports.ts, not this page), the page reads the stored message instead
+ * (agentHoldNow), which errs towards waiting: after a person confirms, the row keeps saying it waits
+ * for an agent's change until the schedule really runs, a hold for internet services behind it is
+ * not shown, and a schedule an agent made that has not reached its first run shows no badge.
+ * test/dom/agentChrome.dom.tsx pins both: what the page shows with today's listing, and with the
+ * server's answer.
  */
 import { useCallback, useEffect, useState } from 'react';
-import { CalendarClock, Mail, Pause, Play, Plus, Trash2 } from 'lucide-react';
+import { Bot, CalendarClock, Mail, Pause, Play, Plus, Trash2 } from 'lucide-react';
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Input, Label, Modal, PageHeader, Select, Table, Td, Th, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
@@ -28,6 +48,12 @@ interface Schedule {
   lastStatus: string | null;
   lastMessage: string | null;
   emailTo: string | null;
+  /**
+   * Waits for a person because an agent set it up or changed it, as the server decides it now
+   * (memorizedReports' schedulesWaitingForAPerson). GET /api/report-schedules does not carry it
+   * yet; a listing without it is read from the stored message instead (agentHoldNow).
+   */
+  waitingForAPerson?: boolean;
 }
 interface Option {
   id: string;
@@ -38,12 +64,65 @@ const today = () => todayISO();
 
 /**
  * A schedule's last result: red only when it failed. "held" (an emailing schedule waiting until
- * internet services are allowed for this file on this computer) is a wait, not an error.
+ * internet services are allowed for this file on this computer, or one an agent set up waiting for
+ * a person) is a wait, not an error.
  */
 function lastStatusTone(status: string | null): 'success' | 'warning' | 'danger' {
   if (status === 'ok') return 'success';
   if (status === 'partial' || status === 'held') return 'warning';
   return 'danger';
+}
+
+/**
+ * How the message the timer stores on a schedule held for an agent begins
+ * (AGENT_SCHEDULE_HELD_MESSAGE in lib/services/memorizedReports.ts, which a page cannot import).
+ * test/agentChrome.dom.test.ts checks that the two still agree.
+ */
+const AGENT_HOLD_START = 'Waiting for a person: an agent';
+/**
+ * Shown in place of an agent hold's stored message once the server says nobody needs to look: the
+ * timer keeps that message until the schedule next runs or is held for another reason. It claims
+ * nothing about the next run, which may still be held for another reason (internet services).
+ */
+const AGENT_HOLD_RELEASED = 'A person confirmed this schedule after an agent changed it. Its next run shows here.';
+/** Shown when the server says an agent hold applies but the stored message is about something else. */
+const AGENT_HOLD_NOW =
+  'Waiting for a person: an agent set up or changed this schedule or a report it runs. Check the report and who it emails, then choose Confirm recipients and Save.';
+
+/**
+ * Whether the schedule waits for a person because of an agent, now: the server's answer. A listing
+ * that does not carry it (today, every listing) is read from the stored message, which can be out
+ * of date: the timer keeps it until the schedule really runs, even through a later hold for
+ * internet services. It then errs towards waiting, which only asks a person to look again.
+ */
+function agentHoldNow(s: Schedule): boolean {
+  if (typeof s.waitingForAPerson === 'boolean') return s.waitingForAPerson;
+  return s.lastStatus === 'held' && !!s.lastMessage?.startsWith(AGENT_HOLD_START);
+}
+
+/**
+ * The row as shown, so a held row always gives its current reason: a stored agent-hold message the
+ * server says no longer applies says so instead, and an agent hold the server reports over a stored
+ * message about something else (the internet hold) is said as the agent hold, the one that decides
+ * first.
+ */
+function shownRow(s: Schedule, forAgent: boolean): Schedule {
+  const storedForAgent = !!s.lastMessage?.startsWith(AGENT_HOLD_START);
+  if (s.lastStatus !== 'held' || forAgent === storedForAgent) return s;
+  return { ...s, lastMessage: forAgent ? AGENT_HOLD_NOW : AGENT_HOLD_RELEASED };
+}
+
+/**
+ * What saving the recipients did, from the list as the server gives it right after: `confirming`
+ * when the dialog was opened on a schedule waiting for a person. Without the server's answer it
+ * says only what is sure (a person's save is recorded as a confirmation), and why the row may not
+ * change: it still shows the message stored by the schedule's last run.
+ */
+function recipientsSavedMessage(confirming: boolean, now: Schedule | undefined): string {
+  if (!confirming) return 'Recipients saved.';
+  if (now?.waitingForAPerson === false) return 'Recipients confirmed. It no longer waits for you.';
+  if (now?.waitingForAPerson === true) return 'Recipients saved, but it still waits for a person: an agent changed it again. Check it and confirm its recipients once more.';
+  return 'Recipients confirmed. This row shows the schedule’s last run, so it may still say it waits for you.';
 }
 
 export default function ScheduledReportsPage() {
@@ -53,11 +132,13 @@ export default function ScheduledReportsPage() {
   const [groups, setGroups] = useState<Option[]>([]);
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ name: '', target: '', frequency: 'monthly', startDate: today(), format: 'csv', folder: '', emailTo: '' });
-  // "Email to" of an existing schedule (null = dialog closed).
-  const [mailEdit, setMailEdit] = useState<{ s: Schedule; value: string } | null>(null);
+  // "Email to" of an existing schedule (null = dialog closed). `confirm`: opened from "Confirm
+  // recipients" (or the envelope) on a schedule waiting for a person, which Save confirms.
+  const [mailEdit, setMailEdit] = useState<{ s: Schedule; value: string; confirm: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const load = useCallback(async () => {
+  /** Load the list (and what the schedules run); the schedules as loaded, or null when it failed. */
+  const load = useCallback(async (): Promise<Schedule[] | null> => {
     try {
       const [s, m] = await Promise.all([
         api.get<{ schedules: Schedule[]; exportFolder: string }>('/api/report-schedules'),
@@ -67,8 +148,10 @@ export default function ScheduledReportsPage() {
       setFolder(s.exportFolder);
       setReports(m.reports);
       setGroups(m.groups);
+      return s.schedules;
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not load scheduled reports.', 'danger');
+      return null;
     }
   }, []);
   useEffect(() => {
@@ -118,14 +201,19 @@ export default function ScheduledReportsPage() {
     }
   };
 
+  // A person saving the recipients is what ends the wait of a schedule an agent set up (the server
+  // records it as a confirmation); nothing else on this page does. What the row then says comes
+  // from the list loaded right after, not from this page's memory of the save.
   const saveRecipients = async () => {
     if (!mailEdit) return;
+    const id = mailEdit.s.id;
+    const confirming = mailEdit.confirm;
     setBusy(true);
     try {
-      await api.patch(`/api/report-schedules/${mailEdit.s.id}`, { emailTo: mailEdit.value.trim() || null });
+      await api.patch(`/api/report-schedules/${id}`, { emailTo: mailEdit.value.trim() || null });
       setMailEdit(null);
-      await load();
-      toast('Recipients saved.', 'success');
+      const now = (await load())?.find((x) => x.id === id);
+      toast(recipientsSavedMessage(confirming, now), now?.waitingForAPerson === true ? 'info' : 'success');
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not save the recipients.', 'danger');
     } finally {
@@ -194,45 +282,85 @@ export default function ScheduledReportsPage() {
               </tr>
             </thead>
             <tbody>
-              {schedules.map((s) => (
-                <Tr key={s.id}>
-                  <Td>
-                    {s.name} {!s.isActive && <Badge tone="warning">Paused</Badge>}
-                  </Td>
-                  <Td className="capitalize">{s.frequency}</Td>
-                  <Td>{targetName(s)}</Td>
-                  <Td>{new Date(s.nextRunAt).toLocaleDateString()}</Td>
-                  <Td>
-                    {s.lastRunAt ? (
-                      <>
-                        <span title={s.lastMessage ?? ''}>
-                          {new Date(s.lastRunAt).toLocaleDateString()}{' '}
-                          <Badge tone={lastStatusTone(s.lastStatus)}>{s.lastStatus}</Badge>
+              {schedules.map((raw) => {
+                const forAgent = agentHoldNow(raw);
+                const s = shownRow(raw, forAgent);
+                return (
+                  <Tr key={s.id}>
+                    <Td>
+                      {s.name} {!s.isActive && <Badge tone="warning">Paused</Badge>}
+                      {forAgent && (
+                        <span
+                          className="mt-1 flex items-center"
+                          data-agent-hold
+                          title="It does not run until a person confirms its recipients. Pausing or resuming it does not count."
+                        >
+                          <Badge tone="info" className="inline-flex items-center gap-1">
+                            <Bot className="h-3 w-3" aria-hidden="true" /> Waiting for you: an agent set this up
+                          </Badge>
                         </span>
-                        {/* Held is not a failure: it waits for internet services to be allowed on this computer. */}
-                        {s.lastStatus === 'held' && s.lastMessage && <p className="mt-1 max-w-[18rem] text-xs text-navy/70">{s.lastMessage}</p>}
-                      </>
-                    ) : (
-                      '—'
-                    )}
-                  </Td>
-                  <Td className="uppercase">{s.format}{s.folder ? ` → ${s.folder}` : ''}</Td>
-                  <Td className="text-sm text-navy/70 max-w-[14rem] truncate" title={s.emailTo ?? ''}>
-                    {s.emailTo ?? <span className="text-navy/40">Files only</span>}
-                  </Td>
-                  <Td>
-                    <Button variant="ghost" size="sm" onClick={() => setMailEdit({ s, value: s.emailTo ?? '' })} aria-label={`Email recipients of ${s.name}`}>
-                      <Mail className="h-4 w-4" />
-                    </Button>
-                    <Button variant="ghost" size="sm" onClick={() => toggle(s)} aria-label={s.isActive ? `Pause ${s.name}` : `Resume ${s.name}`}>
-                      {s.isActive ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                    </Button>
-                    <Button variant="ghost" size="sm" onClick={() => setRemoving(s)} aria-label={`Delete ${s.name}`}>
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </Td>
-                </Tr>
-              ))}
+                      )}
+                    </Td>
+                    <Td className="capitalize">{s.frequency}</Td>
+                    <Td>{targetName(s)}</Td>
+                    <Td>{new Date(s.nextRunAt).toLocaleDateString()}</Td>
+                    <Td>
+                      {s.lastRunAt ? (
+                        <>
+                          <span title={s.lastMessage ?? ''}>
+                            {new Date(s.lastRunAt).toLocaleDateString()}{' '}
+                            <Badge tone={lastStatusTone(s.lastStatus)}>{s.lastStatus}</Badge>
+                          </span>
+                          {/* Held is not a failure: it waits for internet services to be allowed on this
+                              computer, or for a person to confirm what an agent set up. The reason shown
+                              is the current one (shownRow). */}
+                          {s.lastStatus === 'held' && s.lastMessage && <p className="mt-1 max-w-[18rem] text-xs text-navy/70">{s.lastMessage}</p>}
+                        </>
+                      ) : (
+                        '—'
+                      )}
+                    </Td>
+                    <Td className="uppercase">{s.format}{s.folder ? ` → ${s.folder}` : ''}</Td>
+                    <Td className="text-sm text-navy/70 max-w-[14rem] truncate" title={s.emailTo ?? ''}>
+                      {s.emailTo ?? <span className="text-navy/40">Files only</span>}
+                    </Td>
+                    <Td className="whitespace-nowrap">
+                      {forAgent && (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          className="mr-1"
+                          onClick={() => setMailEdit({ s, value: s.emailTo ?? '', confirm: true })}
+                          aria-label={`Confirm recipients of ${s.name}`}
+                          data-confirm-recipients
+                        >
+                          Confirm recipients
+                        </Button>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setMailEdit({ s, value: s.emailTo ?? '', confirm: forAgent })}
+                        aria-label={`Email recipients of ${s.name}`}
+                      >
+                        <Mail className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => toggle(s)}
+                        aria-label={s.isActive ? `Pause ${s.name}` : `Resume ${s.name}`}
+                        title={forAgent ? 'Pausing or resuming does not let it run: confirm its recipients.' : undefined}
+                      >
+                        {s.isActive ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => setRemoving(s)} aria-label={`Delete ${s.name}`}>
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </Td>
+                  </Tr>
+                );
+              })}
             </tbody>
           </Table>
         )}
@@ -333,7 +461,7 @@ export default function ScheduledReportsPage() {
       <Modal
         open={mailEdit !== null}
         onClose={() => setMailEdit(null)}
-        title={mailEdit ? `Email “${mailEdit.s.name}” to` : 'Email to'}
+        title={mailEdit ? (mailEdit.confirm ? `Confirm who “${mailEdit.s.name}” emails` : `Email “${mailEdit.s.name}” to`) : 'Email to'}
         footer={
           <>
             <Button variant="secondary" onClick={() => setMailEdit(null)}>
@@ -345,6 +473,13 @@ export default function ScheduledReportsPage() {
           </>
         }
       >
+        {mailEdit?.confirm && (
+          <p className="mb-3 rounded-md bg-electric/5 px-3 py-2 text-sm text-navy/80" data-confirm-note>
+            An agent set up or changed this schedule, or a report it runs ({targetName(mailEdit.s)}). It runs on its own and
+            emails whoever is listed here, so it waits for you. Check the report and these addresses, then choose Save so it
+            no longer waits for you. Pausing or resuming it does not.
+          </p>
+        )}
         <Label htmlFor="sc-email-edit">Email addresses</Label>
         <Input
           id="sc-email-edit"

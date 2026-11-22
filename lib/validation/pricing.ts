@@ -49,66 +49,125 @@ export const pricingSettingsSchema = z.object({
   defaultRounding: zRounding.optional(),
 });
 
+const ROUNDING_WORDS = `${ROUNDING_MODES.join(', ')} (none rounds to the cent)`;
+
+// Create (POST) and edit (PUT) take the same full body: an edit replaces the level's settings, so a
+// field left out on an edit goes back to its default (lib/services/pricing.ts normalizeLevel).
 export const priceLevelSchema = z.object({
-  name: z.string().trim().min(1, 'name is required'),
-  type: z.enum(['fixed_percent', 'per_item']),
-  percent: zDecimal.nullish(),
-  rounding: zRounding.nullish(),
-  isActive: z.boolean().optional(),
+  name: z.string().trim().min(1, 'name is required').describe('Name of the price level, such as "Wholesale".'),
+  type: z
+    .enum(['fixed_percent', 'per_item'])
+    .describe('fixed_percent: every price moves by percent; per_item: a price per item, set with PUT /api/pricing/levels/:id/items.'),
+  percent: zDecimal
+    .nullish()
+    .describe('fixed_percent only: signed percentage as decimal text, "-10" for 10% off or "5" for 5% more; leave out for 0, on an edit too.'),
+  rounding: zRounding
+    .nullish()
+    .describe(`fixed_percent only: how the new prices are rounded, ${ROUNDING_WORDS}; leave out for the company's default rounding, on an edit too.`),
+  isActive: z
+    .boolean()
+    .optional()
+    .describe('False makes the level inactive; on a new level leave out for active, and on an edit leave out to keep it.'),
 });
 
 export const priceLevelItemsSchema = z.object({
-  items: z.array(z.object({ itemId: zUuid, price: zDecimal })),
+  items: z
+    .array(
+      z.object({
+        itemId: zUuid.describe('Id of the item (item list), at most once in the list.'),
+        price: zDecimal.describe('Price of the item at this level, as decimal text such as "19.99"; not negative.'),
+      }),
+    )
+    .describe("All item prices of the per_item level, replacing the saved ones; an item not listed sells at its own price."),
 });
 
 const adjustmentSchema = z.object({
-  basis: z.enum(['price', 'cost']).default('price'),
-  method: z.enum(['percent', 'amount', 'fixed']),
-  direction: z.enum(['increase', 'decrease']).default('decrease'),
-  value: zDecimal.transform((v) => String(v)),
+  basis: z.enum(['price', 'cost']).default('price').describe("What the change starts from: price (the item's sales price, the default) or cost."),
+  method: z.enum(['percent', 'amount', 'fixed']).describe('percent or amount changes the basis by value; fixed sets the price to value.'),
+  direction: z.enum(['increase', 'decrease']).default('decrease').describe('increase or decrease (the default); not used with fixed.'),
+  value: zDecimal
+    .transform((v) => String(v))
+    .describe('The percentage, amount or fixed price, as decimal text such as "10"; not negative, and a percent decrease at most 100.'),
 });
 
+// Create (POST) and edit (PUT) take the same full body: an edit replaces the whole rule, so a field
+// left out on an edit goes back to its default (lib/services/pricing.ts normalizeRule).
 export const priceRuleSchema = z.object({
-  name: z.string().trim().min(1, 'name is required'),
-  description: z.string().nullish(),
-  isActive: z.boolean().optional(),
-  priority: z.number().int().min(0).max(100000).optional(),
+  name: z.string().trim().min(1, 'name is required').describe('Name of the price rule, such as "Contractors 10% off lumber".'),
+  description: z.string().nullish().describe('Longer description of the rule; leave out for none.'),
+  isActive: z.boolean().optional().describe('False turns the rule off; leave out for on, on an edit too.'),
+  priority: z
+    .number()
+    .int()
+    .min(0)
+    .max(100000)
+    .optional()
+    .describe('Whole number 0 to 100000; a lower number is a higher priority when rules compete. Leave out for 100, on an edit too.'),
   conditions: z
     .object({
-      itemIds: z.array(zUuid).optional(),
-      itemTypes: z.array(z.string()).optional(),
-      itemCustomField: z.object({ name: z.string(), value: z.string() }).nullish(),
-      customerIds: z.array(zUuid).optional(),
-      customerTypeIds: z.array(zUuid).optional(),
-      jobIds: z.array(zUuid).optional(),
-      classIds: z.array(zUuid).optional(),
-      salesRepIds: z.array(zUuid).optional(),
+      itemIds: z.array(zUuid).optional().describe('Only these items (item list).'),
+      itemTypes: z.array(z.string()).optional().describe('Only items of these types, such as "inventory" or "service".'),
+      itemCustomField: z
+        .object({
+          name: z.string().describe('Name of the item custom field.'),
+          value: z.string().describe('Value the field must have.'),
+        })
+        .nullish()
+        .describe('Only items whose custom field has this value.'),
+      customerIds: z.array(zUuid).optional().describe('Only these customers (customer list).'),
+      customerTypeIds: z.array(zUuid).optional().describe('Only customers of these customer types.'),
+      jobIds: z.array(zUuid).optional().describe('Only these Customer:Jobs (job list).'),
+      classIds: z.array(zUuid).optional().describe('Only documents of these classes (class list).'),
+      salesRepIds: z.array(zUuid).optional().describe('Only documents of these sales reps.'),
     })
-    .optional(),
-  adjustment: adjustmentSchema,
+    .optional()
+    .describe('Which sales the rule applies to; every list given must match, and an empty or missing list matches everything. Leave out for every sale.'),
+  adjustment: adjustmentSchema.describe('How the rule changes the price.'),
   tiers: z
-    .array(z.object({ minQuantity: zDecimal.transform((v) => String(v)), adjustment: adjustmentSchema }))
-    .nullish(),
-  rounding: zRounding.nullish(),
-  startDate: zDay.nullish().or(z.literal('')),
-  endDate: zDay.nullish().or(z.literal('')),
-  minQuantity: zDecimal.nullish().or(z.literal('')),
+    .array(
+      z.object({
+        minQuantity: zDecimal.transform((v) => String(v)).describe('Quantity from which this tier applies, as decimal text above zero; each tier its own.'),
+        adjustment: adjustmentSchema.describe('How the price changes from that quantity on.'),
+      }),
+    )
+    .nullish()
+    .describe('Quantity breaks: from each minQuantity on, its adjustment replaces the main one; leave out for none.'),
+  rounding: zRounding
+    .nullish()
+    .describe(`How the new price is rounded: ${ROUNDING_WORDS}; leave out for the company's default rounding.`),
+  startDate: zDay.nullish().or(z.literal('')).describe('First day the rule applies, YYYY-MM-DD; leave out or blank for no start.'),
+  endDate: zDay.nullish().or(z.literal('')).describe('Last day the rule applies, YYYY-MM-DD, not before startDate; leave out or blank for no end.'),
+  minQuantity: zDecimal
+    .nullish()
+    .or(z.literal(''))
+    .describe('Smallest quantity on the line for the rule to apply, as decimal text; leave out or blank for any quantity.'),
 });
 
 export const customerPricingAssignSchema = z.object({
-  customerTypeId: zUuid.nullish(),
-  priceLevelId: zUuid.nullish(),
+  customerTypeId: zUuid
+    .nullish()
+    .describe("Id of the customer type (customer type list) to give the customer; leave out to keep it, or send null to clear it."),
+  priceLevelId: zUuid
+    .nullish()
+    .describe("Id of the price level to give the customer; leave out to keep it, or send null to clear it."),
 });
 
+// Create (POST /api/type-lists/:kind) and edit (PUT /api/type-lists/:kind/:id) take the same body;
+// an edit saves name and parentId as sent (lib/services/typeLists.ts updateType).
 export const typeListSchema = z.object({
-  name: z.string().trim().min(1, 'name is required'),
-  parentId: zUuid.nullish(),
-  isActive: z.boolean().optional(),
+  name: z.string().trim().min(1, 'name is required').describe('Name of the customer or vendor type, such as "Retail"; unique in its list.'),
+  parentId: zUuid
+    .nullish()
+    .describe('Id of the type this one is a subtype of, in the same list; leave out for a top-level type. On an edit, leaving it out makes it top-level.'),
+  isActive: z
+    .boolean()
+    .optional()
+    .describe('False makes the type inactive; on a new type leave out for active, and on an edit leave out to keep it.'),
 });
 
 export const vendorTypeAssignSchema = z.object({
-  vendorId: zUuid,
-  vendorTypeId: zUuid.nullable(),
+  vendorId: zUuid.describe('Id of the vendor (vendor list).'),
+  vendorTypeId: zUuid.nullable().describe('Id of the vendor type (vendor type list) to give the vendor, or null to clear it.'),
 });
 
 // ---- Fulfillment -------------------------------------------------------------

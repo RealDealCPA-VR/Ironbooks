@@ -56,13 +56,31 @@ function headlessBlocker(cfg, facts = {}) {
   return null;
 }
 
+/** An options object as a caller writes one (`{ … }`): never a window, which is an object of a class. */
+function plainObject(a) {
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return false;
+  const proto = Object.getPrototypeOf(a);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * The options of a dialog call, read as Electron reads its arguments: a plain object first is the
+ * options; otherwise the first argument is the window (or null / undefined, for none) and the
+ * options come second. Never picked by what an object holds (electron/agentShell.js dialogOptions).
+ */
+function dialogOptionsOf(args) {
+  const list = Array.isArray(args) ? args : [];
+  if (plainObject(list[0])) return list[0];
+  return list[1] && typeof list[1] === 'object' && !Array.isArray(list[1]) ? list[1] : {};
+}
+
 /**
  * The answer a question gets while no window shows: the choice that changes nothing (its cancel
  * button; the first button when it has none, which for a plain notice is OK).
  * @param {unknown[]} args  the arguments of dialog.showMessageBox (window?, options)
  */
 function quietDialogAnswer(args) {
-  const options = (Array.isArray(args) ? args : []).find((a) => a && typeof a === 'object' && (Array.isArray(a.buttons) || typeof a.message === 'string')) || {};
+  const options = dialogOptionsOf(args);
   return { response: Number.isInteger(options.cancelId) ? options.cancelId : 0, checkboxChecked: false };
 }
 

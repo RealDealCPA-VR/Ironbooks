@@ -20,16 +20,19 @@ import {
   ARCHIVE_PASSWORD_HEADER,
   ARCHIVE_RECOVERY_KEY_HEADER,
   CLOSING_PASSWORD_HEADER,
+  MAIL_SERVER_PATHS,
   MASKED_TEXT,
   PRODUCED_SECRET_TABLE,
   PRODUCED_SECRET_TEXT,
   SECRET_HEADERS,
   SECRET_PARTS_MARKER,
   SECRET_ROUTE_TABLE,
+  SHOWN_HOST_MAX,
   applySecrets,
   cleanText,
   encodeSecretParts,
   guardInput,
+  hostShownInFull,
   maskAccountsInText,
   maskInput,
   maskSensitiveFields,
@@ -360,7 +363,8 @@ describe('applySecrets', () => {
     ['POST /api/period-copy', 'backup_password', 'password'],
   ] as const)('%s: %s goes in body.%s, replacing what the agent sent', (key, kind, field) => {
     const operation = reg(key);
-    const out = applySecrets(operation, { body: { [field]: AGENT_SECRET, protect: false, name: 'Dana' } }, { [kind]: 'Person-Typed-9' });
+    // A mail server set-up names its server: the typed password goes only to one the line shows.
+    const out = applySecrets(operation, { body: { [field]: AGENT_SECRET, protect: false, name: 'Dana', host: 'smtp.acme.com' } }, { [kind]: 'Person-Typed-9' });
     const b = out.input.body as Record<string, unknown>;
     expect(b[field]).toBe('Person-Typed-9');
     // A copy of the company file is always protected with what the approver typed.
@@ -403,7 +407,14 @@ describe('applySecrets', () => {
   it('every operation that needs secrets gets all of them placed when they are given', () => {
     for (const o of allOperations().filter((x) => x.kind === 'route' && x.needsSecret.length > 0)) {
       const secrets = Object.fromEntries(o.needsSecret.map((k) => [k, k === 'archive_credentials' ? 'RK-1' : `pw-${k}`])) as Partial<Record<SecretKind, string>>;
-      const body = o.route === '/api/email/test' ? { draft: {} } : o.route === '/api/file-lock' ? { action: 'set' } : {};
+      const body =
+        o.route === '/api/email/test'
+          ? { draft: { host: 'smtp.acme.com' } }
+          : o.route === '/api/email/settings'
+            ? { host: 'smtp.acme.com' }
+            : o.route === '/api/file-lock'
+              ? { action: 'set' }
+              : {};
       const out = applySecrets(o, { body }, secrets);
       expect(out.missing, `${o.method} ${o.route}`).toEqual([]);
       for (const name of Object.keys(out.headers)) expect(SECRET_HEADERS).toContain(name);
@@ -424,6 +435,62 @@ describe('applySecrets', () => {
     const out = applySecrets(op(), { body: {} }, { new_user_password: 'x', mail_password: 'y' });
     expect(out.input.body).toEqual({});
     expect(out.headers).toEqual({});
+  });
+});
+
+describe('the mail server a typed mail password goes to', () => {
+  const test = () => reg('POST /api/email/test');
+  const settings = () => reg('PUT /api/email/settings');
+  const draft = (host: unknown) => ({ to: 'me@acme.com', draft: { host, port: 587, security: 'starttls', fromEmail: 'books@acme.com', username: 'books' } });
+  const CYRILLIC_I = String.fromCharCode(0x0456);
+  const ZWSP = String.fromCharCode(0x200b);
+  const notShown: Array<[string, unknown]> = [
+    ['longer than the line shows in full', `${'a'.repeat(SHOWN_HOST_MAX - 'x.example'.length + 1)}x.example`],
+    ['a letter from another alphabet that looks like a Latin one', `smtp.gma${CYRILLIC_I}l.com`],
+    ['an invisible mark inside', `smtp.gmail.com${ZWSP}.attacker.example`],
+    ['spaces inside', 'smtp.gmail.com attacker.example'],
+    ['a web address, not a server name', 'smtp://attacker.example'],
+    ['no name at all', ''],
+    ['not text', 42],
+  ];
+
+  it.each([
+    ['smtp.gmail.com'],
+    ['  smtp.office365.com  '],
+    ['192.168.1.5'],
+    ['[::1]'],
+    [`${'a'.repeat(SHOWN_HOST_MAX - 'x.example'.length)}x.example`],
+  ])('%j is shown in full, so the request goes on and the typed password is put in', (host) => {
+    expect(hostShownInFull(host)).toBe(true);
+    expect(guardInput(test(), { body: draft(host) }).refused).toBeNull();
+    const out = applySecrets(test(), { body: draft(host) }, { mail_password: 'Mail-9' });
+    expect(out.missing).toEqual([]);
+    expect((out.input.body as { draft: Record<string, unknown> }).draft.password).toBe('Mail-9');
+    expect(guardInput(settings(), { body: draft(host).draft }).refused).toBeNull();
+    expect(applySecrets(settings(), { body: draft(host).draft }, { mail_password: 'Mail-9' }).missing).toEqual([]);
+  });
+
+  it.each(notShown)('a server name with %s is refused, and never gets the typed password', (_label, host) => {
+    expect(hostShownInFull(host)).toBe(false);
+    expect(guardInput(test(), { body: draft(host) }).refused).toMatch(/see in full which server/);
+    expect(guardInput(settings(), { body: draft(host).draft }).refused).toMatch(/see in full which server/);
+    // Even when guardInput was not asked first.
+    for (const [o, b] of [[test(), draft(host)], [settings(), draft(host).draft]] as const) {
+      const out = applySecrets(o, { body: b }, { mail_password: 'Mail-9' });
+      expect(out.missing).toEqual(['mail_password']);
+      expect(contains(out, 'Mail-9')).toBe(false);
+    }
+  });
+
+  it('a draft with no server name at all is refused; a test of the saved set-up needs none', () => {
+    expect(guardInput(test(), { body: { to: 'me@acme.com', draft: { port: 587 } } }).refused).toMatch(/see in full which server/);
+    expect(guardInput(test(), { body: { to: 'me@acme.com' } }).refused).toBeNull();
+    expect(applySecrets(test(), { body: { to: 'me@acme.com' } }, { mail_password: 'Mail-9' }).missing).toEqual([]);
+  });
+
+  it('names the same servers as the operations that need a typed mail password', () => {
+    const needing = allOperations().filter((o) => o.kind === 'route' && o.needsSecret.includes('mail_password')).map((o) => `${o.method} ${o.route}`);
+    expect(Object.keys(MAIL_SERVER_PATHS).sort()).toEqual(needing.sort());
   });
 });
 
@@ -547,6 +614,43 @@ describe('maskInput and maskSensitiveFields', () => {
     expect(out).toEqual({ params: { id: 'e1' }, body: { ssn: '***-**-6789', memo: 'Acct # ••••4567' } });
   });
 
+  it('keeps a recipient as it is in the stored request and in the answer, an "acct#" in it or not', () => {
+    const email = reg('POST /api/invoices/[id]/email');
+    const to = 'billing.acme.com.acct#7@evil.com';
+    expect(maskInput(email, { params: { id: 'i1' }, body: { to, memo: 'Acct # 1234567' } }).body).toEqual({ to, memo: 'Acct # ••••4567' });
+    expect(redactAnswer(email, { to, sentTo: ['acctno1@evil.example'] }, { reveal: false }).answer).toEqual({ to, sentTo: ['acctno1@evil.example'] });
+  });
+
+  // Every mark the routes' own checks take in one address (salesForms EMAIL_ADDRESS_RE, emailSettings
+  // EMAIL_RE, the reminder's in attention.ts), which nodemailer then delivers to the domain after "@",
+  // or to the address in angle brackets.
+  const ODD_RECIPIENTS: ReadonlyArray<readonly [string, string]> = [
+    ["billing.acme.com.acct#7'x@evil.com", '@evil.com'],
+    ['billing.acme.com.acct#7(x)@evil.com', '@evil.com'],
+    ['billing.acme.com.acct#7"@evil.com', '@evil.com'],
+    ['billing.acme.com.acct#7[x]@evil.com', '@evil.com'],
+    ['Name.acct#7<x@evil.example>', '<x@evil.example>'],
+    ["accounts.payable.department.of.acme.com.billing.team.o'brien@evil.example", '@evil.example'],
+  ];
+
+  it.each(ODD_RECIPIENTS)('keeps %j whole in the stored request and the answer: as one value, a list item, in a joined text', (to, where) => {
+    for (const key of ['POST /api/invoices/[id]/email', 'POST /api/attention/invoice-reminder', 'POST /api/email/test']) {
+      const o = reg(key);
+      const joined = `ok@acme.com, ${to}; x@acme.com`;
+      const stored = maskInput(o, { params: { id: 'i1' }, body: { to, list: ['ok@acme.com', to], joined } }).body as Record<string, unknown>;
+      expect(stored, key).toMatchObject({ to, list: ['ok@acme.com', to], joined });
+      const answered = redactAnswer(o, { to, sentTo: ['ok@acme.com', to], note: `Sent to ${to}` }, { reveal: false }).answer as Record<string, unknown>;
+      expect(answered, key).toEqual({ to, sentTo: ['ok@acme.com', to], note: `Sent to ${to}` });
+      expect(String(stored.to)).toContain(where);
+    }
+  });
+
+  it('a recipient the mailer reads as two keeps the address after the "," (the reminder takes "," in one)', () => {
+    const reminder = reg('POST /api/attention/invoice-reminder');
+    expect(maskInput(reminder, { body: { to: 'acct#1,b@evil.com' } }).body).toEqual({ to: 'acct#••••,b@evil.com' });
+    expect(redactAnswer(reminder, { to: 'acct#1;b@evil.com' }, { reveal: false }).answer).toEqual({ to: 'acct#••••;b@evil.com' });
+  });
+
   it('masks a preview value the same way as an answer', () => {
     const o = op({ sensitiveFields: ['rows.*.accountNumber'] });
     expect(maskSensitiveFields(o, { rows: [{ accountNumber: '55551234' }] }, { reveal: false })).toEqual({ rows: [{ accountNumber: '••••1234' }] });
@@ -569,7 +673,17 @@ describe('text helpers', () => {
     ['Acct#99887766', 'Acct#••••7766'],
     // After a longer label only the number goes: the words up to the last one with a digit.
     ['acct no: 55443322 ref 7', 'acct no: ••••3322 ref 7'],
-    ['Account number 1000 is already used, so "Checking" was created as 1000-2.', 'Account number •••• is already used, so "Checking" was created as 1000-2.'],
+    // Chart-of-accounts numbers are not protected: the app's own sentences about them stay as they are.
+    ['Account number 1000 is already used, so "Checking" was created as 1000-2.', 'Account number 1000 is already used, so "Checking" was created as 1000-2.'],
+    ['account number 6100.10', 'account number 6100.10'],
+    ['Account number 1000-2 was created', 'Account number 1000-2 was created'],
+    ['Account number 1000 is used; Account No. 33334444 is the bank', 'Account number 1000 is used; Account No. ••••4444 is the bank'],
+    // A bank or vendor number: labelled as one ("No", "Acct", a colon), or too long for a chart of accounts.
+    ['Account No. 1000', 'Account No. ••••'],
+    ['Acct no 1000', 'Acct no ••••'],
+    ['Account Number: 1000', 'Account Number: ••••'],
+    ['Account number 1234 5678', 'Account number ••••5678'],
+    ['Account number AB1000', 'Account number ••••1000'],
     ['Account No. 1234 5678 9012', 'Account No. ••••9012'],
     ['Account Number: SMITH 0012 for rent', 'Account Number: ••••0012 for rent'],
     ['Account no.: 000123456789\nPrint on check as: Bob', 'Account no.: ••••6789\nPrint on check as: Bob'],
@@ -579,6 +693,56 @@ describe('text helpers', () => {
     // "Acct #" is the app's own label: a number without digits is still one.
     ['Acct # SMITHJ-AP', 'Acct # ••••J-AP'],
     ['Account number missing; Acct # SMITHJ', 'Account number missing; Acct # ••••ITHJ'],
+    // Only the app's own sentences about a chart-of-accounts number are left: they start the text or
+    // a clause, and go on "is already used", "is used", "was created", or end there.
+    ['Note: Account number 1000 is already used', 'Note: Account number 1000 is already used'],
+    [
+      'Account number 1000 is already used, so "A" was created as 1000-2. Account number 2000 is already used, so "B" was created as 2000-2.',
+      'Account number 1000 is already used, so "A" was created as 1000-2. Account number 2000 is already used, so "B" was created as 2000-2.',
+    ],
+    // A short number someone wrote down is a bank or vendor number: masked.
+    ['Account number 1234567 is the bank', 'Account number ••••4567 is the bank'],
+    ['Vendor account number 4471234', 'Vendor account number ••••1234'],
+    ['Paid to Account number 1000', 'Paid to Account number ••••'],
+    ['BankAccount number 12345', 'BankAccount number ••••2345'],
+    ['Account number 0001234', 'Account number ••••1234'],
+    ['Account number 1000 for the utility', 'Account number •••• for the utility'],
+    // A memo that ends in the number is one someone typed: only qbGlParse's reason, exactly
+    // "account number N" in small letters as the whole text, is the app's own.
+    ['Account number 4471234', 'Account number ••••1234'],
+    ['Utilities: Account number 4471234', 'Utilities: Account number ••••1234'],
+    ['Electric. Account number 4471234.', 'Electric. Account number ••••1234.'],
+    ['Account number 1.2.3.4.5.6.7', 'Account number ••••.6.7'],
+    ['Account number 6100', 'Account number ••••'],
+    ['account number 6100', 'account number 6100'],
+    ['Paid: account number 6100', 'Paid: account number ••••'],
+    ['account number 4471234 is the utility', 'account number ••••1234 is the utility'],
+    // A label inside an email address is part of the address: it stays whole, domain and all.
+    ['billing.acme.com.acct#7@evil.com', 'billing.acme.com.acct#7@evil.com'],
+    ['acctno1@evil.example', 'acctno1@evil.example'],
+    ['ok@acme.com, billing.acme.com.acct#7@evil.com; x@evil.com', 'ok@acme.com, billing.acme.com.acct#7@evil.com; x@evil.com'],
+    ['Send to <x.acct#7@evil.com>, then Acct # 12345678', 'Send to <x.acct#7@evil.com>, then Acct # ••••5678'],
+    // Every mark the senders take in an address is part of it: only a space, "," or ";" ends one.
+    ["billing.acme.com.acct#7'x@evil.com", "billing.acme.com.acct#7'x@evil.com"],
+    ['billing.acme.com.acct#7(x)@evil.com', 'billing.acme.com.acct#7(x)@evil.com'],
+    ['billing.acme.com.acct#7"@evil.com', 'billing.acme.com.acct#7"@evil.com'],
+    ['billing.acme.com.acct#7[x]@evil.com', 'billing.acme.com.acct#7[x]@evil.com'],
+    ['Name.acct#7<x@evil.example>', 'Name.acct#7<x@evil.example>'],
+    ["Sent to billing.acct#7'x@evil.com; then Acct # 12345678", "Sent to billing.acct#7'x@evil.com; then Acct # ••••5678"],
+    // An address after a "," or ";" is another item, never part of the number before it.
+    ['Acct # 000123456789, ap@acme.com', 'Acct # ••••6789, ap@acme.com'],
+    ['acct#1,b@evil.com', 'acct#••••,b@evil.com'],
+    ['acct no 1234;b@evil.com', 'acct no ••••;b@evil.com'],
+    ['Acct #, b@evil.com', 'Acct #, b@evil.com'],
+    ['Acct # 1234, x.acct#5@evil.com', 'Acct # ••••, x.acct#5@evil.com'],
+    // Not an address after it: still masked to the end.
+    ['Acct # 1234, 5678@x', 'Acct # ••••78@x'],
+    ['Acct # 1234 x@evil.com', 'Acct # ••••.com'],
+    // Two "@" is no address the senders take.
+    ['billing.acct#7@x@evil.com', 'billing.acct#••••.com'],
+    // Not an address: a label with a space in it, or no domain.
+    ['Acct #7@evil.com', 'Acct #••••.com'],
+    ['Acct#12345678@x', 'Acct#••••78@x'],
     // Already masked, as the app's own answers are: unchanged.
     ['Acct # ••••6789', 'Acct # ••••6789'],
     // Sentences that only start like a label, with no digit after: unchanged.

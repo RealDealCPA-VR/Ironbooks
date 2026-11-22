@@ -41,10 +41,12 @@
  *
  * Secrets (plan 5.8): only on a commit, only from actor.secrets (typed by the approving person),
  * put in place by applySecrets (lib/agent/guards.ts). Never in a read or a dry run, never from the
- * agent's input (guardInput strips them). The closing-date override is set only for a closing
- * password that verifies, on a commit, for an access that holds the closed-period right. Its
- * guesses count against the same limiter and keys as the person's own x-closing-password (lib/
- * context.ts resolveClosingDateOverride), so approvals cannot be used to try passwords.
+ * agent's input (guardInput strips them, and nothing of the input ever becomes a header). The
+ * headers they travel in are exactly SERVICE_SCOPE_SECRET_HEADERS (the closing-date password, and
+ * the user name, password and recovery key that open a backup, a portable file or an Accountant's
+ * Copy). The closing-date override is set only for a closing password that verifies, on a commit,
+ * for an access that holds the closed-period right. Its guesses count against the one limiter of
+ * that password (lib/closingPasswordLimiter.ts), so approvals cannot be used to try passwords.
  *
  * The staleness key (plan §7.4) says what the run did and what it read: the versions of the records
  * the input names (read in the same transaction, before the handler runs), the ledger lines it
@@ -55,8 +57,14 @@
  *
  * Files an operation saves (effects.writeFile) must land inside one of the agent's folders
  * (lib/agent/files.ts allowedFolder): the folder itself, or, when it does not exist yet, its
- * nearest existing parent with only plain names below it. The check is made inside the effects
- * collection, so a refused run still reports the calls to other computers it already made.
+ * nearest existing parent with only plain names below it. The effects are collected with
+ * { pinFiles: true }, so effects.writeFile does not look at the disk itself; the bridge looks at a
+ * path only once it is known, as text, to be inside an allowed folder (allowedTarget). (The route's
+ * own code could still look at a folder it is given; no route takes one from the agent today.) The
+ * check is made inside the effects collection, so a refused run still reports the calls to other
+ * computers it already made, and each allowed file is pinned to the real folder checked
+ * (lib/effects.ts pinFile): it is written there, and only while that folder still resolves to
+ * itself. A file the work asks for after the last check is never written (FILE_NOT_CHECKED).
  *
  * Never throws for what the handler answered: a refusal, an error answer, a time-out or a failed
  * commit all come back as outcome 'error' with the app's own message. It throws only for a
@@ -65,11 +73,23 @@
  * Time limits (BRIDGE_TIME_LIMIT_MS, reports BRIDGE_REPORT_TIME_LIMIT_MS): PGlite runs one
  * transaction at a time, so a long run blocks the app. On time-out the answer says the work took
  * too long; work still running is rolled back when it reaches the end (it cannot be interrupted
- * in the middle), and it releases nothing. A commit of a dryRun 'none' operation has no limit: its
- * service opens its own database handle, so the bridge could not undo it, only abandon its effects.
+ * in the middle), and it releases nothing. A commit of a dryRun 'none' operation has a longer limit
+ * of its own (IRREVERSIBLE_COMMIT_TIME_LIMIT_MS, 10 minutes, see there): its service opens its own
+ * database handle, so the bridge cannot undo it, only answer that it may still finish and abandon
+ * its effects; work not yet started by then never starts.
+ *
+ * The amount (facts): the run's ledger, all of it. Entries it makes (changesInTransaction), and
+ * entries that existed and that it voids, deletes or changes in place (touchedEntries): both are
+ * shown in the ledger preview, and counted when the run moves their money (a void, a delete, lines
+ * rewritten, a draft posted; not a new title, number or link), so voiding a $50,000 check is a
+ * $50,000 request. See factsFor for the rules, "0.00" for a run that moves no entry included.
+ *
+ * The preview is read by the agent as well as the approver, so its ledger memos, descriptions and
+ * field values hide what the run's own answer would: account numbers in memo or description text
+ * are masked (shownText, lib/services/journal.ts lineMemoFor) unless a reveal was approved.
  */
 import { createHash } from 'node:crypto';
-import { promises as fsp } from 'node:fs';
+import { promises as fsp, type Stats } from 'node:fs';
 import path from 'node:path';
 import { eq, sql } from 'drizzle-orm';
 import type { AnyPgColumn, PgTable } from 'drizzle-orm/pg-core';
@@ -104,16 +124,16 @@ import {
 } from '@/lib/db/schema';
 import {
   SERVICE_SCOPE_HEADERS,
+  SERVICE_SCOPE_SECRET_HEADERS,
   isArchivedCompany,
   runWithServiceContext,
   type ServiceScopeOptions,
 } from '@/lib/context';
 import { AGENT_NOT_READY_MESSAGE, AGENT_SANDBOX_MESSAGE } from '@/lib/agentContext';
-import { currentEffects, effectsOfFailedRun, runWithEffects, type EffectReport, type EffectsMode, type EffectsRun } from '@/lib/effects';
+import { limitClosingPasswordGuess } from '@/lib/closingPasswordLimiter';
+import { currentEffects, effectsOfFailedRun, pinFile, runWithEffects, type EffectReport, type EffectsMode, type EffectsRun } from '@/lib/effects';
 import { featureOffError } from '@/lib/featureGate';
 import { Money, toAmountString } from '@/lib/money';
-import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
-import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { blockingFeatureGate, resolveCompanyPreferences } from '@/lib/preferences';
 import { authorizeRequest } from '@/lib/permissions/enforce';
 import { isSecretKey, maskSensitive } from '@/lib/permissions/mask';
@@ -125,11 +145,12 @@ import { useGrant } from '@/lib/services/agentGrants';
 import { verifyClosingDatePassword } from '@/lib/services/company';
 import { VERSIONED_ENTITIES, versionField, type VersionedEntity } from '@/lib/services/concurrency';
 import { getFileLockStatus } from '@/lib/services/fileLock';
+import { lineMemoFor } from '@/lib/services/journal';
 import { assertPasswordChangeNotRequired } from '@/lib/services/passwordPolicy';
 import { isSandboxActive } from '@/lib/services/sandboxState';
 import { getSingleUserMode } from '@/lib/services/sessions';
 import { ServiceError, translateLedgerDbError, type ServiceContext } from '@/lib/services/_base';
-import { changesInTransaction, type ChangePreview } from './actions';
+import { changesInTransaction, type ChangePreview, type PostingEntry } from './actions';
 import {
   BRIDGE_REPORT_TIME_LIMIT_MS,
   BRIDGE_TIME_LIMIT_MS,
@@ -149,7 +170,7 @@ import {
 import { personSignedIn } from './endpointFile';
 import { factsOf } from './facts';
 import { allowedFolder, readStagedFile, stageFile } from './files';
-import { applySecrets, guardInput, redactAnswer } from './guards';
+import { applySecrets, guardInput, maskAccountsInText, redactAnswer } from './guards';
 import { loadRouteHandler, operationById, operationForPath, type RouteHandler, type RouteParams } from './operations/registry';
 import type { EffectKind, EffectPreview, Operation, RecordDiff, RequestFacts, RiskClass, SecretKind, WarningPreview } from './operations/types';
 
@@ -170,12 +191,48 @@ const EFFECT_WORDS: Record<EffectKind, string> = {
   network: 'May contact another computer',
 };
 
-const NOT_TRIED: Record<'preview' | 'none', string> = {
+/**
+ * Why a dry run was not tried out (routePreview { ran: false, note }). The agent reads it, and the
+ * person's approval card shows it as "Ironbooks' note" under its own "Ironbooks did not try this
+ * ahead of time" (app/agent-requests/Preview.tsx), so it gives the reason, true and in words that
+ * read well for both, and leaves the decision with the person approving it.
+ *  - preview: its own preview is the SAME operation sent with its preview option (a flag in the
+ *    body or the query, or a preview action: the bulk list saves, price changes, a reorder, a
+ *    paycheck, receiving, the batch entry, the exchange-rate adjustment, the QuickBooks imports,
+ *    opening a portable file or an Accountant's Copy), which is a run of that operation like any
+ *    other, so it may need approval too; there is no separate operation to look for. Not every
+ *    description names the option, so the note does not point there.
+ *  - answer: a read the agent may see only once a person approves it (a GET of class admin, file,
+ *    outside ...): running it ahead of time would hand over its answer first.
+ *  - none: work that cannot be rolled back (dryRun 'none').
+ */
+const NOT_TRIED: Record<'preview' | 'answer' | 'none', string> = {
   preview:
-    'This was not tried out: this operation has a preview of its own, which is a separate operation to read. Nothing was changed.',
-  none:
-    'This was not tried out: it cannot be run and then undone (it works outside the books, or on the company file itself). Nothing was changed; a person decides on its description.',
+    'This operation has a preview mode of its own: the same operation, sent with its preview option. That preview is a run like any other, so it may need approval too. Nothing was changed.',
+  answer:
+    'Running it ahead of time would hand its answer to the agent before a person approved it. Nothing was read or changed; the person approving it decides from its description.',
+  none: 'It cannot be run and then undone: it works outside the books, or on the company file itself. Nothing was changed; the person approving it decides from its description.',
 };
+
+/** A request that only reads by its method (GET), whatever its class. */
+function readsByMethod(operation: Operation): boolean {
+  return operation.method === 'GET';
+}
+
+/**
+ * Time limit of a commit of a dryRun 'none' operation, work that cannot be undone: 10 minutes. Such
+ * work runs on a database handle of its own or outside the books (restoring or opening a backup, a
+ * portable file or an Accountant's Copy, making a copy of the company file, condensing archives, a
+ * year-end close, a test email), so the bridge can neither roll it back nor stop it part way, and it
+ * can rightly take far longer than an entry: copying or restoring a company file reads and writes
+ * all of it, on a slow disk or a shared folder, and an outside call waits on the other computer.
+ * The 10 seconds of BRIDGE_TIME_LIMIT_MS would answer "took too long" for work that then finishes
+ * anyway. The limit is only there so the approving person's window and the agent are never left
+ * waiting for ever on work that hangs (a PGlite lock wait, a server that never answers); 10 minutes
+ * is well past the longest such work seen, yet short enough that a person still waiting at the
+ * window is told. Work that has not started when it passes never starts.
+ */
+export const IRREVERSIBLE_COMMIT_TIME_LIMIT_MS = 10 * 60 * 1000;
 
 /** Shown in a preview in place of a hidden value. */
 const MASK = '••••';
@@ -466,10 +523,11 @@ async function settleGates(
 /**
  * The closing-date override of a commit: only for an access holding the closed-period right, and
  * only for a closing password the approving person typed that verifies. Every guess goes through
- * the limiter and keys the person's own x-closing-password goes through (lib/context.ts
- * resolveClosingDateOverride: per person in this company, plus the global cap), so an approver
- * without the password cannot use approvals to try passwords until one works, nor spread guesses
- * over the two ways in. A locked limiter refuses the run before anything runs.
+ * the one limiter of the closing-date password (lib/closingPasswordLimiter.ts: the same keys as
+ * the person's own x-closing-password and Set Closing Date), so an approver without the password
+ * cannot use approvals to try passwords until one works, nor spread guesses over the ways in. A
+ * locked limiter refuses the run before anything runs. The guess is counted against the request
+ * the bridge runs in (the approving person's), read here, outside the scope.
  */
 async function closingOverride(
   db: DB,
@@ -480,29 +538,11 @@ async function closingOverride(
 ): Promise<boolean | { refusal: BridgeError }> {
   const supplied = secretValue(actor.secrets, 'closing_password');
   if (mode !== 'commit' || access.flags.closedPeriod !== true || supplied === null) return false;
-  const origin = await getRequestOrigin();
-  const limiter = loginLimiter();
-  // As lib/context.ts: the person (in this company) and the global cap, never the address.
-  const keys = attemptKeys('closing-password', `${companyId}:${actor.userId ?? ''}`, origin.addr).filter((k) => !k.includes(':addr:'));
-  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
-  const gate = limiter.begin(keys, Date.now(), weights);
-  if (!gate.allowed) {
-    const secs = Number(tooManyAttempts(gate.retryAfterMs).retryAfter);
-    return {
-      refusal: {
-        message: `Too many wrong closing-date passwords. Try again in ${secs < 90 ? `${secs} seconds` : `${Math.ceil(secs / 60)} minutes`}.`,
-        code: 'FORBIDDEN',
-        details: { rateLimited: true, retryAfterSeconds: secs },
-      },
-    };
-  }
   try {
-    const ok = await verifyClosingDatePassword(db, companyId, supplied);
-    if (ok) limiter.recordSuccess(keys.slice(0, -1));
-    else limiter.recordFailure(keys, Date.now(), weights);
-    return ok;
-  } finally {
-    gate.release();
+    return await limitClosingPasswordGuess({ companyId, userId: actor.userId }, () => verifyClosingDatePassword(db, companyId, supplied));
+  } catch (err) {
+    if (err instanceof ServiceError) return { refusal: serviceErrorAsBridgeError(err) };
+    throw err;
   }
 }
 
@@ -526,11 +566,16 @@ function buildPath(operation: Operation, given: unknown): { path: string; params
       error: `This operation has no path value ${extra.map((k) => `"${k}"`).join(', ')}.${operation.params.length ? ` It takes: ${operation.params.join(', ')}.` : ' It takes none.'}`,
     };
   }
+  // A value becomes one segment of the path. A slash, a backslash or a "%" (which could spell an
+  // encoded one, %2F or %5C) would let it be read as more than one, so the scope's route checks
+  // might judge another route than the one the handler serves: refused (guardInput refuses them
+  // first; this is the second line, and the scope itself is the third).
   const check = (name: string, v: string): { error: string } | null => {
     if (!v) return badParam(name, 'is empty.');
     if (v.length > 500) return badParam(name, 'is too long.');
     if (v === '.' || v === '..') return badParam(name, 'cannot be "." or "..".');
     if (BAD_SEGMENT.test(v)) return badParam(name, 'holds characters a path cannot carry.');
+    if (/[/\\%]/.test(v)) return badParam(name, 'cannot hold a slash, a backslash or "%". Send the record\'s id as Ironbooks shows it.');
     return null;
   };
   const out: string[] = [];
@@ -677,8 +722,11 @@ async function buildRequest(
   const method = operation.method;
   const canHaveBody = method !== 'GET';
   const headers: Record<string, string> = { accept: 'application/json, */*;q=0.8' };
+  // Only the secrets the scope carries (the closing-date password, a backup's or a copy's user
+  // name, password and recovery key), and only as applySecrets put them from what the approving
+  // person typed: nothing of the agent's input ever becomes a header.
   for (const [name, value] of Object.entries(secretHeaders)) {
-    if (!SERVICE_SCOPE_HEADERS.includes(name.toLowerCase())) {
+    if (!SERVICE_SCOPE_SECRET_HEADERS.includes(name.toLowerCase()) || typeof value !== 'string') {
       throw new BridgeRefusal(
         'This operation needs a password that agent work cannot pass on yet. A person can do it in Ironbooks.',
         'SECRET_NOT_CARRIED',
@@ -773,6 +821,11 @@ interface RawAnswer {
  * Call the handler inside the service scope and read its whole answer there (a streamed answer
  * may still call into the app while it is read). With `failOnError` an answer of 400 or more is
  * thrown, so the effects collected so far are kept by the error and a transaction rolls back.
+ *
+ * The scope refuses to open (a plain Error from runWithServiceContext, before the handler runs)
+ * for a path no real request could carry, a context that cannot be checked while it runs, a
+ * header off its list, or a scope already open. Nothing ran then, so it is an internal refusal
+ * that says so (BridgeRefusal 'INTERNAL'), never a crash and never "something went wrong".
  */
 async function invoke(
   handler: RouteHandler,
@@ -782,18 +835,26 @@ async function invoke(
   scope: ServiceScopeOptions,
   failOnError: boolean,
 ): Promise<RawAnswer> {
-  return runWithServiceContext(ctx, scope, async () => {
-    const res = await handler(request.req, { params: Promise.resolve(params) });
-    if (!(res instanceof Response)) throw new Error('The route handler gave no answer.');
-    const raw: RawAnswer = {
-      status: res.status,
-      type: res.headers.get('content-type') ?? '',
-      disposition: res.headers.get('content-disposition'),
-      bytes: new Uint8Array(await res.arrayBuffer()),
-    };
-    if (failOnError && raw.status >= 400) throw new HandlerAnswered(raw);
-    return raw;
-  });
+  let entered = false;
+  try {
+    return await runWithServiceContext(ctx, scope, async () => {
+      entered = true;
+      const res = await handler(request.req, { params: Promise.resolve(params) });
+      if (!(res instanceof Response)) throw new Error('The route handler gave no answer.');
+      const raw: RawAnswer = {
+        status: res.status,
+        type: res.headers.get('content-type') ?? '',
+        disposition: res.headers.get('content-disposition'),
+        bytes: new Uint8Array(await res.arrayBuffer()),
+      };
+      if (failOnError && raw.status >= 400) throw new HandlerAnswered(raw);
+      return raw;
+    });
+  } catch (err) {
+    if (entered || !(err instanceof Error) || err instanceof ServiceError) throw err;
+    const why = err.message ? `${err.message.charAt(0).toLowerCase()}${err.message.slice(1)}` : 'it could not be set up safely.';
+    throw new BridgeRefusal(`Ironbooks did not run this request, and nothing was changed: ${why}`, 'INTERNAL', { notRun: true });
+  }
 }
 
 /** A time-out guard shared by a run and the timer racing it. */
@@ -839,46 +900,142 @@ const DEVICE_NAME = /^(con|prn|aux|nul|conin\$|conout\$|clock\$|com[0-9¹²³]|l
 /** Most folders one save may make below the nearest one that exists. */
 const MAX_NEW_FOLDERS = 16;
 
+const WIN = process.platform === 'win32';
+
 /**
- * Where a file would be saved, when that is inside one of the agent's folders; else null. A folder
- * that does not exist yet (effects.writeFile makes it) counts by its nearest existing parent, which
- * must be allowed (links resolved by allowedFolder), with only plain folder names below it: those
- * do not exist, so no link can sit among them at the time of the check.
+ * The parts of `child` below `parent` ([] for the folder itself), or null when `child` is not
+ * inside it. Both are absolute and resolved; on Windows any case matches.
  */
-async function allowedTarget(folders: readonly string[], dir: string): Promise<string | null> {
-  if (!dir || !path.isAbsolute(dir)) return null;
-  let at = path.resolve(dir);
-  const missing: string[] = [];
-  for (;;) {
+function partsBelow(child: string, parent: string): string[] | null {
+  const key = (p: string) => (WIN ? p.toLowerCase() : p);
+  const c = key(child);
+  const p = key(parent);
+  if (c === p) return [];
+  const withSep = p.endsWith(path.sep) ? p : `${p}${path.sep}`;
+  if (!c.startsWith(withSep)) return null;
+  return child.slice(withSep.length).split(path.sep).filter(Boolean);
+}
+
+/** A folder name effects.writeFile may make (it does not exist yet, so nothing can be odd about it). */
+function plainNewFolder(name: string): boolean {
+  return PLAIN_FOLDER_NAME.test(name) && !DEVICE_NAME.test(name) && !/[. ]$/.test(name);
+}
+
+/**
+ * Walk down from `base` (a real allowed folder, every link in it resolved) along `parts`, one name
+ * at a time with lstat, so nothing is ever looked at outside an allowed folder: lstat does not
+ * follow the name it is given, and every folder above it is real. A link on the way counts only
+ * when allowedFolder resolves it to a folder inside an allowed one (it looks only at the shares an
+ * allowed folder names); the walk goes on from where it really leads. The first name that does not
+ * exist starts the folders still to be made: plain names only, at most MAX_NEW_FOLDERS of them.
+ * Returns the real folder the file would be saved in, or null.
+ */
+async function walkAllowed(folders: readonly string[], base: string, parts: readonly string[]): Promise<string | null> {
+  let at = base;
+  let missing: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const next = path.join(at, parts[i]);
+    let st: Stats;
     try {
-      await fsp.lstat(at);
-      break;
+      st = await fsp.lstat(next);
     } catch (err) {
       if ((err as { code?: unknown } | null)?.code !== 'ENOENT') return null;
-      const up = path.dirname(at);
-      if (up === at || missing.length >= MAX_NEW_FOLDERS) return null;
-      missing.unshift(path.basename(at));
-      at = up;
+      missing = parts.slice(i);
+      break;
+    }
+    if (st.isSymbolicLink()) {
+      const real = await allowedFolder(folders, next);
+      if (!real) return null;
+      at = real;
+    } else if (st.isDirectory()) {
+      at = next;
+    } else {
+      return null; // a file where a folder should be
     }
   }
-  if (missing.some((name) => !PLAIN_FOLDER_NAME.test(name) || DEVICE_NAME.test(name) || /[. ]$/.test(name))) return null;
-  const real = await allowedFolder(folders ?? [], at);
+  if (missing.length > MAX_NEW_FOLDERS || !missing.every(plainNewFolder)) return null;
+  // Once more on the folder found, links and all, exactly as save_file and the shell are checked.
+  const real = await allowedFolder(folders, at);
   return real ? path.join(real, ...missing) : null;
 }
 
-/** The first file an effect would save outside the agent's folders, as a refusal; else null. */
-async function folderRefusal(effects: readonly EffectPreview[], folders: readonly string[]): Promise<BridgeRefusal | null> {
-  for (const e of effects) {
-    if (e.kind !== 'file') continue;
-    const dir = typeof e.detail.dir === 'string' ? e.detail.dir : '';
-    if (dir && (await allowedTarget(folders, dir))) continue;
-    return new BridgeRefusal(
-      `Saving a file in "${dir || 'an unnamed folder'}" is not allowed for this agent. An Admin can add the folder to the agent's folders in ${AGENTS_TAB}.`,
-      'FOLDER_NOT_ALLOWED',
-      { folder: dir },
-    );
+/**
+ * Where a file would be saved, when that is inside one of the agent's folders; else null. The path
+ * is first compared, as text, with each allowed folder (as typed, and as it really is), and only a
+ * path already known to be inside one is ever looked at on the disk (walkAllowed). So a path on
+ * someone's network share, or anywhere else, is refused without the bridge or effects.writeFile
+ * looking at it: merely looking at a folder on a share makes Windows offer that share the person's
+ * sign-in (lib/agent/files.ts). A folder that does not exist yet (effects.writeFile makes it)
+ * counts by its nearest existing parent, with only plain folder names below it. The answer is the
+ * real folder, which the file is then pinned to (lib/effects.ts pinFile).
+ */
+async function allowedTarget(folders: readonly string[], dir: string): Promise<string | null> {
+  if (typeof dir !== 'string' || !dir || !path.isAbsolute(dir)) return null;
+  const want = path.resolve(dir);
+  const list = Array.isArray(folders) ? folders : [];
+  for (const raw of list) {
+    const typed = typeof raw === 'string' ? raw.trim() : '';
+    if (!typed || !path.isAbsolute(typed)) continue;
+    const entry = path.resolve(typed);
+    const lexical = partsBelow(want, entry);
+    // The allowed folder itself is looked at only through allowedFolder, as everywhere else.
+    const base = await allowedFolder(list, entry);
+    if (!base) continue;
+    const parts = lexical ?? partsBelow(want, base);
+    if (parts === null) continue;
+    const found = await walkAllowed(list, base, parts);
+    if (found) return found;
   }
   return null;
+}
+
+/**
+ * Most rounds of checkAndPinFiles: work still asking for new files after this many is refused. A
+ * round only follows one in which the work (left running in the background) asked for another file.
+ */
+const MAX_FILE_CHECK_ROUNDS = 50;
+
+/**
+ * Check every file the work asked to save against the agent's folders, and pin each allowed one to
+ * the real folder found (lib/effects.ts pinFile): after the commit it is written there and only
+ * there, and only when that folder still resolves to itself, so a link made inside an allowed
+ * folder while the work was committing cannot lead the write elsewhere. Returns the refusal for the
+ * first file outside the folders (or with a folder in the way of its name), else null. Inside the
+ * effects collection (the scope is open).
+ *
+ * The list is read again after every round until a round finds no file it has not checked: work
+ * the handler left running may ask for one while the checks wait on the disk. One asked for after
+ * the last round is never written: the collection runs with { pinFiles: true }, and release saves
+ * only pinned files.
+ */
+async function checkAndPinFiles(folders: readonly string[]): Promise<BridgeRefusal | null> {
+  const checked = new Set<EffectPreview>();
+  for (let round = 0; ; round++) {
+    const fresh = (currentEffects() ?? []).filter((e) => e.kind === 'file' && !checked.has(e));
+    if (!fresh.length) return null;
+    if (round >= MAX_FILE_CHECK_ROUNDS) {
+      return new BridgeRefusal('This work kept asking to save more files while they were being checked, so nothing was saved. Ask again with fewer files.', 'VALIDATION');
+    }
+    for (const e of fresh) {
+      checked.add(e);
+      const dir = typeof e.detail.dir === 'string' ? e.detail.dir : '';
+      const target = dir ? await allowedTarget(folders, dir) : null;
+      if (!target) {
+        return new BridgeRefusal(
+          `Saving a file in "${dir || 'an unnamed folder'}" is not allowed for this agent. An Admin can add the folder to the agent's folders in ${AGENTS_TAB}.`,
+          'FOLDER_NOT_ALLOWED',
+          { folder: dir },
+        );
+      }
+      try {
+        await pinFile(e, target);
+      } catch (err) {
+        // A folder where the file's name should go: the words a person saving it would get.
+        if (err instanceof ServiceError) return new BridgeRefusal(err.message, err.code, err.details ?? null);
+        throw err;
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -948,13 +1105,38 @@ async function ledgerRowsInTransaction(ctx: ServiceContext): Promise<LedgerRow[]
 /** Keys whose values a preview never shows (credentials, whatever their case). */
 const SECRET_WORDS = /password|secret|token|apikey|api_key|privatekey|recoverykey|filekey/i;
 
+/**
+ * Keys holding free text of the books that may carry an account number: a memo (every memo column
+ * is named `memo`; "lineMemo" too) and a description. lib/services/auditVisibility.ts masks memo
+ * text in the audit trail the same way.
+ */
+const BOOKS_TEXT_KEY = /(?:memo|description)$/i;
+
+/**
+ * Text of the books as this run may show it (a preview): the account number in it ("Acct #
+ * 000123456789", the memo a check gets when it is left blank, still on older Sales Tax Payment
+ * lines, or typed by a person) masked to its last four, unless a person approved a reveal of full
+ * account numbers for this very call. `ctx.access` is the run's (runAccess), so the rule is the
+ * one every other reader of these memos follows (lib/services/journal.ts lineMemoFor).
+ */
+function shownText(ctx: Pick<ServiceContext, 'access'>, text: string | null): string | null {
+  return lineMemoFor(ctx, text);
+}
+
+/** A ledger preview entry with its description and line memos as this run may show them. */
+function shownEntry<E extends PostingEntry>(ctx: Pick<ServiceContext, 'access'>, entry: E): E {
+  return { ...entry, description: shownText(ctx, entry.description), lines: entry.lines.map((l) => ({ ...l, memo: shownText(ctx, l.memo) })) };
+}
+
 /** Hide the sensitive and secret values of one field's value (a copy). */
 function maskFieldValue(field: string, value: unknown, hidden: Set<string>, access: EffectiveAccess): unknown {
   const hide = (v: unknown) => (v === null || v === undefined || v === '' ? v : MASK);
   const walk = (key: string, v: unknown, depth: number): unknown => {
     if (hidden.has(key.toLowerCase()) || isSecretKey(key) || SECRET_WORDS.test(key)) return hide(v);
+    if (typeof v === 'string' && BOOKS_TEXT_KEY.test(key) && access.flags.fullAccountNumbers !== true) return maskAccountsInText(v);
     if (depth > 32) return v;
-    if (Array.isArray(v)) return v.map((item) => walk('', item, depth + 1));
+    // Items keep their list's key: a list of memos is memo text too.
+    if (Array.isArray(v)) return v.map((item) => walk(key, item, depth + 1));
     if (isObject(v)) {
       const out: Record<string, unknown> = {};
       for (const [k, item] of Object.entries(v)) out[k] = walk(k, item, depth + 1);
@@ -1005,13 +1187,352 @@ function lossOf(rows: AuditRow[]): string | null {
   return `This deletes for good: ${words.join(', ')}.`;
 }
 
-/** The largest single ledger entry's total debits, as decimal text (lib/money.ts, never a float). */
-function largestEntryTotal(rows: readonly LedgerRow[]): string | null {
-  const totals = new Map<string, ReturnType<typeof Money.zero>>();
-  for (const r of rows) totals.set(r.entry_id, Money.add(totals.get(r.entry_id) ?? Money.zero(), r.debit));
-  let best: ReturnType<typeof Money.zero> | null = null;
-  for (const t of totals.values()) if (best === null || t.greaterThan(best)) best = t;
-  return best === null ? null : toAmountString(best);
+// ---------------------------------------------------------------------------
+// Entries that already existed: voided, deleted or changed by the run
+// ---------------------------------------------------------------------------
+//
+// changesInTransaction lists only the entries a run MAKES (created_at = now()). A void flips an
+// entry's status (the ledger trigger takes its amounts back out), a batch delete hides it, a
+// reclassify or a merge rewrites its lines in place: none of that is a new entry, yet it is money
+// the run moves. These are found here, shown in the ledger preview, and counted in the amount, so
+// "Void check 1042" for $50,000 is judged and shown at $50,000.
+
+/** One more than the largest transaction id (ids are 32 bits and wrap around). */
+const XID_SPAN = '4294967296';
+/**
+ * How far past the run's own transaction id a row's xmin may be and still be the run's: the
+ * savepoints a service opens (lib/services/_base.ts inTransaction) get ids of their own after the
+ * run's. PGlite runs one transaction at a time, so every id from the run's own up is this run's;
+ * a run makes far fewer within its time limit.
+ */
+const OWN_XID_WINDOW = '1000000';
+
+/** SQL: the row (of table alias `t`) was written by this transaction or one of its savepoints. */
+function writtenHere(t: 'je' | 'l') {
+  return sql.raw(
+    `((((${t}.xmin::text::bigint - (txid_current() % ${XID_SPAN})) % ${XID_SPAN}) + ${XID_SPAN}) % ${XID_SPAN}) < ${OWN_XID_WINDOW}`,
+  );
+}
+
+type TouchedHow = 'voided' | 'deleted' | 'changed';
+
+/** How the preview names an entry the run voided, deleted or changed. */
+const TOUCHED_WORDS: Record<TouchedHow, string> = {
+  voided: 'Voided by this request',
+  deleted: 'Deleted by this request',
+  changed: 'Changed by this request',
+};
+
+/** A journal entry that existed before the run and that the run voided, deleted or changed. */
+interface TouchedEntry {
+  id: string;
+  how: TouchedHow;
+  /** Its status now ('void' once voided), or 'deleted' when it is gone. */
+  status: string;
+  /**
+   * Its total debits when the run moves it into or out of the books, or rewrites its lines: what
+   * the run moves. Null when it moves none of it (a draft or an entry already void touched, a
+   * posted entry only given a new title, number, link or line memo).
+   */
+  counted: string | null;
+  /** Its total cannot be known (it is gone and the audit trail does not hold it): fail closed. */
+  unknown: boolean;
+  entryNumber: number | null;
+  date: string;
+  description: string | null;
+  source: string | null;
+}
+
+/** A decimal amount for a preview line: null when there is none or it is zero (as changesInTransaction). */
+function lineAmount(v: unknown): string | null {
+  if ((typeof v !== 'string' && typeof v !== 'number') || v === '') return null;
+  try {
+    return Money.isZero(v) ? null : toAmountString(v);
+  } catch {
+    return null;
+  }
+}
+
+/** The total of a deleted entry as its audit row holds it ({ total } or its { lines }), or null. */
+function deletedTotal(old: Record<string, unknown>): string | null {
+  try {
+    if (typeof old.total === 'string' || typeof old.total === 'number') return toAmountString(old.total);
+    if (Array.isArray(old.lines)) {
+      return toAmountString(Money.add(...old.lines.map((l) => (isObject(l) && (typeof l.debit === 'string' || typeof l.debit === 'number') ? l.debit : null))));
+    }
+  } catch {
+    /* unreadable: unknown */
+  }
+  return null;
+}
+
+/** Most drafts remembered before a run (draftsBefore); with more, every posted entry the run touches counts. */
+const MAX_DRAFTS_REMEMBERED = 100_000;
+
+/**
+ * The company's draft entries before the run, read in its transaction before the handler runs, or
+ * null when there are too many to remember. A draft is not in the books: one the run posts moves
+ * its whole total in, and nothing else can (the ledger guards keep a void entry void and a posted
+ * one from going back to draft: drizzle/0017_team_ledger.sql bka_je_guard).
+ */
+async function draftsBefore(db: DB, companyId: string): Promise<ReadonlySet<string> | null> {
+  const res = (await db.execute(sql`
+    SELECT id::text AS id FROM journal_entries
+     WHERE company_id = ${companyId} AND status = 'draft'
+     LIMIT ${MAX_DRAFTS_REMEMBERED + 1}`)) as unknown as { rows: Array<{ id: string }> };
+  if (res.rows.length > MAX_DRAFTS_REMEMBERED) return null;
+  return new Set(res.rows.map((r) => r.id.toLowerCase()));
+}
+
+/**
+ * The entries of this company that existed before the run and that it voided, deleted or changed,
+ * read inside the run's transaction: every entry whose own row the run wrote (its xmin is this
+ * transaction's: a void, a batch delete, a new title or number, a draft posted), every entry whose
+ * lines it rewrote in place when it opened the ledger for rewriting (lib/services/posting.ts
+ * allowLedgerRewrite: a merge, a reclassify), and every entry the audit trail says it touched (an
+ * entry deleted outright leaves only that). `newIds` are the entries the run made, left out.
+ *
+ * What counts toward the amount (TouchedEntry.counted) is only what moves money: an entry voided
+ * or deleted while in the books, one whose lines were rewritten under that flag, and a draft the run
+ * posted (`drafts`, from draftsBefore; null: any posted entry may have been one, so it counts). An
+ * entry only retitled, renumbered, relinked or given new line memos (the ledger guards let nothing
+ * else change on a posted entry without the flag) is still shown, but counts nothing.
+ */
+async function touchedEntries(
+  ctx: ServiceContext,
+  audit: readonly AuditRow[],
+  newIds: ReadonlySet<string>,
+  drafts: ReadonlySet<string> | null,
+): Promise<TouchedEntry[]> {
+  const ids = new Set<string>();
+  const add = (id: unknown) => {
+    const s = typeof id === 'string' ? id.toLowerCase() : '';
+    if (UUID.test(s) && !newIds.has(s)) ids.add(s);
+  };
+  const own = (await ctx.db.execute(sql`
+    SELECT je.id::text AS id FROM journal_entries je
+     WHERE je.company_id = ${ctx.companyId} AND je.created_at <> now() AND ${writtenHere('je')}`)) as unknown as { rows: Array<{ id: string }> };
+  for (const r of own.rows) add(r.id);
+  const flag = (await ctx.db.execute(sql`
+    SELECT coalesce(current_setting('bka.allow_ledger_rewrite', true) = 'on'
+                    AND current_setting('bka.ledger_rewrite_txid', true) = txid_current()::text, false) AS on`)) as unknown as { rows: Array<{ on: boolean }> };
+  // Under the flag a line can also be deleted, which leaves no trace on the lines left, so every
+  // posted entry the run wrote then may have had its lines rewritten: all of them count (fail closed).
+  const rewriteOpen = flag.rows[0]?.on === true;
+  if (rewriteOpen) {
+    const rewritten = (await ctx.db.execute(sql`
+      SELECT DISTINCT l.journal_entry_id::text AS id
+        FROM journal_entry_lines l JOIN journal_entries je ON je.id = l.journal_entry_id
+       WHERE je.company_id = ${ctx.companyId} AND je.created_at <> now() AND ${writtenHere('l')}`)) as unknown as { rows: Array<{ id: string }> };
+    for (const r of rewritten.rows) add(r.id);
+  }
+  const auditOf = new Map<string, AuditRow[]>();
+  for (const r of audit) {
+    if (r.entity_type !== 'journal_entry') continue;
+    const id = r.entity_id.toLowerCase();
+    auditOf.set(id, [...(auditOf.get(id) ?? []), r]);
+    // An entry made and removed again inside the run never was in the books.
+    if (r.action !== 'create') add(id);
+  }
+  for (const [id, rows] of auditOf) if (rows.some((r) => r.action === 'create')) ids.delete(id);
+  if (!ids.size) return [];
+
+  // Every id passed the UUID pattern (hex digits and dashes only), so it can be written in place.
+  const list = sql.raw(`ARRAY[${[...ids].map((id) => `'${id}'`).join(',')}]::uuid[]`);
+  const found = (await ctx.db.execute(sql`
+    SELECT je.id::text AS id, je.entry_number, je.date::text AS date, je.description, je.status::text AS status, je.source_ref,
+           (je.voided_at IS NOT NULL AND je.voided_at >= date_trunc('milliseconds', now() AT TIME ZONE 'UTC')) AS voided_now,
+           (je.deleted_at IS NOT NULL AND je.deleted_at >= date_trunc('milliseconds', now() AT TIME ZONE 'UTC')) AS deleted_now,
+           coalesce((SELECT sum(l.debit) FROM journal_entry_lines l WHERE l.journal_entry_id = je.id), 0)::text AS total
+      FROM journal_entries je
+     WHERE je.company_id = ${ctx.companyId} AND je.id = ANY(${list})`)) as unknown as {
+    rows: Array<{
+      id: string;
+      entry_number: number | string | null;
+      date: string | null;
+      description: string | null;
+      status: string;
+      source_ref: string | null;
+      voided_now: boolean;
+      deleted_now: boolean;
+      total: string;
+    }>;
+  };
+  const out: TouchedEntry[] = [];
+  const day = (d: unknown) => (typeof d === 'string' ? d.slice(0, 10) : d instanceof Date ? d.toISOString().slice(0, 10) : '');
+  const actions = (id: string) => new Set((auditOf.get(id) ?? []).map((r) => r.action));
+  for (const r of found.rows) {
+    const key = r.id.toLowerCase();
+    const did = actions(key);
+    const how: TouchedHow = did.has('delete') || r.deleted_now ? 'deleted' : did.has('void') || r.voided_now ? 'voided' : 'changed';
+    // A draft before the run (null: not known, so it may have been).
+    const wasDraft = drafts === null ? null : drafts.has(key);
+    // In the books before the run: posted then (still posted, or voided by it), not a draft.
+    const wasInBooks = wasDraft !== true && (r.status === 'posted' || did.has('void') || r.voided_now);
+    const moves =
+      how !== 'changed'
+        ? wasInBooks // voided or deleted: its whole total leaves the books
+        : r.status === 'posted' && (rewriteOpen || wasDraft !== false); // lines rewritten, or a draft posted
+    out.push({
+      id: r.id,
+      how,
+      status: r.status,
+      counted: moves ? toAmountString(r.total) : null,
+      unknown: false,
+      entryNumber: r.entry_number === null || r.entry_number === undefined ? null : Number(r.entry_number),
+      date: day(r.date),
+      description: r.description,
+      source: r.source_ref,
+    });
+  }
+  // Gone altogether: only the audit trail tells what they were.
+  const still = new Set(found.rows.map((r) => r.id.toLowerCase()));
+  for (const id of ids) {
+    if (still.has(id)) continue;
+    const gone = (auditOf.get(id) ?? []).filter((r) => r.action === 'delete').pop();
+    const old = gone && isObject(gone.old_values) ? gone.old_values : {};
+    const status = typeof old.status === 'string' ? old.status : null;
+    const total = deletedTotal(old);
+    const notInBooks = drafts?.has(id) === true || status === 'draft' || status === 'void';
+    out.push({
+      id,
+      how: 'deleted',
+      status: 'deleted',
+      counted: notInBooks ? null : total,
+      unknown: !notInBooks && total === null,
+      entryNumber: typeof old.entryNumber === 'number' ? old.entryNumber : null,
+      date: day(old.date),
+      description: typeof old.description === 'string' ? old.description : null,
+      source: typeof old.sourceRef === 'string' ? old.sourceRef : null,
+    });
+  }
+  return out.sort((a, b) => (a.entryNumber ?? Number.MAX_SAFE_INTEGER) - (b.entryNumber ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id));
+}
+
+/**
+ * The touched entries as the ledger preview shows them, at most `limit`: their lines as they are
+ * now (as they were, for an entry deleted outright, when its audit row holds them), and a
+ * description that says what the run did to each. Memos and descriptions as the run may show them
+ * (shownText): the agent reads this preview too, so an account number in them is masked unless a
+ * reveal was approved for this call.
+ */
+async function touchedPreview(ctx: ServiceContext, touched: readonly TouchedEntry[], audit: readonly AuditRow[], limit: number): Promise<PostingEntry[]> {
+  const shown = touched.slice(0, Math.max(0, limit));
+  if (!shown.length) return [];
+  const lines = new Map<string, PostingEntry['lines']>();
+  const live = shown.filter((t) => t.status !== 'deleted').map((t) => t.id.toLowerCase());
+  if (live.length) {
+    const list = sql.raw(`ARRAY[${live.map((id) => `'${id}'`).join(',')}]::uuid[]`);
+    const res = (await ctx.db.execute(sql`
+      SELECT l.journal_entry_id::text AS id, l.account_id::text AS account_id, a.code AS account_code, a.name AS account_name,
+             l.debit::text AS debit, l.credit::text AS credit, l.memo
+        FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
+       WHERE l.journal_entry_id = ANY(${list})
+       ORDER BY (l.debit IS NULL OR l.debit = 0), l.id`)) as unknown as {
+      rows: Array<{ id: string; account_id: string; account_code: string | null; account_name: string; debit: string | null; credit: string | null; memo: string | null }>;
+    };
+    for (const r of res.rows) {
+      const k = r.id.toLowerCase();
+      lines.set(k, [
+        ...(lines.get(k) ?? []),
+        {
+          accountId: r.account_id,
+          accountCode: r.account_code,
+          accountName: r.account_name,
+          debit: lineAmount(r.debit),
+          credit: lineAmount(r.credit),
+          memo: shownText(ctx, r.memo),
+          entityName: null,
+        },
+      ]);
+    }
+  }
+  // An entry deleted outright: the lines its audit row kept, named from the chart of accounts.
+  const goneLines = new Map<string, Array<Record<string, unknown>>>();
+  for (const t of shown) {
+    if (t.status !== 'deleted') continue;
+    const row = audit.filter((r) => r.entity_type === 'journal_entry' && r.action === 'delete' && r.entity_id.toLowerCase() === t.id.toLowerCase()).pop();
+    const old = row && isObject(row.old_values) ? row.old_values : {};
+    if (Array.isArray(old.lines)) goneLines.set(t.id.toLowerCase(), old.lines.filter(isObject));
+  }
+  const accountIds = [...new Set([...goneLines.values()].flat().map((l) => (typeof l.accountId === 'string' ? l.accountId.toLowerCase() : '')).filter((id) => UUID.test(id)))];
+  const names = new Map<string, { code: string | null; name: string }>();
+  if (accountIds.length) {
+    const list = sql.raw(`ARRAY[${accountIds.map((id) => `'${id}'`).join(',')}]::uuid[]`);
+    const res = (await ctx.db.execute(sql`
+      SELECT id::text AS id, code, name FROM accounts WHERE company_id = ${ctx.companyId} AND id = ANY(${list})`)) as unknown as {
+      rows: Array<{ id: string; code: string | null; name: string }>;
+    };
+    for (const r of res.rows) names.set(r.id.toLowerCase(), { code: r.code, name: r.name });
+  }
+  for (const [id, kept] of goneLines) {
+    lines.set(
+      id,
+      kept.map((l) => {
+        const acct = typeof l.accountId === 'string' ? l.accountId : '';
+        const named = names.get(acct.toLowerCase());
+        return {
+          accountId: acct,
+          accountCode: named?.code ?? null,
+          accountName: named?.name ?? 'An account',
+          debit: lineAmount(l.debit),
+          credit: lineAmount(l.credit),
+          memo: shownText(ctx, typeof l.memo === 'string' ? l.memo : null),
+          entityName: null,
+        };
+      }),
+    );
+  }
+  return shown.map((t): TouchedPostingEntry => ({
+    journalEntryId: t.id,
+    entryNumber: t.entryNumber,
+    date: t.date,
+    description: t.description ? `${TOUCHED_WORDS[t.how]}: ${shownText(ctx, t.description)}` : TOUCHED_WORDS[t.how],
+    status: t.status,
+    source: t.source,
+    lines: lines.get(t.id.toLowerCase()) ?? [],
+    touched: t.how,
+  }));
+}
+
+/**
+ * A ledger preview entry the run did not make but voided, deleted or changed. `touched` says
+ * which, so a reader can tell it from the entries the run made without reading its words (an
+ * agent writes descriptions too). An addition to actions.ts PostingEntry, which has no such field.
+ */
+export type TouchedPostingEntry = PostingEntry & { touched: 'voided' | 'deleted' | 'changed' };
+
+/** What the run moves in the ledger, for the facts (lib/money.ts throughout, never a float). */
+interface LedgerTotals {
+  /** It made, voided, deleted or changed at least one entry. */
+  any: boolean;
+  /** The largest single entry it made, or whose money it moved (TouchedEntry.counted). */
+  largest: string | null;
+  /**
+   * All of it: the entries made, added up, or the counted ones it voided, deleted or changed, added
+   * up, whichever is larger. Not both: an edit that re-posts (voids the old entry, posts the new
+   * one) would otherwise count twice.
+   */
+  sum: string | null;
+  /** A touched entry's total cannot be known: the amount is unknown. */
+  unknown: boolean;
+}
+
+function ledgerTotals(rows: readonly LedgerRow[], touched: readonly TouchedEntry[]): LedgerTotals {
+  const made = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const r of rows) made.set(r.entry_id, Money.add(made.get(r.entry_id) ?? Money.zero(), r.debit));
+  const moved = touched.filter((t) => t.counted !== null).map((t) => Money.of(t.counted));
+  let largest: ReturnType<typeof Money.zero> | null = null;
+  for (const t of [...made.values(), ...moved]) if (largest === null || t.greaterThan(largest)) largest = t;
+  const sumMade = Money.add(...made.values());
+  const sumMoved = Money.add(...moved);
+  const any = made.size > 0 || touched.length > 0;
+  return {
+    any,
+    largest: largest === null ? null : toAmountString(largest),
+    sum: any ? toAmountString(sumMade.greaterThan(sumMoved) ? sumMade : sumMoved) : null,
+    unknown: touched.some((t) => t.unknown),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1680,7 @@ function stalenessKeyOf(parts: {
   ledger: readonly LedgerRow[];
   audit: readonly AuditRow[];
   effects: readonly EffectPreview[];
+  touched: readonly TouchedEntry[];
 }): string {
   const created = new Map<string, string>();
   for (const r of parts.audit) if (r.action === 'create') created.set(r.entity_id.toLowerCase(), `new:${r.entity_type}`);
@@ -1214,6 +1736,12 @@ function stalenessKeyOf(parts: {
   }
   const versions = [...firstVersion].map(([k, v]) => `${k}:${v}`).sort();
 
+  // Entries that existed and that the run voided, deleted or changed: by their own (lasting) ids.
+  // Left out when there are none, so the key of every other run is what it was before.
+  const touched = parts.touched
+    .map((t) => stableJson({ id: t.id.toLowerCase(), how: t.how, status: t.status, counted: t.counted, unknown: t.unknown }))
+    .sort();
+
   return sha256(
     stableJson({
       key: 'bridge-staleness-v2',
@@ -1221,6 +1749,7 @@ function stalenessKeyOf(parts: {
       status: parts.status,
       named: parts.named,
       ledger,
+      touched: touched.length ? touched : undefined,
       records: records.sort(),
       versions,
       effects: parts.effects.map((e) => effectKey(e, created)).sort(),
@@ -1230,32 +1759,55 @@ function stalenessKeyOf(parts: {
 
 interface Collected {
   preview: OperationPreview;
-  /** The largest single entry the run posts, as decimal text (facts). */
-  ledgerTotal: string | null;
+  /** What the run moves in the ledger (facts). */
+  ledger: LedgerTotals;
   stalenessKey: string;
 }
 
-/** Read back what the run did, still inside its transaction. */
+/** What the run read before the handler ran, in its transaction (versionsOf, draftsBefore). */
+interface Before {
+  named: readonly string[];
+  drafts: ReadonlySet<string> | null;
+}
+
+async function readBefore(ctx: ServiceContext, companyId: string, input: OperationInput): Promise<Before> {
+  return { named: await versionsOf(ctx.db, companyId, namedIds(input)), drafts: await draftsBefore(ctx.db, companyId) };
+}
+
+/**
+ * Read back what the run did, still inside its transaction. The ledger preview lists the entries
+ * the run makes, then those it voids, deletes or changes (their description says which), at most
+ * PREVIEW_ROW_LIMIT in all, their memos and descriptions as the run may show them (shownText).
+ */
 async function collect(
   ctx: ServiceContext,
   operation: Operation,
   access: EffectiveAccess,
   effects: EffectPreview[],
-  named: readonly string[],
+  before: Before,
   status: number,
 ): Promise<Collected> {
+  const { named } = before;
   const ledger = await changesInTransaction(ctx);
   const lines = await ledgerRowsInTransaction(ctx);
   const rows = await auditRowsInTransaction(ctx);
+  const touched = await touchedEntries(ctx, rows, new Set(lines.map((l) => l.entry_id.toLowerCase())), before.drafts);
+  // changesInTransaction gives the memos as stored: a reversal copies its entry's, account numbers and all.
+  const madeShown = ledger.entries.slice(0, PREVIEW_ROW_LIMIT).map((e) => shownEntry(ctx, e));
+  const touchedShown = await touchedPreview(ctx, touched, rows, PREVIEW_ROW_LIMIT - madeShown.length);
   const { records, cut } = recordDiffs(rows, operation, access);
   const shown = capped(effects);
   const truncated =
-    cut || shown.truncated || ledger.entries.length > PREVIEW_ROW_LIMIT || ledger.changes.length > PREVIEW_ROW_LIMIT || records.length > PREVIEW_ROW_LIMIT;
+    cut ||
+    shown.truncated ||
+    ledger.entries.length + touched.length > PREVIEW_ROW_LIMIT ||
+    ledger.changes.length > PREVIEW_ROW_LIMIT ||
+    records.length > PREVIEW_ROW_LIMIT;
   return {
-    ledgerTotal: largestEntryTotal(lines),
-    stalenessKey: stalenessKeyOf({ operation, status, named, ledger: lines, audit: rows, effects }),
+    ledger: ledgerTotals(lines, touched),
+    stalenessKey: stalenessKeyOf({ operation, status, named, ledger: lines, audit: rows, effects, touched }),
     preview: {
-      ledger: { entries: ledger.entries.slice(0, PREVIEW_ROW_LIMIT), changes: ledger.changes.slice(0, PREVIEW_ROW_LIMIT) } satisfies ChangePreview,
+      ledger: { entries: [...madeShown, ...touchedShown], changes: ledger.changes.slice(0, PREVIEW_ROW_LIMIT) } satisfies ChangePreview,
       records: records.slice(0, PREVIEW_ROW_LIMIT),
       effects: shown.list,
       warnings: [],
@@ -1409,8 +1961,8 @@ function interpret(raw: RawAnswer, operation: Operation, actor: BridgeActor, sen
   const message = text(b.error) ?? text(b.message) ?? fallback;
   const code = text(b.code);
   const details = b.details !== undefined ? b.details : b.fields !== undefined ? { fields: b.fields } : null;
-  if (raw.status === 409) {
-    const named = namedFlags(answer.body as Record<string, unknown>);
+  if (raw.status === 409 || raw.status === 400) {
+    const named = raw.status === 409 ? namedFlags(answer.body as Record<string, unknown>) : warningFlagsOf400(answer.body as Record<string, unknown>);
     const flags = operation.confirmFlags.filter((f) => named.has(f));
     // A flag the agent already sent and the route still refuses cannot be confirmed again: asking
     // for it would loop. It is an error then.
@@ -1420,6 +1972,21 @@ function interpret(raw: RawAnswer, operation: Operation, actor: BridgeActor, sen
     }
   }
   return { ...none, outcome: 'error', error: { message, code, details } };
+}
+
+/**
+ * Warnings a route answers with a 400 rather than a 409, by the flag that accepts them: only the
+ * markers listed here, so an ordinary 400 (a field the route cannot read) stays the error it is.
+ *  - details.tieOut with ok false: POST /api/import's reviewed statement rows do not tie out
+ *    (opening + rows is not closing), or the balances are missing. The page asks "import anyway?"
+ *    and resends with statement.acknowledgeDifference (WAVE1 note 7).
+ */
+function warningFlagsOf400(body: Record<string, unknown>): Set<string> {
+  const out = new Set<string>();
+  if (body.code !== undefined && body.code !== 'VALIDATION') return out;
+  const details = isObject(body.details) ? body.details : {};
+  if (isObject(details.tieOut) && details.tieOut.ok === false) out.add('statement.acknowledgeDifference');
+  return out;
 }
 
 /**
@@ -1439,20 +2006,33 @@ function stoppedAtNetwork(raw: RawAnswer, operation: Operation, actor: BridgeAct
 // ---------------------------------------------------------------------------
 
 /**
- * The request's facts, with the amount the run posts: the larger of what factsOf found and the
- * largest single entry, so an operation with no amountField still has a true amount. An operation
- * that names an amount field and whose amount factsOf could not read keeps null: that is "over
- * every limit" to the policy, and nothing the ledger shows makes it smaller.
+ * The request's facts, with the amount the run moves in the ledger. `ledger` is what a run that
+ * went through showed (a dry run or a commit in a transaction); null when there was no such run
+ * (a refusal, an error answer, a warning, a read, a dryRun 'none' commit on its own handle).
+ *
+ *  - An operation that names an amount field: the larger of what factsOf found and the largest
+ *    single entry the run made, voided, deleted or changed. Its amount field not read (absent, or
+ *    unreadable) keeps null: that is "over every limit" to the policy, and nothing the ledger
+ *    shows makes it smaller.
+ *  - An operation with no amount field: what the run moves, all of it (LedgerTotals.sum), so a
+ *    bulk accept, a rules run, a batch enter or void, a reclassify is judged at its whole, not its
+ *    largest row; and "0.00" when the run made no entry and moved none it touched (a new customer,
+ *    a memo, a list entry removed, a check number or a title given to a posted entry: nothing to
+ *    compare with a limit). A touched entry whose total cannot be known keeps null (fail closed).
  */
-function factsFor(operation: Operation, input: OperationInput, closingDate: string | null, answer: unknown, ledgerTotal: string | null): RequestFacts {
+function factsFor(operation: Operation, input: OperationInput, closingDate: string | null, answer: unknown, ledger: LedgerTotals | null): RequestFacts {
   const facts = factsOf(operation, input, answer === undefined ? { closingDate } : { closingDate, answer });
-  if (ledgerTotal === null) return facts;
-  if (facts.amount === null) return operation.amountField ? facts : { ...facts, amount: ledgerTotal };
-  try {
-    return Money.gt(ledgerTotal, Money.abs(facts.amount)) ? { ...facts, amount: ledgerTotal } : facts;
-  } catch {
-    return { ...facts, amount: null };
+  if (ledger === null) return facts;
+  if (ledger.unknown) return { ...facts, amount: null };
+  if (operation.amountField) {
+    if (facts.amount === null || ledger.largest === null) return facts;
+    try {
+      return Money.gt(ledger.largest, Money.abs(facts.amount)) ? { ...facts, amount: ledger.largest } : facts;
+    } catch {
+      return { ...facts, amount: null };
+    }
   }
+  return { ...facts, amount: ledger.any ? ledger.sum : '0.00' };
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,9 +2138,12 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
   const scope: ServiceScopeOptions = { path: built.path, method: operation.method, headers: request.scopeHeaders };
   const sentFlags = Array.isArray(asked.confirm) ? asked.confirm : [];
 
-  // A dry run of what cannot be rolled back is described, not run. (A read is simply read.)
-  if (!isRead && mode === 'dry_run' && operation.dryRun !== 'transaction') {
+  // A dry run of what cannot be rolled back is described, not run. (A read is simply read.) So is a
+  // read the agent may see only once approved, whatever its dryRun says: its answer is the point.
+  const answerFirst = !isRead && readsByMethod(operation);
+  if (!isRead && mode === 'dry_run' && (operation.dryRun !== 'transaction' || answerFirst)) {
     const effects: EffectPreview[] = operation.effects.map((kind) => ({ kind, summary: EFFECT_WORDS[kind], detail: { declared: true } }));
+    const note = answerFirst ? NOT_TRIED.answer : operation.dryRun === 'preview' ? NOT_TRIED.preview : NOT_TRIED.none;
     return {
       ...blank(mode, factsOf(operation, asked, { closingDate: gates.closingDate })),
       preview: {
@@ -1569,7 +2152,7 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
         effects,
         warnings: [],
         loss: null,
-        routePreview: { ran: false, note: NOT_TRIED[operation.dryRun] },
+        routePreview: { ran: false, note },
         truncated: false,
       },
     };
@@ -1578,7 +2161,7 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
   // 6. Run.
   const handler = await loadRouteHandler(operation);
   const limit = isReportRoute(operation.route) ? BRIDGE_REPORT_TIME_LIMIT_MS : BRIDGE_TIME_LIMIT_MS;
-  const facts = (answer: unknown, ledgerTotal: string | null) => factsFor(operation, asked, gates.closingDate, answer, ledgerTotal);
+  const facts = (answer: unknown, ledger: LedgerTotals | null) => factsFor(operation, asked, gates.closingDate, answer, ledger);
   const timeout = () =>
     errorResult(mode, startFacts, {
       message:
@@ -1624,13 +2207,14 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
   /**
    * Call the handler with its effects collected. A file it would save outside the agent's folders
    * fails the run inside the collection, so the calls to other computers it already made are still
-   * reported (effectsOfFailedRun) and nothing queued is ever released. `kept` says the work itself
-   * cannot be undone (a dryRun 'none' commit), so the refusal says what did and did not happen.
+   * reported (effectsOfFailedRun) and nothing queued is ever released; a file inside them is pinned
+   * to the real folder that was checked (checkAndPinFiles). `kept` says the work itself cannot be
+   * undone (a dryRun 'none' commit), so the refusal says what did and did not happen.
    */
   const collectRun = (effectsMode: EffectsMode, ctx: ServiceContext, kept: boolean): Promise<EffectsRun<RawAnswer>> =>
     runWithEffects(effectsMode, async () => {
       const raw = await invoke(handler, request, built.params, ctx, scope, true);
-      const refusal = await folderRefusal(currentEffects() ?? [], actor.folders);
+      const refusal = await checkAndPinFiles(actor.folders);
       if (refusal) {
         throw new BridgeRefusal(
           kept
@@ -1642,7 +2226,7 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
         );
       }
       return raw;
-    });
+    }, { pinFiles: true });
 
   const stage = (file: Interpreted['file']) => (file ? stageFile(owner, file) : Promise.resolve(null));
 
@@ -1650,7 +2234,8 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
     return withDeadline(limit, async (d) => {
       try {
         const ctx = handlerContext(readOnlyDb(db), parts, true);
-        const run = await runWithEffects('capture', () => invoke(handler, request, built.params, ctx, scope, false));
+        // { pinFiles }: a file a read asks for is never looked at on the disk, and never saved.
+        const run = await runWithEffects('capture', () => invoke(handler, request, built.params, ctx, scope, false), { pinFiles: true });
         const seen = interpret(run.value, operation, actor, sentFlags);
         if (d.expired) return timeout();
         const file = seen.outcome === 'ok' ? await stage(seen.file) : null;
@@ -1678,14 +2263,14 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
       try {
         await db.transaction(async (txRaw) => {
           const ctx = handlerContext(txRaw as unknown as DB, parts, false);
-          const named = await versionsOf(ctx.db, base.companyId, namedIds(asked));
+          const before = await readBefore(ctx, base.companyId, asked);
           const run = await collectRun('capture', ctx, false);
           if (d.expired) throw new TimedOut();
           await ctx.db.execute(sql`SET CONSTRAINTS ALL IMMEDIATE`);
-          const done = await collect(ctx, operation, access, run.effects, named, run.value.status);
+          const done = await collect(ctx, operation, access, run.effects, before, run.value.status);
           const seen = interpret(run.value, operation, actor, sentFlags);
           throw new RolledBack({
-            ...blank(mode, facts(seen.answer, done.ledgerTotal)),
+            ...blank(mode, facts(seen.answer, done.ledger)),
             httpStatus: run.value.status,
             outcome: seen.outcome,
             result: seen.result,
@@ -1713,36 +2298,60 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
   }
 
   // Commit of an operation whose service opens its own database handle: no wrapping transaction
-  // (it could not be rolled back anyway), still inside the scope and the outbox.
+  // (it could not be rolled back anyway), still inside the scope and the outbox, with a time limit
+  // of its own (IRREVERSIBLE_COMMIT_TIME_LIMIT_MS). Work past it cannot be stopped or undone, so the
+  // answer says it may still finish; whatever it queued (emails, files, print jobs) is then never
+  // sent, since nobody is left to report how they went. Work that has not started when the limit
+  // passes (still waiting to count the grant, on a PGlite lock say) never starts.
   if (operation.dryRun === 'none') {
-    let run: EffectsRun<RawAnswer> | null = null;
-    try {
-      if (actor.approval?.grantId) {
-        const grantId = actor.approval.grantId;
-        // Counted first, in its own transaction: a failed run then uses it up, never the other way.
-        await db.transaction(async (txRaw) => countGrantUse(handlerContext(txRaw as unknown as DB, parts, false), grantId));
+    const seconds = Math.round(IRREVERSIBLE_COMMIT_TIME_LIMIT_MS / 1000);
+    const stillRunning = () =>
+      errorResult(mode, startFacts, {
+        message:
+          `This has taken longer than ${Math.round(seconds / 60)} minutes. It works outside the books, so Ironbooks cannot stop or undo it ` +
+          'part way: it may still finish. Check whether it was done before asking again. Emails, files and print jobs it asked for will not be sent.',
+        code: 'TIMEOUT',
+        details: { seconds, mayStillFinish: true },
+      });
+    return withDeadline(IRREVERSIBLE_COMMIT_TIME_LIMIT_MS, async (d) => {
+      let run: EffectsRun<RawAnswer> | null = null;
+      try {
+        if (actor.approval?.grantId) {
+          const grantId = actor.approval.grantId;
+          // Counted first, in its own transaction: a failed run then uses it up, never the other way.
+          await db.transaction(async (txRaw) => countGrantUse(handlerContext(txRaw as unknown as DB, parts, false), grantId));
+        }
+        // The answer has already gone out ("may still finish"): what cannot be undone must not
+        // start after it.
+        if (d.expired) return stillRunning();
+        run = await collectRun('defer', handlerContext(db, parts, false), true);
+        if (d.expired) {
+          run.discard();
+          return stillRunning();
+        }
+        // From here on the time limit no longer answers: this answer is the one that counts.
+        d.finishing = true;
+        const seen = interpret(run.value, operation, actor, sentFlags);
+        const file = await stage(seen.file);
+        const shown = capped(run.effects);
+        const effects = await run.release();
+        return {
+          ...blank(mode, facts(seen.answer, null)),
+          httpStatus: run.value.status,
+          outcome: seen.outcome,
+          result: seen.result,
+          file,
+          preview: { ledger: null, records: [], effects: shown.list, warnings: [], loss: null, routePreview: null, truncated: shown.truncated },
+          warnings: seen.warnings,
+          error: seen.error,
+          effects,
+          produced: seen.produced,
+        };
+      } catch (err) {
+        run?.discard();
+        return failed(err, effectsOfFailedRun(err)?.ran ?? []);
       }
-      run = await collectRun('defer', handlerContext(db, parts, false), true);
-      const seen = interpret(run.value, operation, actor, sentFlags);
-      const file = await stage(seen.file);
-      const shown = capped(run.effects);
-      const effects = await run.release();
-      return {
-        ...blank(mode, facts(seen.answer, null)),
-        httpStatus: run.value.status,
-        outcome: seen.outcome,
-        result: seen.result,
-        file,
-        preview: { ledger: null, records: [], effects: shown.list, warnings: [], loss: null, routePreview: null, truncated: shown.truncated },
-        warnings: seen.warnings,
-        error: seen.error,
-        effects,
-        produced: seen.produced,
-      };
-    } catch (err) {
-      run?.discard();
-      return failed(err, effectsOfFailedRun(err)?.ran ?? []);
-    }
+    }, stillRunning);
   }
 
   return withDeadline(limit, async (d) => {
@@ -1750,12 +2359,12 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
       const kept = await db.transaction(async (txRaw) => {
         const ctx = handlerContext(txRaw as unknown as DB, parts, false);
         if (actor.approval?.grantId) await countGrantUse(ctx, actor.approval.grantId);
-        const named = await versionsOf(ctx.db, base.companyId, namedIds(asked));
+        const before = await readBefore(ctx, base.companyId, asked);
         const run = await collectRun('defer', ctx, false);
         try {
           if (d.expired) throw new TimedOut();
           await ctx.db.execute(sql`SET CONSTRAINTS ALL IMMEDIATE`);
-          const done = await collect(ctx, operation, access, run.effects, named, run.value.status);
+          const done = await collect(ctx, operation, access, run.effects, before, run.value.status);
           const seen = interpret(run.value, operation, actor, sentFlags);
           if (seen.outcome !== 'ok') {
             // A success answer that cannot be read: nothing is kept, so the agent never retries
@@ -1764,7 +2373,7 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
           }
           const file = await stage(seen.file);
           const result: BridgeResult = {
-            ...blank(mode, facts(seen.answer, done.ledgerTotal)),
+            ...blank(mode, facts(seen.answer, done.ledger)),
             httpStatus: run.value.status,
             outcome: seen.outcome,
             result: seen.result,

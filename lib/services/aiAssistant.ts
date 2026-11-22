@@ -12,15 +12,32 @@
  * and posts only when a user approves it — via journal.createManualEntry → postJournalEntry,
  * inside the user's own permissions (viewers cannot approve; closed periods stay closed).
  *
+ * What an outside AGENT asks for is not decided here. Its old proposals (kind 'agent_action')
+ * were copied into agent_permission_requests, and those requests are approved or denied in one
+ * place only, Agent requests (app/agent-requests, lib/services/agentRequests.ts): that page shows
+ * what the work would change first, and only a person's own Ironbooks window may answer there.
+ * Ask AI lists such a proposal with its state and a link to its request, and refuses to approve
+ * or reject it (one left over with no request can only be declined, which enters nothing).
+ *
  * Without any eligible model the assistant still works in an offline, keyword-driven mode
  * that runs the same tools and formats their results deterministically.
  */
 import { and, desc, eq, gte, ilike, inArray, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { accounts, aiProposals, customers, invoices, items, journalEntries, journalEntryLines, vendors } from '@/lib/db/schema';
+import {
+  accounts,
+  agentPermissionRequests,
+  aiProposals,
+  customers,
+  invoices,
+  items,
+  journalEntries,
+  journalEntryLines,
+  vendors,
+} from '@/lib/db/schema';
 import { Money, toAmountString, formatCurrency } from '@/lib/money';
-import { AGENT_PROPOSAL_KIND, runApprovedAgentAction } from '@/lib/agent/actions';
-import '@/lib/agent/catalog';
+import { AGENT_PROPOSAL_KIND } from '@/lib/agent/actions';
+import type { RequestStatus } from '@/lib/agent/operations/types';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { balanceSheet, profitAndLoss, trialBalance } from './reports';
 import { apAging, arAging, cashFlow, expensesByVendor, openInvoices, salesByCustomer } from './reportsExtra';
@@ -28,7 +45,7 @@ import { assertBalanced } from './posting';
 import { createBill } from './bills';
 import { createInvoice } from './invoices';
 import { receivePayment } from './payments';
-import { createManualEntry, followMergedNames } from './journal';
+import { createManualEntry, followMergedNames, ilikeMatches, lineMemoFor, memoMayHoldAccountNumber, searchesShownMemos } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { companyToday } from './preferences';
 import { AiError } from '@/lib/ai/types';
@@ -257,29 +274,75 @@ interface SearchArgs {
   limit?: number;
 }
 
+/**
+ * At most this many lines are read for a search matched in code (below): far more than an answer
+ * of at most 25 entries needs. Past it some older matches are left out, never shown unmasked.
+ */
+const SHOWN_MEMO_SCAN = 5000;
+
 async function searchTransactions(ctx: ServiceContext, a: SearchArgs) {
   const conds = [eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted')];
   const from = parseDate(a.from);
   const to = parseDate(a.to, true);
   if (from) conds.push(gte(journalEntries.date, from));
   if (to) conds.push(lte(journalEntries.date, to));
-  if (a.query?.trim()) {
-    const q = `%${a.query.trim()}%`;
-    conds.push(or(ilike(journalEntries.description, q), ilike(journalEntries.reference, q), ilike(journalEntryLines.memo, q))!);
-  }
+  const limit = a.limit ?? 15;
+  const like = a.query?.trim() ? `%${a.query.trim()}%` : null;
+  // A line memo is free text, and some hold a payee's full account number ("Acct # 000123456789").
+  // A caller who sees such a memo masked (journal.ts lineMemoFor) is matched against the memo as
+  // shown, the way the journal and the reports search: matching the stored text would let them test
+  // guesses at the hidden digits ("Acct # 0001%"), the entry coming back only when the guess is
+  // right. So a line whose memo may hold a number is read whatever its text and matched in code;
+  // every other line is matched by the database as before.
+  const shownMemoSearch = like !== null && searchesShownMemos(ctx);
+  const otherHit = like
+    ? sql<boolean>`(${journalEntries.description} ILIKE ${like} OR ${journalEntries.reference} ILIKE ${like})`
+    : sql<boolean>`false`;
+  const memoHit = like ? sql<boolean>`(${journalEntryLines.memo} ILIKE ${like})` : sql<boolean>`false`;
+  if (like) conds.push(shownMemoSearch ? sql`(${otherHit} OR ${memoHit} OR ${memoMayHoldAccountNumber()})` : sql`(${otherHit} OR ${memoHit})`);
   if (a.accountCode) conds.push(eq(accounts.code, a.accountCode));
   const amt = sql`COALESCE(${journalEntryLines.debit}, ${journalEntryLines.credit}, 0)`;
   if (a.minAmount !== undefined) conds.push(sql`${amt} >= ${toAmountString(a.minAmount)}`);
   if (a.maxAmount !== undefined) conds.push(sql`${amt} <= ${toAmountString(a.maxAmount)}`);
 
-  const hits = await ctx.db
-    .selectDistinct({ id: journalEntries.id, date: journalEntries.date, entryNumber: journalEntries.entryNumber })
-    .from(journalEntries)
-    .innerJoin(journalEntryLines, eq(journalEntryLines.journalEntryId, journalEntries.id))
-    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
-    .where(and(...conds))
-    .orderBy(desc(journalEntries.date), desc(journalEntries.entryNumber))
-    .limit(a.limit ?? 15);
+  let hits: Array<{ id: string; date: Date; entryNumber: number }>;
+  if (!shownMemoSearch) {
+    hits = await ctx.db
+      .selectDistinct({ id: journalEntries.id, date: journalEntries.date, entryNumber: journalEntries.entryNumber })
+      .from(journalEntries)
+      .innerJoin(journalEntryLines, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(and(...conds))
+      .orderBy(desc(journalEntries.date), desc(journalEntries.entryNumber))
+      .limit(limit);
+  } else {
+    const read = await ctx.db
+      .select({
+        id: journalEntries.id,
+        date: journalEntries.date,
+        entryNumber: journalEntries.entryNumber,
+        memo: journalEntryLines.memo,
+        memoHit,
+        otherHit,
+      })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(and(...conds))
+      .orderBy(desc(journalEntries.date), desc(journalEntries.entryNumber))
+      .limit(SHOWN_MEMO_SCAN);
+    const isTrue = (v: unknown) => v === true || v === 't';
+    const found = new Map<string, { id: string; date: Date; entryNumber: number }>();
+    for (const r of read) {
+      if (found.size >= limit) break;
+      if (found.has(r.id)) continue;
+      const shown = lineMemoFor(ctx, r.memo);
+      // A memo the mask leaves alone is matched as the database matched it; one it changes, as shown.
+      const hit = isTrue(r.otherHit) || (shown === r.memo ? isTrue(r.memoHit) : ilikeMatches(shown, like!));
+      if (hit) found.set(r.id, { id: r.id, date: r.date, entryNumber: r.entryNumber });
+    }
+    hits = [...found.values()];
+  }
   if (hits.length === 0) return { entries: [] };
 
   const ids = hits.map((h) => h.id);
@@ -307,7 +370,9 @@ async function searchTransactions(ctx: ServiceContext, a: SearchArgs) {
       date: h.date.toISOString().slice(0, 10),
       description: ls[0]?.description ?? '',
       reference: ls[0]?.reference ?? null,
-      lines: ls.map((l) => ({ code: l.code, account: l.account, debit: l.debit, credit: l.credit, memo: l.memo })),
+      // Masked for a caller without "view full account numbers" (journal.ts lineMemoFor: the rule of
+      // the check memo, liabilityPayments.ts checkMemoFor); field-name masking never looks inside a memo.
+      lines: ls.map((l) => ({ code: l.code, account: l.account, debit: l.debit, credit: l.credit, memo: lineMemoFor(ctx, l.memo) })),
     };
   });
   return { entries };
@@ -357,6 +422,25 @@ export interface ProposalView {
   createdAt: Date;
   resultRef: string | null;
   error: string | null;
+  /**
+   * Kind 'agent_action' only (listProposals): the agent's request this proposal was copied into,
+   * where it is decided. Null when it is not there (it cannot be decided anywhere then).
+   */
+  agentRequest?: AgentRequestLink | null;
+}
+
+/** Where an agent's request is approved or denied: Agent requests. */
+export interface AgentRequestLink {
+  id: string;
+  /** Its state there ('approved' is "being carried out"). */
+  status: RequestStatus;
+  /** "/agent-requests?id=<id>". */
+  href: string;
+}
+
+/** The Agent requests page, opened on one request. */
+export function agentRequestHref(requestId: string): string {
+  return `/agent-requests?id=${encodeURIComponent(requestId)}`;
 }
 
 interface StoredJournalProposal {
@@ -892,18 +976,166 @@ function toView(row: typeof aiProposals.$inferSelect): ProposalView {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Proposals an outside agent made: decided in Agent requests, never here
+// ---------------------------------------------------------------------------
+
+type ProposalRow = typeof aiProposals.$inferSelect;
+
+/** What Ask AI needs of the request a proposal was copied into. */
+interface CopiedRequest {
+  id: string;
+  proposalId: string | null;
+  status: string;
+  expiresAt: Date;
+  error: string | null;
+}
+
+const COPIED_REQUEST_COLUMNS = {
+  id: agentPermissionRequests.id,
+  proposalId: agentPermissionRequests.proposalId,
+  status: agentPermissionRequests.status,
+  expiresAt: agentPermissionRequests.expiresAt,
+  error: agentPermissionRequests.error,
+};
+
+export const AGENT_PROPOSAL_ELSEWHERE_MESSAGE =
+  'An agent asked for this, so it is approved or denied in Agent requests, where you can see everything it would change first. Open it there.';
+export const AGENT_PROPOSAL_UNLISTED_MESSAGE =
+  "An agent asked for this. Agents' requests are approved only in Agent requests, and this one is not listed there. Ask the agent to send it again, or enter the change yourself. You can decline this one to clear it from Ask AI.";
+export const AGENT_DECIDES_NOTHING_MESSAGE =
+  "An agent cannot approve or decline proposals. A person decides them in Ironbooks: the assistant's in Ask AI, agents' in Agent requests.";
+
+/**
+ * An agent never approves or declines anything (it can never change approvals). The door refuses
+ * the route for agents already (its operation is a hard floor); this keeps the service closed too.
+ */
+function refuseAgentCaller(ctx: Pick<ServiceContext, 'agent'>): void {
+  if (ctx.agent) throw new ServiceError('FORBIDDEN', AGENT_DECIDES_NOTHING_MESSAGE, { agentRequests: true });
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * How a copied proposal reads while its request has moved on and the proposal row has not been
+ * settled yet (agentRequests.ts settles it the next time someone opens the request, the list or the
+ * title bar badge). In the four words the proposals table knows, as agentRequests.ts writes them:
+ * a withdrawn or expired request is "rejected", with why in `error`.
+ */
+const REQUEST_OUTCOME: Partial<Record<RequestStatus, { status: 'approved' | 'rejected' | 'failed'; note?: string }>> = {
+  executed: { status: 'approved' },
+  denied: { status: 'rejected' },
+  failed: { status: 'failed' },
+  cancelled: { status: 'rejected', note: 'The agent withdrew this request.' },
+  expired: { status: 'rejected', note: 'This request expired before anyone decided it.' },
+};
+
+/** The requests these proposals were copied into, by proposal id. */
+async function copiedRequests(ctx: ServiceContext, proposalIds: string[]): Promise<Map<string, CopiedRequest>> {
+  if (proposalIds.length === 0) return new Map();
+  const rows = await ctx.db
+    .select(COPIED_REQUEST_COLUMNS)
+    .from(agentPermissionRequests)
+    .where(and(eq(agentPermissionRequests.companyId, ctx.companyId), inArray(agentPermissionRequests.proposalId, proposalIds)));
+  return new Map(rows.map((r) => [r.proposalId!, r]));
+}
+
+/**
+ * An agent's proposal as Ask AI shows it: what was asked and its state, linked to its request. The
+ * agent's input and the ledger preview are left out (Agent requests shows them, masked for the
+ * person looking); what the agent sent can hold protected values (a vendor's tax ID, an account
+ * number) that this list never masked.
+ */
+function agentProposalView(row: ProposalRow, request: CopiedRequest | null, now: Date): ProposalView {
+  const view = toView(row);
+  const { input: _input, changes: _changes, ...shown } = (row.payload ?? {}) as Record<string, unknown>;
+  const payload = { ...shown, lines: [] } as unknown as StoredJournalProposal;
+  if (!request) return { ...view, payload, agentRequest: null };
+  const status = (request.status === 'pending' && request.expiresAt.getTime() <= now.getTime() ? 'expired' : request.status) as RequestStatus;
+  const agentRequest: AgentRequestLink = { id: request.id, status, href: agentRequestHref(request.id) };
+  const outcome = view.status === 'pending' ? REQUEST_OUTCOME[status] : undefined;
+  if (!outcome) return { ...view, payload, agentRequest };
+  return { ...view, payload, status: outcome.status, error: view.error ?? outcome.note ?? request.error ?? null, agentRequest };
+}
+
+/**
+ * The refusal for deciding an agent's proposal here. There is one place where an agent's work is
+ * approved or denied, Agent requests: it shows what the work would change first, and its routes
+ * answer only a person's own Ironbooks window (app/api/agent-requests/_guards.ts), which this
+ * route does not check. The error names the request so the screen can link to it.
+ *
+ * A proposal with no request cannot be decided there: migration 0097 copied every proposal whose
+ * agent it could tell, and nothing new is written to this table (lib/agent/actions.ts), so this is
+ * one left over from an agent it could not tell. Approving it is refused, saying what to do.
+ * Declining it is let through (returns): it enters nothing, so it is not a second place where an
+ * agent's work is approved, and without it the row would wait in every person's Ask AI for good.
+ *
+ * An agent never decides either way: refused before anything else.
+ */
+async function refuseAgentProposal(ctx: ServiceContext, row: ProposalRow, decision: 'approve' | 'reject'): Promise<void> {
+  refuseAgentCaller(ctx);
+  const request = (await copiedRequests(ctx, [row.id])).get(row.id);
+  if (request) {
+    const href = agentRequestHref(request.id);
+    throw new ServiceError('FORBIDDEN', AGENT_PROPOSAL_ELSEWHERE_MESSAGE, { agentRequests: true, agentRequestId: request.id, href }, [
+      { id: 'open-agent-request', label: 'Open in Agent requests', kind: 'navigate', href },
+    ]);
+  }
+  if (row.status !== 'pending') throw new ServiceError('CONFLICT', `Proposal is already ${row.status}.`);
+  if (decision === 'reject') return;
+  throw new ServiceError('FORBIDDEN', AGENT_PROPOSAL_UNLISTED_MESSAGE, { agentRequests: true, agentRequestId: null });
+}
+
+/**
+ * Refuse (above) when proposal `id` is an agent's. Run before the transaction, so even a view-only
+ * person is pointed to Agent requests rather than told they cannot change anything. The
+ * transaction checks again on the row it locks.
+ */
+async function refuseIfAgentProposal(ctx: ServiceContext, id: string, decision: 'approve' | 'reject'): Promise<void> {
+  if (!UUID_RE.test(id)) return;
+  const [row] = await ctx.db
+    .select()
+    .from(aiProposals)
+    .where(and(eq(aiProposals.id, id), eq(aiProposals.companyId, ctx.companyId)));
+  if (row?.kind === AGENT_PROPOSAL_KIND) await refuseAgentProposal(ctx, row, decision);
+}
+
+/**
+ * The proposals of this company, newest first. An agent's proposal comes with the request it was
+ * copied into (`agentRequest`), and its state is that request's. A read only: nothing is written.
+ *
+ * `status` filters on the state each proposal is SHOWN with. For the app's own proposals that is
+ * the stored one. An agent's proposal still 'pending' in this table can read otherwise (its request
+ * was decided, withdrawn or expired and the row is not settled yet), so those are read too and
+ * kept only when they read as asked: '?status=pending' leaves out one already done there, and
+ * '?status=rejected' includes one that expired. At most 100 rows are read before that filter.
+ */
 export async function listProposals(ctx: ServiceContext, status?: string): Promise<ProposalView[]> {
   const conds = [eq(aiProposals.companyId, ctx.companyId)];
-  if (status) conds.push(eq(aiProposals.status, status));
+  if (status) {
+    conds.push(
+      status === 'pending'
+        ? eq(aiProposals.status, 'pending')
+        : or(eq(aiProposals.status, status), and(eq(aiProposals.kind, AGENT_PROPOSAL_KIND), eq(aiProposals.status, 'pending')))!,
+    );
+  }
   const rows = await ctx.db.select().from(aiProposals).where(and(...conds)).orderBy(desc(aiProposals.createdAt)).limit(100);
-  return rows.map(toView);
+  const asked = rows.filter((r) => r.kind === AGENT_PROPOSAL_KIND);
+  if (asked.length === 0) return rows.map(toView);
+  const requests = await copiedRequests(ctx, asked.map((r) => r.id));
+  const now = new Date();
+  const views = rows.map((r) => (r.kind === AGENT_PROPOSAL_KIND ? agentProposalView(r, requests.get(r.id) ?? null, now) : toView(r)));
+  return status ? views.filter((v) => v.status === status) : views;
 }
 
 /**
  * Approve: post the proposed entry through the normal journal service (posting.ts enforces
  * balance, company ownership of accounts, and closed periods; inTransaction enforces RBAC).
+ * An agent's proposal is refused: it is approved in Agent requests.
  */
 export async function approveProposal(ctx: ServiceContext, id: string): Promise<ProposalView> {
+  refuseAgentCaller(ctx);
+  await refuseIfAgentProposal(ctx, id, 'approve');
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
       .select()
@@ -911,6 +1143,11 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
       .where(and(eq(aiProposals.id, id), eq(aiProposals.companyId, tx.companyId)))
       .for('update');
     if (!row) throw notFound('Proposal');
+    // Checked before the transaction too (refuseIfAgentProposal); never entered here whatever happens.
+    if (row.kind === AGENT_PROPOSAL_KIND) {
+      await refuseAgentProposal(tx, row, 'approve');
+      throw new ServiceError('FORBIDDEN', AGENT_PROPOSAL_ELSEWHERE_MESSAGE, { agentRequests: true });
+    }
     if (row.status !== 'pending') throw new ServiceError('CONFLICT', `Proposal is already ${row.status}.`);
     // The approver needs the same right the screen would need (Users & Roles), checked before any
     // kind is entered: a journal-entry right alone does not let someone enter bills, invoices or
@@ -1003,25 +1240,6 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
       });
       return toView(updated);
     }
-    if (row.kind === AGENT_PROPOSAL_KIND) {
-      // A change an outside agent proposed (lib/agent/actions.ts): entered now under the
-      // approving person's own permissions, recorded as proposed by the agent and approved by them.
-      const done = await runApprovedAgentAction(tx, row.payload);
-      const [updated] = await tx.db
-        .update(aiProposals)
-        .set({ status: 'approved', resultRef: done.resultRef, decidedBy: tx.userId, decidedAt: new Date() })
-        .where(eq(aiProposals.id, id))
-        .returning();
-      await writeAudit(tx, {
-        action: 'update',
-        entityType: 'ai_proposal',
-        entityId: id,
-        oldValues: { status: 'pending' },
-        newValues: { status: 'approved', result: done.result },
-        llmReasoning: (row.payload as { rationale?: string | null }).rationale ?? 'Approved a proposal made by an agent.',
-      });
-      return toView(updated);
-    }
     if (row.kind !== 'journal_entry') throw validation(`Unsupported proposal kind: ${row.kind}`);
     const p = row.payload as unknown as StoredJournalProposal;
     const date = parseDate(p.date);
@@ -1092,21 +1310,38 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
   });
 }
 
+/**
+ * Reject: nothing is entered. An agent's proposal is refused (it is denied in Agent requests),
+ * except one that is not listed there, which can only be declined (refuseAgentProposal).
+ */
 export async function rejectProposal(ctx: ServiceContext, id: string): Promise<ProposalView> {
+  refuseAgentCaller(ctx);
+  await refuseIfAgentProposal(ctx, id, 'reject');
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
       .select()
       .from(aiProposals)
-      .where(and(eq(aiProposals.id, id), eq(aiProposals.companyId, tx.companyId)));
+      .where(and(eq(aiProposals.id, id), eq(aiProposals.companyId, tx.companyId)))
+      .for('update');
     if (!row) throw notFound('Proposal');
+    const agents = row.kind === AGENT_PROPOSAL_KIND;
+    // Checked again on the locked row: only an agent's proposal no request was copied from gets past.
+    if (agents) await refuseAgentProposal(tx, row, 'reject');
     if (row.status !== 'pending') throw new ServiceError('CONFLICT', `Proposal is already ${row.status}.`);
     const [updated] = await tx.db
       .update(aiProposals)
       .set({ status: 'rejected', decidedBy: tx.userId, decidedAt: new Date() })
       .where(eq(aiProposals.id, id))
       .returning();
-    await writeAudit(tx, { action: 'update', entityType: 'ai_proposal', entityId: id, oldValues: { status: 'pending' }, newValues: { status: 'rejected' } });
-    return toView(updated);
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'ai_proposal',
+      entityId: id,
+      oldValues: { status: 'pending' },
+      newValues: agents ? { status: 'rejected', note: 'Declined in Ask AI: it was not in Agent requests. Nothing was entered.' } : { status: 'rejected' },
+    });
+    // An agent's proposal is answered the way the list shows it: without the agent's input.
+    return agents ? agentProposalView(updated, null, new Date()) : toView(updated);
   });
 }
 

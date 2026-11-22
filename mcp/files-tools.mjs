@@ -8,9 +8,14 @@
  *  - attach_local_file: a file on this computer the agent names by its path. The connector reads
  *    it itself (it runs on the same computer as the agent's client), but only when the file, once
  *    every link and ".." is resolved, is inside one of the folders an Admin opened to this agent
- *    (get_my_permissions lists them). Anywhere else it is refused before the file is opened, and
- *    the refusal is written to the connector's log. A network share is looked at only when an
- *    allowed folder is on it: merely touching a share makes Windows offer it this person's sign-in.
+ *    (get_my_permissions lists them), and not inside a folder Ironbooks keeps for itself
+ *    (ironbooksFolders: its settings, the working copies of company files, staged agent files),
+ *    even when an opened folder holds one. Anywhere else it is refused before the file is opened,
+ *    and every refusal is written to the connector's log. A missing file is said to be missing
+ *    only where it would be inside an allowed folder, so nothing is learnt about what exists
+ *    elsewhere. A network share is looked at only when an allowed folder is on it: merely touching
+ *    a share makes Windows offer it this person's sign-in. The file is read with the size cap
+ *    held all the way (readUpTo), even when it grows while it is read.
  *  - get_file: a staged file's content: an image as an image, text as text, anything else as an
  *    embedded resource with its bytes in base64.
  *  - save_file: writes a staged file to an allowed folder. That is the 'file' class: a person
@@ -21,11 +26,11 @@
  */
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
-import { LOST_ANSWER_MESSAGE } from './client.mjs';
+import { ENDPOINT_DIR_ENV, LOST_ANSWER_MESSAGE, TOKEN_FILE_ENV, endpointDir } from './client.mjs';
 import { ToolContent, ToolError } from './protocol.mjs';
-import { settle } from './write-tools.mjs';
-import { REQUEST_ID, verb } from './operations-tools.mjs';
+import { REQUEST_ID, settleLong, verb } from './operations-tools.mjs';
 
 /** One part of an upload, and the whole of one (lib/agent/contract.ts UPLOAD_CHUNK_BYTES, UPLOAD_MAX_BYTES). */
 export const UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
@@ -290,11 +295,93 @@ export function outsideMessage(/** @type {string[]} */ folders) {
 
 export const NOT_FOUND_MESSAGE = 'That file could not be found. Check the path, or ask the person where the file is.';
 
+/**
+ * Said of a file in ironbooksFolders or ironbooksFiles. It names only what those cover: the
+ * company file itself and a backups folder the person chose elsewhere are not among them (no
+ * connector setting says where they are), so it does not claim them.
+ */
+export const IRONBOOKS_OWN_MESSAGE =
+  "That file is one Ironbooks keeps for itself on this computer (its settings folder with the backups it makes when it closes, the working copies of company files, agent files, or this connector's access token). An agent may never read those, even inside a folder open to it. Read what you need through Ironbooks itself instead: find_operations lists what it can show you.";
+
+/** Older names of Ironbooks' settings folder (electron/main.js useLegacyUserDataIfPresent), and the name in a source checkout. */
+const APP_FOLDER_NAMES = ['Ironbooks', 'BookKeeper AI', 'bookkeeper-ai', 'ironbooks'];
+
+/**
+ * Folders Ironbooks keeps for itself on this computer, which an agent may never read from even
+ * when an Admin opened a folder that holds one (say the whole user profile):
+ *  - its settings folder (electron/main.js userData, also by its older names, or
+ *    IRONBOOKS_USER_DATA): the device key, settings, quit-time backups, TLS keys;
+ *  - its local folder (Windows %LOCALAPPDATA%\Ironbooks): the working copies of company files and
+ *    practice copies (electron/companySession.js workingRoot, sandboxRoot), which hold the books in
+ *    plain form even for a password-protected file; every agent's staged files (lib/agent/files.ts
+ *    appDataRoot); the endpoint files with the value Ironbooks proves itself with to this
+ *    connector (lib/agent/endpointFile.ts endpointDir);
+ *  - elsewhere, the same places under the system's own names.
+ * A test holds these to those modules.
+ * @param {Record<string, string | undefined>} [env]
+ * @param {string} [platform]
+ * @param {string} [home]
+ * @returns {string[]}
+ */
+export function ironbooksFolders(env = process.env, platform = process.platform, home = os.homedir()) {
+  const out = [];
+  if (platform === 'win32') {
+    const roaming = env.APPDATA || path.join(home, 'AppData', 'Roaming');
+    for (const n of APP_FOLDER_NAMES) out.push(path.join(roaming, n));
+    out.push(path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'Ironbooks'));
+  } else if (platform === 'darwin') {
+    for (const n of APP_FOLDER_NAMES) out.push(path.join(home, 'Library', 'Application Support', n));
+  } else {
+    for (const n of APP_FOLDER_NAMES) out.push(path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), n));
+    out.push(path.join(env.XDG_STATE_HOME || path.join(home, '.local', 'state'), 'ironbooks'));
+  }
+  // companySession.workingRoot when Electron gives it no settings folder.
+  out.push(path.join(home, '.ironbooks'));
+  if (env.IRONBOOKS_USER_DATA) out.push(path.resolve(env.IRONBOOKS_USER_DATA));
+  if (env[ENDPOINT_DIR_ENV]) out.push(endpointDir(env, platform));
+  return [...new Map(out.map((p) => [key(p), p])).values()];
+}
+
+/**
+ * Files of Ironbooks' an agent may never read either: this connector's own token file.
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {string[]}
+ */
+export function ironbooksFiles(env = process.env) {
+  const file = env[TOKEN_FILE_ENV];
+  return file ? [path.resolve(file)] : [];
+}
+
+/**
+ * `p` (a path with its links resolved) is inside, or is, one of Ironbooks' own folders or files.
+ * Each is taken as written and with its own links followed, but a folder on a network share is
+ * only looked at when an allowed folder is on that share too.
+ * @param {string} p @param {{ folders: string[], files: string[] }} own @param {ReadonlySet<string>} shares
+ */
+async function isIronbooksOwn(p, own, shares) {
+  const lookable = (/** @type {string} */ f) => {
+    const s = uncShare(f);
+    return s === null || shares.has(s);
+  };
+  for (const folder of own.folders) {
+    if (inside(p, folder) || key(p) === key(folder)) return true;
+    const real = lookable(folder) ? await realOf(folder, shares) : null;
+    if (real && (inside(p, real) || key(p) === key(real))) return true;
+  }
+  for (const file of own.files) {
+    if (key(p) === key(file)) return true;
+    const real = lookable(file) ? await realOf(file, shares) : null;
+    if (real && key(p) === key(real)) return true;
+  }
+  return false;
+}
+
 /** Write a refusal to the connector's log (stderr; never stdout, which is the protocol). */
 function logRefusal(/** @type {unknown} */ requested, /** @type {string} */ why) {
   // Quoted as JSON and cut short, so a path cannot add lines of its own to the log.
+  // The reason may quote an argument's name the agent chose: no control characters from it either.
   const shown = JSON.stringify(typeof requested === 'string' ? requested.slice(0, 300) : String(requested));
-  process.stderr.write(`[ironbooks-mcp] attach_local_file refused ${shown}: ${why}\n`);
+  process.stderr.write(`[ironbooks-mcp] attach_local_file refused ${shown}: ${why.slice(0, 400).replace(/\p{Cc}/gu, ' ')}\n`);
 }
 
 /** `p` is one of `folders`, or inside one (each as given, and with its links followed). */
@@ -339,11 +426,16 @@ export async function readUpTo(handle, cap, sizeHint = 0) {
  * that only has this connector does not have.
  * @param {string} requested
  * @param {string[]} folders
+ * @param {{ own?: { folders: string[], files: string[] } }} [opts]  Ironbooks' own folders and files (tests pass their own)
  * @returns {Promise<{ path: string, bytes: Buffer }>}
  */
-export async function readAllowedFile(requested, folders) {
+export async function readAllowedFile(requested, folders, opts = {}) {
   const entries = /** @type {string[]} */ ((Array.isArray(folders) ? folders : []).map(plainPath).filter((p) => typeof p === 'string'));
-  if (!entries.length) throw new ToolError(NO_FOLDERS_MESSAGE);
+  // Every refusal is logged (plan §5.7); a file that is missing, a folder or too large is not one.
+  if (!entries.length) {
+    logRefusal(requested, 'no folders are open to this agent.');
+    throw new ToolError(NO_FOLDERS_MESSAGE);
+  }
   const want = plainPath(requested);
   if (!want) {
     logRefusal(requested, 'not a plain full path (relative, a device, a stream or a device name).');
@@ -352,6 +444,11 @@ export async function readAllowedFile(requested, folders) {
   const outside = () => {
     logRefusal(requested, 'not inside a folder this agent may use.');
     return new ToolError(outsideMessage(entries));
+  };
+  const own = opts.own ?? { folders: ironbooksFolders(), files: ironbooksFiles() };
+  const ironbooksOwn = () => {
+    logRefusal(requested, 'inside a folder Ironbooks keeps for itself.');
+    return new ToolError(IRONBOOKS_OWN_MESSAGE);
   };
   // Network shares an allowed folder names itself: the only ones ever looked at.
   const shares = new Set(entries.map(uncShare).filter((s) => typeof s === 'string' && s !== ''));
@@ -364,8 +461,10 @@ export async function readAllowedFile(requested, folders) {
     // way is followed, so nothing is learnt about what exists elsewhere, even through a link that
     // leads out. A link that may not be followed at all counts as outside.
     const { at } = await walkLinks(want, shares);
-    if (at && (await inAllowedFolder(at, entries, shares))) throw new ToolError(NOT_FOUND_MESSAGE);
-    throw outside();
+    if (!at || !(await inAllowedFolder(at, entries, shares))) throw outside();
+    // Inside one of Ironbooks' own folders: refused alike whether the file is there or not.
+    if (await isIronbooksOwn(at, own, shares)) throw ironbooksOwn();
+    throw new ToolError(NOT_FOUND_MESSAGE);
   }
   const realShare = uncShare(real);
   let allowed = false;
@@ -380,6 +479,7 @@ export async function readAllowedFile(requested, folders) {
     }
   }
   if (!allowed) throw outside();
+  if (await isIronbooksOwn(real, own, shares)) throw ironbooksOwn();
 
   // A pipe or a device would never end; a folder is not a file. Looked at before it is opened.
   const before = await fsp.stat(real).catch(() => null);
@@ -504,6 +604,9 @@ export const FILE_TOOLS = [
       },
       ['path'],
     ),
+    // Arguments the schema refuses (a path that is not text, or over PATH_MAX) never reach the
+    // handler: they are logged like every other refusal.
+    refused: (a, problem) => logRefusal(a && typeof a === 'object' ? /** @type {any} */ (a).path : a, `the arguments were refused: ${problem}`),
     handler: async (a, c) => {
       const permissions = await verb(c, 'get_my_permissions', {});
       const folders = Array.isArray(permissions?.folders) ? permissions.folders.filter((f) => typeof f === 'string') : [];
@@ -539,7 +642,6 @@ export const FILE_TOOLS = [
       },
       ['file_id', 'folder', 'request_id'],
     ),
-    handler: async (a, c) =>
-      settle(await verb(c, 'save_file', { fileId: a.file_id, folder: a.folder, name: a.name, requestId: a.request_id, reason: a.reason }), { fields: 'confirm' }),
+    handler: async (a, c) => settleLong(await verb(c, 'save_file', { fileId: a.file_id, folder: a.folder, name: a.name, requestId: a.request_id, reason: a.reason })),
   },
 ];

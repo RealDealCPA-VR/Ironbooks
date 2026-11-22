@@ -15,10 +15,17 @@
  * shows them, so there is no second mapping per operation to drift (plan §6.3).
  *
  * The long wait is a GET of the agent's own request (GET /api/agent/requests/<id>?wait=<seconds>),
- * sent on its own connection so other tools are not held up. When it comes back decided, the
- * client also hears about it as a log message and, if it subscribed, as a change of the resource
- * ironbooks://requests/<id> (plan §6.2). The answer of wait_for_decision stays the dependable path.
+ * sent on its own connection so other tools are not held up. When no wait can be held open (two
+ * are open here already, or Ironbooks answers 429 because the agent holds as many as it allows),
+ * the request is read at once instead, and the answer says to check it later. When it comes back
+ * decided, the client also hears about it once as a log message and, if it subscribed, as a change
+ * of the resource ironbooks://requests/<id> (plan §6.2). The answer of wait_for_decision stays the
+ * dependable path.
+ *
+ * An answer is held to MAX_RESULT_CHARS: its result, the operation's own preview and what it would
+ * also send are each cut to a fair share, and the answer says what was cut and how to see the rest.
  */
+import { WAITS_BUSY_CODE } from './client.mjs';
 import { ToolError } from './protocol.mjs';
 import { CLASS_MEANINGS, SETTING_MEANINGS, SHORT_GRANT_MINUTES, STANDING, STANDING_TEXT } from './guide.mjs';
 import { camelize, settle } from './write-tools.mjs';
@@ -138,40 +145,170 @@ export function cutToFit(value, budget = MAX_RESULT_CHARS) {
   return { value: jsonLength(copy) <= budget ? copy : null };
 }
 
-const CUT_NOTE = 'The answer was too long to show in full: its longest lists were cut. Narrow the request (dates, a filter, a limit in the query) to see everything.';
-const TOO_LONG_NOTE = 'The answer was too long to show. Narrow the request (dates, a filter, a limit in the query).';
-
-/** The parts of a shaped answer that say what happened and what to do next: never left out. */
-const ALWAYS_SHOWN = new Set(['outcome', 'said', 'next', 'request_id', 'status', 'who_decides', 'warnings', 'note', 'file', 'summary', 'repeated', 'note_repeat', 'under_standing_permission', 'proposal_id']);
+/** Said of a change that was carried out, whatever part of its answer was cut. */
+const DONE_ONCE = 'It was carried out once, in full: do not send it again.';
+/** How to see the rest of a long answer of a change that was carried out: never by sending it again. */
+const RUN_RESULT_REST = `${DONE_ONCE} To see the rest, read what it made with a narrower read (find_operations finds one).`;
 
 /**
- * Run settle() on an answer that may be very long anywhere: its result, the operation's own
- * preview (route_preview), the records it would change. The whole shaped answer is held to
- * MAX_RESULT_CHARS: first by cutting its longest lists; when even that is not enough (one very long
- * text), by leaving out its longest parts, never what it says happened or what to do next.
+ * Where an answer stands, for what the agent is told about a part that was cut:
+ *  - 'card': a person decides on an approval card, which shows every part in full;
+ *  - 'done': it was carried out, so the rest is read with a narrower read, never by sending it again;
+ *  - 'other': nothing was kept (a dry run, a read, a warning), so a smaller request shows the rest.
+ * @typedef {'card' | 'done' | 'other'} Phase
  */
-function settleLong(/** @type {any} */ answer) {
-  const shaped = settle(answer, { fields: 'confirm' });
-  const cut = cutToFit(shaped);
-  if (!cut) return shaped;
-  if (cut.value) return { .../** @type {object} */ (cut.value), result_cut_short: CUT_NOTE };
-  /** @type {Record<string, unknown>} */
-  let rest = { ...shaped };
-  const leftOut = [];
-  const bulky = Object.keys(rest)
+
+/** The phase of an answer by its outcome (mcp/write-tools.mjs shapeAnswer). @returns {Phase} */
+function phaseOf(/** @type {unknown} */ outcome) {
+  if (outcome === 'asked' || outcome === 'proposed') return 'card';
+  if (outcome === 'posted' || outcome === 'done') return 'done';
+  return 'other';
+}
+
+/**
+ * The parts of an answer that may be very long, in plain words, and how the agent sees the rest of
+ * each when it was cut, by phase ('other' when a phase has nothing of its own). Only an answer that
+ * waits for a person mentions the approval card: there is none otherwise. A part not named here is
+ * cut the same way, with a plainer note.
+ * @type {Record<string, { what: string, rest: { other: string, card?: string, done?: string } }>}
+ */
+const LONG_PARTS = {
+  result: {
+    what: 'The result',
+    rest: { other: 'Narrow the request (dates, a filter, a limit in the query) to see everything.', done: RUN_RESULT_REST },
+  },
+  route_preview: {
+    what: "The operation's own preview (route_preview)",
+    rest: {
+      card: 'A person sees all of it on the approval card. To see it all yourself, dry run a smaller request (fewer records, a shorter date range).',
+      other: 'Nothing was kept. To see all of it, dry run a smaller request (fewer records, a shorter date range).',
+      done: RUN_RESULT_REST,
+    },
+  },
+  would_also: {
+    what: 'The list of what it would also do outside the books (would_also)',
+    rest: {
+      card: 'A person sees every one on the approval card. To see each yourself, dry run a smaller batch.',
+      other: 'Nothing was sent. To see each one, dry run a smaller batch.',
+    },
+  },
+  also: {
+    what: 'The list of what it also did outside the books (also)',
+    rest: { other: 'Ironbooks keeps all of them in its audit trail.', done: `${DONE_ONCE} Ironbooks keeps all of them in its audit trail.` },
+  },
+  also_done: {
+    what: 'The list of how each send or file went (also_done)',
+    rest: { other: 'Ironbooks keeps all of them in its audit trail.', done: `${DONE_ONCE} Ironbooks keeps all of them in its audit trail.` },
+  },
+  would_post: {
+    what: 'The ledger lines it would post (would_post)',
+    rest: { card: 'A person sees every line on the approval card. To see each yourself, dry run a smaller request.', other: 'Nothing was posted. Dry run a smaller request to see every line.' },
+  },
+  ledger: {
+    what: 'The ledger lines it posted (ledger)',
+    rest: { other: 'Read the entries with get_journal_entry to see every line.', done: `${DONE_ONCE} Read the entries with get_journal_entry to see every line.` },
+  },
+};
+
+/** How to see the rest of a part not named in LONG_PARTS. */
+const PLAIN_REST = { other: 'Narrow the request to see all of it.', done: RUN_RESULT_REST };
+
+/** Room kept for the notes that say what was cut. */
+const NOTE_ROOM = 4_000;
+
+/** The parts of a shaped answer that say what happened and what to do next: never cut or left out. */
+const ALWAYS_SHOWN = new Set([
+  'outcome', 'said', 'next', 'request_id', 'status', 'who_decides', 'warnings', 'note', 'file', 'summary', 'repeated', 'note_repeat',
+  'under_standing_permission', 'proposal_id', 'decision', 'kind', 'operation', 'error', 'note_from_person', 'stale',
+  'standing_permission', 'limits_given', 'minutes_given', 'standing_permission_ends_at', 'standing_permission_not_given',
+  'check_again_after_seconds',
+]);
+
+/**
+ * What the agent reads about one part that was cut (`kept`) or left out (`kept` undefined).
+ * `restOf`: how to see the rest, where it differs from LONG_PARTS. `phase`: where the answer stands.
+ */
+function cutNote(
+  /** @type {string} */ part,
+  /** @type {unknown} */ whole,
+  /** @type {unknown} */ kept,
+  /** @type {Record<string, string>} */ restOf = {},
+  /** @type {Phase} */ phase = 'other',
+) {
+  const p = Object.prototype.hasOwnProperty.call(LONG_PARTS, part) ? LONG_PARTS[part] : undefined;
+  const what = p?.what ?? `"${part}"`;
+  const rests = p?.rest ?? PLAIN_REST;
+  const rest = restOf[part] ?? rests[phase] ?? rests.other;
+  if (kept === undefined) return `${what} was too long to show at all, so it was left out. ${rest}`;
+  if (Array.isArray(whole) && Array.isArray(kept)) return `${what} was too long to show in full: only the first ${kept.length} of ${whole.length} are shown. ${rest}`;
+  return `${what} was too long to show in full: its longest lists were cut. ${rest}`;
+}
+
+/**
+ * Hold a shaped answer to MAX_RESULT_CHARS of JSON. Every part that may be long (the result, the
+ * operation's own preview, what it would also do outside the books, the ledger lines) gets a fair
+ * share of the room: a part that fits its share is kept whole, and what it leaves over goes to the
+ * others; a part that does not is cut to its share by halving its longest lists, or left out when
+ * even that is not enough (one very long text). What the answer says happened and what to do next
+ * is never cut. `cut_short` names each part that was cut, says so, and says how to see the rest:
+ * by where the answer stands (`opts.phase`, else from its outcome), so a change that was carried
+ * out is never answered with advice that would send it again, and the approval card is named only
+ * when there is one.
+ * @param {Record<string, unknown>} shaped
+ * @param {number} [budget]
+ * @param {{ rest?: Record<string, string>, phase?: Phase }} [opts]  how to see the rest of a part, where it differs from LONG_PARTS
+ */
+export function holdToLimit(shaped, budget = MAX_RESULT_CHARS, opts = {}) {
+  const restOf = opts.rest ?? {};
+  const phase = opts.phase ?? phaseOf(shaped.outcome);
+  if (jsonLength(shaped) <= budget) return shaped;
+  const fixed = Object.fromEntries(Object.entries(shaped).filter(([k]) => ALWAYS_SHOWN.has(k)));
+  let room = budget - jsonLength(fixed) - NOTE_ROOM;
+  const sized = Object.keys(shaped)
     .filter((k) => !ALWAYS_SHOWN.has(k))
-    .sort((a, b) => jsonLength(rest[b]) - jsonLength(rest[a]));
-  for (const k of bulky) {
-    delete rest[k];
-    leftOut.push(k);
-    const again = cutToFit(rest);
-    if (!again) break;
-    if (again.value) {
-      rest = /** @type {Record<string, unknown>} */ (again.value);
-      break;
+    .map((k) => /** @type {[string, number]} */ ([k, jsonLength(shaped[k]) + k.length + 4]))
+    .sort((a, b) => a[1] - b[1]);
+  /** @type {Record<string, unknown>} */
+  const out = { ...shaped };
+  /** @type {Record<string, string>} */
+  const cutShort = {};
+  const leftOut = [];
+  sized.forEach(([k, size], i) => {
+    const share = Math.floor(room / (sized.length - i));
+    if (size <= share) {
+      room -= size;
+      return;
     }
-  }
-  return { ...rest, left_out: leftOut, result_cut_short: TOO_LONG_NOTE };
+    const cut = cutToFit(shaped[k], share - k.length - 4);
+    if (cut === null) {
+      room -= size; // fits after all
+      return;
+    }
+    if (cut.value !== null && cut.value !== undefined) {
+      out[k] = cut.value;
+      room -= jsonLength(cut.value) + k.length + 4;
+      cutShort[k] = cutNote(k, shaped[k], cut.value, restOf, phase);
+    } else {
+      delete out[k];
+      leftOut.push(k);
+      cutShort[k] = cutNote(k, shaped[k], undefined, restOf, phase);
+    }
+  });
+  return {
+    ...out,
+    cut_short: cutShort,
+    ...(leftOut.length ? { left_out: leftOut } : {}),
+    // The older name, for agents that read it: what became of the result.
+    ...(cutShort.result ? { result_cut_short: cutShort.result } : {}),
+  };
+}
+
+/**
+ * Run settle() on an answer that may be very long anywhere (its result, the operation's own
+ * preview, what it would also send), then hold it to MAX_RESULT_CHARS (holdToLimit).
+ */
+export function settleLong(/** @type {any} */ answer) {
+  return holdToLimit(settle(answer, { fields: 'confirm' }));
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +419,7 @@ export function isSettled(/** @type {any} */ r) {
   return !!r && typeof r.status === 'string' && r.status !== 'pending' && !stillRunning(r);
 }
 
-/** A grant's limits in the tools' words (lib/agent/operations/types.ts GrantConstraints). */
+/** A grant's limits in the tools' words (lib/agent/operations/types.ts GrantConstraints). Undefined when it has none. */
 function limitsOf(/** @type {any} */ c) {
   if (!c || typeof c !== 'object') return undefined;
   const out = compact({
@@ -297,9 +434,22 @@ function limitsOf(/** @type {any} */ c) {
   return Object.keys(out).length ? out : undefined;
 }
 
+/** Said of a standing permission given with no limits of its own. */
+const NO_LIMITS = 'none beyond the operation itself (your other limits, such as the most records per request, still apply)';
+
+/**
+ * The standing permission a person actually gave (lib/agent/contract.ts AgentRequestView.grant,
+ * wave 3), in the tools' words, or null when the view does not say (an older Ironbooks, or none).
+ */
+function givenOf(/** @type {any} */ g) {
+  if (!g || typeof g !== 'object' || typeof g.expiresAt !== 'string') return null;
+  return { limits: limitsOf(g.constraints) ?? NO_LIMITS, minutes: typeof g.minutes === 'number' ? g.minutes : undefined, endsAt: g.expiresAt };
+}
+
 /**
  * One request as the agent reads it (lib/agent/contract.ts AgentRequestView): what it was, what a
- * person decided, in plain words, and what to do next. `full`: with the result of the run.
+ * person decided, in plain words, and what to do next. `full`: with the result of the run (held to
+ * MAX_RESULT_CHARS, holdToLimit).
  * @param {any} r
  * @param {{ full?: boolean }} [opts]
  */
@@ -307,25 +457,48 @@ export function shapeRequest(r, opts = {}) {
   const decision = DECISIONS[/** @type {keyof typeof DECISIONS} */ (r.status)] ?? r.status;
   const by = r.decidedByName ? ` by ${r.decidedByName}` : '';
   const pending = r.status === 'pending';
+  const isGrant = r.kind === 'grant';
+  // The books changed after a person was shown the preview (plan §7.4): the request waits again,
+  // with a new preview, and a person must decide again on that one. It stays marked stale after
+  // that (lib/services/agentRequests.ts: the mark counts the rounds, and is never taken off).
+  const stale = pending && r.stale === true;
   // Two people must approve (a large amount): after the first, the request stays pending with
-  // that person's name on it until a second, different person approves it too.
+  // that person's name on it until a second, different person approves it too. Going stale sets
+  // every approval aside (backToWaiting clears the name), so a name on a stale request is a first
+  // approval of the NEW preview, and a second person must still approve.
   const firstOfTwo = pending && !!r.decidedByName;
+  const done = !pending && !stillRunning(r) && decision === 'approved';
+  // What the person really gave: it may be narrower, or shorter, than what was asked.
+  const given = done ? givenOf(r.grant) : null;
   const file = r.file && r.file.fileId ? { file_id: r.file.fileId, name: r.file.name, type: r.file.type, size: r.file.size } : undefined;
   let said;
   let next;
   if (pending) {
-    said = firstOfTwo
-      ? `Approved by ${r.decidedByName}. A second person must also approve it before anything is done.`
-      : 'A person has not decided yet.';
+    if (stale && firstOfTwo) {
+      said = `The books changed after a person was shown what this would do, so Ironbooks made a new preview. One person approved the new preview (${r.decidedByName}); a second person must also approve it before anything is done.`;
+    } else if (stale) {
+      said = 'The books changed after a person was shown what this would do, so Ironbooks made a new preview. Nothing was done: a person must look at the new preview and decide again.';
+    } else if (firstOfTwo) {
+      said = `One person approved it (${r.decidedByName}); a second person must also approve it before anything is done.`;
+    } else {
+      said = 'A person has not decided yet.';
+    }
     next = `Call wait_for_decision again to keep waiting, or carry on with other work and check later. Do not send the request again: it is already waiting.${r.expiresAt ? ` If nobody decides, it expires at ${r.expiresAt}.` : ''}`;
   } else if (stillRunning(r)) {
-    said = r.kind === 'grant' ? `Approved${by}. Ironbooks is setting up the standing permission.` : `Approved${by}. Ironbooks is carrying it out.`;
+    // Not announced as decided: it can still end as failed.
+    said = isGrant ? `Approved${by}. Ironbooks is setting up the standing permission.` : `Approved${by}. Ironbooks is carrying it out.`;
     next = 'Call wait_for_decision again in a moment for the result.';
-  } else if (decision === 'approved' && r.kind === 'grant') {
-    said = `Approved${by}: you have standing permission for ${r.operation}.`;
-    next = `Run the operation now (run_operation with operation "${r.operation}"). The person may have narrowed the limits or the time you asked for: get_my_permissions shows the limits you were given and when it ends. Requests within them run without asking until then.`;
-  } else if (decision === 'approved') {
-    said = `Approved${by}, and done.`;
+  } else if (done && isGrant) {
+    said = given
+      ? `Approved${by}: you have standing permission for ${r.operation} until ${given.endsAt}, within the limits you were given (limits_given).`
+      : `Approved${by}: you have standing permission for ${r.operation}.`;
+    next = given
+      ? `Run the operation now (run_operation with operation "${r.operation}"). Requests within limits_given run without asking until ${given.endsAt}; anything outside them still asks a person. The person may have given less than you asked for: go by limits_given, not by what you asked.`
+      : `Run the operation now (run_operation with operation "${r.operation}"). The person may have narrowed the limits or the time you asked for: get_my_permissions shows the limits you were given and when it ends. Requests within them run without asking until then.`;
+  } else if (done) {
+    said = `Approved${by}, and ${r.posted === true ? 'posted to the books' : 'done'}.`;
+    if (given) said += ` The person also gave you standing permission for more of the same until ${given.endsAt}, within limits_given.`;
+    else if (r.grantError) said += ' The person also wanted to give you standing permission for more of the same, but it was not given (standing_permission_not_given says why): each one still asks.';
     next = file ? `Call get_file with file_id "${file.file_id}" to read the file it made.` : 'It is done. Do not send it again.';
   } else if (r.status === 'denied') {
     said = `Denied${by}. Nothing was done.`;
@@ -336,16 +509,21 @@ export function shapeRequest(r, opts = {}) {
   } else if (r.status === 'cancelled') {
     said = 'The request was withdrawn. Nothing was done.';
   } else if (r.status === 'failed') {
-    said = `Approved${by}, but Ironbooks could not carry it out.`;
-    next = 'Read the error. If the request can be fixed, dry run the corrected one and ask again with a NEW request_id.';
+    said = isGrant ? `Approved${by}, but Ironbooks could not set up the standing permission.` : `Approved${by}, but Ironbooks could not carry it out.`;
+    next = isGrant
+      ? 'Read the error. You hold no standing permission from this request: ask for each request one at a time, or ask again for standing permission that fits what the error says.'
+      : 'Read the error. If the request can be fixed, dry run the corrected one and ask again with a NEW request_id.';
   }
-  const cut = opts.full && r.result !== undefined && r.result !== null ? cutToFit(r.result) : null;
-  return compact({
+  // What the agent asked for is shown while it waits (labelled as asked); once given, only what
+  // was given, so the agent never takes the wider limits it asked for as its own.
+  const showAsked = isGrant && !!r.grantAsked && !given;
+  const row = compact({
     request_id: r.id,
-    kind: r.kind === 'grant' ? 'standing permission' : undefined,
+    kind: isGrant ? 'standing permission' : undefined,
     decision,
     status: r.status !== decision ? r.status : undefined,
     said,
+    stale: stale ? true : undefined,
     operation: r.operation,
     class: r.class,
     summary: r.summary,
@@ -360,16 +538,26 @@ export function shapeRequest(r, opts = {}) {
     second_approver: r.secondApproverName,
     note_from_person: r.note,
     error: r.error,
-    // What the agent asked for, not what it was given: the person may narrow both.
-    limits_you_asked: r.kind === 'grant' && r.grantAsked ? limitsOf(r.grantAsked.constraints) : undefined,
-    minutes_you_asked: r.kind === 'grant' && r.grantAsked ? r.grantAsked.minutes : undefined,
+    limits_you_asked: showAsked ? limitsOf(r.grantAsked.constraints) : undefined,
+    minutes_you_asked: showAsked ? r.grantAsked.minutes : undefined,
     standing_permission: r.grantId,
-    result: opts.full ? (cut ? cut.value : r.result) : undefined,
-    result_cut_short: cut ? (cut.value === null ? TOO_LONG_NOTE : CUT_NOTE) : undefined,
+    limits_given: given ? given.limits : undefined,
+    minutes_given: given ? given.minutes : undefined,
+    standing_permission_ends_at: given ? given.endsAt : undefined,
+    standing_permission_not_given: done && !given && r.grantError ? r.grantError : undefined,
+    entry_ids: opts.full && done && Array.isArray(r.entryIds) ? r.entryIds : undefined,
+    result: opts.full ? r.result : undefined,
     file: opts.full ? file : undefined,
     next: opts.full ? next : undefined,
   });
+  // A request's result is the approved run's: once run, the rest is never seen by sending it again;
+  // not run (it failed, say), sending it again shows nothing either.
+  if (!opts.full) return row;
+  return holdToLimit(row, MAX_RESULT_CHARS, done ? { phase: 'done' } : { rest: { result: REQUEST_RESULT_REST } });
 }
+
+/** How to see the rest of a long result on a request that was not carried out: not by sending it again. */
+const REQUEST_RESULT_REST = 'Do not send the request again to see the rest: read the error and what to do next (next).';
 
 /** Per server session, the requests whose decision the client was already told about. */
 const announced = new WeakMap();
@@ -395,7 +583,7 @@ function announce(/** @type {any} */ session, /** @type {any} */ r, /** @type {s
 }
 
 /** Read one of the agent's requests, waiting up to `waitSeconds` for a decision. Null when there is none. */
-async function readRequest(/** @type {any} */ client, /** @type {string} */ id, /** @type {number} */ waitSeconds) {
+async function getRequest(/** @type {any} */ client, /** @type {string} */ id, /** @type {number} */ waitSeconds) {
   let res;
   try {
     res = await client.get(`/api/agent/requests/${encodeURIComponent(id)}`, { wait: waitSeconds }, { wait: waitSeconds > 0 });
@@ -403,7 +591,39 @@ async function readRequest(/** @type {any} */ client, /** @type {string} */ id, 
     if (err instanceof Error && /** @type {any} */ (err).status === 404) return null;
     throw err;
   }
-  return res?.request && typeof res.request === 'object' ? res.request : null;
+  const r = res?.request && typeof res.request === 'object' ? res.request : null;
+  // A request for a restart tells the connector not to start a second Ironbooks meanwhile.
+  if (r) client.noteRequest?.(r);
+  return r;
+}
+
+/**
+ * The same, but when no wait can be held open for it right now (this connector already holds
+ * MAX_OPEN_WAITS, or Ironbooks answers 429 because the agent holds as many as it allows), it is
+ * read at once without waiting, and `held` says why, so the agent is told to check later instead
+ * of being refused.
+ * @returns {Promise<{ request: any, held: { retryAfter: number, here: boolean } | null }>}
+ */
+async function readRequest(/** @type {any} */ client, /** @type {string} */ id, /** @type {number} */ waitSeconds) {
+  try {
+    return { request: await getRequest(client, id, waitSeconds), held: null };
+  } catch (err) {
+    const e = /** @type {any} */ (err);
+    const here = e?.code === WAITS_BUSY_CODE;
+    if (waitSeconds <= 0 || !(here || e?.status === 429)) throw err;
+    return { request: await getRequest(client, id, 0), held: { retryAfter: here ? 0 : Number(e.retryAfter) || 0, here } };
+  }
+}
+
+/** What to do next when the wait could not be held open and the request is still undecided. */
+function checkLater(/** @type {{ retryAfter: number, here: boolean }} */ held) {
+  const why = held.here
+    ? 'You are already waiting on other requests here, so this one was read now, without waiting.'
+    : 'Ironbooks is already holding as many waits for you as it allows, so this one was read now, without waiting.';
+  const when = held.here
+    ? 'once one of your other waits has come back'
+    : `in ${Math.max(held.retryAfter, 5)} seconds or more`;
+  return `${why} Check this request later: call wait_for_decision for it again ${when}, or carry on with other work first. Do not send the request again: it is already waiting.`;
 }
 
 const NOT_FOUND = 'There is no request of yours with that id. list_my_requests shows the requests you made.';
@@ -412,7 +632,7 @@ const NOT_FOUND = 'There is no request of yours with that id. list_my_requests s
 export async function readRequestResource(/** @type {string} */ uri, /** @type {any} */ client) {
   const id = uri.slice(REQUEST_URI_PREFIX.length);
   if (!new RegExp(ID_TEXT).test(id)) return null;
-  const r = await readRequest(client, id, 0);
+  const r = await getRequest(client, id, 0);
   if (!r) return null;
   return [{ uri, mimeType: 'application/json', text: JSON.stringify(shapeRequest(r, { full: true })) }];
 }
@@ -436,7 +656,9 @@ const LIST_REQUESTS_SCHEMA = schema({
 
 /** list_my_requests and its older name list_my_proposals: one handler, one answer. */
 async function listMyRequests(/** @type {any} */ a, /** @type {any} */ c) {
-  const rows = asList(await verb(c, 'list_my_requests', { status: a.status, limit: a.limit }), 'requests').map((r) => shapeRequest(r));
+  const views = asList(await verb(c, 'list_my_requests', { status: a.status, limit: a.limit }), 'requests');
+  for (const r of views) if (r && typeof r === 'object') c.noteRequest?.(r);
+  const rows = views.map((r) => shapeRequest(r));
   return { count: rows.length, requests: rows, ...(rows.length ? { note: 'wait_for_decision with a request_id gives one request in full, with its result.' } : {}) };
 }
 
@@ -529,6 +751,11 @@ export const OPERATION_TOOLS = [
         // A dry run keeps nothing, so it is never filed under a request id the real run will need.
         ...(dryRun ? { dryRun: true } : { requestId: a.request_id, reason: a.reason }),
       });
+      // Asking for a restart (a company file switched, an update installed): until it is decided,
+      // a silence of Ironbooks may be that restart, so no second copy is started meanwhile.
+      if (answer?.outcome === 'asked' && typeof answer.requestId === 'string') {
+        c.noteRequest?.({ id: answer.requestId, operation: answer.operation ?? a.operation, status: answer.status ?? 'pending' });
+      }
       return settleLong(answer);
     },
   },
@@ -536,7 +763,7 @@ export const OPERATION_TOOLS = [
     name: 'wait_for_decision',
     title: 'Wait for a person\'s decision',
     description:
-      'After an answer said "asked": wait until a person approves or denies the request in Ironbooks, it expires, or the time runs out (at most 50 seconds; call again while it is pending). The answer is approved (with the result), denied (with the person\'s note), expired, failed (approved but it could not be carried out, with the error) or pending, with what to do next. timeout_seconds 0 reads where it stands now. Wait for one request at a time: at most two waits run at once, and a third waits for one of them to finish first.',
+      'After an answer said "asked": wait until a person approves or denies the request in Ironbooks, it expires, or the time runs out (at most 50 seconds; call again while it is pending). The answer is approved (with the result), denied (with the person\'s note), expired, failed (approved but it could not be carried out, with the error) or pending, with what to do next. timeout_seconds 0 reads where it stands now. Wait for one request at a time: at most two waits run at once, and a third is read at once without waiting, with advice to check it later.',
     inputSchema: schema(
       {
         request_id: REQUEST_REF,
@@ -546,10 +773,15 @@ export const OPERATION_TOOLS = [
     ),
     handler: async (a, c, session) => {
       const wait = a.timeout_seconds ?? WAIT_MAX_SECONDS;
-      const r = await readRequest(c, a.request_id, wait);
+      const { request: r, held } = await readRequest(c, a.request_id, wait);
       if (!r) throw new ToolError(NOT_FOUND);
       if (isSettled(r)) announce(session, r, a.request_id);
-      return shapeRequest(r, { full: true });
+      const out = shapeRequest(r, { full: true });
+      if (held && r.status === 'pending') {
+        out.next = checkLater(held);
+        if (!held.here) out.check_again_after_seconds = Math.max(held.retryAfter, 5);
+      }
+      return out;
     },
   },
   {
@@ -576,6 +808,7 @@ export const OPERATION_TOOLS = [
     handler: async (a, c) => {
       const r = (await verb(c, 'cancel_request', { requestId: a.request_id }))?.request;
       if (!r || typeof r !== 'object') throw new ToolError(NOT_FOUND);
+      c.noteRequest?.(r);
       const out = shapeRequest(r);
       if (r.status !== 'cancelled') out.said = `It could not be withdrawn: it is already ${out.decision}. ${out.said ?? ''}`.trim();
       return out;
@@ -652,7 +885,7 @@ export const OPERATION_TOOLS = [
       ['operation', 'reason', 'request_id'],
     ),
     handler: async (a, c) =>
-      settle(
+      settleLong(
         await verb(c, 'ask_for_permission', {
           operation: a.operation,
           constraints: a.constraints ? camelize(a.constraints) : undefined,
@@ -660,7 +893,6 @@ export const OPERATION_TOOLS = [
           reason: a.reason,
           requestId: a.request_id,
         }),
-        { fields: 'confirm' },
       ),
   },
 ];

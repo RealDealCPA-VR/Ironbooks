@@ -48,6 +48,12 @@ export interface OperationInput {
   confirm?: string[];
   /** Ask for unmasked values (always asks a person). */
   reveal?: boolean;
+  /**
+   * (wave 4) The record's updatedAt as the caller last read it. The bridge sends it to the route as
+   * the x-expected-updated-at header, so the route's own withVersionCheck compares it inside the
+   * committing transaction: a person's edit made in between answers 409, never an overwrite.
+   */
+  expectedUpdatedAt?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,8 +412,9 @@ export interface ApproveResult {
    * 'executed': done. 'failed': the run failed (the request says why). 'needs_second_approver':
    * recorded, a different person must also approve. 'stale': nothing ran; `request.preview` is what
    * would happen now and the person must approve again with acceptStale. 'not_approved' (wave 3,
-   * batch approval only): this one was not approved and nothing ran; `request.error` says why and
-   * the request is still waiting.
+   * batch approval only): this one was not approved by this call and this call ran nothing;
+   * `request.error` says why and `request.status` says where the request stands now (usually still
+   * waiting; it may meanwhile be denied, expired, withdrawn or being carried out for someone else).
    */
   status: 'executed' | 'failed' | 'needs_second_approver' | 'stale' | 'not_approved';
   request: AgentRequestForPerson;
@@ -488,6 +495,8 @@ export interface AgentOperationAnswer {
   note?: string;
   /** The grant it ran under. */
   grantId?: string;
+  /** (wave 4) With a "slow down" refusal: how long to wait before asking again. The route answers 429. */
+  retryAfterSeconds?: number;
 }
 
 export interface RunOperationRequest extends OperationInput {
@@ -538,6 +547,8 @@ export interface OperationDescription extends OperationSummary {
   effects: Operation['effects'];
   /** Notes for the caller ("the amount is taken from the answer"). */
   notes: string[];
+  /** (wave 4) Worked examples, each a whole request { params?, query?, body?, confirm?, reveal? } with an optional title or note. */
+  examples?: unknown[];
 }
 
 export interface MyPermissions {

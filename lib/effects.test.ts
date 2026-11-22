@@ -12,6 +12,8 @@ import path from 'node:path';
 import nodemailer from 'nodemailer';
 import {
   EffectNotRunInPreview,
+  FILE_NOT_CHECKED,
+  PINNED_FOLDER_CHANGED,
   PRINTING_NOT_AVAILABLE,
   STILL_RUNNING,
   currentEffects,
@@ -20,6 +22,7 @@ import {
   effectsOfFailedRun,
   formatSize,
   outsideEffects,
+  pinFile,
   runWithEffects,
   setPrintHandler,
   type EmailMessage,
@@ -371,6 +374,152 @@ describe('defer (a real run in a transaction): queued, done on release after the
     expect(await run.release()).toEqual([
       expect.objectContaining({ status: 'failed', error: 'Printing is not available here.' }),
     ]);
+  });
+});
+
+describe('a file pinned to the folder that was approved (pinFile)', () => {
+  /** A link to a folder: a junction on Windows (no special right needed), a symbolic link elsewhere. */
+  const linkFolder = (target: string, at: string) => fs.symlinkSync(target, at, process.platform === 'win32' ? 'junction' : 'dir');
+  const real = (p: string) => fs.realpathSync.native(p);
+  const fileEffect = () => (currentEffects() ?? []).find((e) => e.kind === 'file')!;
+
+  it('is written into exactly that folder at release, made when it is new', async () => {
+    const allowed = path.join(TMP, 'pin-ok');
+    fs.mkdirSync(allowed, { recursive: true });
+    const target = path.join(real(allowed), 'reports', '2026');
+    const run = await runWithEffects('defer', async () => {
+      await effects.writeFile({ dir: path.join(allowed, 'reports', '2026'), name: 'r.csv', bytes: 'x' });
+      await pinFile(fileEffect(), target);
+      // Pinning it again to the same folder changes nothing; to another one is refused.
+      await pinFile(fileEffect(), target);
+      await expect(pinFile(fileEffect(), path.join(real(allowed), 'other'))).rejects.toThrow(/already pinned to another folder/);
+    });
+    expect(fs.existsSync(target)).toBe(false);
+    const report = await run.release();
+    expect(report.map((r) => [r.status, r.error])).toEqual([['sent', null]]);
+    expect(fs.readFileSync(path.join(target, 'r.csv'), 'utf8')).toBe('x');
+    expect(fs.readdirSync(target)).toEqual(['r.csv']); // no temporary file left behind
+  });
+
+  it('a link made inside the approved folder before release cannot lead the write elsewhere', async () => {
+    const allowed = path.join(TMP, 'pin-allowed');
+    const elsewhere = path.join(TMP, 'pin-elsewhere');
+    fs.mkdirSync(allowed, { recursive: true });
+    fs.mkdirSync(elsewhere, { recursive: true });
+    // A folder still to be made, one that exists, and one still to be made BELOW a name still to be
+    // made: each swapped for a link while the work commits. Nothing is saved, and no folder is made,
+    // where the link leads.
+    const cases: Array<{ name: string; dir: string; prepare: () => void }> = [
+      { name: 'new', dir: 'new', prepare: () => linkFolder(elsewhere, path.join(allowed, 'new')) },
+      {
+        name: 'old',
+        dir: 'old',
+        prepare: () => {
+          fs.rmSync(path.join(allowed, 'old'), { recursive: true, force: true });
+          linkFolder(elsewhere, path.join(allowed, 'old'));
+        },
+      },
+      { name: 'deep', dir: path.join('deep', 'reports', '2026'), prepare: () => linkFolder(elsewhere, path.join(allowed, 'deep')) },
+    ];
+    fs.mkdirSync(path.join(allowed, 'old'));
+    for (const c of cases) {
+      const dir = path.join(allowed, c.dir);
+      const run = await runWithEffects('defer', async () => {
+        await effects.writeFile({ dir, name: `${c.name}.csv`, bytes: 'secret rows' });
+        await pinFile(fileEffect(), path.join(real(allowed), c.dir));
+      });
+      c.prepare();
+      const report = await run.release();
+      expect(report, c.name).toEqual([expect.objectContaining({ status: 'failed', error: PINNED_FOLDER_CHANGED })]);
+      expect(fs.readdirSync(elsewhere), c.name).toEqual([]);
+    }
+  });
+
+  it('a link at a name still to be made that leads nowhere yet gets no folder made where it points', async () => {
+    const allowed = path.join(TMP, 'pin-dangling');
+    const nowhere = path.join(TMP, 'pin-nowhere');
+    fs.mkdirSync(allowed, { recursive: true });
+    const run = await runWithEffects('defer', async () => {
+      await effects.writeFile({ dir: path.join(allowed, 'out', 'sub'), name: 'x.csv', bytes: 'x' });
+      await pinFile(fileEffect(), path.join(real(allowed), 'out', 'sub'));
+    });
+    // A link to a folder that does not exist (yet): mkdir through it would make it.
+    fs.mkdirSync(nowhere);
+    linkFolder(nowhere, path.join(allowed, 'out'));
+    fs.rmSync(nowhere, { recursive: true, force: true });
+    const report = await run.release();
+    expect(report).toEqual([expect.objectContaining({ status: 'failed', error: PINNED_FOLDER_CHANGED })]);
+    expect(fs.existsSync(nowhere)).toBe(false);
+  });
+
+  it('an unpinned file is saved where the work said, as before; pinning only works on a file of the open work', async () => {
+    const dir = path.join(TMP, 'pin-none');
+    const run = await runWithEffects('defer', async () => {
+      await effects.writeFile({ dir, name: 'plain.txt', bytes: 'p' });
+      await effects.email(msg('Not a file'), send);
+      const email = (currentEffects() ?? []).find((e) => e.kind === 'email')!;
+      await expect(pinFile(email, dir)).rejects.toThrow(/not a file this work asked to save/);
+      await expect(pinFile(fileEffect(), 'relative/folder')).rejects.toThrow(/full folder path/);
+    });
+    await run.release();
+    expect(fs.readFileSync(path.join(dir, 'plain.txt'), 'utf8')).toBe('p');
+    // Outside the work, and after it ended: refused.
+    await expect(pinFile(run.effects[0], dir)).rejects.toThrow(/only be pinned while the work/);
+  });
+});
+
+describe('a scope whose caller checks the folders itself ({ pinFiles: true })', () => {
+  const real = (p: string) => fs.realpathSync.native(p);
+  const fileEffect = () => (currentEffects() ?? []).find((e) => e.kind === 'file')!;
+
+  it('writeFile does not look at the disk; pinFile looks, once the folder is approved, and the preview says what it found', async () => {
+    const dir = path.join(TMP, 'pinned-look');
+    fs.mkdirSync(path.join(dir, 'taken'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'old.csv'), 'old');
+    const looks = [vi.spyOn(fs.promises, 'stat'), vi.spyOn(fs.promises, 'lstat'), vi.spyOn(fs.promises, 'realpath')];
+    const looked = () => looks.flatMap((s) => s.mock.calls.map(([p]) => String(p)));
+    try {
+      const run = await runWithEffects(
+        'capture',
+        async () => {
+          const w = await effects.writeFile({ dir, name: 'old.csv', bytes: 'new' });
+          // Not looked at yet: nothing known about what is there.
+          expect(w).toMatchObject({ written: false, replaces: false });
+          expect(looked().filter((p) => p.startsWith(dir))).toEqual([]);
+          await pinFile(fileEffect(), real(dir));
+          await effects.writeFile({ dir, name: 'taken', bytes: 'x' });
+          const taken = (currentEffects() ?? []).filter((e) => e.kind === 'file')[1];
+          await expect(pinFile(taken, real(dir))).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/There is a folder called "taken"/) });
+        },
+        { pinFiles: true },
+      );
+      expect(run.effects[0].summary).toBe(`Save old.csv (3 bytes) in ${dir}, replacing the file already there`);
+      expect(run.effects[0].detail.replaces).toBe(true);
+    } finally {
+      for (const s of looks) s.mockRestore();
+    }
+    expect(fs.readFileSync(path.join(dir, 'old.csv'), 'utf8')).toBe('old');
+  });
+
+  it('release saves only pinned files: one never pinned is reported and not written anywhere', async () => {
+    const dir = path.join(TMP, 'pinned-only');
+    fs.mkdirSync(dir, { recursive: true });
+    const run = await runWithEffects(
+      'defer',
+      async () => {
+        await effects.writeFile({ dir, name: 'checked.txt', bytes: 'c' });
+        await pinFile(fileEffect(), real(dir));
+        // Asked for after the caller's last check: never pinned.
+        await effects.writeFile({ dir, name: 'late.txt', bytes: 'l' });
+      },
+      { pinFiles: true },
+    );
+    const report = await run.release();
+    expect(report.map((r) => [r.effect.detail.name, r.status, r.error])).toEqual([
+      ['checked.txt', 'sent', null],
+      ['late.txt', 'failed', FILE_NOT_CHECKED],
+    ]);
+    expect(fs.readdirSync(dir)).toEqual(['checked.txt']);
   });
 });
 

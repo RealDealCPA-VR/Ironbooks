@@ -6,7 +6,8 @@
  *    the Integrated Applications switch, "save the copy without a password") and refuses what an
  *    agent may never ask for, even with approval: an operation that is not an agent's, the hard
  *    floor reached through a body field, a "yes, I am sure" flag no warning of the route names, a
- *    reveal where nothing is masked, and a path value that is not a plain id.
+ *    reveal where nothing is masked, a path value that is not a plain id, and a mail server whose
+ *    name the approval line could not show in full (the approver's mail password would go there).
  *  - applySecrets: puts what the approving person typed on the card exactly where the route reads
  *    it (a header or a body field). The agent never sees it and it is never stored.
  *  - redactAnswer: takes every secret the route produced out of the answer (the approver sees it
@@ -198,6 +199,52 @@ const SECRET_ROUTES: Readonly<Record<string, SecretRoute>> = {
   'POST /api/accountant-copy/changes/import': { fields: [], place: {} },
 };
 
+/**
+ * Operations that send the mail password the approver types to a mail server the request itself
+ * names, and where that server's name is in the body. POST /api/email/test connects to the draft's
+ * server with it (only a draft carries one: without a draft the saved set-up is tested and the
+ * typed password goes nowhere); PUT /api/email/settings saves it for that server, which every later
+ * email then signs in to. The approval line names that server (lib/agent/describe.ts), so a person
+ * sees where their password goes; a name the line cannot show in full (hostShownInFull) is refused
+ * by guardInput and never gets the password from applySecrets.
+ */
+export const MAIL_SERVER_PATHS: Readonly<Record<string, { host: string; inside?: string }>> = Object.freeze({
+  'POST /api/email/test': { host: 'draft.host', inside: 'draft' },
+  'PUT /api/email/settings': { host: 'host' },
+});
+
+/** Longest server name an approval line shows. Real mail server names are far shorter. */
+export const SHOWN_HOST_MAX = 100;
+
+/**
+ * A server name the approval line shows exactly as it is, in full: letters, digits, dots and
+ * hyphens (no look-alike letters from other alphabets, no spaces or invisible marks that would
+ * make the line differ from the name used), or an IP address, at most SHOWN_HOST_MAX characters.
+ * The same shape lib/services/emailSettings.ts accepts for a mail server, only shorter.
+ */
+export function hostShownInFull(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const host = value.trim();
+  return (
+    host !== '' &&
+    host.length <= SHOWN_HOST_MAX &&
+    /^(?:\[[0-9a-fA-F:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|[0-9a-fA-F:]+)$/.test(host)
+  );
+}
+
+/**
+ * The mail server this request would send a typed mail password to, as the approval line shows it.
+ * 'none': the operation sends none to a server it names, or (a test without a draft) the typed
+ * password is not used. A draft or set-up with no server name at all is 'not_shown' too: nobody
+ * can say where it would go.
+ */
+function mailServerOf(operation: Pick<Operation, 'method' | 'route'>, input: OperationInput): 'none' | 'shown' | 'not_shown' {
+  const spot = MAIL_SERVER_PATHS[routeKey(operation)];
+  if (!spot) return 'none';
+  if (spot.inside !== undefined && !(isPlainObject(input.body) && isPlainObject(input.body[spot.inside]))) return 'none';
+  return hostShownInFull(valuesAt(input.body, spot.host)[0]) ? 'shown' : 'not_shown';
+}
+
 /** Where a produced secret sits in the route's answer, and how the approver's screen names it. */
 const PRODUCED_PLACES: Readonly<Record<string, Partial<Record<SecretKind, { paths: readonly string[]; label: string }>>>> = {
   // { ok, recoveryKey, status }: the key that opens the protected file, in this answer only, once.
@@ -374,6 +421,7 @@ const REFUSE = {
     'This operation has no reveal: its protected values stay masked for agents. Send it again without reveal, or ask a person to look them up in Ironbooks.',
   bulkAcceptBoth:
     'Send either a list of items or allHighConfidence, not both: with both, every waiting line would be posted, not only the listed ones.',
+  mailServerNotShown: `Name the mail server by its plain name or address, at most ${SHOWN_HOST_MAX} characters (such as smtp.gmail.com): the person approving types the mail password, and must see in full which server it is sent to. Send it again with that name, or ask a person to set up email in Preferences > Send Forms.`,
 };
 
 function unknownFlag(flag: string, listed: readonly string[]): string {
@@ -479,6 +527,9 @@ function refusalOf(operation: Operation, raw: OperationInput, cleaned: Operation
     const b = cleaned.body;
     if (b.allHighConfidence !== undefined && b.allHighConfidence !== false && b.items !== undefined) return REFUSE.bulkAcceptBoth;
   }
+  // The mail password a person types goes to the server this request names: the approval line
+  // must be able to show that name in full, or nobody could see where the password goes.
+  if (mailServerOf(operation, cleaned) === 'not_shown') return REFUSE.mailServerNotShown;
 
   if (raw.params !== undefined && !isPlainObject(raw.params)) return REFUSE.notAnObject;
   if (raw.query !== undefined && !isPlainObject(raw.query)) return REFUSE.notAnObject;
@@ -656,7 +707,9 @@ function place(spot: SecretPlace, value: string, input: OperationInput, headers:
  * Put the approver's secrets where the route reads them. Whatever the agent sent in those places
  * is removed first. A kind the operation has no place for is not used (a shell operation passes
  * its secrets itself). `missing`: kinds the operation needs that were not given, or could not be
- * used as given (a closing-date password with a line break cannot travel in a header). Many are
+ * used as given (a closing-date password with a line break cannot travel in a header; a mail
+ * password is never put into a request whose mail server the approval line cannot show in full,
+ * MAIL_SERVER_PATHS). Many are
  * optional to the route (a backup that is not sealed with another key needs no credentials), so
  * `missing` says what was not supplied, not that the run will fail.
  */
@@ -681,7 +734,10 @@ export const applySecrets: ApplySecrets = (operation, input, secrets) => {
     const spot = route?.place[kind];
     if (spot) {
       placed = true;
-      ok = place(spot, value, out, headers) && ok;
+      // A mail password only for a server the approval line shows in full (guardInput refuses
+      // the others first; this holds even when it was not asked).
+      if (kind === 'mail_password' && mailServerOf(operation, out) === 'not_shown') ok = false;
+      else ok = place(spot, value, out, headers) && ok;
     }
     if (placed && ok) used.add(kind);
   }
@@ -783,6 +839,131 @@ function maskValue(key: string, value: unknown): unknown {
 const ACCT_LABEL = /(?:Acct|Account|A\/C)s?\.?\s*(?:#|No(?![a-z])\.?|Number(?![a-z]))\s*:?\s*/gi;
 
 /**
+ * The words "Account number" written out in full (no "#", no "No", no colon): how the app writes
+ * about a chart-of-accounts number ("Account number 1000 is already used, so "Checking" was created
+ * as 1000-2.", lib/services/qbGlImport.ts; "account number 6100" alone, the reason given for a
+ * guessed account type, lib/services/qbGlParse.ts).
+ */
+const PLAIN_ACCOUNT_NUMBER_LABEL = /^Accounts?\s+Number\s+$/i;
+
+/**
+ * A chart-of-accounts number: one word of digits, groups joined by "." or "-" ("1000", "6100.10",
+ * "1000-2"), short (7 digits at most, as charts of accounts number them) and not starting with 0
+ * (a bank or vendor number often does: "0001234"). Not protected.
+ */
+function chartNumberShaped(word: string): boolean {
+  return /^[1-9]\d*(?:[.-]\d+)*$/.test(word) && word.replace(/\D/g, '').length <= 7;
+}
+
+/**
+ * What follows the number in the app's own sentence about a chart-of-accounts number
+ * (lib/services/qbGlImport.ts): "is already used", "was created". Not the end of the text: a memo
+ * such as "Utilities: Account number 4471234" ends there too, and that is a number someone wrote down.
+ */
+const CHART_NUMBER_AFTER = /^\s+(?:is\s+(?:already\s+)?used|was\s+created)\b/i;
+
+/**
+ * Whether the plain words "Account number" at `at`, then `number`, are one of the app's own
+ * sentences about a chart-of-accounts number, the number shaped like one (chartNumberShaped):
+ *  - qbGlImport.ts's warning: the words start the text or a clause (nothing before them, or ".",
+ *    ";", ":", "!", "?" or "("), and the sentence goes on the way it does (CHART_NUMBER_AFTER);
+ *  - qbGlParse.ts's reason for a guessed account type, which is the whole text, in small letters:
+ *    exactly "account number 6100".
+ * Anything else is a number someone wrote down and stays masked: "Account number 4471234" (a whole
+ * memo), "Utilities: Account number 4471234", "Vendor account number 4471234", "BankAccount number
+ * 12345", "Account number 1234567 is the bank", "Account number 0001234".
+ */
+function appChartNumberSentence(text: string, at: number, number: string, after: string): boolean {
+  if (!chartNumberShaped(number)) return false;
+  if (text === `account number ${number}`) return true;
+  const before = text.slice(0, at).trimEnd();
+  return (before === '' || /[.;:!?(]$/.test(before)) && CHART_NUMBER_AFTER.test(after);
+}
+
+/**
+ * What ends a word an email address could sit in: spaces and the marks that part the items of a
+ * list ("," and ";"), the ones the mailer splits recipients at. Nothing else does: the routes'
+ * own checks take every other mark inside one address (see EMAIL_ADDRESS).
+ */
+const WORD_STOP = /[\s,;]/;
+/**
+ * One email address and nothing else, the way the app's senders take one: exactly one "@", a domain
+ * with a dot in it, and no space, "," or ";". That is lib/services/salesForms.ts EMAIL_ADDRESS_RE;
+ * emailSettings.ts EMAIL_RE takes less, and the reminder's check in attention.ts takes no "<" or ">"
+ * but does take "," and ";", which the mailer reads as two recipients (see addressItemAt). The
+ * mailer delivers what they take: "billing.acct#7'x@evil.com", "billing.acct#7(x)@evil.com",
+ * 'billing.acct#7"@evil.com' and "billing.acct#7[x]@evil.com" all go to evil.com (nodemailer drops
+ * the "(x)" and the stray quote), and "Name<x@evil.example>" goes to x@evil.example. So every mark
+ * but those three can be part of an address, and is.
+ */
+const EMAIL_ADDRESS = /^([^\s@,;]+)@([^\s@,;]+\.[^\s@,;]+)$/;
+
+/** One email address (EMAIL_ADDRESS) in two parts: what may be cut to fit, and what decides where the mail goes. */
+export interface EmailAddressParts {
+  /**
+   * The part that may be cut when the address is too long for its room: in the "Name<addr>" form
+   * the name before the "<" (cut at its end: it only shows), otherwise the name before "@" (cut in
+   * its middle, so both its ends show).
+   */
+  head: string;
+  /**
+   * Where the mail goes, shown whole and as written: from the last "<" in the "Name<addr>" form
+   * ("<x@evil.example>", which is what the mailer delivers to), otherwise "@" and the domain.
+   */
+  kept: string;
+  form: 'name' | 'local';
+}
+
+/** `text` in its two parts (EmailAddressParts) when it is exactly one email address (EMAIL_ADDRESS); otherwise null. */
+export function emailAddressParts(text: string): EmailAddressParts | null {
+  if (!EMAIL_ADDRESS.test(text)) return null;
+  const bracket = text.lastIndexOf('<');
+  if (bracket >= 0) return { head: text.slice(0, bracket), kept: text.slice(bracket), form: 'name' };
+  const at = text.indexOf('@');
+  return { head: text.slice(0, at), kept: text.slice(at), form: 'local' };
+}
+
+/** Where the word holding `at` starts and ends (WORD_STOP ends one). */
+function wordAround(text: string, at: number): { start: number; end: number } {
+  let start = at;
+  while (start > 0 && !WORD_STOP.test(text[start - 1])) start--;
+  let end = at;
+  while (end < text.length && !WORD_STOP.test(text[end])) end++;
+  return { start, end };
+}
+
+/**
+ * When the label at `at`, `length` characters long, lies inside one word that is an email address
+ * ("billing.acme.com.acct#7@evil.com", "billing.acct#7'x@evil.com", "Name.acct#7<x@evil.example>",
+ * "acctno1@evil.example"), where that word ends; otherwise null. An address is not an account
+ * number, and masking from a label inside it would hide its domain: the line would show
+ * "billing.acme.com.acct#••••.com", which reads as an acme.com address, for mail that goes to
+ * evil.com. A label with a space in it ("Acct # 7@evil.com") is never inside one word, so it is
+ * masked as before.
+ */
+function addressAround(text: string, at: number, length: number): number | null {
+  const { start, end } = wordAround(text, at);
+  if (at + length > end) return null;
+  return EMAIL_ADDRESS.test(text.slice(start, end)) ? end : null;
+}
+
+/**
+ * Where a list of addresses starts after an account number: the first "," or ";" in `rest` that an
+ * email address follows ("Acct # 1234, ap@acme.com"); rest.length when there is none. An address
+ * is another item, never part of the number, and the mailer reads it as one: the reminder's check
+ * (lib/services/attention.ts) takes "," in a recipient, and "acct#1,b@evil.com" is mailed to
+ * b@evil.com. Masked with the number, the stored request would never say so.
+ */
+function addressItemAt(rest: string): number {
+  const separator = /[,;]\s*/g;
+  for (let m = separator.exec(rest); m !== null; m = separator.exec(rest)) {
+    const from = m.index + m[0].length;
+    if (from < rest.length && EMAIL_ADDRESS.test(rest.slice(from, wordAround(rest, from).end))) return m.index;
+  }
+  return rest.length;
+}
+
+/**
  * "Acct # 000123456789" shows as "Acct # ••••6789". It is the memo the print queue and liability
  * checks write when a check's memo is blank (lib/services/printQueue.ts, liabilityPayments.ts),
  * with the payee's full account number. That number is free text of up to 100 characters (a
@@ -791,12 +972,26 @@ const ACCT_LABEL = /(?:Acct|Account|A\/C)s?\.?\s*(?:#|No(?![a-z])\.?|Number(?![a
  * for people, everything after the label to the end of the text is masked, keeping its last 4
  * characters that are not spaces: no punctuation inside the number can end the mask early. That
  * errs on the safe side: "Paid Acct # 1234, thanks" shows as "Paid Acct # ••••anks".
- * That is for a label with "#" ("Acct #" is the app's own). The longer labels ("Account number",
- * "Account No.") also start the app's own sentences about chart-of-accounts numbers, which are not
- * protected ("Account number 1000 is already used, so …"), so after them only the number itself
- * is masked: the words that follow the label up to the last one holding a digit, stopping at the
- * first ordinary word (one with a small letter and no digit). "1234 5678", "AB-12 CD-34" and
- * "SMITH 0012" are numbers of several words; "Account number must be unique" holds none.
+ * That is for a label with "#" ("Acct #" is the app's own). The one thing that ends it early is
+ * a list of addresses after a "," or ";" ("Acct # 1234, ap@acme.com", addressItemAt): an address
+ * is never part of a number, and it may be where mail goes.
+ *
+ * Only bank and vendor account numbers are protected; chart-of-accounts numbers are not, and the
+ * app's own sentences about them start with the same words ("Account number 1000 is already
+ * used …"). So after the other labels only the number itself is masked (the words that follow the
+ * label up to the last one holding a digit, stopping at the first ordinary word: one with a small
+ * letter and no digit; "1234 5678", "AB-12 CD-34" and "SMITH 0012" are numbers of several words),
+ * and only where it is a bank or vendor number:
+ *  - after a label written the way such numbers are labelled ("Acct No", "A/C Number", "Account
+ *    No.", "Account Number:" with its colon), always;
+ *  - after the plain words "Account number", unless they are one of the app's own sentences about
+ *    a chart-of-accounts number (appChartNumberSentence): "Account number 1000 is already used"
+ *    stays as it is; "Account number 12345678.", "Account number 4471234" (a whole memo), "Vendor
+ *    account number 4471234" and "Account number 1234567 is the bank" do not.
+ * "Account number must be unique" holds no number, so nothing in it is masked. A label inside an
+ * email address ("billing.acct#7@acme.com", "billing.acct#7'x@evil.com") is part of the address,
+ * not a label (addressAround): the address stays whole, so a recipient reads, is stored and is
+ * answered as it is.
  */
 export function maskAccountsInText(text: string): string {
   const label = new RegExp(ACCT_LABEL.source, ACCT_LABEL.flags);
@@ -804,13 +999,33 @@ export function maskAccountsInText(text: string): string {
   let from = 0;
   for (let m = label.exec(text); m !== null; m = label.exec(text)) {
     const end = m.index + m[0].length;
-    const rest = text.slice(end);
-    if (rest.trim() === '') break;
-    if (m[0].includes('#')) return `${out}${text.slice(from, end)}${maskAccountNumber(rest) ?? MASKED_TEXT}`;
+    const address = addressAround(text, m.index, m[0].trimEnd().length);
+    if (address !== null) {
+      label.lastIndex = address;
+      continue;
+    }
+    // The number runs no further than a list of addresses after it.
+    const rest = text.slice(end, end + addressItemAt(text.slice(end)));
+    if (rest.trim() === '') {
+      label.lastIndex = end + rest.length;
+      continue;
+    }
+    if (m[0].includes('#')) {
+      out += `${text.slice(from, end)}${maskAccountNumber(rest) ?? MASKED_TEXT}`;
+      from = end + rest.length;
+      label.lastIndex = from;
+      continue;
+    }
     const n = numberAtStart(rest);
     // A sentence that only starts like a label: a real one may still follow ("…; Acct # SMITHJ").
     if (n === 0) continue;
-    out += `${text.slice(from, end)}${maskAccountNumber(rest.slice(0, n)) ?? MASKED_TEXT}`;
+    const number = rest.slice(0, n);
+    // A chart-of-accounts number in the app's own words: left as it is, and the search goes on after it.
+    if (PLAIN_ACCOUNT_NUMBER_LABEL.test(m[0]) && appChartNumberSentence(text, m.index, number, text.slice(end + n))) {
+      label.lastIndex = end + n;
+      continue;
+    }
+    out += `${text.slice(from, end)}${maskAccountNumber(number) ?? MASKED_TEXT}`;
     from = end + n;
     label.lastIndex = from;
   }

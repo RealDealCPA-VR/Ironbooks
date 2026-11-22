@@ -111,16 +111,24 @@ describe('amountShown: the amount a person reads on the card', () => {
     ['as amountOf when both can be read', { total: '1' }, { total: '9000.00' }, '9000.00'],
     // amountOf is null here (the policy treats it as over every limit); the card still shows the figure.
     ['junk in the body, the real figure in the answer', { total: 'n/a' }, { total: '9000.00' }, '9000.00'],
-    ['junk in the answer, a figure in the body', { total: '12' }, { total: { value: 5 } }, '12.00'],
-    ['the larger readable one, by size', { total: 'n/a', other: 1 }, { total: '-75' }, '-75.00'],
+    ['junk in the body, a negative figure in the answer', { total: 'n/a', other: 1 }, { total: '-75' }, '-75.00'],
+    // The route's answer beats the body: the body's figure is one the route did not use.
+    ['junk in the answer, a figure in the body', { total: '12' }, { total: { value: 5 } }, 'unreadable'],
+    ['junk in the answer, none in the body', {}, { total: 'n/a' }, 'unreadable'],
     ['junk and nothing else', { total: 'n/a' }, undefined, 'unreadable'],
-    ['nothing at all', {}, undefined, null],
+    ['junk in the body, an answer without a figure', { total: 'n/a' }, { id: 'x' }, 'unreadable'],
+    // No figure at all is not a figure of 0: the policy reads it as over every limit, and the card says it is not known.
+    ['nothing at all', {}, undefined, 'unreadable'],
+    ['nothing in the body or the answer', {}, { id: 'x' }, 'unreadable'],
+    ['a figure in the body, an answer without one', { total: '12' }, { id: 'x' }, '12.00'],
   ])('%s', (_label, bodyIn, answer, shown) => {
     expect(amountShown(total, { body: bodyIn }, answer)).toBe(shown);
   });
 
   it('never changes what the policy reads', () => {
     expect(facts(total, { body: { total: 'n/a' } }, null, { total: '9000.00' }).amount).toBeNull();
+    expect(facts(total, { body: { total: '12' } }, null, { total: { value: 5 } }).amount).toBeNull();
+    expect(facts(total, { body: {} }).amount).toBeNull();
   });
 });
 

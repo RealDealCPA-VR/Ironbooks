@@ -4,24 +4,17 @@
  * (payroll for employees, vendors for vendors, lists for other names).
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { getServerContext } from '@/lib/context';
 import { routeError } from '@/lib/routeErrors';
 import { requirePermission } from '@/lib/services/access';
 import { assignBillingRateLevel } from '@/lib/services/lists/billingRates';
-import { zodErrorBody, zUuid } from '@/lib/validation/helpers';
-
-const schema = z.object({
-  employeeId: zUuid.optional(),
-  vendorId: zUuid.optional(),
-  otherNameId: zUuid.optional(),
-  levelId: zUuid.nullable(),
-});
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { assignBillingRateLevelSchema } from '@/lib/validation/lists';
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const parsed = schema.safeParse(await req.json().catch(() => ({})));
+    const parsed = assignBillingRateLevelSchema.safeParse(await req.json().catch(() => ({})));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const { levelId, ...person } = parsed.data;
     if (person.employeeId) requirePermission(ctx, 'payroll.employees', 'modify');

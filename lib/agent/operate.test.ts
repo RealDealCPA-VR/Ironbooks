@@ -1,26 +1,41 @@
 /**
  * Agent full access: the agent's door (lib/agent/operate.ts, app/api/agent/actions/route.ts).
  *
- * The bridge, the input guard, the facts, the summary, the policy store, grants, permission
- * requests, staged files and the shell are replaced (they are other units' work); the policy
- * engine (lib/agent/policy.ts decide) and the request-id table (agent_requests, a real company
- * database) are the real ones. What is proved:
+ * Most tests replace the bridge, the input guard, the facts, the summary, the policy store, grants,
+ * permission requests, staged files and the shell (they are other units' work) with stand-ins; the
+ * policy engine (lib/agent/policy.ts decide), people's access (lib/services/access.ts) and the
+ * request-id table (agent_requests, a real company database) are the real ones. The last block
+ * puts the real bridge, guards, facts, summary and grants back and runs journal entries through
+ * the app's own route on the same PGlite company. What is proved:
  *
  *  - every branch of operate: unknown, guarded, refused, read, dry run, run, ask, replay;
  *  - the policy decides a second time with what the dry run showed, and that answer is followed:
- *    run can become ask or refuse, and an ask whose amount was unknown can run;
+ *    run can become ask or refuse, and an ask whose amount was unknown can run; when nothing shows
+ *    the real figures, the amount counts as unknown (two people, no grant by amount);
  *  - a missing reason never creates a request;
- *  - the actor of an agent's own run never carries secrets, a reveal, a person or an approval;
+ *  - a warning from work that is not undone keeps its request id: never run twice;
+ *  - a dry-run refusal becomes an ask only when an approved reveal would get it through;
+ *  - the actor of an agent's own run never carries secrets, a reveal, a person or an approval; a
+ *    run under a grant has the giver's access within the agent's role, and a grant whose giver is
+ *    gone or lost the right does not apply;
  *  - runApproved runs as the approver, within the approver's access INTERSECTED with the agent's
- *    role, and shows a fresh preview instead of running when the books changed;
+ *    role; it tries the request first with those rights, shows a fresh preview instead of running
+ *    when the books changed or the real figures are more than the person read (the card's figures,
+ *    or the agent's own where the card had none), and never reads acceptStale; work found dated in
+ *    a closed period goes back as closed-period work; a request only an approved reveal gets
+ *    through is tried with the reveal for its figures alone, and its preview never leaves;
+ *  - an ask whose real figures were not seen stores its amount as unknown, never the agent's figure;
  *  - intersectAccess is never wider than either side (property test over areas, activities, flags);
- *  - the verbs, and the route sending `{ verb }` bodies to them and everything else to the old runner.
+ *  - the verbs (find and describe judged as a real request is, examples, permissions with grants'
+ *    real limits and this company's people signed in), the rate limits with when to try again, and
+ *    the route sending `{ verb }` bodies to them (429 with Retry-After when slowed down) and
+ *    everything else to the curated actions.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { NextRequest } from 'next/server';
 
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-agent-operate');
@@ -57,19 +72,21 @@ const m = vi.hoisted(() => ({
   getServerContext: vi.fn(),
 }));
 
-vi.mock('@/lib/agent/bridge', () => ({ runOperation: m.runOperation }));
-vi.mock('@/lib/agent/guards', () => ({ guardInput: m.guardInput, applySecrets: vi.fn(), redactAnswer: vi.fn() }));
-vi.mock('@/lib/agent/facts', () => ({ factsOf: m.factsOf }));
-vi.mock('@/lib/agent/describe', () => ({ describeRequest: m.describeRequest }));
+// Stand-ins by default; the real module behind each, for the block that runs the real bridge.
+vi.mock('@/lib/agent/bridge', async (orig) => ({ ...(await orig<Record<string, unknown>>()), runOperation: m.runOperation }));
+vi.mock('@/lib/agent/guards', async (orig) => ({ ...(await orig<Record<string, unknown>>()), guardInput: m.guardInput }));
+vi.mock('@/lib/agent/facts', async (orig) => ({ ...(await orig<Record<string, unknown>>()), factsOf: m.factsOf }));
+vi.mock('@/lib/agent/describe', async (orig) => ({ ...(await orig<Record<string, unknown>>()), describeRequest: m.describeRequest }));
 vi.mock('@/lib/services/agentPolicies', () => ({ loadAgentPolicy: m.loadAgentPolicy, agentCeiling: m.agentCeiling }));
-vi.mock('@/lib/services/agentGrants', () => ({ liveGrants: m.liveGrants }));
+vi.mock('@/lib/services/agentGrants', async (orig) => ({ ...(await orig<Record<string, unknown>>()), liveGrants: m.liveGrants }));
 vi.mock('@/lib/services/agentRequests', () => ({
   createAgentRequest: m.createAgentRequest,
   requestForAgent: m.requestForAgent,
   listRequestsForAgent: m.listRequestsForAgent,
   cancelAgentRequest: m.cancelAgentRequest,
 }));
-vi.mock('@/lib/agent/operations/schemas', () => ({ describeSchemas: m.describeSchemas, loadBodySchema: vi.fn() }));
+// The schemas are a stand-in; the examples are the real reading of them (examplesOf).
+vi.mock('@/lib/agent/operations/schemas', async (orig) => ({ ...(await orig<Record<string, unknown>>()), describeSchemas: m.describeSchemas }));
 vi.mock('@/lib/agent/files', () => ({
   uploadChunk: m.uploadChunk,
   readStagedFile: m.readStagedFile,
@@ -104,7 +121,24 @@ vi.mock('@/lib/services/sessions', async (orig) => ({ ...(await orig<Record<stri
 vi.mock('@/lib/context', async (orig) => ({ ...(await orig<Record<string, unknown>>()), getServerContext: m.getServerContext }));
 
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { agentPermissionRequests, agentRequests, agents, companies, users } from '@/lib/db/schema';
+import {
+  accounts,
+  agentGrants,
+  agentPermissionRequests,
+  agentRequests,
+  agents,
+  auditLogs,
+  companies,
+  companyRoles,
+  journalEntries,
+  userCompanies,
+  userRoleAssignments,
+  users,
+} from '@/lib/db/schema';
+import { createCompany } from '@/lib/services/company';
+import { resolveAccess } from '@/lib/services/access';
+import { maskedForAgent } from '@/lib/permissions/agentAccess';
+import { OPERATION_CLASSES } from '@/lib/agent/operations/classes';
 import {
   ACTIONS,
   AREA_KEYS,
@@ -128,7 +162,10 @@ import type { AgentGrant, AgentPolicy, AgentPreset, Operation, RequestFacts } fr
 import type { BridgeActor, BridgeMode, BridgeResult, OperationInput, OperationPreview, ShellOperationDef } from './contract';
 import {
   AGENT_CALLS_PER_MINUTE,
+  AGENT_RUNS_AT_ONCE,
+  AgentRateLimited,
   NO_REASON_NOTE,
+  agentRetryAfter,
   handleVerb,
   intersectAccess,
   lowerRole,
@@ -190,6 +227,25 @@ const OPS: Operation[] = [
   // A change whose service opens its own database handle: the bridge commits it without a wrapping
   // transaction, so a failure may have kept part of it.
   op({ id: 'feeds.refresh', route: '/api/bank-feeds/refresh', dryRun: 'none', describe: 'Refresh the bank feeds' }),
+  // A change whose full SSNs can be revealed (an approved reveal turns on "View sensitive payroll").
+  op({
+    id: 'employees.update',
+    route: '/api/employees/[id]',
+    method: 'PATCH',
+    params: ['id'],
+    rule: { area: 'payroll', action: 'modify' },
+    area: 'payroll',
+    action: 'modify',
+    class: 'change',
+    reveal: 'ssn',
+    describe: 'Change employee {id}',
+  }),
+  // Work that names no amount field (its amount is what the ledger shows).
+  op({ id: 'customers.create', route: '/api/customers', describe: 'Add a customer' }),
+  // Work that is not undone when it stops, with a warning the agent may accept.
+  op({ id: 'feeds.import', route: '/api/bank-feeds/import', dryRun: 'none', confirmFlags: ['allowDuplicate'], effects: ['network'], describe: 'Import bank lines' }),
+  // A route with a preview of its own: the bridge describes it, so its figures are never seen ahead.
+  op({ id: 'bills.receive', route: '/api/receiving/bill', dryRun: 'preview', amountField: 'total', describe: 'Enter a bill for received items' }),
   // Desktop and server actions (lib/agent/operations/shell.ts). The area and action are the test's
   // own, so a role that is not Admin passes the ceiling.
   op({ id: 'files.save', kind: 'shell', route: 'saveStagedFile', rule: null, action: 'view', class: 'file', dryRun: 'none', describe: 'Save file {fileId} in {folder}' }),
@@ -219,8 +275,11 @@ function custom(permissions: PermissionGrant, flags: RoleDefinition['flags'] = {
   return unionRoles([{ key: 'custom', name: 'Custom', description: '', builtin: false, permissions, flags }]);
 }
 
-/** The agent's role: customers, payroll and banking in full, and every flag (the door must mask them). */
-const CEILING = custom({ customers: ['full'], payroll: ['full'], banking: ['full'] }, { sensitivePayroll: true, fullAccountNumbers: true, closedPeriod: true });
+/** The agent's role: customers, payroll, banking and the general ledger in full, and every flag (the door must mask them). */
+const CEILING = custom(
+  { customers: ['full'], payroll: ['full'], banking: ['full'], accounting: ['full'] },
+  { sensitivePayroll: true, fullAccountNumbers: true, closedPeriod: true },
+);
 
 function facts(over: Partial<RequestFacts> = {}): RequestFacts {
   return { confirm: [], reveal: false, amount: null, count: null, entityIds: [], accountIds: [], date: null, closedPeriod: false, ...over };
@@ -315,6 +374,33 @@ function storeView(view: Record<string, unknown>) {
   m.views.set(`key:${String(view.requestKey ?? '')}`, view);
 }
 
+/** A live grant of this agent (20 minutes left), given by the owner unless said otherwise. */
+function grantOf(over: Partial<AgentGrant> = {}): AgentGrant {
+  return {
+    id: randomUUID(),
+    agentId,
+    operation: 'invoices.create',
+    constraints: {},
+    givenBy: ownerId,
+    expiresAt: new Date(Date.now() + 20 * 60_000).toISOString(),
+    revokedAt: null,
+    uses: 0,
+    ...over,
+  };
+}
+
+/** A person of the company: by their legacy role, or with a custom role of these rights. */
+async function member(name: string, role: string, permissions?: PermissionGrant, isActive = true): Promise<string> {
+  const [u] = await db.insert(users).values({ email: `${randomUUID()}@operate.test`, name, passwordHash: 'x' }).returning();
+  const legacy = (['owner', 'admin', 'accountant', 'viewer'] as const).find((r) => r === role) ?? 'viewer';
+  await db.insert(userCompanies).values({ userId: u.id, companyId, role: legacy, isActive });
+  if (permissions) {
+    const [r] = await db.insert(companyRoles).values({ companyId, name, permissions: permissions as Record<string, string[]>, flags: {} }).returning();
+    await db.insert(userRoleAssignments).values({ companyId, userId: u.id, roleKey: r.id });
+  }
+  return u.id;
+}
+
 async function claimRow(requestKey: string) {
   const [row] = await db.select().from(agentRequests).where(eq(agentRequests.requestKey, requestKey));
   return row ?? null;
@@ -338,7 +424,8 @@ beforeAll(async () => {
   db = await getDb(TEST_DIR);
   const [owner] = await db.insert(users).values({ email: 'owner@operate.test', name: 'Olive Owner', passwordHash: 'x' }).returning();
   ownerId = owner.id;
-  const [company] = await db.insert(companies).values({ name: 'Operate Co', ownerId }).returning();
+  // A company as the app makes one: its owner's membership and the default chart of accounts.
+  const company = await createCompany(db, { name: 'Operate Co', ownerId });
   companyId = company.id;
   const [agent] = await db
     .insert(agents)
@@ -356,7 +443,7 @@ beforeAll(async () => {
     readOnly: true,
   };
   approver = { db, companyId, userId: ownerId, role: 'owner', access: fullAccess() };
-});
+}, 120_000);
 
 afterAll(async () => {
   await closeDb(TEST_DIR);
@@ -653,7 +740,15 @@ describe('operate', () => {
     expect(await again()).toMatchObject({ outcome: 'asked', replayed: true, requestId: view.id });
 
     Object.assign(view, { status: 'executed', result: { id: 'inv-77' }, decidedByName: 'Olive Owner' });
+    // A row from before the requests service kept what the run posted: told from its preview.
     expect(await again()).toMatchObject({ outcome: 'posted', replayed: true, result: { id: 'inv-77' } });
+    // What the run itself posted decides when the request says (AgentRequestView.posted), never the preview.
+    Object.assign(view, { posted: false });
+    expect((await again()).outcome).toBe('done');
+    Object.assign(view, { posted: true, preview: null });
+    expect((await again()).outcome).toBe('posted');
+    Object.assign(view, { posted: undefined });
+    expect((await again()).outcome).toBe('done');
 
     Object.assign(view, { status: 'denied', note: 'Not this month.' });
     expect((await again()).note).toBe('A person said no: "Not this month."');
@@ -730,6 +825,117 @@ describe('operate', () => {
     expect((await claimRow(called))?.outcome).toBe('failed');
   });
 
+  it('a warning from work that is not undone keeps its request id with what happened: the same id never runs it twice', async () => {
+    const sent = { effect: { kind: 'network' as const, summary: 'Contact bank.example', detail: {} }, status: 'sent' as const, error: null, ranDuringOperation: true };
+    const warned: Partial<BridgeResult> = {
+      outcome: 'needs_confirmation',
+      httpStatus: 409,
+      result: null,
+      preview: null,
+      effects: [sent],
+      warnings: [{ flag: 'allowDuplicate', message: 'These lines look like ones already imported.' }],
+    };
+    bridgeAnswers({ commit: (input) => (input.confirm?.includes('allowDuplicate') ? {} : warned) });
+    const key = rid();
+    const body = { account: 'checking' };
+    const a = await operate(agentCtx, { operation: 'feeds.import', body, requestId: key });
+    expect(a).toMatchObject({ outcome: 'needs_confirmation', warnings: [{ flag: 'allowDuplicate' }], effects: [sent] });
+    expect(a.note).toMatch(/part of it may already have been done \(effects lists what already went out\)/);
+    expect(a.note).toMatch(/new request_id and confirm: \["allowDuplicate"\]/);
+    expect(a.note).not.toMatch(/Nothing was done/);
+    expect((await claimRow(key))?.outcome).toBe('warned');
+
+    // The same id and input: the same answer, nothing run again.
+    const again = await operate(agentCtx, { operation: 'feeds.import', body, requestId: key });
+    expect(again).toEqual({ ...a, replayed: true });
+    expect(callsOf('commit')).toHaveLength(1);
+    // The same id with the flag is another request: refused, never run.
+    await expectError(operate(agentCtx, { operation: 'feeds.import', body, confirm: ['allowDuplicate'], requestId: key }), 'CONFLICT', /already used for a different request/);
+    expect(callsOf('commit')).toHaveLength(1);
+    // A new id with the flag goes on.
+    expect((await operate(agentCtx, { operation: 'feeds.import', body, confirm: ['allowDuplicate'], requestId: rid() })).outcome).toBe('posted');
+
+    // Nothing sent, but its service keeps what it did before the warning: kept as well.
+    bridgeAnswers({ commit: () => ({ ...warned, effects: [] }) });
+    const quiet = rid();
+    const b = await operate(agentCtx, { operation: 'feeds.import', body: { account: 'savings' }, requestId: quiet });
+    expect(b.outcome).toBe('needs_confirmation');
+    expect(b.note).toMatch(/part of it may already have been done\./);
+    expect((await claimRow(quiet))?.outcome).toBe('warned');
+  });
+
+  it('when nothing can show the real figures, the amount counts as unknown: two people, whatever the body says', async () => {
+    const described = { ...preview(0), ledger: null, routePreview: { ran: false, note: 'Described only.' } };
+    bridgeAnswers({ dry_run: () => ({ preview: described, stalenessKey: null }) });
+    // No two-person limit: the amount does not matter, so it runs as before (no dry run is possible).
+    const plain = await operate(agentCtx, { operation: 'bills.receive', body: { total: '10' }, requestId: rid() });
+    expect(plain.outcome).toBe('posted');
+    expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['commit']);
+
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    m.runOperation.mockClear();
+    const tried = await operate(agentCtx, { operation: 'bills.receive', body: { total: '10' }, dryRun: true });
+    expect(tried.outcome).toBe('dry_run');
+    expect(tried.note).toMatch(/would ask a person first.*two different people must approve it/);
+    const silent = await operate(agentCtx, { operation: 'bills.receive', body: { total: '10' }, requestId: rid() });
+    expect(silent).toMatchObject({ outcome: 'refused', note: NO_REASON_NOTE });
+    const key = rid();
+    const asked = await operate(agentCtx, { operation: 'bills.receive', body: { total: '10' }, requestId: key, reason: 'The delivery came today' });
+    expect(asked).toMatchObject({ outcome: 'asked', needs: { twoPerson: true } });
+    expect(callsOf('commit')).toHaveLength(0);
+    // The person is shown the figures the policy judged on: the amount unknown, never the agent's
+    // own figure presented as the amount; the needs are those of the worst case.
+    const req = m.createAgentRequest.mock.calls[0][1] as Out;
+    expect(req.facts.amount).toBeNull();
+    expect(req.needs.twoPerson).toBe(true);
+  });
+
+  it('closing-date work counts its amount as unknown, and says why there is no preview', async () => {
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    await db.update(companies).set({ settings: { closingDate: '2026-06-30' } }).where(eq(companies.id, companyId));
+    try {
+      const a = await operate(agentCtx, { operation: 'invoices.create', body: { total: '10', date: '2026-03-01' }, requestId: rid(), reason: 'Late March invoice' });
+      expect(a).toMatchObject({ outcome: 'asked', needs: { twoPerson: true } });
+      expect(a.note).toMatch(/because it is dated on or before the closing date, so the person approving it sees no preview/);
+      expect(m.runOperation).not.toHaveBeenCalled();
+      // The card's amount is unknown, not the body's 10 (nothing checked it).
+      expect((m.createAgentRequest.mock.calls.at(-1)?.[1] as Out).facts).toMatchObject({ amount: null, closedPeriod: true, date: '2026-03-01' });
+
+      bridgeAnswers({ dry_run: () => ({ outcome: 'error', httpStatus: 400, preview: null, error: { message: 'The period is closed.', code: 'PERIOD_CLOSED', details: null } }) });
+      const b = await operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid(), reason: 'Correction' });
+      expect(b).toMatchObject({ outcome: 'asked', needs: { twoPerson: true } });
+      expect((m.createAgentRequest.mock.calls.at(-1)?.[1] as Out).facts).toMatchObject({ amount: null, closedPeriod: true });
+
+      // With no two-person limit the amount still shows as unknown on the card.
+      usePolicy('trusted_bookkeeper');
+      await operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid(), reason: 'Correction' });
+      const plain = m.createAgentRequest.mock.calls.at(-1)?.[1] as Out;
+      expect(plain.facts).toMatchObject({ amount: null, closedPeriod: true });
+      expect(plain.needs.twoPerson).toBe(false);
+      expect(plain.preview).toBeNull();
+    } finally {
+      await db.update(companies).set({ settings: null }).where(eq(companies.id, companyId));
+    }
+  });
+
+  it('a dry run that went all the way and moved no money has the amount 0.00, so the two-person limit does not hold it', async () => {
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    const created = { ...preview(0), ledger: { entries: [], changes: [{ action: 'create', kind: 'customer', id: 'c-1' }] }, records: [{ action: 'create', kind: 'customer', id: 'c-1', fields: [] }] };
+    bridgeAnswers({ dry_run: () => ({ preview: created }), commit: () => ({ preview: created }) });
+    const a = await operate(agentCtx, { operation: 'customers.create', body: { displayName: 'Acme' }, requestId: rid() });
+    expect(a.outcome).toBe('done');
+    expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run', 'commit']);
+
+    // An edit (or a void) of something that exists may move money without a new entry: unknown.
+    const edited = { ...created, ledger: { entries: [], changes: [{ action: 'update', kind: 'invoice', id: 'i-1' }] } };
+    bridgeAnswers({ dry_run: () => ({ preview: edited }) });
+    expect(await operate(agentCtx, { operation: 'customers.create', body: { displayName: 'Acme 2' }, requestId: rid() })).toMatchObject({ outcome: 'refused', note: NO_REASON_NOTE });
+    // An amount field that could not be read stays unknown.
+    bridgeAnswers({ dry_run: () => ({ preview: created }) });
+    expect(await operate(agentCtx, { operation: 'invoices.create', body: {}, requestId: rid() })).toMatchObject({ outcome: 'refused', note: NO_REASON_NOTE });
+    expect(callsOf('commit')).toHaveLength(1);
+  });
+
   it("the bridge's own refusals are said as what they are, with the bridge's code kept", async () => {
     bridgeAnswers({
       dry_run: () => ({
@@ -752,7 +958,7 @@ describe('operate', () => {
     expect(slow.details).toEqual({ seconds: 30, code: 'TIMEOUT' });
   });
 
-  it('a request the agent asks a person about, but cannot even try with its own rights, asks without a preview', async () => {
+  it('a dry run refused for want of the View flag an approved reveal adds asks without a preview; nothing else does', async () => {
     usePolicy('ask_every_change');
     const forbidden: Partial<BridgeResult> = {
       outcome: 'error',
@@ -762,21 +968,48 @@ describe('operate', () => {
       error: { message: 'This needs "View sensitive payroll".', code: 'FORBIDDEN', details: null },
     };
     bridgeAnswers({ dry_run: () => forbidden });
-    const a = await operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid(), reason: 'Correct the SSN' });
+    const reveal = { operation: 'employees.update', params: { id: 'emp-1' }, body: { ssn: '123-45-6789' }, reveal: true };
+    const a = await operate(agentCtx, { ...reveal, requestId: rid(), reason: 'Correct the SSN' });
     expect(a.outcome).toBe('asked');
+    expect(a.note).toMatch(/could not be tried with this agent's own rights.*sees no preview/);
     expect((m.createAgentRequest.mock.calls[0][1] as Out).preview).toBeNull();
-    const d = await operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, dryRun: true });
+    const d = await operate(agentCtx, { ...reveal, dryRun: true });
     expect(d.outcome).toBe('dry_run');
     expect(d.note).toMatch(/could not be tried with this agent's own rights.*would ask a person first/);
 
-    // Allowed without asking: the refusal is the answer.
+    // Without the reveal, no approval adds a flag (the bridge turns the View flags on only for an
+    // approved reveal): the refusal is said, with how to ask for the full values.
+    const plain = await expectError(operate(agentCtx, { operation: 'employees.update', params: { id: 'emp-1' }, body: {}, requestId: rid(), reason: 'x' }), 'FORBIDDEN', /View sensitive payroll/);
+    expect(plain.message).toMatch(/send it again with reveal: true and a reason/);
+    // Allowed without asking: the refusal is the answer, never an ask.
     usePolicy('trusted_bookkeeper');
-    await expectError(operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid() }), 'FORBIDDEN', /View sensitive payroll/);
-
-    // A refusal about the agent itself (removed, paused, blocked) is never put to a person.
+    await expectError(operate(agentCtx, { operation: 'employees.update', params: { id: 'emp-1' }, body: {}, requestId: rid() }), 'FORBIDDEN', /View sensitive payroll/);
     usePolicy('ask_every_change');
-    bridgeAnswers({ dry_run: () => ({ ...forbidden, httpStatus: 0, error: { message: 'This agent no longer has access.', code: 'FORBIDDEN', details: { agent: true } } }) });
-    await expectError(operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid(), reason: 'x' }), 'FORBIDDEN', /no longer has access/);
+
+    // Refusals no approval can lift are said, never put to a person, reveal or not: the agent
+    // itself, an archived company and the route map (the bridge's own gates, status 0), a feature
+    // switched off, the Accountant's Copy rule, and a right of the role (the handler's, marked).
+    const unliftable: Array<Partial<BridgeResult>> = [
+      { ...forbidden, httpStatus: 0, error: { message: 'This agent no longer has access.', code: 'FORBIDDEN', details: { agent: true } } },
+      { ...forbidden, httpStatus: 0, error: { message: 'This company is not available. Open it in Ironbooks first.', code: 'FORBIDDEN', details: null } },
+      { ...forbidden, httpStatus: 0, error: { message: 'You do not have permission to modify Payroll.', code: 'FORBIDDEN', details: { area: 'payroll', action: 'modify' } } },
+      { ...forbidden, error: { message: 'Payroll is turned off in Preferences.', code: 'FORBIDDEN', details: { featureOff: true } } },
+      { ...forbidden, error: { message: "That isn't available in an Accountant's Copy.", code: 'FORBIDDEN', details: { accountantCopy: true } } },
+      { ...forbidden, error: { message: 'You do not have permission to view Items.', code: 'FORBIDDEN', details: { area: 'items', action: 'view' } } },
+    ];
+    for (const r of unliftable) {
+      bridgeAnswers({ dry_run: () => r });
+      const err = await expectError(operate(agentCtx, { ...reveal, requestId: rid(), reason: 'x' }), 'FORBIDDEN');
+      expect(err.message).toBe(r.error!.message);
+      const tried = await expectError(operate(agentCtx, { ...reveal, dryRun: true }), 'FORBIDDEN');
+      expect(tried.message).toBe(r.error!.message);
+    }
+
+    // A role that lacks the flag itself is refused before anything runs (the policy's role check).
+    m.agentCeiling.mockImplementation(async () => ({ access: custom({ payroll: ['full'] }), role: 'accountant', roleNames: ['Payroll clerk'] }));
+    const noFlag = await operate(agentCtx, { ...reveal, requestId: rid(), reason: 'x' });
+    expect(noFlag.outcome).toBe('refused');
+    expect(noFlag.note).toMatch(/Your role does not allow this/);
     expect(m.createAgentRequest).toHaveBeenCalledTimes(1);
     expect(callsOf('commit')).toHaveLength(0);
   });
@@ -866,14 +1099,68 @@ describe('operate', () => {
     }
   });
 
-  it('runs under a live grant and says so; the dry run carries no grant', async () => {
+  it("runs under a live grant and says so, with the giver's access within the agent's role; the dry run carries no grant", async () => {
     usePolicy('ask_every_change');
     const grantId = randomUUID();
-    grants = [{ id: grantId, agentId, operation: 'invoices.create', constraints: {}, givenBy: ownerId, expiresAt: new Date(Date.now() + 20 * 60_000).toISOString(), revokedAt: null, uses: 0 }];
+    grants = [grantOf({ id: grantId })];
     const a = await operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid() });
     expect(a).toMatchObject({ outcome: 'posted', grantId });
     expect(callsOf('dry_run')[0].actor.approval.grantId).toBeNull();
-    expect(callsOf('commit')[0].actor.approval).toEqual({ approvedBy: null, requestId: null, grantId });
+    const [commit] = callsOf('commit');
+    expect(commit.actor.approval).toEqual({ approvedBy: null, requestId: null, grantId });
+    // Plan §4.5: the giver's access INTERSECTED with the agent's ceiling, masked; never a person.
+    const giver = await resolveAccess(db, companyId, ownerId);
+    expect(commit.actor.access).toEqual(maskedForAgent(intersectAccess(giver.access, CEILING)));
+    expect(commit.actor).toMatchObject({ userId: null, reveal: false, secrets: {}, role: 'accountant' });
+  });
+
+  it('a grant runs within what its giver may do: narrower than the agent, the run is narrower too', async () => {
+    usePolicy('ask_every_change');
+    const clerk = await member('Cora Clerk', 'customers-only', { customers: ['full'] });
+    const grantId = randomUUID();
+    grants = [grantOf({ id: grantId, givenBy: clerk })];
+    const a = await operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid() });
+    expect(a).toMatchObject({ outcome: 'posted', grantId });
+    const access = callsOf('commit')[0].actor.access;
+    expect(access.permissions.customers).toEqual(CEILING.permissions.customers);
+    // The agent's role holds payroll and banking; the clerk who gave the grant does not.
+    expect(access.permissions.payroll).toEqual([]);
+    expect(access.permissions.banking).toEqual([]);
+    expect(isSubset(access, CEILING)).toBe(true);
+  });
+
+  it('a grant whose giver is gone, inactive or without the right does not apply: the request is asked', async () => {
+    usePolicy('ask_every_change');
+    const viewer = await member('Vic Viewer', 'viewer');
+    const inactive = await member('Ina Inactive', 'owner', undefined, false);
+    for (const givenBy of [randomUUID(), viewer, inactive]) {
+      m.runOperation.mockClear();
+      m.createAgentRequest.mockClear();
+      grants = [grantOf({ givenBy })];
+      const a = await operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid(), reason: 'Monthly retainer' });
+      expect(a).toMatchObject({ outcome: 'asked', status: 'pending' });
+      expect(a.grantId).toBeUndefined();
+      expect(callsOf('commit')).toHaveLength(0);
+      expect(m.createAgentRequest).toHaveBeenCalledTimes(1);
+    }
+    // Another grant that does stand answers instead of the one set aside.
+    const good = randomUUID();
+    grants = [grantOf({ givenBy: viewer }), grantOf({ id: good })];
+    expect(await operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid() })).toMatchObject({ outcome: 'posted', grantId: good });
+    // Without a reason, the ask a grant could not answer is refused like any other.
+    grants = [grantOf({ givenBy: viewer })];
+    expect(await operate(agentCtx, { operation: 'invoices.create', body: { total: '10' }, requestId: rid() })).toMatchObject({ outcome: 'refused', note: NO_REASON_NOTE });
+  });
+
+  it("a grant never covers an amount nobody could check: work that cannot be tried asks, the grant's limit unused", async () => {
+    usePolicy('ask_every_change');
+    grants = [grantOf({ operation: 'bills.receive', constraints: { maxAmount: '500' } })];
+    const a = await operate(agentCtx, { operation: 'bills.receive', body: { total: '10' }, requestId: rid(), reason: 'The delivery came today' });
+    expect(a.outcome).toBe('asked');
+    expect(callsOf('commit')).toHaveLength(0);
+    // A grant with no amount limit is not about the amount: it still answers.
+    grants = [grantOf({ operation: 'bills.receive' })];
+    expect((await operate(agentCtx, { operation: 'bills.receive', body: { total: '10' }, requestId: rid() })).outcome).toBe('posted');
   });
 
   it('a desktop action never runs on the agent\'s own say-so, even under a grant', async () => {
@@ -885,13 +1172,52 @@ describe('operate', () => {
     expect(m.runShellOperation).not.toHaveBeenCalled();
   });
 
-  it(`stops an agent after ${AGENT_CALLS_PER_MINUTE} calls in a minute, in plain words`, async () => {
+  it(`stops an agent after ${AGENT_CALLS_PER_MINUTE} calls in a minute, in plain words, and says when to try again`, async () => {
     for (let i = 0; i < AGENT_CALLS_PER_MINUTE; i++) expect((await operate(agentCtx, { operation: 'nothing.here' })).note).toMatch(/find_operations/);
     const a = await operate(agentCtx, { operation: 'invoices.list' });
     expect(a.outcome).toBe('refused');
-    expect(a.note).toMatch(/more than 120 requests in the last minute.*Wait about \d+ seconds/);
+    expect(a.note).toMatch(/more than 120 requests in the last minute.*Wait about \d+ seconds?, then carry on/);
     expect(m.runOperation).not.toHaveBeenCalled();
-    await expectError(handleVerb(agentCtx, 'get_my_permissions', {}), 'FORBIDDEN', /more than 120 requests/);
+    // Every verb, an operation's included, is slowed down as an error that carries the wait.
+    for (const verb of ['get_my_permissions', 'run_operation'] as const) {
+      const err = await expectError(handleVerb(agentCtx, verb, verb === 'run_operation' ? { operation: 'invoices.list' } : {}), 'FORBIDDEN', /more than 120 requests/);
+      expect(err).toBeInstanceOf(AgentRateLimited);
+      const secs = agentRetryAfter(err);
+      expect(secs).toBeGreaterThanOrEqual(1);
+      expect(secs).toBeLessThanOrEqual(60);
+      expect(err.details).toMatchObject({ rateLimited: true, retryAfterSeconds: secs });
+    }
+    expect(m.runOperation).not.toHaveBeenCalled();
+    // An error that only looks alike (the bridge's closing-password limiter) is not the door's.
+    expect(agentRetryAfter(new ServiceError('FORBIDDEN', 'Too many wrong passwords.', { rateLimited: true, retryAfterSeconds: 30 }))).toBeNull();
+  });
+
+  it(`runs at most ${AGENT_RUNS_AT_ONCE} operations of one agent at once; one more is told to wait, and the place comes back`, async () => {
+    const gates: Array<() => void> = [];
+    m.runOperation.mockImplementation(
+      (_b: unknown, operation: Operation, input: OperationInput, mode: BridgeMode) =>
+        new Promise<BridgeResult>((resolve) => gates.push(() => resolve(bridged(mode, { facts: bodyFacts(operation, input, { closingDate: null }) })))),
+    );
+    const running = Array.from({ length: AGENT_RUNS_AT_ONCE }, () => operate(agentCtx, { operation: 'invoices.list' }));
+    await vi.waitFor(() => expect(gates).toHaveLength(AGENT_RUNS_AT_ONCE));
+    const busy = await operate(agentCtx, { operation: 'invoices.list' });
+    expect(busy).toMatchObject({ outcome: 'refused' });
+    expect(busy.note).toMatch(/already has 4 requests under way.*Wait about 2 seconds/);
+    const verb = await expectError(handleVerb(agentCtx, 'run_operation', { operation: 'invoices.list' }), 'FORBIDDEN', /already has 4 requests under way/);
+    expect(agentRetryAfter(verb)).toBe(2);
+    // Another agent is not held up by this one.
+    const other = { ...agentCtx, agent: { ...agentCtx.agent!, id: randomUUID() } };
+    const elsewhere = operate(other, { operation: 'invoices.list' });
+    await vi.waitFor(() => expect(gates).toHaveLength(AGENT_RUNS_AT_ONCE + 1));
+    for (const open of gates) open();
+    expect((await Promise.all(running)).map((x) => x.outcome)).toEqual(Array(AGENT_RUNS_AT_ONCE).fill('read'));
+    expect((await elsewhere).outcome).toBe('read');
+    // A run that throws gives its place back too.
+    m.runOperation.mockRejectedValueOnce(new Error('boom'));
+    await expect(operate(agentCtx, { operation: 'invoices.list' })).rejects.toThrow('boom');
+    bridgeAnswers({});
+    const again = await Promise.all(Array.from({ length: AGENT_RUNS_AT_ONCE }, () => operate(agentCtx, { operation: 'invoices.list' })));
+    expect(again.every((x) => x.outcome === 'read')).toBe(true);
   });
 });
 
@@ -899,30 +1225,53 @@ describe('operate', () => {
 // runApproved
 // ---------------------------------------------------------------------------
 
-describe('runApproved', () => {
-  async function storedRequest(stalenessKey: string | null, operation = 'invoices.create'): Promise<string> {
-    const [row] = await db
-      .insert(agentPermissionRequests)
-      .values({
-        companyId,
-        agentId,
-        requestKey: rid(),
-        operation,
-        class: 'enter',
-        summary: 'Enter an invoice',
-        stalenessKey,
-        expiresAt: new Date(Date.now() + 86_400_000),
-      })
-      .returning({ id: agentPermissionRequests.id });
-    return row.id;
-  }
+/**
+ * A stored request as the requests service keeps one: its staleness key, and in `needs` what the
+ * person must have plus, under `request`, the facts they were shown.
+ */
+async function storedRequest(
+  stalenessKey: string | null,
+  operation = 'invoices.create',
+  shown: Partial<RequestFacts> | null = { amount: '10' },
+  twoPerson = false,
+): Promise<string> {
+  const needs = {
+    admin: false,
+    fileAdmin: false,
+    hostOnly: false,
+    flag: null,
+    flags: [],
+    secrets: [],
+    twoPerson,
+    grantable: 'yes',
+    request: { kind: 'operation', facts: shown ? facts(shown) : undefined, staleRound: 0, staleSeen: [] },
+  };
+  const [row] = await db
+    .insert(agentPermissionRequests)
+    .values({
+      companyId,
+      agentId,
+      requestKey: rid(),
+      operation,
+      class: 'enter',
+      summary: 'Enter an invoice',
+      stalenessKey,
+      needs: needs as never,
+      expiresAt: new Date(Date.now() + 86_400_000),
+    })
+    .returning({ id: agentPermissionRequests.id });
+  return row.id;
+}
 
+describe('runApproved', () => {
   it('runs as the approver, within what the approver and the agent both have', async () => {
     const id = await storedRequest(null);
     const input = { body: { total: '10' }, reveal: true };
     const r = await runApproved(approver, { id, agentId, operation: 'invoices.create', input }, { secrets: { closing_password: 'pw' }, answers: {} }, { atHost: true });
     expect(r.mode).toBe('commit');
-    expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['commit']);
+    // Tried first with the approver's rights (no reveal, no secrets), then run.
+    expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run', 'commit']);
+    expect(callsOf('dry_run')[0].actor).toMatchObject({ reveal: false, secrets: {}, userId: ownerId });
     const [call] = callsOf('commit');
     expect(call.base).toBe(approver);
     expect(call.input).toEqual(input);
@@ -1006,6 +1355,233 @@ describe('runApproved', () => {
     expect(callsOf('commit')).toHaveLength(0);
   });
 
+  it('asked without a preview: tried with the approver\'s rights first, and shown to the person again when it would do more than they saw', async () => {
+    const more: Array<[string, Partial<RequestFacts>, Partial<RequestFacts>]> = [
+      ['invoices.create', { amount: '10' }, { amount: '5000.00' }],
+      ['invoices.create', { amount: '10' }, { amount: '-25.00' }],
+      ['invoices.create', { amount: '10' }, { amount: '10', closedPeriod: true }],
+      ['invoices.batch', { count: 2 }, { count: 5 }],
+    ];
+    for (const [operation, shown, real] of more) {
+      m.runOperation.mockClear();
+      const id = await storedRequest(null, operation, shown);
+      bridgeAnswers({ dry_run: () => ({ facts: facts(real), preview: preview(3), stalenessKey: 'k-real' }) });
+      const r = await runApproved(approver, { id, agentId, operation, input: { body: { total: '10' } } }, {}, { atHost: true });
+      expect(r.mode, `${operation} ${JSON.stringify(real)}`).toBe('dry_run');
+      expect(r.outcome).toBe('ok');
+      expect(r.preview?.ledger?.entries).toHaveLength(3);
+      expect(callsOf('commit')).toHaveLength(0);
+    }
+
+    // What the person was shown cannot be read: nothing counts as shown, so the real preview is shown.
+    m.runOperation.mockClear();
+    const unread = await storedRequest(null, 'invoices.create', null);
+    bridgeAnswers({});
+    expect((await runApproved(approver, { id: unread, agentId, operation: 'invoices.create', input: { body: { total: '10' } } }, {}, { atHost: true })).mode).toBe('dry_run');
+    expect(callsOf('commit')).toHaveLength(0);
+
+    // Within what was shown (an amount shown as unknown, with no figure of the agent's, included): it runs.
+    for (const [shown, real, body] of [
+      [{ amount: '10' }, { amount: '10.00' }, { total: '10' }],
+      [{ amount: '10' }, { amount: '-10' }, { total: '10' }],
+      [{ amount: null }, { amount: '900.00' }, {}],
+      [{ amount: null }, { amount: '10.00' }, { total: '10' }],
+    ] as Array<[Partial<RequestFacts>, Partial<RequestFacts>, Record<string, unknown>]>) {
+      m.runOperation.mockClear();
+      const id = await storedRequest(null, 'invoices.create', shown);
+      bridgeAnswers({ dry_run: () => ({ facts: facts(real) }) });
+      expect((await runApproved(approver, { id, agentId, operation: 'invoices.create', input: { body } }, {}, { atHost: true })).mode, JSON.stringify(shown)).toBe('commit');
+      expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run', 'commit']);
+    }
+
+    // The card had the amount as unknown, but the summary line showed the agent's own 10: a real
+    // 900 is more than the person read, so they see it first.
+    m.runOperation.mockClear();
+    const claimed = await storedRequest(null, 'invoices.create', { amount: null });
+    bridgeAnswers({ dry_run: () => ({ facts: facts({ amount: '900.00' }), stalenessKey: 'k-900' }) });
+    const again = await runApproved(approver, { id: claimed, agentId, operation: 'invoices.create', input: { body: { total: '10' } } }, {}, { atHost: true });
+    expect(again).toMatchObject({ mode: 'dry_run', outcome: 'ok', stalenessKey: 'k-900', facts: { amount: '900.00' } });
+    expect(callsOf('commit')).toHaveLength(0);
+  });
+
+  it('a dry run at approval that meets the closing date judges closed-period work: back to the person when it was not shown so, refused when the policy says Never', async () => {
+    const closed: Partial<BridgeResult> = { outcome: 'error', httpStatus: 400, result: null, preview: null, error: { message: 'The period is closed.', code: 'PERIOD_CLOSED', details: null } };
+    bridgeAnswers({ dry_run: () => closed });
+    const input = { body: { total: '10', date: '2026-03-01' } };
+    // Asked as open-period work (the closing date moved since), with or without a preview: nothing
+    // runs; it goes back as closed-period work, its amount unknown, with why.
+    for (const key of [null, 'k1']) {
+      m.runOperation.mockClear();
+      const id = await storedRequest(key, 'invoices.create', { amount: '10', closedPeriod: false });
+      const back = await runApproved(approver, { id, agentId, operation: 'invoices.create', input }, { secrets: { closing_password: 'pw' } }, { atHost: true });
+      expect(back, String(key)).toMatchObject({ mode: 'dry_run', outcome: 'ok', stalenessKey: null, result: null, facts: { amount: null, closedPeriod: true } });
+      expect(back.preview?.ledger).toBeNull();
+      expect(String((back.preview?.routePreview as Out).note)).toMatch(/dated on or before the closing date.*closing-date password/);
+      expect(callsOf('commit')).toHaveLength(0);
+    }
+
+    // Closed periods set to Never since: refused, nothing done, whatever was shown.
+    policy = { ...policy, classes: { ...policy.classes, period: 'never' } };
+    for (const shown of [{ amount: '10', closedPeriod: false }, { amount: '10', closedPeriod: true }]) {
+      const id = await storedRequest(null, 'invoices.create', shown);
+      await expectError(
+        runApproved(approver, { id, agentId, operation: 'invoices.create', input }, { secrets: { closing_password: 'pw' } }, { atHost: true }),
+        'FORBIDDEN',
+        /^Nothing was done\./,
+      );
+    }
+    expect(callsOf('commit')).toHaveLength(0);
+
+    // Shown as closed-period work with a preview this try cannot be compared with: never run on it.
+    usePolicy('trusted_bookkeeper');
+    const keyed = await storedRequest('k1', 'invoices.create', { amount: '10', closedPeriod: true });
+    expect(await runApproved(approver, { id: keyed, agentId, operation: 'invoices.create', input }, { secrets: { closing_password: 'pw' } }, { atHost: true })).toMatchObject({
+      mode: 'dry_run',
+      outcome: 'error',
+    });
+    expect(callsOf('commit')).toHaveLength(0);
+  });
+
+  it('a request only an approved reveal gets through is tried again with the reveal for its figures alone; its preview never leaves', async () => {
+    const forbidden: Partial<BridgeResult> = {
+      outcome: 'error',
+      httpStatus: 403,
+      result: null,
+      preview: null,
+      error: { message: 'This needs "View sensitive payroll".', code: 'FORBIDDEN', details: null },
+    };
+    const secret = { id: 'emp-1', ssn: '123-45-6789' };
+    let seen: Partial<RequestFacts> = { amount: '0.00' };
+    m.runOperation.mockImplementation(async (_b: unknown, operation: Operation, input: OperationInput, mode: BridgeMode, actor: BridgeActor) => {
+      if (mode === 'dry_run' && !actor.reveal) return bridged(mode, { ...forbidden, facts: bodyFacts(operation, input, { closingDate: null }) });
+      if (mode === 'dry_run') return bridged(mode, { result: secret, facts: facts(seen), stalenessKey: 'k-revealed' });
+      return bridged(mode, { result: secret });
+    });
+    const input = { params: { id: 'emp-1' }, body: { total: '10' }, reveal: true };
+
+    // More than the person read (the agent said 10): asked again with the real figures, no preview,
+    // no answer, no staleness key, so the unmasked values go nowhere.
+    seen = { amount: '5000.00' };
+    const more = await storedRequest(null, 'employees.update', { amount: null });
+    const back = await runApproved(approver, { id: more, agentId, operation: 'employees.update', input }, { secrets: { closing_password: 'pw' } }, { atHost: true });
+    expect(back).toMatchObject({ mode: 'dry_run', outcome: 'ok', result: null, stalenessKey: null, facts: { amount: '5000.00' } });
+    expect(back.preview?.ledger).toBeNull();
+    expect(back.preview?.records).toEqual([]);
+    expect(String((back.preview?.routePreview as Out).note)).toMatch(/would do more than the request showed.*not shown, because it holds those protected values/);
+    expect(JSON.stringify(back)).not.toContain('123-45-6789');
+    expect(callsOf('commit')).toHaveLength(0);
+    const [masked, revealed] = callsOf('dry_run');
+    expect(masked.actor).toMatchObject({ reveal: false, secrets: {} });
+    expect(revealed.actor).toMatchObject({ reveal: true, secrets: {}, userId: ownerId, approval: { approvedBy: ownerId, requestId: more } });
+
+    // The real figures need two people where the request did not: asked again, saying why.
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    m.runOperation.mockClear();
+    const two = await storedRequest(null, 'employees.update', { amount: '5000.00' }, false);
+    const twice = await runApproved(approver, { id: two, agentId, operation: 'employees.update', input }, {}, { atHost: true });
+    expect(twice).toMatchObject({ mode: 'dry_run', outcome: 'ok', facts: { amount: '5000.00' } });
+    expect(String((twice.preview?.routePreview as Out).note)).toMatch(/two different people must approve it/);
+    expect(callsOf('commit')).toHaveLength(0);
+
+    // Within what was read, and already of two people: it runs, with the reveal.
+    m.runOperation.mockClear();
+    const fine = await storedRequest(null, 'employees.update', { amount: '5000.00' }, true);
+    expect((await runApproved(approver, { id: fine, agentId, operation: 'employees.update', input }, {}, { atHost: true })).mode).toBe('commit');
+    expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run', 'dry_run', 'commit']);
+    expect(callsOf('commit')[0].actor.reveal).toBe(true);
+    usePolicy('trusted_bookkeeper');
+  });
+
+  it('what a dry run cannot get through at approval: the closing date and a reveal go on; anything else ends it, nothing done', async () => {
+    const closed: Partial<BridgeResult> = { outcome: 'error', httpStatus: 400, result: null, preview: null, error: { message: 'The period is closed.', code: 'PERIOD_CLOSED', details: null } };
+    const shownClosed = { amount: '10', closedPeriod: true };
+    bridgeAnswers({ dry_run: () => closed });
+    // The closing-date override is the commit's alone: a dry run of closed-period work cannot pass.
+    const id = await storedRequest(null, 'invoices.create', shownClosed);
+    expect((await runApproved(approver, { id, agentId, operation: 'invoices.create', input: { body: { total: '10', date: '2026-03-01' } } }, { secrets: { closing_password: 'pw' } }, { atHost: true })).mode).toBe('commit');
+    expect(callsOf('commit')[0].actor.secrets).toEqual({ closing_password: 'pw' });
+
+    // With a two-person limit, figures nobody could check need two people: a request that did not
+    // say so goes back to the person (nothing runs), with the amount unknown and why.
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    m.runOperation.mockClear();
+    const one = await storedRequest(null, 'invoices.create', shownClosed, false);
+    const back = await runApproved(approver, { id: one, agentId, operation: 'invoices.create', input: { body: { total: '10' } } }, {}, { atHost: true });
+    expect(back).toMatchObject({ mode: 'dry_run', outcome: 'ok', stalenessKey: null, facts: { amount: null, closedPeriod: true } });
+    expect(back.preview?.routePreview).toMatchObject({ ran: false });
+    expect(String((back.preview?.routePreview as Out).note)).toMatch(/could not try this ahead of time.*two different people must approve it/);
+    expect(callsOf('commit')).toHaveLength(0);
+    // Already asked of two people: it runs.
+    const two = await storedRequest(null, 'invoices.create', shownClosed, true);
+    expect((await runApproved(approver, { id: two, agentId, operation: 'invoices.create', input: { body: { total: '10' } } }, {}, { atHost: true })).mode).toBe('commit');
+    usePolicy('trusted_bookkeeper');
+
+    // A reveal: the dry run is kept without it, so the View flag is missing there, not on the run.
+    m.runOperation.mockClear();
+    bridgeAnswers({ dry_run: () => ({ ...closed, httpStatus: 403, error: { message: 'This needs "View sensitive payroll".', code: 'FORBIDDEN', details: null } }) });
+    const reveal = await storedRequest(null, 'employees.update', { amount: null });
+    const ran = await runApproved(approver, { id: reveal, agentId, operation: 'employees.update', input: { params: { id: 'emp-1' }, body: {}, reveal: true } }, {}, { atHost: true });
+    expect(ran.mode).toBe('commit');
+    expect(callsOf('commit')[0].actor.reveal).toBe(true);
+
+    // Without a reveal, the same refusal would meet the run too: it ends here, nothing done.
+    m.runOperation.mockClear();
+    const plain = await storedRequest(null, 'employees.update', { amount: null });
+    await expectError(
+      runApproved(approver, { id: plain, agentId, operation: 'employees.update', input: { params: { id: 'emp-1' }, body: {} } }, {}, { atHost: true }),
+      'FORBIDDEN',
+      /View sensitive payroll".* It was tried before running and would not go through, so nothing was done\./,
+    );
+    // Any other failure too (a refusal no approval lifts, a customer since made inactive).
+    for (const r of [
+      { ...closed, httpStatus: 403, error: { message: 'Payroll is turned off in Preferences.', code: 'FORBIDDEN', details: { featureOff: true } } },
+      { ...closed, httpStatus: 400, error: { message: 'Customer is inactive.', code: 'VALIDATION', details: null } },
+    ]) {
+      bridgeAnswers({ dry_run: () => r });
+      const fresh = await storedRequest(null, 'employees.update', { amount: null });
+      await expectError(
+        runApproved(approver, { id: fresh, agentId, operation: 'employees.update', input: { params: { id: 'emp-1' }, body: {}, reveal: true } }, {}, { atHost: true }),
+        r.error.code,
+        r.error.message,
+      );
+    }
+    expect(callsOf('commit')).toHaveLength(0);
+
+    // A warning ends it with the warning (the agent can send it again with the flag).
+    bridgeAnswers({ dry_run: () => ({ outcome: 'needs_confirmation', httpStatus: 409, warnings: [{ flag: 'allowDuplicateNumber', message: 'Invoice 1001 is already used.' }] }) });
+    const warned = await storedRequest(null);
+    expect(await runApproved(approver, { id: warned, agentId, operation: 'invoices.create', input: { body: { total: '10' } } }, {}, { atHost: true })).toMatchObject({
+      mode: 'dry_run',
+      outcome: 'needs_confirmation',
+    });
+    expect(callsOf('commit')).toHaveLength(0);
+  });
+
+  it("the agent's policy as it is now still holds for an approved request, on the real figures", async () => {
+    // A record limit lowered since it was asked.
+    usePolicy('full_with_asks', { bulkCap: 200 });
+    bridgeAnswers({ dry_run: () => ({ facts: facts({ count: 500 }) }) });
+    const big = await storedRequest(null, 'invoices.batch', { count: 500 });
+    await expectError(
+      runApproved(approver, { id: big, agentId, operation: 'invoices.batch', input: { body: { items: [1] } } }, {}, { atHost: true }),
+      'FORBIDDEN',
+      /^Nothing was done\. This would change 500 records, more than this agent may change in one request \(200\)/,
+    );
+    // A class an Admin has set to Never since.
+    usePolicy('read_only');
+    bridgeAnswers({});
+    const never = await storedRequest(null);
+    await expectError(runApproved(approver, { id: never, agentId, operation: 'invoices.create', input: { body: { total: '10' } } }, {}, { atHost: true }), 'FORBIDDEN', /has not allowed agents to enter new records/);
+    // A two-person limit set since: the person sees it again and a second person approves too.
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    bridgeAnswers({ dry_run: () => ({ facts: facts({ amount: '5000.00' }), stalenessKey: 'k5' }) });
+    const large = await storedRequest('k5', 'invoices.create', { amount: '5000.00' }, false);
+    expect((await runApproved(approver, { id: large, agentId, operation: 'invoices.create', input: { body: { total: '5000.00' } } }, {}, { atHost: true })).mode).toBe('dry_run');
+    const both = await storedRequest('k5', 'invoices.create', { amount: '5000.00' }, true);
+    expect((await runApproved(approver, { id: both, agentId, operation: 'invoices.create', input: { body: { total: '5000.00' } } }, {}, { atHost: true })).mode).toBe('commit');
+    expect(callsOf('commit')).toHaveLength(1);
+  });
+
   it('an approved read runs as a read, on the read path, with the reveal the person approved', async () => {
     const id = await storedRequest('k1', 'invoices.list');
     const r = await runApproved(approver, { id, agentId, operation: 'invoices.list', input: { reveal: true } }, {}, { atHost: false });
@@ -1046,7 +1622,7 @@ describe('runApproved', () => {
     const fileId = 'c'.repeat(32);
     m.readStagedFile.mockResolvedValue({ file: { fileId, name: 'statement.pdf', type: 'application/pdf', size: 5 }, bytes: new TextEncoder().encode('%PDF-') });
     const r = await runApproved(approver, { id, agentId, operation: 'files.save', input: { body: { fileId, folder: SAVE_DIR, name: 'March.pdf' } } }, {}, { atHost: true });
-    expect(r).toMatchObject({ mode: 'commit', outcome: 'ok', result: { saved: true, name: 'March.pdf' } });
+    expect(r, JSON.stringify(r.error)).toMatchObject({ mode: 'commit', outcome: 'ok', result: { saved: true, name: 'March.pdf' } });
     expect(fs.readFileSync(path.join(SAVE_DIR, 'March.pdf'), 'utf8')).toBe('%PDF-');
     const [base, def, request] = m.runShellOperation.mock.calls[0];
     expect(base).toBe(approver);
@@ -1178,6 +1754,55 @@ describe('handleVerb', () => {
     await expectError(handleVerb(agentCtx, 'find_operations', { query: 'x', dry_run: true }), 'VALIDATION');
   });
 
+  it('find_operations: an ordinary request decides the treatment; the limits that change it are said', async () => {
+    // A two-person limit does not make every entry ask: an ordinary one runs, and why says when not.
+    usePolicy('full_with_asks', { twoPersonOver: '1000', bulkCap: 50 });
+    const a = (await handleVerb(agentCtx, 'find_operations', { query: 'invoices' })) as Out;
+    const byId = Object.fromEntries(a.operations.map((o: Out) => [o.id, o]));
+    expect(byId['invoices.create']).toMatchObject({ treatment: 'run', class: 'enter' });
+    expect(byId['invoices.create'].why).toMatch(/Above 1000, or when its amount cannot be told ahead of time, two different people must approve it/);
+    expect(byId['invoices.batch']).toMatchObject({ treatment: 'run' });
+    expect(byId['invoices.batch'].why).toMatch(/At most 50 records in one request/);
+    // A read is never held by the amount.
+    expect(byId['invoices.list'].why).toBeNull();
+    // Protected values: asking for them always asks.
+    const e = (await handleVerb(agentCtx, 'find_operations', { query: 'employees' })) as Out;
+    expect(e.operations[0].why).toMatch(/reveal: true\) always asks a person/);
+
+    // Under standing permission it runs, and says until when; a grant whose giver may not do it does not count.
+    usePolicy('ask_every_change');
+    const viewer = await member('Wes Viewer', 'viewer');
+    const good = grantOf();
+    grants = [grantOf({ givenBy: viewer }), good];
+    const g = (await handleVerb(agentCtx, 'find_operations', { query: 'invoices.create' })) as Out;
+    expect(g.operations[0]).toMatchObject({ id: 'invoices.create', treatment: 'run' });
+    expect(g.operations[0].why).toBe(`Runs under standing permission a person gave, until ${good.expiresAt}.`);
+    grants = [grantOf({ givenBy: viewer })];
+    const none = (await handleVerb(agentCtx, 'find_operations', { query: 'invoices.create' })) as Out;
+    expect(none.operations[0]).toMatchObject({ treatment: 'ask' });
+  });
+
+  it('find_operations: work that cannot be tried ahead is judged with its amount unknown, as every real request of it is', async () => {
+    // With a two-person limit, an entry whose figures are never seen ahead always needs two people.
+    usePolicy('full_with_asks', { twoPersonOver: '1000' });
+    for (const id of ['bills.receive', 'feeds.refresh']) {
+      const [found] = ((await handleVerb(agentCtx, 'find_operations', { query: id })) as Out).operations;
+      expect(found, id).toMatchObject({ id, treatment: 'ask' });
+      expect(found.why).toMatch(/two different people must approve it/);
+      expect(found.why).toMatch(/cannot be tried ahead of time, so its amount counts as unknown/);
+      // What a real request of it meets: the same.
+      const real = await operate(agentCtx, { operation: id, body: { total: '1' }, requestId: rid(), reason: 'Today' });
+      expect(real).toMatchObject({ outcome: 'asked', needs: { twoPerson: true } });
+    }
+    // One that is tried first still runs when its real amount is small.
+    const [tried] = ((await handleVerb(agentCtx, 'find_operations', { query: 'invoices.create' })) as Out).operations;
+    expect(tried).toMatchObject({ treatment: 'run' });
+    // Without the limit, the amount does not matter.
+    usePolicy('full_with_asks');
+    const [plain] = ((await handleVerb(agentCtx, 'find_operations', { query: 'bills.receive' })) as Out).operations;
+    expect(plain).toMatchObject({ treatment: 'run', why: null });
+  });
+
   it("describe_operation: the schemas, notes and this agent's treatment", async () => {
     m.describeSchemas.mockResolvedValueOnce({ body: { type: 'object', properties: { total: { type: 'string' } } }, query: null });
     const d = (await handleVerb(agentCtx, 'describe_operation', { operation: 'invoices.create' })) as Out;
@@ -1190,6 +1815,27 @@ describe('handleVerb', () => {
     expect(e.bodySchema).toBeNull();
     expect(e.notes.join(' ')).toMatch(/could not be loaded/);
     await expectError(handleVerb(agentCtx, 'describe_operation', { operation: 'nope.nope' }), 'NOT_FOUND', /find_operations/);
+  });
+
+  it('describe_operation: the examples its classification has, as run_operation takes them; none when it has none', async () => {
+    m.describeSchemas.mockResolvedValue({ body: null, query: null });
+    const none = (await handleVerb(agentCtx, 'describe_operation', { operation: 'invoices.create' })) as Out;
+    expect(none.examples).toEqual([]);
+
+    // The classification of POST /api/invoices (lib/agent/operations/classes) given examples: one
+    // written as a whole request, one as a body alone.
+    const classified = OPERATION_CLASSES['POST /api/invoices'] as { examples?: unknown };
+    expect(classified).toBeTruthy();
+    classified.examples = [{ body: { customerId: 'c-1', total: '10.00' }, confirm: ['allowDuplicateNumber'], note: 'A plain invoice' }, { customerId: 'c-2', total: '5.00' }];
+    try {
+      const d = (await handleVerb(agentCtx, 'describe_operation', { operation: 'invoices.create' })) as Out;
+      expect(d.examples).toEqual([{ body: { customerId: 'c-1', total: '10.00' }, confirm: ['allowDuplicateNumber'] }, { body: { customerId: 'c-2', total: '5.00' } }]);
+      expect(d.notes.join(' ')).toMatch(/Each of examples is a request as run_operation takes it/);
+      // Still the whole description beside them.
+      expect(d).toMatchObject({ id: 'invoices.create', treatment: 'run', confirmFlags: ['allowDuplicateNumber'] });
+    } finally {
+      delete classified.examples;
+    }
   });
 
   it('run_operation is operate, with its arguments checked strictly', async () => {
@@ -1212,8 +1858,8 @@ describe('handleVerb', () => {
     await expectError(handleVerb(agentCtx, 'cancel_request', { requestId: 'nobody' }), 'NOT_FOUND');
   });
 
-  it('get_my_permissions: ceiling, policy, grants, and whether someone is signed in', async () => {
-    m.listActiveSessions.mockResolvedValueOnce([{ id: 's1' }]);
+  it('get_my_permissions: ceiling, policy, and whether a person of this company is signed in', async () => {
+    m.listActiveSessions.mockResolvedValueOnce([{ id: 's1', userId: ownerId }]);
     const p = (await handleVerb(agentCtx, 'get_my_permissions', {})) as Out;
     expect(p).toMatchObject({
       agent: { id: agentId, name: 'Robo' },
@@ -1225,9 +1871,84 @@ describe('handleVerb', () => {
       someoneSignedIn: true,
     });
     expect(p.classes.enter).toBe('allow');
-    expect(m.listActiveSessions.mock.calls[0][1]).toEqual({ companyId });
+    // Signed in, but not a person of this company, or no longer active: nobody who may answer.
+    const outsider = (await db.insert(users).values({ email: `${randomUUID()}@elsewhere.test`, name: 'Otto Outsider', passwordHash: 'x' }).returning())[0].id;
+    const gone = await member('Gil Gone', 'accountant', undefined, false);
+    m.listActiveSessions.mockResolvedValueOnce([{ id: 's2', userId: outsider }, { id: 's3', userId: gone }]);
+    expect(((await handleVerb(agentCtx, 'get_my_permissions', {})) as Out).someoneSignedIn).toBe(false);
+    const active = await member('Ada Active', 'accountant');
+    m.listActiveSessions.mockResolvedValueOnce([{ id: 's4', userId: outsider }, { id: 's5', userId: active }]);
+    expect(((await handleVerb(agentCtx, 'get_my_permissions', {})) as Out).someoneSignedIn).toBe(true);
+    m.listActiveSessions.mockResolvedValueOnce([]);
+    expect(((await handleVerb(agentCtx, 'get_my_permissions', {})) as Out).someoneSignedIn).toBe(false);
     m.listActiveSessions.mockRejectedValueOnce(new Error('boom'));
     expect(((await handleVerb(agentCtx, 'get_my_permissions', {})) as Out).someoneSignedIn).toBe(false);
+  });
+
+  it("get_my_permissions: the grants that would really let something run, with their real limits", async () => {
+    usePolicy('full_with_asks', { twoPersonOver: '1000', bulkCap: 50 });
+    const viewer = await member('Val Viewer', 'viewer');
+    const small = grantOf({ constraints: { maxAmount: '200', maxUses: 5 } });
+    const large = grantOf({ constraints: { maxAmount: '5000' } });
+    const open = grantOf({ constraints: {} });
+    const batch = grantOf({ operation: 'invoices.batch', constraints: { maxCount: 500 } });
+    const theirs = grantOf({ givenBy: viewer });
+    // Work that cannot be tried ahead: its amount is never known, so a grant limited by amount never
+    // covers it, nor does any grant while the unknown amount needs two people.
+    const cappedUntried = grantOf({ operation: 'bills.receive', constraints: { maxAmount: '200' } });
+    const openUntried = grantOf({ operation: 'bills.receive', constraints: {} });
+    // A person approves each desktop action: a grant on one never lets anything run.
+    const printing = grantOf({ operation: 'shell.print.file', constraints: {} });
+    grants = [small, large, open, batch, theirs, cappedUntried, openUntried, printing];
+    const p = (await handleVerb(agentCtx, 'get_my_permissions', {})) as Out;
+    const byId = Object.fromEntries((p.grants as AgentGrant[]).map((g) => [g.id, g]));
+    // A grant never covers what needs two people: its amount limit is at most the two-person limit.
+    expect(byId[small.id].constraints).toEqual({ maxAmount: '200', maxUses: 5 });
+    expect(byId[large.id].constraints).toEqual({ maxAmount: '1000' });
+    expect(byId[open.id].constraints).toEqual({ maxAmount: '1000' });
+    // The agent's record limit holds under a grant too.
+    expect(byId[batch.id].constraints).toEqual({ maxAmount: '1000', maxCount: 50 });
+    // Given by someone who may not do it themselves: it would not apply, so it is not listed.
+    expect(byId[theirs.id]).toBeUndefined();
+    expect(byId[cappedUntried.id]).toBeUndefined();
+    expect(byId[openUntried.id]).toBeUndefined();
+    expect(byId[printing.id]).toBeUndefined();
+    expect(p.grants).toHaveLength(4);
+
+    // Without a two-person limit, the open one covers it (no amount limit is made up for it); the
+    // one limited by amount still never does. A real request agrees with both answers.
+    usePolicy('ask_every_change');
+    const q = (await handleVerb(agentCtx, 'get_my_permissions', {})) as Out;
+    const listed = Object.fromEntries((q.grants as AgentGrant[]).map((g) => [g.id, g]));
+    expect(listed[openUntried.id].constraints).toEqual({});
+    expect(listed[cappedUntried.id]).toBeUndefined();
+    grants = [cappedUntried];
+    expect(await operate(agentCtx, { operation: 'bills.receive', body: { total: '5' }, requestId: rid(), reason: 'Delivery' })).toMatchObject({ outcome: 'asked' });
+    grants = [openUntried];
+    expect(await operate(agentCtx, { operation: 'bills.receive', body: { total: '5' }, requestId: rid() })).toMatchObject({ outcome: 'posted', grantId: openUntried.id });
+  });
+
+  it("get_my_permissions: someoneSignedIn looks only at this company's people, and finds an owner with no membership row", async () => {
+    const signed = await member('Sid Signed', 'accountant');
+    // Many people signed in to other company files on this computer.
+    const elsewhere = Array.from({ length: 40 }, (_, i) => ({ id: `x${i}`, userId: randomUUID() }));
+    m.listActiveSessions.mockImplementation(async (_db: unknown, o: { companyId?: string } = {}) =>
+      o.companyId === companyId ? [{ id: 'm1', userId: signed }] : [...elsewhere, { id: 'm1', userId: signed }],
+    );
+    expect(((await handleVerb(agentCtx, 'get_my_permissions', {})) as Out).someoneSignedIn).toBe(true);
+    expect(m.listActiveSessions).toHaveBeenCalledWith(db, { companyId });
+
+    // The owner may have no membership row: still a person who may answer.
+    const [row] = await db.select().from(userCompanies).where(and(eq(userCompanies.userId, ownerId), eq(userCompanies.companyId, companyId)));
+    await db.delete(userCompanies).where(and(eq(userCompanies.userId, ownerId), eq(userCompanies.companyId, companyId)));
+    try {
+      m.listActiveSessions.mockImplementation(async (_db: unknown, o: { companyId?: string } = {}) => (o.companyId ? [] : [...elsewhere, { id: 'o1', userId: ownerId }]));
+      expect(((await handleVerb(agentCtx, 'get_my_permissions', {})) as Out).someoneSignedIn).toBe(true);
+      m.listActiveSessions.mockImplementation(async (_db: unknown, o: { companyId?: string } = {}) => (o.companyId ? [] : elsewhere));
+      expect(((await handleVerb(agentCtx, 'get_my_permissions', {})) as Out).someoneSignedIn).toBe(false);
+    } finally {
+      await db.insert(userCompanies).values(row);
+    }
   });
 
   it('ask_for_permission asks for a grant; never for classes that cannot have one', async () => {
@@ -1344,6 +2065,174 @@ describe('handleVerb', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The real bridge: journal entries through the app's own route, on this PGlite company
+// ---------------------------------------------------------------------------
+
+describe('against the real bridge, on a PGlite company', () => {
+  type Real = {
+    bridge: typeof import('./bridge');
+    guards: typeof import('./guards');
+    facts: typeof import('./facts');
+    describe: typeof import('./describe');
+    context: typeof import('@/lib/context');
+    grants: typeof import('@/lib/services/agentGrants');
+    registry: typeof import('./operations/registry');
+  };
+  let real: Real;
+  const acct: Record<string, string> = {};
+  const JE = 'journal-entries.create';
+
+  /** A journal entry the route posts for `amount`; its body names no amount (the operation has no amount field). */
+  const jeBody = (amount: string, description: string) => ({
+    date: '2026-03-03',
+    description,
+    lines: [
+      { accountId: acct['6300'], debit: amount },
+      { accountId: acct['1000'], credit: amount },
+    ],
+  });
+
+  async function entriesNamed(description: string): Promise<number> {
+    const rows = await db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, companyId), eq(journalEntries.description, description)));
+    return rows.length;
+  }
+
+  beforeAll(async () => {
+    real = {
+      bridge: await vi.importActual<Real['bridge']>('./bridge'),
+      guards: await vi.importActual<Real['guards']>('./guards'),
+      facts: await vi.importActual<Real['facts']>('./facts'),
+      describe: await vi.importActual<Real['describe']>('./describe'),
+      context: await vi.importActual<Real['context']>('@/lib/context'),
+      grants: await vi.importActual<Real['grants']>('@/lib/services/agentGrants'),
+      registry: await vi.importActual<Real['registry']>('./operations/registry'),
+    };
+    for (const a of await db.select().from(accounts).where(eq(accounts.companyId, companyId))) acct[a.code] = a.id;
+    expect(acct['6300'] && acct['1000']).toBeTruthy();
+  }, 120_000);
+
+  beforeEach(() => {
+    // The real modules behind the stand-ins: bridge, guards, facts, summary, the route's own
+    // context (inside the bridge's scope), live grants, and the registry's own operation.
+    m.runOperation.mockImplementation(real.bridge.runOperation);
+    m.guardInput.mockImplementation(real.guards.guardInput);
+    m.factsOf.mockImplementation(real.facts.factsOf);
+    m.describeRequest.mockImplementation(real.describe.describeRequest);
+    m.getServerContext.mockImplementation(real.context.getServerContext);
+    m.liveGrants.mockImplementation(real.grants.liveGrants);
+    const je = real.registry.operationById(JE);
+    expect(je).toBeTruthy();
+    m.ops.set(JE, je!);
+  });
+
+  it('decides again on what the run really posts: a small entry runs, a large one asks two people with its real amount', async () => {
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    // The body names no amount: on the body alone, it would need two people.
+    const small = await operate(agentCtx, { operation: JE, body: jeBody('250.00', 'Supplies, small'), requestId: rid() });
+    expect(small, JSON.stringify(small)).toMatchObject({ operation: JE, outcome: 'posted' });
+    expect(small.ledger?.entries).toHaveLength(1);
+    expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run', 'commit']);
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
+    expect(await entriesNamed('Supplies, small')).toBe(1);
+
+    m.runOperation.mockClear();
+    const large = await operate(agentCtx, { operation: JE, body: jeBody('5000.00', 'Supplies, large'), requestId: rid(), reason: 'Year-end supplies' });
+    expect(large, JSON.stringify(large)).toMatchObject({ outcome: 'asked', needs: { twoPerson: true } });
+    expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run']);
+    const req = m.createAgentRequest.mock.calls.at(-1)![1] as Out;
+    expect(req.facts.amount).toBe('5000.00');
+    expect(req.preview.ledger.entries).toHaveLength(1);
+    expect(typeof req.stalenessKey).toBe('string');
+    expect(await entriesNamed('Supplies, large')).toBe(0);
+  });
+
+  it("an approval of a request asked without a preview tries it with the approver's rights first: more than was shown is shown, nothing done", async () => {
+    usePolicy('trusted_bookkeeper');
+    const input = { body: jeBody('5000.00', 'Approved without a preview') };
+    const understated = await storedRequest(null, JE, { amount: '250.00' });
+    const r = await runApproved(approver, { id: understated, agentId, operation: JE, input }, {}, { atHost: true });
+    expect(r, JSON.stringify(r.error)).toMatchObject({ mode: 'dry_run', outcome: 'ok' });
+    expect(r.facts.amount).toBe('5000.00');
+    expect(r.preview?.ledger?.entries).toHaveLength(1);
+    expect(typeof r.stalenessKey).toBe('string');
+    expect(await entriesNamed('Approved without a preview')).toBe(0);
+
+    // Shown as it really is: it runs, as the approver, and the audit trail says who approved it.
+    const shown = await storedRequest(null, JE, { amount: '5000.00' });
+    const done = await runApproved(approver, { id: shown, agentId, operation: JE, input }, {}, { atHost: true });
+    expect(done, JSON.stringify(done.error)).toMatchObject({ mode: 'commit', outcome: 'ok' });
+    expect(await entriesNamed('Approved without a preview')).toBe(1);
+    const rows = await db.select().from(auditLogs).where(and(eq(auditLogs.companyId, companyId), eq(auditLogs.agentRequestId, shown)));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0]).toMatchObject({ agentId, approvedBy: ownerId });
+  });
+
+  it('a request as the door asks it, whose period was closed since: the approval sends it back as closed-period work, amount unknown, nothing posted', async () => {
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    const asked = await operate(agentCtx, { operation: JE, body: jeBody('5000.00', 'Closed since it was asked'), requestId: rid(), reason: 'Year-end accrual' });
+    expect(asked, JSON.stringify(asked)).toMatchObject({ outcome: 'asked', needs: { twoPerson: true } });
+    const req = m.createAgentRequest.mock.calls.at(-1)![1] as Out;
+    expect(req.facts).toMatchObject({ amount: '5000.00', closedPeriod: false });
+    expect(typeof req.stalenessKey).toBe('string');
+    // Kept as the requests service keeps it: its staleness key, and the figures the person is shown.
+    const id = await storedRequest(req.stalenessKey, JE, req.facts, req.needs.twoPerson);
+    const [before] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, companyId));
+    await db
+      .update(companies)
+      .set({ settings: { ...((before?.settings as Record<string, unknown> | null) ?? {}), closingDate: '2026-06-30' } })
+      .where(eq(companies.id, companyId));
+    try {
+      m.runOperation.mockClear();
+      const r = await runApproved(approver, { id, agentId, operation: JE, input: req.input }, {}, { atHost: true });
+      expect(r, JSON.stringify(r.error)).toMatchObject({ mode: 'dry_run', outcome: 'ok', stalenessKey: null, result: null, facts: { amount: null, closedPeriod: true } });
+      expect(String((r.preview?.routePreview as Out).note)).toMatch(/closing-date password/);
+      expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run']);
+      expect(await entriesNamed('Closed since it was asked')).toBe(0);
+    } finally {
+      await db.update(companies).set({ settings: before?.settings ?? null }).where(eq(companies.id, companyId));
+    }
+  });
+
+  it("a run under a grant has the giver's access within the agent's role, counts one use, and is recorded under it; a giver who lost the right lends nothing", async () => {
+    usePolicy('ask_every_change');
+    const [g] = await db
+      .insert(agentGrants)
+      .values({ companyId, agentId, operation: JE, class: 'enter', constraints: {}, givenBy: ownerId, expiresAt: new Date(Date.now() + 20 * 60_000) })
+      .returning();
+    const a = await operate(agentCtx, { operation: JE, body: jeBody('75.00', 'Under standing permission'), requestId: rid() });
+    expect(a, JSON.stringify(a)).toMatchObject({ outcome: 'posted', grantId: g.id });
+    const [commit] = callsOf('commit');
+    const giver = await resolveAccess(db, companyId, ownerId);
+    expect(commit.actor.access).toEqual(maskedForAgent(intersectAccess(giver.access, CEILING)));
+    expect(commit.actor.approval).toEqual({ approvedBy: null, requestId: null, grantId: g.id });
+    expect((await db.select().from(agentGrants).where(eq(agentGrants.id, g.id)))[0].uses).toBe(1);
+    const audit = await db.select().from(auditLogs).where(and(eq(auditLogs.companyId, companyId), eq(auditLogs.agentGrantId, g.id)));
+    expect(audit.length).toBeGreaterThan(0);
+    expect(audit[0]).toMatchObject({ agentId, approvedBy: null });
+    expect(await entriesNamed('Under standing permission')).toBe(1);
+    await db.update(agentGrants).set({ revokedAt: new Date() }).where(eq(agentGrants.id, g.id));
+
+    // An Admin gives one, then is made view-only: the grant no longer applies and the request is asked.
+    const admin = await member('Ada Admin', 'admin');
+    const [h] = await db
+      .insert(agentGrants)
+      .values({ companyId, agentId, operation: JE, class: 'enter', constraints: {}, givenBy: admin, expiresAt: new Date(Date.now() + 20 * 60_000) })
+      .returning();
+    await db.update(userCompanies).set({ role: 'viewer' }).where(and(eq(userCompanies.userId, admin), eq(userCompanies.companyId, companyId)));
+    m.runOperation.mockClear();
+    const b = await operate(agentCtx, { operation: JE, body: jeBody('80.00', 'After the giver lost the right'), requestId: rid(), reason: 'Office supplies' });
+    expect(b, JSON.stringify(b)).toMatchObject({ outcome: 'asked' });
+    expect(b.grantId).toBeUndefined();
+    expect(callsOf('commit')).toHaveLength(0);
+    expect((await db.select().from(agentGrants).where(eq(agentGrants.id, h.id)))[0].uses).toBe(0);
+    expect(await entriesNamed('After the giver lost the right')).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The route
 // ---------------------------------------------------------------------------
 
@@ -1375,5 +2264,28 @@ describe('POST /api/agent/actions', () => {
     const r = await post({ verb: 'get_my_permissions' });
     expect(r.status).toBe(403);
     expect(r.json.error).toBe('This is for agents.');
+  });
+
+  it('answers a slowed-down agent with 429 and Retry-After, for any verb', async () => {
+    m.getServerContext.mockResolvedValue(agentCtx);
+    for (let i = 0; i < AGENT_CALLS_PER_MINUTE; i++) await operate(agentCtx, { operation: 'nothing.here' });
+    for (const body of [{ verb: 'get_my_permissions' }, { verb: 'run_operation', operation: 'invoices.list' }]) {
+      const res = await actionsPOST(
+        new NextRequest('http://localhost:45123/api/agent/actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+      );
+      expect(res.status).toBe(429);
+      const wait = Number(res.headers.get('retry-after'));
+      expect(wait).toBeGreaterThanOrEqual(1);
+      expect(wait).toBeLessThanOrEqual(60);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      const json = (await res.json()) as Out;
+      expect(json).toMatchObject({ code: 'RATE_LIMITED', details: { retryAfterSeconds: wait } });
+      expect(json.error).toMatch(/more than 120 requests in the last minute.*Wait about/);
+    }
+    expect(m.runOperation).not.toHaveBeenCalled();
+    // Other errors are answered as before.
+    resetAgentRateLimits();
+    const unknown = await post({ verb: 'make_me_admin' });
+    expect(unknown.status).toBe(400);
   });
 });

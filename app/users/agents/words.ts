@@ -21,21 +21,107 @@ export const PRESET_HELP: Record<AgentPreset, string> = {
   ask_every_change:
     'Looks and prepares drafts by itself. Every change to the books waits for a person to say yes. Never Users & Roles, the company file or passwords.',
   trusted_bookkeeper:
-    'Enters and edits everyday transactions by itself. Protected data, changing many at once, deleting, closed periods, sending, printing, settings and company file work wait for a person. Never Users & Roles or passwords.',
+    'Looks, prepares drafts, enters and edits everyday transactions by itself. Protected data, changing many at once, deleting, closed periods, sending, printing, settings and company file work wait for a person. Never Users & Roles or passwords.',
   full_with_asks:
-    'Enters, edits and changes many records at once by itself, within a limit on how many one request may change. Everything else waits for a person: protected data, Users & Roles, the company file and passwords included.',
+    'Looks, prepares drafts, enters, edits and changes many records at once by itself, within a limit on how many one request may change. Protected data, deleting, closed periods, sending, printing, settings, Users & Roles, the company file and passwords wait for a person.',
 };
 
 /** D2: a new agent starts here: the server's own default (DEFAULT_PRESET, lib/agent/policy.ts). */
 export const NEW_AGENT_PRESET: AgentPreset = DEFAULT_PRESET;
 
 /**
- * The preset as the list and the detail page name it, with how many changes the agent has from it,
- * so an agent switched to "Read only" that still has looser changes is never shown as plain "Read only".
+ * The preset as the list and the detail page name it, with how many settings the agent has of its
+ * own (stored adjustments, AgentView.overrideCount): "Read only (adjusted: 2)". So an agent
+ * switched to "Read only" that still has looser changes is never shown as plain "Read only".
  */
 export function presetSummary(label: string, changes: number | null | undefined): string {
   if (!label || !changes || changes < 1) return label;
-  return `${label} (adjusted: ${changes} ${changes === 1 ? 'change' : 'changes'})`;
+  return `${label} (adjusted: ${changes})`;
+}
+
+/**
+ * What "(adjusted: N)" means, for its tooltip. N counts every setting of the agent's own, and one
+ * may only keep the setting its cell would follow anyway ("Kept as chosen", so a later change of
+ * preset cannot move it): an adjusted agent does not always do other than its preset. The list
+ * cannot tell (it has the count only), so it says so; the detail page passes `kept`, how many of
+ * them change nothing today (policyDraft.ts keptAsChosen), and says it exactly.
+ */
+export function adjustedTitle(changes: number | null | undefined, kept?: number): string | undefined {
+  if (!changes || changes < 1) return undefined;
+  const head = `${changes === 1 ? 'One kind of work is' : `${changes} kinds of work are`} set for this agent itself, everywhere or in an area.`;
+  if (kept === undefined) {
+    return `${head} Some may only keep the setting they would have anyway, so a later change cannot move them. Open the agent to see what it may do.`;
+  }
+  if (kept <= 0) return `${head} ${changes === 1 ? 'It changes' : 'Each one changes'} what the agent may do.`;
+  if (kept >= changes) {
+    return `${head} ${keptWords(changes, changes)} Today the agent may do just what the preset says.`;
+  }
+  return `${head} ${keptWords(kept, changes)}`;
+}
+
+/** How many of the agent's own settings only keep the setting they would have anyway. */
+function keptWords(kept: number, changes: number): string {
+  if (kept >= changes) {
+    return changes === 1
+      ? 'It only keeps the setting it would have anyway, so a later change cannot move it.'
+      : 'Each one only keeps the setting it would have anyway, so a later change cannot move them.';
+  }
+  return kept === 1
+    ? 'One of them only keeps the setting it would have anyway, so a later change cannot move it.'
+    : `${kept} of them only keep the setting they would have anyway, so a later change cannot move them.`;
+}
+
+/**
+ * Said under the preset's own line on the detail page when the agent has settings of its own, so
+ * the preset's line ("Changes nothing and asks for nothing") never claims more than is true: it
+ * describes the preset as it comes, and this says what the agent's own settings add. `kept`: how
+ * many of them only keep the setting they would have anyway (policyDraft.ts keptAsChosen).
+ */
+export function adjustedPresetNote(changes: number, looserChanges: string[], kept = 0): string | null {
+  if (changes < 1) return null;
+  let note = `That is the preset as it comes. This agent has ${changes === 1 ? 'one setting' : `${changes} settings`} of its own, so the grid below is what holds.`;
+  if (looserChanges.length > 0) {
+    note += ` ${looserChanges.length === 1 ? 'One of them lets' : `${looserChanges.length} of them let`} it do more by itself than the preset says: ${looserChanges.join('; ')}.`;
+  }
+  if (kept > 0) note += ` ${keptWords(kept, changes)}`;
+  return note;
+}
+
+// ---------------------------------------------------------------------------
+// Only an Admin lets an agent do more by itself (plan 4.4)
+// ---------------------------------------------------------------------------
+
+/** On a control that would let the agent do more by itself, for a person who is not an Admin. */
+export const ADMIN_TO_LOOSEN = 'Only an Admin can let an agent do more by itself.';
+
+/** At the top of the detail page for a person who manages agents but is not an Admin. */
+export const NOT_ADMIN_NOTE =
+  'You can make this agent stricter, pause it and take back its standing permissions. Only an Admin can let it do more by itself: a looser preset, Allow or Ask where it is stricter now, a higher limit on records per request, another folder, a higher two-person amount, a longer wait for requests, or the email notice.';
+
+/** On the list for a person who is not an Admin. */
+export const NOT_ADMIN_LIST_NOTE = 'Only an Admin can make or remove an agent. Open one to make it stricter or pause it.';
+
+/** Under the limits a person who is not an Admin may only lower. */
+export const ADMIN_TO_RAISE_CAP = 'Only an Admin can raise this limit or take it away. You can lower it.';
+/** The same, where no limit is saved: standing permissions are still held to the usual one (DEFAULT_BULK_CAP). */
+export function adminToRaiseUsualCap(usual: number): string {
+  return `With no limit saved, standing permissions are still held to the usual ${usual.toLocaleString('en-US')} records a request. Only an Admin can set a limit above that. You can set one up to ${usual.toLocaleString('en-US')}.`;
+}
+export const ADMIN_TO_RAISE_TWO_PERSON = 'Only an Admin can raise this amount or turn two-person approval off. You can lower it, or turn it on.';
+export const ADMIN_TO_ADD_FOLDER = 'Only an Admin can give an agent another folder. You can take folders off the list.';
+export const ADMIN_TO_RAISE_DAYS = 'Only an Admin can let requests wait longer. You can shorten the wait.';
+export const ADMIN_TO_NOTIFY = 'Only an Admin can turn the email notice on, since it sends email outside this computer. You can turn it off.';
+/**
+ * On Resume, for a person who is not an Admin, when the agent holds the Admin role: the server's
+ * own words (lib/services/agentPolicies.ts ADMIN_AGENT_RESUME). An agent with more access than the
+ * person in another way is refused by the server too, and that refusal is shown as it is.
+ */
+export const ADMIN_TO_RESUME_ADMIN_AGENT = 'Only an Admin can turn back on an agent that holds the Admin role.';
+
+/** By the Save button when the draft would let the agent do more, for a person who is not an Admin. */
+export function adminOnlyNote(loosenings: string[]): string {
+  const n = loosenings.length;
+  return `${ADMIN_TO_LOOSEN} ${n === 1 ? 'This change would give it' : 'These changes would give it'}: ${loosenings.join('; ')}. Put ${n === 1 ? 'it' : 'them'} back to save the rest, or ask an Admin.`;
 }
 
 /** Shown when another preset is picked and some changes still let the agent do more than it. */
@@ -95,13 +181,23 @@ export const ADMIN_ROLE_WARNING =
   'With the Admin role this agent can ask for anything an Admin can do: users and roles, backups, restoring, the company file and passwords. Every one of those requests still needs a person to say yes, and only an Admin can approve them. Choose it only if the agent needs that work.';
 
 export const POLICY_INTRO =
-  'For each kind of work: Allow lets the agent do it by itself, Ask makes it wait for a person, Never refuses it. A locked choice cannot be made for an agent.';
+  'For each kind of work: Allow lets the agent do it by itself, Ask makes it wait for a person, Never refuses it. A locked choice cannot be made for an agent. What you click is kept as chosen, even when it is the preset\'s own, so a later change of preset does not move it; "As the preset" makes it follow again.';
 
 export const AREA_INTRO =
   'Make an exception for one area, such as "Allow entry in Banking, Ask in Payroll". A kind of work not set here follows the setting for everywhere. What you choose here stays when the setting for everywhere changes, even when it is the same now; "As everywhere" makes it follow again.';
 
 export const GRANTS_INTRO =
   'Standing permission a person gave while approving a request ("this and similar ones until the end of the day"). Revoke takes it back at once; the next such request waits for a person again.';
+
+/** Why a standing permission that is still listed does nothing right now. */
+export const GRANT_PAUSED = 'Not in effect while this agent is paused. It counts again if the agent is resumed before it ends.';
+export const GRANT_ALL_PAUSED =
+  'Not in effect while every agent is paused (Preferences > Integrated Applications). It counts again if that is turned back on before it ends.';
+
+/** Asked once before a standing permission is taken back. */
+export function revokeQuestion(agentName: string, what: string): string {
+  return `${agentName} will ask a person again before "${what}", one request at a time. A person can give standing permission again when approving a request.`;
+}
 
 export const ACTIVITY_INTRO = 'Its last 200 operations and requests, newest first.';
 

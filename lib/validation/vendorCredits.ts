@@ -6,7 +6,7 @@
  * Customer:Job. The credit has the vendor's Ref. No.
  */
 import { z } from 'zod';
-import { zDate, zDecimalPositive, zLines, zMoneyPositive, zUuid } from './helpers';
+import { zDate, zDecimalPositive, zLenient, zLines, zMoneyPositive, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
 
 export const vendorCreditLineSchema = z
@@ -49,7 +49,12 @@ export const createVendorCreditSchema = z.object({
     .describe("3-letter currency code such as \"EUR\"; leave out for the vendor's currency, which it must match."),
   exchangeRate: zDecimalPositive
     .nullish()
-    .describe('Home-currency units per 1 unit of the vendor currency, as decimal text such as "1.10"; leave out for the currency list rate.'),
+    // lib/services/vendorCredits.ts updateVendorCredit: on an edit a blank rate keeps the credit's
+    // saved rate, not today's list rate. No condition is needed here: the edit refuses a vendor
+    // or currency change that would move the credit to another currency.
+    .describe(
+      "Home-currency units per 1 unit of the vendor currency, as decimal text such as \"1.10\"; on a new credit leave it out for the currency list's rate, and on an edit leaving it out keeps the saved rate.",
+    ),
   /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
   allowReconciledEdit: z
     .boolean()
@@ -57,3 +62,47 @@ export const createVendorCreditSchema = z.object({
     .describe('Edits only: send true only after the app warned that this credit is reconciled, to save the change anyway.'),
 });
 export type CreateVendorCreditBody = z.infer<typeof createVendorCreditSchema>;
+
+/**
+ * POST /api/vendor-credits/:id — apply the credit to a bill, take an application off again, or
+ * record a refund from the vendor.
+ *
+ * The route reads this body by hand, and its own checks answer first with the messages they always
+ * gave. The schema is checked after them: it says what each field is, for agents (plan §6.3), and
+ * refuses only a value the service could not use anyway (an id that is not text, an amount that is
+ * not a number). Fields the handler converts or checks itself are zLenient, so what the route
+ * accepts is unchanged.
+ */
+const vendorCreditAmount = z
+  .union([z.string(), z.number()], { invalid_type_error: 'must be an amount' })
+  .describe('Amount of the credit, as decimal text such as "125.00".');
+const applicationDate = zLenient(z.union([z.string(), z.number()]).nullable()).describe(
+  'Date it takes effect, YYYY-MM-DD; leave out for today. It can never be earlier than the credit or the bill.',
+);
+
+export const vendorCreditActionSchema = z.discriminatedUnion('action', [
+  z.object({
+    action: z.literal('apply').describe("apply: use the credit to pay part of one of the vendor's open bills."),
+    billId: z.string().min(1).describe("Id of the vendor's open bill the credit pays."),
+    amount: vendorCreditAmount.describe('Amount of the credit applied, as decimal text such as "125.00"; at most what is left on the credit and open on the bill.'),
+    date: applicationDate,
+  }),
+  z.object({
+    action: z.literal('unapply').describe('unapply: take back an amount applied to a bill earlier.'),
+    billId: z.string().min(1).describe('Id of the bill the credit was applied to.'),
+    amount: vendorCreditAmount.describe('Amount to take back, as decimal text such as "125.00"; at most what was applied to that bill.'),
+    date: applicationDate.describe('Date it takes effect, YYYY-MM-DD; leave out for today. It can never be earlier than the day the credit was applied.'),
+  }),
+  z.object({
+    action: z.literal('refund').describe('refund: record money the vendor paid back for the credit.'),
+    bankAccountId: z.string().min(1).describe('Id of the bank or cash account the refund is deposited to (chart of accounts).'),
+    amount: vendorCreditAmount.describe('Amount refunded, as decimal text such as "125.00"; at most what is left on the credit.'),
+    date: zLenient(z.union([z.string(), z.number()]).nullable()).describe(
+      "Date of the refund, YYYY-MM-DD; leave out for today. It can never be earlier than the credit's date.",
+    ),
+    memo: zLenient(z.string().nullable()).describe('Memo saved with the refund; leave out for none.'),
+    exchangeRate: zLenient(z.union([z.string(), z.number()]).nullable()).describe(
+      "Foreign-currency credits only: home-currency units per 1 unit on the refund day, as decimal text such as \"1.10\"; leave out for the currency list's rate.",
+    ),
+  }),
+]);

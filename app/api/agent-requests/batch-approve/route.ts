@@ -1,7 +1,10 @@
 /**
  * POST /api/agent-requests/batch-approve { ids } — approve several requests of the same operation
- * at once (plan 7.2, 11.2: enter and change requests only, checked by the service). Each one is
- * approved and reported on its own. Answers { results: ApproveResult[] }.
+ * at once (plan 7.2, 11.2: enter and change requests only, checked by the service). At most
+ * BATCH_APPROVE_MAX ids (lib/validation/agentAccess.ts), each id once. Each one is approved and
+ * reported on its own. Answers { results: ApproveResult[] }, exactly as the service gave them: one
+ * that was not approved ('not_approved', still waiting, with why in request.error) is reported as
+ * such, never folded into 'failed' or left out.
  *
  * A person's window only (app/api/agent-requests/_guards.ts); whether it is the host computer's own
  * is passed on, as for a single approval.

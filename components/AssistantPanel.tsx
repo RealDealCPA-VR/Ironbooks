@@ -5,11 +5,17 @@
  * company's own reports (read-only tools) and cite their sources. Any write the assistant
  * proposes appears as a card that the user must Approve (posted through the normal journal
  * service) or Reject.
+ *
+ * What an outside agent asked for is not decided here: it is approved or denied in Agent requests
+ * (app/agent-requests), the one place that shows what the work would change first. The panel lists
+ * such a request with its state and a link there, and does not count it among the things waiting
+ * for an answer (the title bar badge counts agents' requests). One left over with no request there
+ * can only be declined, which enters nothing.
  */
 import * as React from 'react';
 import Link from 'next/link';
 import { AlertTriangle, Bot, ChevronDown, ChevronRight, Cloud, Send, Sparkles, Wifi, X } from 'lucide-react';
-import { Badge, Button, Spinner, toast } from '@/components/ui';
+import { Badge, Button, Spinner, toast, type BadgeTone } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 
@@ -23,7 +29,7 @@ interface ProposalLine {
   memo: string | null;
 }
 
-interface Proposal {
+export interface Proposal {
   id: string;
   kind: string;
   summary: string;
@@ -31,6 +37,99 @@ interface Proposal {
   /** `agent` is set when an outside agent proposed it (kind 'agent_action', lib/agent/actions.ts). */
   payload: { date: string; description: string; lines?: ProposalLine[]; totalDebit: string; agent?: { name?: string } | null };
   resultRef: string | null;
+  /** Why it was not done: a run that failed, or an agent's request withdrawn or expired. */
+  error?: string | null;
+  /**
+   * Kind 'agent_action': the request it was copied into, decided in Agent requests (null when it is
+   * not there). From lib/services/aiAssistant.ts listProposals.
+   */
+  agentRequest?: { id: string; status: string; href?: string } | null;
+}
+
+/** The proposals table's kind for what an outside agent asked for (lib/agent/actions.ts). */
+const AGENT_KIND = 'agent_action';
+
+/** True for what an outside agent asked for: decided in Agent requests, never on this panel. */
+export function isAgentProposal(p: Pick<Proposal, 'kind'>): boolean {
+  return p.kind === AGENT_KIND;
+}
+
+/** The Agent requests page, opened on one request. */
+export function agentRequestsHref(requestId: string): string {
+  return `/agent-requests?id=${encodeURIComponent(requestId)}`;
+}
+
+/** Where an agent's request stands, in a few words, and what to know about it. */
+export function agentRequestState(p: Pick<Proposal, 'status' | 'error' | 'agentRequest'>): { label: string; tone: BadgeTone; note: string | null } {
+  if (p.status === 'approved') return { label: 'Done', tone: 'success', note: null };
+  if (p.status === 'failed') return { label: 'Failed', tone: 'danger', note: p.error || 'It could not be done. Open it in Agent requests to see why.' };
+  // A withdrawn or expired request is "rejected", with why in `error`; a denied one has none.
+  if (p.status === 'rejected') return p.error ? { label: 'Not done', tone: 'neutral', note: p.error } : { label: 'Denied', tone: 'neutral', note: null };
+  if (p.status === 'pending') {
+    if (!p.agentRequest) {
+      return {
+        label: 'Not in Agent requests',
+        tone: 'warning',
+        note: 'It cannot be approved here or there. Ask the agent to send it again, or enter the change yourself. Decline it to clear it from this list.',
+      };
+    }
+    if (p.agentRequest.status === 'approved') return { label: 'Being carried out', tone: 'info', note: null };
+    return { label: 'Waiting in Agent requests', tone: 'warning', note: null };
+  }
+  return { label: p.status, tone: 'neutral', note: p.error ?? null };
+}
+
+/**
+ * True for an agent's proposal that waits with no request to decide it in Agent requests (one left
+ * over from before agents' requests had their own page). It can only be declined, here.
+ */
+export function canOnlyDecline(p: Pick<Proposal, 'kind' | 'status' | 'agentRequest'>): boolean {
+  return isAgentProposal(p) && p.status === 'pending' && !p.agentRequest;
+}
+
+/**
+ * One thing an outside agent asked for: what it asked and where that stands, with a link to its
+ * request. No Approve or Reject here: that is done in Agent requests. The one exception is a row
+ * with no request there (canOnlyDecline): it gets Decline, which enters nothing and clears it.
+ */
+export function AgentRequestRow({ p, onOpen, onChange }: { p: Proposal; onOpen?: () => void; onChange?: (p: Proposal) => void }) {
+  const [busy, setBusy] = React.useState(false);
+  const state = agentRequestState(p);
+  const who = p.payload.agent?.name ? `The agent ${p.payload.agent.name}` : 'An agent';
+  async function decline() {
+    setBusy(true);
+    try {
+      const r = await api.post<{ proposal: Proposal }>(`/api/ai/proposals/${p.id}`, { action: 'reject' });
+      onChange?.(r.proposal);
+      toast('Declined. Nothing was entered.', 'info');
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'It could not be declined. Try again.', 'danger');
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="mt-2 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-semibold text-navy">{who} asked</span>
+        <Badge tone={state.tone}>{state.label}</Badge>
+      </div>
+      <div className="mt-1 text-navy/70">{p.summary}</div>
+      {state.note && <div className="mt-1 text-navy/50">{state.note}</div>}
+      {p.agentRequest && (
+        <Link href={agentRequestsHref(p.agentRequest.id)} onClick={onOpen} className="mt-2 inline-block text-electric underline">
+          Open in Agent requests
+        </Link>
+      )}
+      {onChange && canOnlyDecline(p) && (
+        <div className="mt-2 flex justify-end">
+          <Button size="sm" variant="secondary" loading={busy} disabled={busy} onClick={decline}>
+            Decline
+          </Button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 interface ToolCall {
@@ -187,9 +286,7 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
       onChange(r.proposal);
       toast(
         action === 'approve'
-          ? p.kind === 'agent_action'
-            ? 'Entered.'
-            : p.kind === 'bill'
+          ? p.kind === 'bill'
             ? 'Bill entered.'
             : p.kind === 'invoice'
               ? 'Invoice created.'
@@ -209,15 +306,13 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
     <div className="mt-2 rounded-xl border border-gold/40 bg-gold/5 p-3 text-xs">
       <div className="flex items-center justify-between gap-2 mb-2">
         <span className="font-semibold text-navy">
-          {p.kind === 'agent_action'
-            ? `Proposed by ${p.payload.agent?.name ? `the agent ${p.payload.agent.name}` : 'an agent'}`
-            : p.kind === 'bill'
-              ? 'Proposed bill'
-              : p.kind === 'invoice'
-                ? 'Proposed invoice'
-                : p.kind === 'payment'
-                  ? 'Proposed payment'
-                  : 'Proposed journal entry'}{' '}
+          {p.kind === 'bill'
+            ? 'Proposed bill'
+            : p.kind === 'invoice'
+              ? 'Proposed invoice'
+              : p.kind === 'payment'
+                ? 'Proposed payment'
+                : 'Proposed journal entry'}{' '}
           · {p.payload.date}
         </span>
         <Badge tone={p.status === 'approved' ? 'success' : p.status === 'rejected' ? 'neutral' : 'warning'}>
@@ -259,13 +354,6 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
             Approve &amp; post
           </Button>
         </div>
-      ) : p.status === 'approved' && p.kind === 'agent_action' ? (
-        <div className="mt-2 text-emerald font-semibold">
-          Entered.{' '}
-          <Link href="/audit-trail" className="underline">
-            View in the Audit Trail
-          </Link>
-        </div>
       ) : p.status === 'approved' && p.resultRef ? (
         <div className="mt-2 text-emerald font-semibold">
           {p.kind === 'bill' ? 'Entered.' : p.kind === 'invoice' ? 'Created.' : p.kind === 'payment' ? 'Recorded.' : 'Posted.'}{' '}
@@ -284,6 +372,50 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
         </div>
       ) : null}
     </div>
+  );
+}
+
+/** One proposal: the app's own as a card to approve or reject, an agent's as a row linking to Agent requests. */
+export function ProposalItem({ p, onChange, onOpen }: { p: Proposal; onChange: (p: Proposal) => void; onOpen?: () => void }) {
+  return isAgentProposal(p) ? <AgentRequestRow p={p} onOpen={onOpen} onChange={onChange} /> : <ProposalCard p={p} onChange={onChange} />;
+}
+
+/**
+ * Proposals from earlier conversations that nobody has answered yet. The count is of the app's own
+ * proposals only: what agents asked for is listed apart, and counted by the title bar badge.
+ */
+export function WaitingProposals({
+  pending,
+  onChange,
+  onOpen,
+}: {
+  pending: Proposal[];
+  onChange: (p: Proposal) => void;
+  onOpen?: () => void;
+}) {
+  const own = pending.filter((p) => !isAgentProposal(p));
+  const asked = pending.filter(isAgentProposal);
+  if (own.length === 0 && asked.length === 0) return null;
+  return (
+    <>
+      {own.length > 0 && (
+        <div>
+          <div className="text-xs font-semibold text-navy/60">Waiting for your approval ({own.length})</div>
+          {own.map((p) => (
+            <ProposalCard key={p.id} p={p} onChange={onChange} />
+          ))}
+        </div>
+      )}
+      {asked.length > 0 && (
+        <div>
+          <div className="text-xs font-semibold text-navy/60">Asked by agents</div>
+          <div className="text-[11px] text-navy/40">These are approved or denied in Agent requests, where you can see what each would change.</div>
+          {asked.map((p) => (
+            <AgentRequestRow key={p.id} p={p} onOpen={onOpen} onChange={onChange} />
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -403,14 +535,11 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
         </div>
 
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-          {pending.length > 0 && (
-            <div>
-              <div className="text-xs font-semibold text-navy/60">Waiting for your approval ({pending.length})</div>
-              {pending.map((p) => (
-                <ProposalCard key={p.id} p={p} onChange={(np) => setPending((prev) => (np.status === 'pending' ? prev.map((x) => (x.id === np.id ? np : x)) : prev.filter((x) => x.id !== np.id)))} />
-              ))}
-            </div>
-          )}
+          <WaitingProposals
+            pending={pending}
+            onOpen={onClose}
+            onChange={(np) => setPending((prev) => (np.status === 'pending' ? prev.map((x) => (x.id === np.id ? np : x)) : prev.filter((x) => x.id !== np.id)))}
+          />
           {messages.length === 0 && (
             <div className="text-sm text-navy/60">
               <p className="mb-3">
@@ -477,7 +606,7 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
                 )}
                 <Sources calls={m.reply.toolCalls} />
                 {m.reply.proposals.map((p) => (
-                  <ProposalCard key={p.id} p={p} onChange={(np) => updateProposal(i, np)} />
+                  <ProposalItem key={p.id} p={p} onOpen={onClose} onChange={(np) => updateProposal(i, np)} />
                 ))}
               </div>
             ),

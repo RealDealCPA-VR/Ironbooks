@@ -2,19 +2,47 @@
  * Agent access at the edge (middleware.ts, lib/net/agentToken.ts, lib/permissions/agentAccess.ts):
  * what a request with an Authorization header may even attempt, before any token is looked at.
  *
- *  - no pages, and nothing but GET / HEAD on the API;
+ *  - no pages, and nothing but GET / HEAD on the API at the edge (the way in then refuses HEAD);
  *  - people's requests (no Authorization header) pass exactly as before;
  *  - the token parser accepts only a well-formed agent token;
- *  - the agent route list is closed: GET only, listed patterns only, never a page.
+ *  - what an agent's own request reaches (agentRouteAllowed), as the rules are now: the one door
+ *    (POST /api/agent/actions), the agent's own reads, and GETs the registry classes as plain reads
+ *    open to agents, GET only (HEAD is refused). Without the registry's lookup only the door and the
+ *    agent's own reads pass;
+ *  - the agent's ceiling keeps the roles' Admin, areas and flags (D1, plan 5.3), while the access its
+ *    own request works with drops Users & Roles, File Utilities, the flags and Admin.
+ * lib/permissions/agentAccess.test.ts holds the full rule; this file checks the edge's side of it.
  */
 import { describe, expect, it } from 'vitest';
 import { NextRequest } from 'next/server';
 import { middleware } from '@/middleware';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/headers';
 import { API_ROUTE_PERMISSIONS } from '@/lib/permissions/routes';
-import { AGENT_ACTION_ROUTE, AGENT_DENIED_AREAS, AGENT_READ_ROUTES, agentMayPropose, agentMayWrite, agentRouteAllowed, clampForAgent, AGENT_MODES } from '@/lib/permissions/agentAccess';
+import {
+  AGENT_ACTION_ROUTE,
+  AGENT_DOOR_ONLY_AREAS,
+  AGENT_MODES,
+  AGENT_OWN_ROUTES,
+  agentDirectAccess,
+  agentMayPropose,
+  agentMayWrite,
+  agentRouteAllowed,
+  clampForAgent,
+  type AgentRouteLookup,
+} from '@/lib/permissions/agentAccess';
 import { fullAccess } from '@/lib/permissions/model';
+import { operationForPath } from '@/lib/agent/operations/registry';
 import { AGENT_TOKEN_RE, bearerAgentToken, hasAuthorization, tokenFileTag } from './agentToken';
+
+const ID = '11111111-2222-4333-8444-555555555555';
+/** A concrete path for a route pattern ("/api/invoices/[id]" -> "/api/invoices/1111…"). */
+const concrete = (pattern: string) => pattern.replace(/\[\.\.\.[^\]]+\]/g, 'a/b').replace(/\[[^\]]+\]/g, ID);
+/**
+ * The lookup the way in hands over: the registry's operation for GET on the path. A copy, so this
+ * file need not load the way in; lib/agentContext.test.ts checks that agentRequestAllowed and
+ * agentRouteAllowed with this same lookup agree on every route.
+ */
+const registry: AgentRouteLookup = (p) => operationForPath('GET', p)?.operation ?? null;
 
 const TOKEN = `ibka_0123abcd_${'A'.repeat(43)}`;
 const AUTH = { authorization: `Bearer ${TOKEN}` };
@@ -34,7 +62,11 @@ describe('middleware and the Authorization header', () => {
     // The stamp is middleware's own: a path the caller claimed is overwritten.
     expect(res.headers.get(`x-middleware-request-${ROUTE_PATH_HEADER}`)).toBe('/api/accounts');
     expect(res.headers.get(`x-middleware-request-${ROUTE_METHOD_HEADER}`)).toBe('GET');
-    expect(continued(send('HEAD', '/api/accounts', AUTH))).toBe(true);
+    // The edge lets HEAD by, stamped as HEAD; the way in refuses it (below), never the edge's word.
+    const head = send('HEAD', '/api/accounts', AUTH);
+    expect(continued(head)).toBe(true);
+    expect(head.headers.get(`x-middleware-request-${ROUTE_METHOD_HEADER}`)).toBe('HEAD');
+    expect(agentRouteAllowed('/api/accounts', 'HEAD', registry)).toBe(false);
   });
 
   it('refuses every other method on the API, for any Authorization header', async () => {
@@ -108,14 +140,19 @@ describe('the token parser', () => {
 });
 
 describe('what an agent may reach', () => {
-  it('only reads on the listed routes', () => {
-    for (const p of AGENT_READ_ROUTES) {
-      const concrete = p.replace(/\[[^\]]+\]/g, '11111111-2222-4333-8444-555555555555');
-      expect(agentRouteAllowed(concrete, 'GET'), p).toBe(true);
-      expect(agentRouteAllowed(concrete, 'get'), p).toBe(true);
-      expect(agentRouteAllowed(concrete, 'HEAD'), p).toBe(true);
-      for (const m of ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', '']) expect(agentRouteAllowed(concrete, m), `${m} ${p}`).toBe(false);
-      // Every listed route exists in the map with a GET rule that is not public or self.
+  it("its own reads, GET only: HEAD is refused (it runs the GET handler and no agent needs it)", () => {
+    expect(AGENT_OWN_ROUTES.length).toBeGreaterThan(0);
+    for (const p of AGENT_OWN_ROUTES) {
+      const path = concrete(p);
+      expect(agentRouteAllowed(path, 'GET'), p).toBe(true);
+      expect(agentRouteAllowed(path, 'get'), p).toBe(true);
+      // The same with the registry's lookup: an own read never needs it.
+      expect(agentRouteAllowed(path, 'GET', registry), p).toBe(true);
+      for (const m of ['HEAD', 'head', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', '']) {
+        expect(agentRouteAllowed(path, m), `${m} ${p}`).toBe(false);
+        expect(agentRouteAllowed(path, m, registry), `${m} ${p} (registry)`).toBe(false);
+      }
+      // Every own route exists in the map with a GET rule that is not public or self.
       const rule = API_ROUTE_PERMISSIONS[p]?.GET;
       expect(rule, p).toBeDefined();
       expect(rule, p).not.toBe('public');
@@ -123,37 +160,65 @@ describe('what an agent may reach', () => {
     }
   });
 
-  it('nothing else: the list is closed', () => {
+  it('without the registry, only the door and its own reads: everything else is closed', () => {
     expect(agentRouteAllowed(AGENT_ACTION_ROUTE, 'POST')).toBe(true);
-    for (const m of ['GET', 'PUT', 'PATCH', 'DELETE']) expect(agentRouteAllowed(AGENT_ACTION_ROUTE, m), m).toBe(false);
-    const allowed = new Set<string>([...AGENT_READ_ROUTES, AGENT_ACTION_ROUTE]);
-    const others = Object.keys(API_ROUTE_PERMISSIONS).filter((p) => !allowed.has(p));
+    for (const m of ['GET', 'HEAD', 'PUT', 'PATCH', 'DELETE']) expect(agentRouteAllowed(AGENT_ACTION_ROUTE, m), m).toBe(false);
+    const open = new Set<string>([...AGENT_OWN_ROUTES, AGENT_ACTION_ROUTE]);
+    const others = Object.keys(API_ROUTE_PERMISSIONS).filter((p) => !open.has(p));
     expect(others.length).toBeGreaterThan(400);
     for (const p of others) {
-      const concrete = p.replace(/\[\.\.\.[^\]]+\]/g, 'a/b').replace(/\[[^\]]+\]/g, 'x1');
-      expect(agentRouteAllowed(concrete, 'GET'), p).toBe(false);
-      expect(agentRouteAllowed(concrete, 'POST'), p).toBe(false);
+      expect(agentRouteAllowed(concrete(p), 'GET'), p).toBe(false);
+      expect(agentRouteAllowed(concrete(p), 'POST'), p).toBe(false);
     }
     for (const p of [null, undefined, '', '/', '/dashboard', '/api', '/apix/accounts', '/api/accounts/../users', '/api/accounts/x/y/z']) {
       expect(agentRouteAllowed(p, 'GET'), String(p)).toBe(false);
+      expect(agentRouteAllowed(p, 'GET', registry), `${String(p)} (registry)`).toBe(false);
     }
     expect(agentRouteAllowed('/api/accounts', null)).toBe(false);
+    expect(agentRouteAllowed('/api/accounts', null, registry)).toBe(false);
   });
 
-  it('no route on the list belongs to Users & Roles or File Utilities', () => {
-    for (const p of AGENT_READ_ROUTES) {
-      const rule = API_ROUTE_PERMISSIONS[p].GET;
-      if (rule && typeof rule === 'object') expect(AGENT_DENIED_AREAS, p).not.toContain(rule.area);
+  it('with the registry, a GET it classes as a plain read open to agents; HEAD and every change still refused', () => {
+    // Reads a bookkeeper needs every day.
+    for (const p of ['/api/accounts', '/api/customers', `/api/invoices/${ID}`, '/api/reports/std/profit-loss']) {
+      expect(agentRouteAllowed(p, 'GET', registry), p).toBe(true);
+      expect(agentRouteAllowed(p, 'HEAD', registry), `HEAD ${p}`).toBe(false);
+      for (const m of ['POST', 'PUT', 'PATCH', 'DELETE']) expect(agentRouteAllowed(p, m, registry), `${m} ${p}`).toBe(false);
+    }
+    // Not a plain read, or not for agents: through the door, or not at all.
+    for (const p of ['/api/backup', '/api/network-policy', '/api/reports/1099-xml', `/api/attachments/${ID}`, '/api/auth/me', '/api/agents', '/api/agent-requests']) {
+      expect(agentRouteAllowed(p, 'GET', registry), p).toBe(false);
     }
   });
 
-  it('an Admin-wide access is cut down for an agent, and the mode decides what happens to a change', () => {
-    const access = clampForAgent(fullAccess());
-    expect(access.isAdmin).toBe(false);
-    expect(access.roleKeys).toEqual([]);
-    for (const area of AGENT_DENIED_AREAS) expect(access.permissions[area]).toEqual([]);
-    expect(Object.values(access.flags).some(Boolean)).toBe(false);
-    expect(access.permissions.banking.length).toBeGreaterThan(0);
+  it('nothing of Users & Roles or File Utilities, even with the registry', () => {
+    expect(AGENT_DOOR_ONLY_AREAS).toEqual(['users', 'file_utilities']);
+    for (const p of AGENT_OWN_ROUTES) {
+      const rule = API_ROUTE_PERMISSIONS[p].GET;
+      if (rule && typeof rule === 'object') expect(AGENT_DOOR_ONLY_AREAS, p).not.toContain(rule.area);
+    }
+    for (const [pattern, rules] of Object.entries(API_ROUTE_PERMISSIONS)) {
+      const rule = rules.GET;
+      if (!rule || typeof rule !== 'object' || !AGENT_DOOR_ONLY_AREAS.includes(rule.area)) continue;
+      expect(agentRouteAllowed(concrete(pattern), 'GET', registry), pattern).toBe(false);
+    }
+  });
+
+  it("the ceiling keeps the roles' Admin, areas and flags; the agent's own request gets none of them", () => {
+    // The ceiling (D1, plan 5.3): the door asks within it, so it is the roles' access as it is.
+    const ceiling = clampForAgent(fullAccess());
+    expect(ceiling.isAdmin).toBe(true);
+    expect(ceiling.roleKeys).toEqual(['admin']);
+    for (const area of AGENT_DOOR_ONLY_AREAS) expect(ceiling.permissions[area].length, area).toBeGreaterThan(0);
+    expect(ceiling.flags).toEqual(fullAccess().flags);
+    // Admin only with the Admin role itself.
+    expect(clampForAgent({ ...fullAccess(), roleKeys: ['bookkeeper'] }).isAdmin).toBe(false);
+    // The access of the agent's own request: no Admin, no door-only areas, no flags.
+    const direct = agentDirectAccess(fullAccess());
+    expect(direct.isAdmin).toBe(false);
+    for (const area of AGENT_DOOR_ONLY_AREAS) expect(direct.permissions[area], area).toEqual([]);
+    expect(Object.values(direct.flags).some(Boolean)).toBe(false);
+    expect(direct.permissions.banking.length).toBeGreaterThan(0);
     // The original is not changed.
     expect(fullAccess().isAdmin).toBe(true);
     // Only Post enters changes itself; Propose asks; Read only neither.

@@ -3,7 +3,7 @@
  * Debit-xor-credit and balance enforcement stay in postJournalEntry.
  */
 import { z } from 'zod';
-import { zDate, zLines, zMoney, zUuid } from './helpers';
+import { zDate, zLenient, zLines, zMoney, zUuid } from './helpers';
 
 export const postingLineSchema = z.object({
   accountId: zUuid.describe('Id of the account this line posts to (chart of accounts).'),
@@ -48,3 +48,13 @@ export type CreateJournalEntryBody = z.infer<typeof createJournalEntrySchema>;
  */
 export const updateJournalEntrySchema = createJournalEntrySchema;
 export type UpdateJournalEntryBody = z.infer<typeof updateJournalEntrySchema>;
+
+/**
+ * POST /api/journal-entries/:id/reverse — the body is optional. The route reads it by hand and its
+ * own date check answers first, so the field is zLenient: what the route accepts is unchanged.
+ */
+export const reverseJournalEntrySchema = z.object({
+  asOfDate: zLenient(z.string().nullable()).describe(
+    'Date of the reversing entry, YYYY-MM-DD; leave out for the first day of the month after the original entry.',
+  ),
+});

@@ -10,6 +10,8 @@ import { getServerContext } from '@/lib/context';
 import { createReport, listReports } from '@/lib/services/expenseReports';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject, assertStringFields } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { createExpenseReportSchema } from '@/lib/validation/expenseReports';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -42,6 +44,10 @@ export async function POST(req: NextRequest) {
     if (Array.isArray(body.lines) && body.lines.some((l: Record<string, unknown>) => l.date && Number.isNaN(new Date(l.date as string).getTime()))) {
       return NextResponse.json({ error: 'An expense line date is not a valid date.', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/expenseReports.ts). The checks above and
+    // the service's own answer as before: this refuses nothing they let through.
+    const checked = createExpenseReportSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const lines = Array.isArray(body.lines)
       ? body.lines.map((l: Record<string, unknown>) => ({

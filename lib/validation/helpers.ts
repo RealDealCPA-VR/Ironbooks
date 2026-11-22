@@ -163,6 +163,30 @@ export function zLines<T extends z.ZodTypeAny>(line: T) {
     .describe('The lines of the document; at least one.');
 }
 
+/**
+ * A field of a route that reads its body by hand: the schema says what the field is, but a value
+ * of another type still gets through, because the handler ignores or converts it and the service
+ * checks it. That way adding the schema (so agents can read the body, plan §6.3) leaves what the
+ * route accepts unchanged. Only for a schema the route checks the body with, never one whose
+ * parsed data it uses: the value comes out as undefined.
+ */
+export function zLenient<T extends z.ZodTypeAny>(schema: T) {
+  return schema.optional().catch(undefined);
+}
+
+/**
+ * `shape` with `.describe(texts[k])` on every field, for two schemas built from one shared shape
+ * that need different words (a create and its edit). The texts are typed by the shape's keys, so
+ * a field added to the shape later fails the typecheck until it is described here, instead of
+ * being missing from a schema that lists the fields by hand (and so stripped from what a person
+ * sends).
+ */
+export function describeShape<S extends z.ZodRawShape>(shape: S, texts: { readonly [K in keyof S]: string }): S {
+  const out: Record<string, z.ZodTypeAny> = {};
+  for (const k of Object.keys(shape) as Array<keyof S & string>) out[k] = shape[k].describe(texts[k]);
+  return out as S;
+}
+
 // ---------------------------------------------------------------------------
 // 400 response body
 // ---------------------------------------------------------------------------
@@ -191,4 +215,13 @@ export function zodErrorBody(error: z.ZodError): ValidationErrorBody {
     fields: error.flatten().fieldErrors as Record<string, string[] | undefined>,
     issues,
   };
+}
+
+/**
+ * The same refusal as a ServiceError VALIDATION (400), for a route that answers every error
+ * through its own ServiceError helper: `throw bodyValidationError(parsed.error)` inside its try.
+ */
+export function bodyValidationError(error: z.ZodError): ServiceError {
+  const { error: message, fields, issues } = zodErrorBody(error);
+  return new ServiceError('VALIDATION', message, { fields, issues });
 }

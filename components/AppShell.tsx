@@ -674,7 +674,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // 'turned off' message, and the server refuses their saves (lib/featureGate.ts).
   const prefs = usePreferences(!bare);
   // Agent full access: "Agent requests" is on the menu (and found by search) only while the
-  // company has an agent; the same poll as its count bubble and the title bar.
+  // company has an agent; the same poll as its count bubble and the title bar. The command bar
+  // is told too, so "go to agent requests" says where an agent is connected instead of opening it.
   const hasAgents = (useAgentRequestCount(!bare)?.agents ?? 0) > 0;
   const hiddenPaths = React.useMemo(
     () =>
@@ -898,7 +899,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         {/* F5 (QuickBooks' Refresh) starts the page area over in place: components/PageRefresh.tsx. */}
         <PageRefresh>{blockedGate ? <FeatureOff gate={blockedGate} /> : noAccess ? <NoAccess pathname={pathname} /> : children}</PageRefresh>
       </main>
-      <CommandPalette permissions={me?.permissions} hiddenPaths={hiddenPaths} />
+      <CommandPalette permissions={me?.permissions} hiddenPaths={hiddenPaths} hasAgents={hasAgents} />
       <AssistantPanel open={assistantOpen} onClose={closeAssistant} />
       <GlobalShortcuts />
       <PreferenceBehaviors />

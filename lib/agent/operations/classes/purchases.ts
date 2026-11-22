@@ -7,9 +7,18 @@
  * the body's and the answer's figure, so a typed figure the route ignores cannot lower it). Where the
  * answer lists one figure per row (a batch count's applied[].glAmount), a '*' path adds them up.
  * A request with no amount counts as over every amount limit until its dry run. After it the bridge
- * (lib/agent/bridge.ts factsFor) takes the larger of that figure and the largest SINGLE ledger entry
- * the run posted (with no amountField, the entry alone), which is only the largest row of a request
- * that posts an entry per row.
+ * (lib/agent/bridge.ts factsFor) reads the run's whole ledger: the entries it posted, and the
+ * entries already in the books that it voided, deleted or changed in place. With an amountField the
+ * amount is the larger of that field and the largest SINGLE one of those entries, which is only the
+ * largest row of a request that posts an entry per row (so those name their rows with '*'). With
+ * none it is all of them added up, and "0.00" for a run that posted and touched no entry. A void
+ * posts nothing new (it marks the existing entry void), but the bridge counts the voided entry at
+ * its total, so a void is sized by the larger of its amountField and that entry.
+ *
+ * Confirmation flags: the bill payment and vendor credit body schemas carry allowReconciledEdit
+ * because one schema serves the new record and the edit, but only the edit asks for it
+ * (updateBillPayment, updateVendorCredit; a new record has no reconciled lines), so it is listed on
+ * the PATCH entries alone.
  *
  * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
  * ".post", with a short verb: vendors.bulk.save, inventory.adjust, fifo.adjust.
@@ -17,11 +26,16 @@
 import type { ClassificationMap } from '../types';
 
 // The default "Main Warehouse" site is created by ensureDefaultSite (lib/services/inventorySites.ts)
-// the first time a company's sites are read. It has no read-only guard, so the GETs that reach it
-// can write once per company and are classed as what that write is: a new list entry.
+// the first time a company's sites are read, or by the first site operation of any kind. It has no
+// read-only guard. The GETs that reach it are still reads: an agent's read runs on the read-only
+// database handle (lib/agent/bridge.ts, mode 'read'), so that one write can never happen under an
+// agent's name. Classing them 'enter' instead made listing sites ask a person every time and kept a
+// Read only agent from listing them at all, for a write that happens once per company.
 const MAKES_DEFAULT_SITE =
-  'Creates the company\'s default inventory site ("Main Warehouse") the first time it runs when none exists ' +
-  '(ensureDefaultSite has no read-only guard); after that it only reads.';
+  'Read only for an agent: the first call on a company with no default inventory site would create ' +
+  '"Main Warehouse" (ensureDefaultSite has no read-only guard), and the read-only database handle refuses ' +
+  'that write, so on such a company the read fails with "This connection can only read the books" until a ' +
+  'person opens the inventory sites. After that it only reads.';
 
 // ensureSeeded (lib/services/lists/simpleLists.ts) saves the default Terms list on a person's first
 // read; it returns early only when ctx.readOnly is set.
@@ -132,12 +146,14 @@ export const PURCHASES_CLASSES: ClassificationMap = {
     why:
       'Classed by its riskiest part. One Pay Bills save (payBillsWithCredits) can also apply vendor credits ' +
       'and General Journal credits to existing bills, which is a change, and a save with credits only ' +
-      'makes no payment at all (payment is null, so there is no amount and the two-person rule treats ' +
-      'it as above the limit). The amount is the cash paid only: credits applied in the same save are ' +
-      'reported apart in the answer (creditsApplied) and are not counted, so the approval card and the ' +
-      'ledger preview are where a large credit shows.',
+      'makes no payment at all (payment is null). The amount is the larger of the cash paid and the ' +
+      'credits applied, so a $1 check that applies a $50,000 credit is judged at $50,000: amountField is ' +
+      'the answer\'s creditsApplied (one total of every credit used), and the cash payment posts its own ' +
+      'new ledger entry, which the bridge takes when it is larger. A save that both pays and applies ' +
+      'credits is judged by the larger of the two, not their sum. Until the dry run has answered, the ' +
+      'amount is unknown and counts as over every amount limit.',
     confirmFlags: ['allowDuplicateNumber'],
-    amountField: 'payment.amount',
+    amountField: 'creditsApplied',
   },
   'GET /api/bill-payments/[id]': { class: 'read', describe: 'Show bill payment {id}' },
   'PATCH /api/bill-payments/[id]': {
@@ -159,7 +175,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'POST /api/bill-payments/journal-items': {
     class: 'change',
     id: 'bill-payments.journal-items.apply',
-    describe: 'Apply or remove a General Journal vendor credit ({action})',
+    describe: 'Apply or remove a General Journal vendor credit (action: {action})',
     why: 'Applies a General Journal credit to a bill or amount owed, or takes one off: applying credits is a change.',
     amountField: 'amount',
   },
@@ -174,7 +190,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/vendor-credits/[id]': { class: 'read', describe: 'Show vendor credit {id}' },
   'POST /api/vendor-credits/[id]': {
     class: 'change',
-    describe: 'Apply, unapply or refund vendor credit {id} ({action}, {amount})',
+    describe: 'Apply, unapply or refund vendor credit {id} (action: {action}, amount: {amount})',
     why:
       'Applies the credit to a bill or takes it off (a change), or records the vendor\'s refund into a bank ' +
       'account (a new deposit, no higher than change).',
@@ -209,7 +225,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/purchase-orders/[id]': { class: 'read', describe: 'Show purchase order {id}' },
   'POST /api/purchase-orders/[id]': {
     class: 'change',
-    describe: 'Purchase order {id}: {action}',
+    describe: 'Turn purchase order {id} into a bill, void it or close it (action: {action})',
     why:
       'convert enters the bill for the order (posting what was pending), void and close change the order\'s ' +
       'status: all changes to an existing record.',
@@ -270,7 +286,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/expense-reports/[id]': { class: 'read', describe: 'Show expense report {id}' },
   'POST /api/expense-reports/[id]': {
     class: 'change',
-    describe: 'Expense report {id}: {action}',
+    describe: 'Submit or reimburse expense report {id} (action: {action})',
     why: 'submit moves the draft on; reimburse posts the report and pays the employee from a bank account (posting a pending one).',
     amountField: 'total',
   },
@@ -285,7 +301,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/item-receipts/[id]': { class: 'read', describe: 'Show item receipt {id}' },
   'POST /api/item-receipts/[id]': {
     class: 'change',
-    describe: 'Item receipt {id}: {action}',
+    describe: 'Turn item receipt {id} into a bill, or void it (action: {action})',
     why: 'convert enters the bill for the received items (posting what was pending); void reverses the receipt.',
     confirmFlags: ['allowDuplicateNumber'],
     amountField: 'total',
@@ -302,7 +318,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'POST /api/inventory': {
     class: 'enter',
     id: 'inventory.adjust',
-    describe: 'Adjust the quantity of item {itemId} ({action})',
+    describe: 'Adjust the quantity of item {itemId} (action: {action})',
     amountField: 'glAmount',
   },
   'POST /api/inventory/batch-count': {
@@ -311,8 +327,8 @@ export const PURCHASES_CLASSES: ClassificationMap = {
     why:
       'Posts one quantity adjustment per counted item, each its own ledger entry. The amount is the size of ' +
       'all of them together: each counted item has its own glAmount under applied in the answer, and ' +
-      'applied.*.glAmount adds them up (shrinkage and overage both count by size). Without it the bridge ' +
-      'would judge the count by its largest single adjustment.',
+      'applied.*.glAmount adds them up (shrinkage and overage both count by size). With an amountField the ' +
+      'bridge compares the field only with the largest single entry, so the field must be the whole count\'s.',
     countField: 'counts',
     amountField: 'applied.*.glAmount',
   },
@@ -320,7 +336,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/inventory/center/[id]': { class: 'read', describe: 'Show inventory item {id}' },
   'POST /api/inventory/physical-count': {
     class: 'enter',
-    describe: 'Record a physical count of item {itemId}: {countedQty} on {date}',
+    describe: 'Record a physical count of {countedQty} for item {itemId} on {date}',
     amountField: 'glAmount',
   },
   'GET /api/inventory/reorder': { class: 'read', describe: 'List items to reorder' },
@@ -350,7 +366,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
 
   // Inventory sites, bins and per-site reorder points (Advanced Inventory).
   'GET /api/inventory-sites': {
-    class: 'enter',
+    class: 'read',
     describe: 'List inventory sites',
     why: MAKES_DEFAULT_SITE,
   },
@@ -366,7 +382,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'POST /api/inventory-sites/bins': { class: 'enter', describe: 'Add bin {name}' },
   'PATCH /api/inventory-sites/bins/[id]': { class: 'change', describe: 'Change bin {id}' },
   'GET /api/inventory-sites/reorder-points': {
-    class: 'enter',
+    class: 'read',
     describe: 'List reorder points by site',
     why: MAKES_DEFAULT_SITE,
   },
@@ -375,7 +391,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
     describe: 'Set the reorder point of item {itemId} at site {siteId}',
   },
   'GET /api/inventory-sites/reports': {
-    class: 'enter',
+    class: 'read',
     describe: 'Run the inventory-by-site report {report}',
     why: MAKES_DEFAULT_SITE,
   },
@@ -408,7 +424,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   },
   'POST /api/assemblies/build': {
     class: 'enter',
-    describe: 'Build or unbuild {quantity} of assembly {assemblyItemId} ({action})',
+    describe: 'Build or unbuild {quantity} of assembly {assemblyItemId} (action: {action})',
     why: PARTIAL_BUILD_SCHEMA,
   },
   'GET /api/assemblies/pending': { class: 'read', describe: 'List pending builds' },
@@ -421,7 +437,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   },
   'POST /api/assemblies/pending/[id]': {
     class: 'change',
-    describe: 'Pending build {id}: {action}',
+    describe: 'Finalize or cancel pending build {id} (action: {action})',
     why: 'finalize builds the queued quantity (posting a pending one); cancel drops it. ' + PARTIAL_BUILD_SCHEMA,
   },
 
@@ -430,7 +446,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'POST /api/fifo': {
     class: 'enter',
     id: 'fifo.adjust',
-    describe: 'Receive or use stock of item {itemId} at FIFO cost ({action})',
+    describe: 'Receive or use stock of item {itemId} at FIFO cost (action: {action})',
     amountField: 'glAmount',
   },
 

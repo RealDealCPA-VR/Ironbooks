@@ -1,6 +1,7 @@
 /** Request bodies for the guided month-end close API (app/api/month-end-close/**). */
 import { z } from 'zod';
 import { MONTH_END_STEP_KEYS } from '@/lib/services/monthEndClose';
+import { zCurrentClosingPassword } from './company';
 
 const zPeriodEnd = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be a date (YYYY-MM-DD)');
 const zVersion = z
@@ -31,3 +32,6 @@ export const monthEndCloseSchema = z
     version: zVersion,
   })
   .strict();
+
+/** POST /api/month-end-close/close: the month-end body plus the current closing-date password (still strict: nothing else). */
+export const monthEndCloseBodySchema = monthEndCloseSchema.extend({ currentPassword: zCurrentClosingPassword });

@@ -9,8 +9,7 @@ import { accounts, aiSettings, companies, currencies, users, userCompanies } fro
 import type { ServiceContext } from './_base';
 import { ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
-import { getRequestOrigin } from '@/lib/net/requestInfo';
-import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
+import { limitClosingPasswordGuess } from '@/lib/closingPasswordLimiter';
 import { assertWrite } from './rbac';
 import { requireEffectivePermission, requirePermission } from './access';
 import { stripSecrets } from '@/lib/permissions/mask';
@@ -480,36 +479,16 @@ function closingChangeNeedsPassword(before: ClosingDateSettings, input: SetClosi
 
 /**
  * Check the current closing-date password given with a change. Guesses share the sign-in-style
- * limiter and keys of the x-closing-password check in lib/context.ts (per person in this company,
- * plus the global cap), so they can't be spread over the two ways in.
+ * limiter and keys of the x-closing-password check in lib/context.ts and of an agent's approval
+ * card (lib/closingPasswordLimiter.ts: per person in this company, plus the global cap), so they
+ * can't be spread over the ways in.
  */
 async function assertCurrentClosingPassword(ctx: ServiceContext, hash: string, supplied: string | null | undefined): Promise<void> {
   if (typeof supplied !== 'string' || supplied === '') {
     throw new ServiceError('FORBIDDEN', CLOSING_CURRENT_PASSWORD_NEEDED, { currentPasswordRequired: true });
   }
-  const origin = await getRequestOrigin();
-  const limiter = loginLimiter();
-  const keys = attemptKeys('closing-password', `${ctx.companyId}:${ctx.userId ?? ''}`, origin.addr).filter((k) => !k.includes(':addr:'));
-  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
-  const gate = limiter.begin(keys, Date.now(), weights);
-  if (!gate.allowed) {
-    const secs = Number(tooManyAttempts(gate.retryAfterMs).retryAfter);
-    throw new ServiceError(
-      'FORBIDDEN',
-      `Too many wrong closing-date passwords. Try again in ${secs < 90 ? `${secs} seconds` : `${Math.ceil(secs / 60)} minutes`}.`,
-      { rateLimited: true, retryAfterSeconds: secs },
-    );
-  }
-  try {
-    if (await verifyPassword(supplied, hash)) {
-      limiter.recordSuccess(keys.slice(0, -1));
-      return;
-    }
-    limiter.recordFailure(keys, Date.now(), weights);
-    throw new ServiceError('FORBIDDEN', CLOSING_CURRENT_PASSWORD_WRONG, { currentPasswordRequired: true });
-  } finally {
-    gate.release();
-  }
+  const right = await limitClosingPasswordGuess(ctx, () => verifyPassword(supplied, hash));
+  if (!right) throw new ServiceError('FORBIDDEN', CLOSING_CURRENT_PASSWORD_WRONG, { currentPasswordRequired: true });
 }
 
 function closingPasswordHashOf(settings: unknown): string | null {

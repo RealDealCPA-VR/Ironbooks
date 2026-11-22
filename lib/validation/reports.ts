@@ -254,3 +254,58 @@ export const updateCommentedReportSchema = z.object({
   name: z.string().trim().min(1, 'Give the commented report a name').max(255).optional(),
   comments: z.array(commentSchema).max(200).optional(),
 });
+
+/** POST /api/memorized-reports/process — Process Multiple Reports. */
+export const processReportsSchema = z.object({
+  groupId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Id of a memorized report group: runs every report in it. Send this or ids.'),
+  ids: z
+    .array(z.string().uuid())
+    .max(100)
+    .optional()
+    .describe('Ids of the memorized reports to run, at most 100; used when groupId is left out.'),
+  format: z
+    .enum(['json', 'xlsx'])
+    .default('json')
+    .describe('json (the default) answers each report as data; xlsx answers one Excel workbook with a sheet per report.'),
+});
+
+/** A cell of an exported report: text, a number, or empty. */
+const exportCellSchema = z.union([z.string(), z.number(), z.null()]);
+
+/**
+ * POST /api/export/reports — the report table already on screen (columns, rows, totals), turned
+ * into an Excel or PDF file.
+ */
+export const exportReportSchema = z.object({
+  format: z.enum(['xlsx', 'pdf']).describe('The file to make: xlsx (Excel) or pdf.'),
+  filename: z.string().min(1).max(120).describe('File name of the download, without a folder; the extension is added when it is missing.'),
+  title: z.string().min(1).max(200).describe('Report title printed at the top (and the Excel sheet name).'),
+  subtitle: z.string().max(300).optional().describe('Second heading line, such as the date range; leave out for none.'),
+  columns: z
+    .array(
+      z.object({
+        header: z.string().max(120).describe('Column heading.'),
+        numeric: z.boolean().optional().describe('True for a column of amounts or numbers (right-aligned).'),
+      }),
+    )
+    .min(1)
+    .max(64)
+    .describe('The columns, left to right; 1 to 64.'),
+  rows: z
+    .array(z.array(exportCellSchema))
+    .max(50_000)
+    .describe('The rows, each a list of cells in column order (text, a number or null); at most 50,000.'),
+  totals: z
+    .array(z.array(exportCellSchema))
+    .max(200)
+    .optional()
+    .describe('Total rows printed after the rows, in the same cell format; leave out for none.'),
+  landscape: z
+    .boolean()
+    .optional()
+    .describe('PDF only: true for landscape pages; leave out to turn landscape on when there are more than 6 columns.'),
+});

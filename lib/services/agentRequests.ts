@@ -48,15 +48,30 @@
  * Requests copied from the old proposals (proposal_id set, operation "action:<name>") still run
  * the old way (runApprovedAgentAction in lib/agent/actions.ts, as Ask AI approves them) and settle
  * the ai_proposals row in the same step, so Ask AI and the approval center show one state.
+ *
+ * What a view carries besides the row (wave 3):
+ *  - `stale`: the request is waiting in a stale round, so its preview is the new one and a yes must
+ *    be given again on it;
+ *  - `posted` and `entryIds`: what the committed run itself posted to the ledger, kept beside its
+ *    answer when it is recorded (not guessed from the preview a person approved);
+ *  - `grant` and `grantError`: the standing permission actually given with the approval, or why
+ *    none was given when the approver asked for some (the run itself still counts as done);
+ *  - for a person: whether THIS window may approve it (`atHost`: a teammate's window never may
+ *    approve host-only work), a desktop flow's questions, and the standing window grantMinutesFor
+ *    (lib/services/agentGrants.ts) allows, so the card never offers one createGrant then refuses.
+ *
+ * A desktop (shell) run that fails ends the request for good: it never goes back to waiting and is
+ * never run again under the same id (the shell itself refuses an id it has seen).
  */
 import { EventEmitter } from 'node:events';
 import { and, desc, eq, gt, inArray, isNull, lte, or, sql } from 'drizzle-orm';
-import { getDb, resolveDataDir, type DB } from '@/lib/db';
+import { getDb, type DB } from '@/lib/db';
 import { agentPermissionRequests, agents, aiProposals, auditLogs, companies, userCompanies, users } from '@/lib/db/schema';
 import { isReadOnlyDb } from '@/lib/db/readOnly';
 import { inServiceScope } from '@/lib/context';
 import {
   ASKS_PER_HOUR_BEFORE_PAUSE,
+  PREVIEW_ROW_LIMIT,
   WAIT_MAX_SECONDS,
   type AgentRequestForPerson,
   type AgentRequestKind,
@@ -64,12 +79,14 @@ import {
   type ApproveAgentRequest,
   type ApproveInput,
   type ApproveResult,
+  type BadgeForPerson,
   type BatchApprove,
   type BridgeResult,
   type CancelAgentRequest,
   type CreateAgentRequest,
   type DenyAgentRequest,
   type ExpireRequests,
+  type FlowQuestion,
   type ListRequestsForAgent,
   type ListRequestsForPerson,
   type OperationInput,
@@ -83,6 +100,7 @@ import {
 } from '@/lib/agent/contract';
 import {
   ADMIN_APPROVAL_CLASSES,
+  GRANTABLE,
   REQUEST_STATUSES,
   RISK_CLASS_LABELS,
   isRiskClass,
@@ -95,20 +113,19 @@ import {
   type SecretKind,
 } from '@/lib/agent/operations/types';
 import { operationById } from '@/lib/agent/operations/registry';
+import { SHELL_OPERATIONS } from '@/lib/agent/operations/shell';
 import {
   DEFAULT_REQUEST_EXPIRY_DAYS,
   SHORT_GRANT_MINUTES,
   approvalNeeds,
   classRank,
   effectiveClass as effectiveClassOf,
-  maxGrantMinutes,
-  minutesToEndOfDay,
   roleProblem,
 } from '@/lib/agent/policy';
 import { guardInput } from '@/lib/agent/guards';
 import { describeRequest } from '@/lib/agent/describe';
 import { runApproved } from '@/lib/agent/operate';
-import { agentAction, agentInputHash, runApprovedAgentAction, type AnyAction } from '@/lib/agent/actions';
+import { agentAction, agentInputHash, changesInTransaction, runApprovedAgentAction, type AnyAction } from '@/lib/agent/actions';
 // The old proposals' actions run through the catalog, which registers itself when loaded (as
 // lib/services/aiAssistant.ts does for Ask AI's approvals).
 import '@/lib/agent/catalog';
@@ -116,7 +133,7 @@ import { FLAGS, legacyRoleFor, type Area, type EffectiveAccess, type Flag } from
 import { maskAccountNumber, maskSensitive, maskSsn, stripSecrets } from '@/lib/permissions/mask';
 import { authorizeRequest } from '@/lib/permissions/enforce';
 import { loadAgentPolicy } from './agentPolicies';
-import { createGrant } from './agentGrants';
+import { createGrant, grantMinutesFor } from './agentGrants';
 import { requireFileAdmin, resolveAccess } from './access';
 import { sendMail } from './email';
 import { listActiveSessions } from './sessions';
@@ -187,22 +204,23 @@ const STATUS_WHY: Record<Status, string> = {
 };
 
 /**
- * Every secret an approver may type on a card. A Record, so that a kind added to
+ * Every secret an approver may type on a card, in the words the agent is told them
+ * (lib/agent/operate.ts SECRET_WORDS). A Record, so that a kind added to
  * lib/agent/operations/types.ts fails to compile here until it is listed (types.ts has no list).
  */
-const SECRET_KIND_SET: Record<SecretKind, true> = {
-  closing_password: true,
-  file_password: true,
-  backup_password: true,
-  archive_credentials: true,
-  new_user_password: true,
-  mail_password: true,
-  portal_password: true,
-  recovery_key: true,
-  file_key: true,
-  capability_link: true,
+const SECRET_WORDS: Record<SecretKind, string> = {
+  closing_password: 'the closing-date password',
+  file_password: "the company file's password",
+  backup_password: "the backup file's password",
+  archive_credentials: "the protected archive's password",
+  new_user_password: 'the new password',
+  mail_password: 'the mail server password',
+  portal_password: 'the portal password',
+  recovery_key: 'the recovery key',
+  file_key: 'the file key',
+  capability_link: 'the sharing link',
 };
-const SECRET_KINDS = Object.keys(SECRET_KIND_SET) as SecretKind[];
+const SECRET_KINDS = Object.keys(SECRET_WORDS) as SecretKind[];
 
 function flagLabel(flag: Flag): string {
   return FLAGS.find((f) => f.key === flag)?.label ?? flag;
@@ -449,6 +467,19 @@ function scrubDeep(v: unknown, secrets: readonly string[]): unknown {
 
 const UNEXPECTED_MESSAGE =
   'Ironbooks could not finish this work because of an unexpected problem. Check the books, then ask the agent to send the request again if it is still needed.';
+/**
+ * The work was done, but the standing permission asked for with it was not given for a reason
+ * nobody can name. Never UNEXPECTED_MESSAGE: following that ("send the request again") would enter
+ * the work twice.
+ */
+const GRANT_NOT_GIVEN_MESSAGE =
+  'Standing permission was not given because of an unexpected problem. The work itself was done, so do not ask for it again; the next request like it will ask a person.';
+/**
+ * The approval claimed the request and then stopped on something unexpected after its run had
+ * ended (its answer could not be kept, say): the work may or may not have been done.
+ */
+const LOST_TRACK_MESSAGE =
+  'Something unexpected went wrong while this was being carried out, so Ironbooks cannot tell whether it was done. Check the books before asking the agent to send it again.';
 
 function messageOf(err: unknown): string {
   if (err instanceof ServiceError && err.message) return err.message;
@@ -629,13 +660,18 @@ type Target =
 
 const ACTION_PREFIX = 'action:';
 
-function targetOf(row: Row): Target {
-  if (row.operation.startsWith(ACTION_PREFIX)) {
-    const action = row.proposalId ? agentAction(row.operation.slice(ACTION_PREFIX.length)) : null;
+function targetOf(row: Pick<Row, 'operation' | 'proposalId'>): Target {
+  return targetFor(row.operation, Boolean(row.proposalId));
+}
+
+/** What an operation id stands for; `copied`: the request was copied from an old proposal. */
+function targetFor(operation: string, copied: boolean): Target {
+  if (operation.startsWith(ACTION_PREFIX)) {
+    const action = copied ? agentAction(operation.slice(ACTION_PREFIX.length)) : null;
     return action && action.kind === 'write' ? { kind: 'proposal', action } : { kind: 'unknown' };
   }
   try {
-    const op = operationById(row.operation);
+    const op = operationById(operation);
     return op ? { kind: 'operation', op } : { kind: 'unknown' };
   } catch {
     return { kind: 'unknown' };
@@ -690,6 +726,93 @@ function settledInput(row: Row, target: Target): { input: OperationInput | null;
   if (!isPlainObject(row.needs)) return { input, needs: null };
   const stored = row.needs as StoredNeeds;
   return { input, needs: { ...stored, request: { ...metaOf(row), scrubbed: true } } };
+}
+
+/** The desktop flow behind a shell operation (lib/agent/operations/shell.ts), or null. */
+function shellDefOf(target: Target) {
+  if (target.kind !== 'operation' || target.op.kind !== 'shell') return null;
+  return SHELL_OPERATIONS.find((d) => d.id === target.op.id) ?? null;
+}
+
+/** The questions the approver answers on the card for a desktop flow; none for anything else. */
+function questionsOf(target: Target): FlowQuestion[] {
+  const def = shellDefOf(target);
+  return def ? (jsonCopy(def.questions) as FlowQuestion[]) : [];
+}
+
+// ---------------------------------------------------------------------------
+// How an approved request ended, kept beside the run's answer
+// ---------------------------------------------------------------------------
+
+/** The standing permission given with an approval, as the views show it. */
+type GrantGiven = NonNullable<AgentRequestView['grant']>;
+
+/**
+ * What the result column keeps once a request is recorded: the answer the agent reads, and how the
+ * approval went. `posted` and `entryIds` are what the committed run itself posted (never the
+ * preview a person approved, which may predate it), so a replay can say 'posted' truthfully. Both
+ * are left out when that is not known (the run never read the ledger), never stored as "nothing".
+ */
+interface StoredOutcome {
+  answer: unknown;
+  file: StagedFile | null;
+  posted?: boolean;
+  entryIds?: string[];
+  grant: GrantGiven | null;
+  grantError: string | null;
+}
+
+/** Journal entry ids, each once, oldest first as given, at most PREVIEW_ROW_LIMIT. */
+function cleanEntryIds(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const id of v) {
+    if (typeof id === 'string' && UUID_RE.test(id) && !out.includes(id)) out.push(id);
+    if (out.length >= PREVIEW_ROW_LIMIT) break;
+  }
+  return out;
+}
+
+function cleanGrantGiven(v: unknown): GrantGiven | null {
+  if (!isPlainObject(v)) return null;
+  const { minutes, expiresAt, constraints } = v;
+  if (typeof minutes !== 'number' || !Number.isSafeInteger(minutes) || minutes < 1) return null;
+  if (typeof expiresAt !== 'string' || !Number.isFinite(Date.parse(expiresAt))) return null;
+  return { minutes, expiresAt, constraints: isPlainObject(constraints) ? (jsonCopy(constraints) as GrantConstraints) : {} };
+}
+
+/**
+ * What a committed run that worked posted, from its own preview ("Commit: what happened"):
+ *  - `posted`: it moved the ledger at all, by an entry it made or one it voided, deleted or changed
+ *    (the test lib/agent/operate.ts hasLedger makes when it answers an agent's own commit
+ *    'posted', so a replay of an approved request answers the same);
+ *  - `entryIds`: only the entries it made, for the card's links (the bridge marks the others
+ *    `touched`, lib/agent/bridge.ts TouchedPostingEntry; a deleted one could not be opened).
+ * Unknown (left out) for a run that did not work, and for one whose ledger was never read: an
+ * operation whose service opens its own database handle (dryRun 'none') or a desktop flow reports
+ * no ledger at all, which says nothing about whether it posted.
+ */
+function committedLedger(r: BridgeResult): Pick<StoredOutcome, 'posted' | 'entryIds'> {
+  if (r.mode !== 'commit' || r.outcome !== 'ok') return {};
+  const list: unknown = r.preview?.ledger?.entries;
+  if (!Array.isArray(list)) return {};
+  const made = list.filter((e): e is Record<string, unknown> => isPlainObject(e) && (e.touched === undefined || e.touched === null));
+  return { posted: list.length > 0, entryIds: cleanEntryIds(made.map((e) => e.journalEntryId)) };
+}
+
+/**
+ * The outcome fields of a view. An executed request with no `posted` beside its answer (recorded
+ * before these were kept, or by a run that never read the ledger) leaves `posted` and `entryIds`
+ * out: unknown, so a reader keeps its own fallback rather than being told "nothing was posted".
+ * Anything not done posted nothing.
+ */
+function outcomeOf(row: Row): Pick<AgentRequestView, 'posted' | 'entryIds' | 'grant' | 'grantError'> {
+  const r = isPlainObject(row.result) ? row.result : null;
+  const grant = cleanGrantGiven(r?.grant);
+  const grantError = typeof r?.grantError === 'string' && r.grantError ? r.grantError : null;
+  if (r && typeof r.posted === 'boolean') return { posted: r.posted, entryIds: cleanEntryIds(r.entryIds), grant, grantError };
+  if (row.status === 'executed') return { grant, grantError };
+  return { posted: false, entryIds: [], grant, grantError };
 }
 
 // ---------------------------------------------------------------------------
@@ -822,17 +945,27 @@ function previewOf(row: Row): OperationPreview | null {
   return stripSecrets(maskSensitive(row.preview as unknown as OperationPreview, NO_FLAGS));
 }
 
-/** The status a reader sees: a waiting request past its time is expired whether or not it was marked yet. */
-function shownStatus(row: Row, now: Date): Status {
+/**
+ * The status as a person sees it, for every screen and report that shows a request (the audit
+ * report uses it too, so the two never disagree):
+ *  - a request still marked pending after its expiry is expired, whether or not anything has
+ *    marked it yet (an expiry that cannot be read counts as passed: it can never be approved);
+ *  - the first of two approvals keeps the request pending (decided_by set, D8): it is still
+ *    waiting, for a second person. 'approved' only ever means "being carried out right now";
+ *  - a status nobody knows reads as withdrawn, never as something that can still run.
+ */
+export function shownStatus(row: { status: string; expiresAt: Date | string | null | undefined }, now: Date = new Date()): RequestStatus {
   const s = (REQUEST_STATUSES as readonly string[]).includes(row.status) ? (row.status as Status) : 'cancelled';
-  if (s === 'pending' && row.expiresAt.getTime() <= now.getTime()) return 'expired';
-  return s;
+  if (s !== 'pending') return s;
+  const ends = row.expiresAt instanceof Date ? row.expiresAt.getTime() : typeof row.expiresAt === 'string' ? Date.parse(row.expiresAt) : NaN;
+  return Number.isFinite(ends) && ends > now.getTime() ? 'pending' : 'expired';
 }
 
 function toView(row: Row, agentName: string, people: Map<string, string>, now: Date): AgentRequestView {
   const meta = metaOf(row);
   const target = targetOf(row);
   const { result, file } = storedResult(row);
+  const status = shownStatus(row, now);
   return {
     id: row.id,
     kind: meta.kind,
@@ -841,7 +974,7 @@ function toView(row: Row, agentName: string, people: Map<string, string>, now: D
     operation: row.operation,
     class: classOf(row),
     area: meta.area ?? (target.kind === 'operation' ? target.op.area : null),
-    status: shownStatus(row, now),
+    status,
     reason: row.reason ?? null,
     summary: row.summary,
     amount: meta.facts.amount,
@@ -859,6 +992,9 @@ function toView(row: Row, agentName: string, people: Map<string, string>, now: D
     result,
     file,
     grantId: row.grantId ?? null,
+    // Waiting in a stale round (plan §7.4): the preview above is the new one, and a yes is given again on it.
+    stale: status === 'pending' && meta.staleRound > 0,
+    ...outcomeOf(row),
   };
 }
 
@@ -887,17 +1023,42 @@ interface JudgeEnv {
   person: Person;
   states: Map<string, AgentState>;
   blocked: boolean;
-  /** null when the caller cannot tell where the window is (a list): the host rule is then left to the approval itself. */
-  atHost: boolean | null;
+  /** The approval would come from the host computer's own window. False for a teammate's window. */
+  atHost: boolean;
   now: Date;
   fileAdmin: () => Promise<boolean>;
+  /**
+   * Work out the standing window an approvable operation request offers (grantMinutesMax). Off for
+   * the badge, which never shows it; a request FOR standing permission is always worked out, since
+   * whether it can be approved at all depends on it.
+   */
+  grantWindows: boolean;
+  /** grantMinutesFor, once per operation and facts for this person. */
+  grantMinutes: (operation: string, facts: RequestFacts) => Promise<number>;
 }
+
+/**
+ * A route the permission map has no rule for: denied to every role, an Admin too (lib/agent/policy.ts
+ * routeWithoutRule, which is private), so no other person can approve it either.
+ */
+function routeWithoutRule(op: Operation): boolean {
+  const rule = op.rule;
+  if (rule === 'public' || rule === 'self' || rule === 'member') return false;
+  if (rule && typeof rule === 'object') return false;
+  return op.kind === 'route';
+}
+
+/** decide()'s own words for such a route, with what the person can do instead. */
+const NO_RULE_MESSAGE =
+  'No role can allow this request, not even Admin, because Ironbooks has no permission rule for it. Deny it; a person can do the work in Ironbooks if it is still needed.';
 
 /** What the person's own access is missing for the request's route, or null. */
 function routeProblem(person: Person, target: Target): string | null {
   if (target.kind === 'operation') {
     const missing = roleProblem(person.access, target.op);
-    return missing ? `Your own access does not allow this: it needs ${missing}. Someone who has that right can approve it.` : null;
+    if (!missing) return null;
+    if (routeWithoutRule(target.op)) return NO_RULE_MESSAGE;
+    return `Your own access does not allow this: it needs ${missing}. Someone who has that right can approve it.`;
   }
   if (target.kind === 'proposal') {
     try {
@@ -911,17 +1072,26 @@ function routeProblem(person: Person, target: Target): string | null {
   return 'Ironbooks no longer knows this kind of request, so it cannot be approved. Deny it and ask the agent to send it again.';
 }
 
+/** Longest window a grantable setting allows before the end of the day (end of day: no limit here). */
+function windowCap(g: Grantable): number {
+  return g === 'no' ? 0 : g === 'short' ? SHORT_GRANT_MINUTES : Number.POSITIVE_INFINITY;
+}
+
 /**
- * Whole minutes of standing permission the request allows right now, before who is asking: the
- * shorter of what its class allows (maxGrantMinutes) and what its needs allow (the strictest class
- * it falls under), never past the end of the day.
+ * Whole minutes of standing permission this person may give with this request right now. The
+ * limit is grantMinutesFor (lib/services/agentGrants.ts): every rule createGrant applies (the end
+ * of the COMPANY's day, host-only and file-Admin work, the Admin rule for outside sends, the
+ * person's own role), so the card never offers a window createGrant then refuses. It is never
+ * longer than the request's stored class and needs allow either (they may be stricter than the
+ * facts alone say: the class the agent's door worked out from the dry run).
  */
-function grantWindow(row: Row, needs: ApprovalNeeds, now: Date): number {
-  if (row.proposalId) return 0;
-  const left = minutesToEndOfDay(now.toISOString(), -now.getTimezoneOffset());
-  const byClass = maxGrantMinutes(classOf(row), left);
-  const byNeeds = needs.grantable === 'no' ? 0 : needs.grantable === 'short' ? Math.min(SHORT_GRANT_MINUTES, left) : left;
-  return Math.max(0, Math.min(byClass, byNeeds));
+async function grantRoomFor(row: Row, target: Target, needs: ApprovalNeeds, env: JudgeEnv): Promise<number> {
+  if (row.proposalId || target.kind !== 'operation') return 0;
+  if (needs.grantAdminOnly && !env.person.isAdmin) return 0;
+  const cap = Math.min(windowCap(needs.grantable), windowCap(GRANTABLE[classOf(row)] ?? 'no'));
+  if (cap < 1) return 0;
+  const allowed = await env.grantMinutes(row.operation, metaOf(row).facts);
+  return Number.isSafeInteger(allowed) ? Math.max(0, Math.min(cap, allowed)) : 0;
 }
 
 async function judge(row: Row, target: Target, env: JudgeEnv): Promise<Judgement> {
@@ -929,10 +1099,8 @@ async function judge(row: Row, target: Target, env: JudgeEnv): Promise<Judgement
   const needs = needsFor(row, target);
   const meta = metaOf(row);
   const firstOfTwo = needs.twoPerson && !row.decidedBy;
-  let grantRoom = grantWindow(row, needs, now);
-  if (needs.grantAdminOnly && !person.isAdmin) grantRoom = 0;
 
-  const no = (why: string, code: 'CONFLICT' | 'FORBIDDEN' = 'FORBIDDEN'): Judgement => ({ canApprove: false, why, code, grantMinutesMax: 0, grantRoom });
+  const no = (why: string, code: 'CONFLICT' | 'FORBIDDEN' = 'FORBIDDEN'): Judgement => ({ canApprove: false, why, code, grantMinutesMax: 0, grantRoom: 0 });
 
   const status = shownStatus(row, now);
   if (status !== 'pending') return no(STATUS_WHY[status], 'CONFLICT');
@@ -963,12 +1131,14 @@ async function judge(row: Row, target: Target, env: JudgeEnv): Promise<Judgement
   for (const flag of needs.flags ?? []) {
     if (!person.access.flags?.[flag]) return no(`Approving this needs "${flagLabel(flag)}" in your own role.`);
   }
+  if (needs.hostOnly && !env.atHost) {
+    return no('This can be approved only in Ironbooks on the computer that holds the company file. Open it there, or deny it from here.');
+  }
+  // Worked out last: it reads the company's day, and only what may be approved needs it.
+  const grantRoom = meta.kind === 'grant' || env.grantWindows ? await grantRoomFor(row, target, needs, env) : 0;
   if (meta.kind === 'grant') {
     if (needs.grantAdminOnly && !person.isAdmin) return no('Only an Admin can give standing permission for this.');
     if (grantRoom < 1) return no('Standing permission cannot be given for this right now, so this request can only be denied.');
-  }
-  if (needs.hostOnly && env.atHost === false) {
-    return no('This can be approved only in Ironbooks on the computer that holds the company file.');
   }
   const offered = firstOfTwo && meta.kind === 'operation' ? 0 : grantRoom;
   return { canApprove: true, why: null, code: null, grantMinutesMax: offered, grantRoom };
@@ -981,9 +1151,27 @@ function visibleTo(person: Person, target: Target): boolean {
   return routeProblem(person, target) === null;
 }
 
-async function judgeEnv(person: Person, rows: Row[], atHost: boolean | null, now: Date): Promise<JudgeEnv> {
+/**
+ * What of a request can change its standing window, as the cache key of judgeEnv.grantMinutes. Each
+ * grantMinutesFor reads the company's day from the company file, and a list of approvable requests
+ * would otherwise read it once per request (their amounts, names and dates all differ). The window
+ * depends on the operation and the facts its rules read (lib/services/agentGrants.ts grantRules,
+ * through lib/agent/policy.ts requestClasses and flagsNeeded): a reveal, closed-period work and the
+ * "yes, I am sure" flags. Amounts, ids, dates and counts play no part in it (approvalNeeds is asked
+ * there without a two-person limit; a count limit is checked when the grant is given). createGrant
+ * applies every rule again when a person gives one, so should these rules ever read more, a key
+ * that missed it could only offer a window createGrant then refuses (the work still runs and the
+ * person is told why), never give a longer one.
+ */
+function windowKey(operation: string, facts: RequestFacts): string {
+  const confirm = Array.isArray(facts.confirm) ? [...facts.confirm].map(String).sort() : [];
+  return JSON.stringify([operation, facts.reveal === true, facts.closedPeriod === true, confirm]);
+}
+
+async function judgeEnv(person: Person, rows: Row[], atHost: boolean, now: Date, opts: { grantWindows?: boolean } = {}): Promise<JudgeEnv> {
   const db = person.ctx.db;
   let fileAdminAnswer: Promise<boolean> | null = null;
+  const windows = new Map<string, Promise<number>>();
   return {
     person,
     states: await agentStates(db, person.ctx.companyId, rows.map((r) => r.agentId)),
@@ -995,6 +1183,17 @@ async function judgeEnv(person: Person, rows: Row[], atHost: boolean | null, now
         () => true,
         () => false,
       )),
+    grantWindows: opts.grantWindows !== false,
+    grantMinutes: (operation, facts) => {
+      const key = windowKey(operation, facts);
+      let answer = windows.get(key);
+      if (!answer) {
+        // A window that cannot be worked out is none (fail closed): the request can still be approved once.
+        answer = grantMinutesFor(person.ctx, operation, facts, now).catch(() => 0);
+        windows.set(key, answer);
+      }
+      return answer;
+    },
   };
 }
 
@@ -1033,7 +1232,7 @@ function resultForPerson(person: Person, row: Row, view: AgentRequestView): Pick
   return { result: maskSensitive(view.result, person.access), file: view.file };
 }
 
-async function personViews(person: Person, rows: Row[], atHost: boolean | null, now: Date): Promise<AgentRequestForPerson[]> {
+async function personViews(person: Person, rows: Row[], atHost: boolean, now: Date): Promise<AgentRequestForPerson[]> {
   if (!rows.length) return [];
   const env = await judgeEnv(person, rows, atHost, now);
   const people = await personNames(person.ctx.db, rows.flatMap((r) => [r.decidedBy, r.secondApprover]));
@@ -1048,12 +1247,13 @@ async function personViews(person: Person, rows: Row[], atHost: boolean | null, 
       canApprove: j.canApprove,
       cannotApproveWhy: j.canApprove ? null : j.why,
       grantMinutesMax: j.grantMinutesMax,
+      questions: questionsOf(target),
     });
   }
   return out;
 }
 
-async function personView(person: Person, row: Row, atHost: boolean | null): Promise<AgentRequestForPerson> {
+async function personView(person: Person, row: Row, atHost: boolean): Promise<AgentRequestForPerson> {
   const [view] = await personViews(person, [row], atHost, new Date());
   return view;
 }
@@ -1612,22 +1812,118 @@ export const listRequestsForPerson: ListRequestsForPerson = async (ctx, opts = {
     .orderBy(desc(agentPermissionRequests.createdAt))
     .limit(Math.min(limit * 4, 2000));
   const visible = rows.filter((r) => visibleTo(person, targetOf(r))).slice(0, limit);
-  return personViews(person, visible, null, now);
+  // Left out, the window counts as the host's (the contract's rule); a teammate's window says false.
+  return personViews(person, visible, opts.atHost !== false, now);
 };
 
-export const requestForPerson: RequestForPerson = async (ctx, id) => {
+export const requestForPerson: RequestForPerson = async (ctx, id, opts = {}) => {
   const person = await requirePerson(ctx);
   const found = await rowById(person.ctx.db, ctx.companyId, id);
   if (!found || !visibleTo(person, targetOf(found))) throw new ServiceError('NOT_FOUND', NOT_FOUND_MESSAGE);
   const row = await settleRow(person.ctx.db, found, new Date());
-  return personView(person, row, null);
+  return personView(person, row, opts?.atHost !== false);
+};
+
+/** How many waiting requests the badge judges, newest first, and how many rows it reads to find them. */
+const BADGE_COUNT_MAX = 500;
+const BADGE_READ_MAX = 2000;
+/** How often the badge brings the company's requests up to date (settleCompany), at most. */
+const BADGE_SETTLE_EVERY_MS = 60_000;
+
+/**
+ * When the badge last settled each company (by company id). On globalThis: Next can load this
+ * module more than once in one process, and the copies must share one time per company.
+ */
+const badgeState = globalThis as typeof globalThis & { __ironbooksAgentBadgeSettled?: Map<string, number> };
+const badgeSettled: Map<string, number> = (badgeState.__ironbooksAgentBadgeSettled ??= new Map());
+
+/**
+ * The badge is the one reader that runs all day, so it is what settles requests nobody opens: an
+ * expired one, a copied proposal decided under Ask AI, a run cut off long ago. Settling masks the
+ * protected values such a request kept in its row for the run (a tax ID, an account number), for
+ * good. At most once a minute per company (the poll is every few seconds), and never failing the
+ * badge: a file that cannot be written now is settled by the next reader that can.
+ */
+async function settleForBadge(db: DB, companyId: string, now: Date): Promise<void> {
+  const at = now.getTime();
+  const last = badgeSettled.get(companyId);
+  // A clock set back since (last in the future) settles again rather than waiting for it.
+  if (last !== undefined && at >= last && at - last < BADGE_SETTLE_EVERY_MS) return;
+  badgeSettled.set(companyId, at);
+  try {
+    await settleCompany(db, companyId, now);
+  } catch {
+    /* the count below never counts what is overdue anyway */
+  }
+}
+
+/**
+ * The title bar's count and the newest request it counts, from ONE read of the waiting requests,
+ * so the two never disagree. Each is judged for this person in this window exactly as an approval
+ * would be (a teammate's window does not count host-only work), without the standing-permission
+ * window the badge never shows. A request past its expiry, or a copied proposal already decided
+ * under Ask AI, is never counted, whether or not anything has marked it yet (settleForBadge marks
+ * them at most once a minute). Someone who is not an Admin reads only the operations they may see,
+ * so a busy company's other work never crowds theirs out of the count. Nothing for an agent, a run
+ * inside an agent's scope, or a context without a person.
+ */
+export const badgeForPerson: BadgeForPerson = async (ctx, opts) => {
+  if (!ctx || ctx.agent || inServiceScope() || !ctx.userId) return { pending: 0, newest: null };
+  const person = await requirePerson(ctx);
+  const db = person.ctx.db;
+  const now = new Date();
+  await settleForBadge(db, ctx.companyId, now);
+  const proposalJoin = and(eq(aiProposals.id, agentPermissionRequests.proposalId), eq(aiProposals.companyId, agentPermissionRequests.companyId));
+  const waiting = and(
+    eq(agentPermissionRequests.companyId, ctx.companyId),
+    eq(agentPermissionRequests.status, 'pending'),
+    gt(agentPermissionRequests.expiresAt, now),
+    or(isNull(agentPermissionRequests.proposalId), eq(aiProposals.status, 'pending')),
+  );
+  let visibleOps: string[] | null = null;
+  if (!person.isAdmin) {
+    // Which kinds of work are waiting, and which of them this person may see (a short list).
+    const kinds = await db
+      .selectDistinct({ operation: agentPermissionRequests.operation })
+      .from(agentPermissionRequests)
+      .leftJoin(aiProposals, proposalJoin)
+      .where(waiting);
+    // A copied proposal always names its proposal; the rows are checked one by one below anyway.
+    visibleOps = kinds.map((k) => k.operation).filter((op) => visibleTo(person, targetFor(op, op.startsWith(ACTION_PREFIX))));
+    if (!visibleOps.length) return { pending: 0, newest: null };
+  }
+  const found = await db
+    .select({ request: agentPermissionRequests })
+    .from(agentPermissionRequests)
+    .leftJoin(aiProposals, proposalJoin)
+    .where(visibleOps ? and(waiting, inArray(agentPermissionRequests.operation, visibleOps)) : waiting)
+    .orderBy(desc(agentPermissionRequests.createdAt))
+    .limit(BADGE_READ_MAX);
+  const rows = found
+    .map((f) => f.request)
+    .filter((r) => visibleTo(person, targetOf(r)))
+    .slice(0, BADGE_COUNT_MAX);
+  if (!rows.length) return { pending: 0, newest: null };
+  const env = await judgeEnv(person, rows, opts?.atHost === true, now, { grantWindows: false });
+  let pending = 0;
+  let newest: Awaited<ReturnType<BadgeForPerson>>['newest'] = null;
+  for (const row of rows) {
+    if (!(await judge(row, targetOf(row), env)).canApprove) continue;
+    pending += 1;
+    // The app's own summary only, never the agent's words: it may be shown in a desktop notice.
+    newest ??= {
+      id: row.id,
+      agentName: (env.states.get(row.agentId) ?? MISSING_AGENT).name,
+      summary: row.summary,
+      createdAt: iso(row.createdAt) ?? new Date(0).toISOString(),
+    };
+  }
+  return { pending, newest };
 };
 
 export const pendingCountForPerson: PendingCountForPerson = async (ctx) => {
-  // The badge: nothing for an agent, a run inside an agent's scope, or a context without a person.
-  if (!ctx || ctx.agent || inServiceScope() || !ctx.userId) return 0;
-  const views = await listRequestsForPerson(ctx, { status: 'pending', limit: 500 });
-  return views.filter((v) => v.canApprove).length;
+  // The same count as the badge, with no window to tell: as the contract reads a left-out atHost.
+  return (await badgeForPerson(ctx, { atHost: true })).pending;
 };
 
 function cleanSecrets(raw: unknown): Partial<Record<SecretKind, string>> {
@@ -1653,6 +1949,37 @@ function cleanApproveInput(raw: unknown): ApproveInput & { secrets: Partial<Reco
     ...(isPlainObject(i.answers) ? { answers: jsonCopy(i.answers) } : {}),
     note: cleanNote(i.note),
   };
+}
+
+const YES_NO_RE = /^(yes|no|true|false)$/i;
+
+/**
+ * A desktop flow's questions must each have an answer the shell can use before anything is claimed
+ * (a 'password' one goes with the secrets instead). The shell stops at a question it has no usable
+ * answer for and the request then fails for good, so a missing or wrong answer is sent back to the
+ * card while the request can still be approved. The words are the ones the shell accepts
+ * (electron/agentShell.js): yes or no for a yes/no question, one of the choices for a choice.
+ */
+function checkFlowAnswers(questions: readonly FlowQuestion[], answers: Record<string, unknown> | undefined): void {
+  for (const q of questions) {
+    if (q.kind === 'password') continue;
+    const raw = answers?.[q.id];
+    if (raw === undefined || raw === null || (typeof raw === 'string' && !raw.trim())) {
+      throw validation(`Answer every question on the card, then approve again. Nothing was done. Still to answer: "${q.text}"`);
+    }
+    if (q.kind === 'yes_no' && !(typeof raw === 'boolean' || (typeof raw === 'string' && YES_NO_RE.test(raw.trim())))) {
+      throw validation(`Answer "${q.text}" with yes or no, then approve again. Nothing was done.`);
+    }
+    if (q.kind === 'choice') {
+      const want = typeof raw === 'string' ? raw.trim().toLowerCase() : null;
+      if (!want || !(q.choices ?? []).some((c) => c.toLowerCase() === want)) {
+        throw validation(`Answer "${q.text}" with one of: ${(q.choices ?? []).join(', ')}. Then approve again. Nothing was done.`);
+      }
+    }
+    if ((q.kind === 'text' || q.kind === 'path') && typeof raw !== 'string') {
+      throw validation(`Answer "${q.text}" in words, then approve again. Nothing was done.`);
+    }
+  }
 }
 
 /** The decision itself in the audit trail: who, what, the outcome. Never a secret or the input. */
@@ -1690,6 +2017,20 @@ function emptyResult(message: string): BridgeResult {
   };
 }
 
+/**
+ * The standing permission as it was given: createGrant's own limits and end time (it cleans the
+ * limits, so they may be narrower than asked), the minutes the person chose.
+ */
+function grantGiven(made: unknown, asked: { minutes: number; constraints: GrantConstraints }, now: Date): GrantGiven {
+  const g = isPlainObject(made) ? made : {};
+  const expiresAt =
+    typeof g.expiresAt === 'string' && Number.isFinite(Date.parse(g.expiresAt))
+      ? g.expiresAt
+      : new Date(now.getTime() + asked.minutes * 60_000).toISOString();
+  const constraints = isPlainObject(g.constraints) ? g.constraints : isPlainObject(asked.constraints) ? asked.constraints : {};
+  return { minutes: asked.minutes, constraints: jsonCopy(constraints) as GrantConstraints, expiresAt };
+}
+
 function producedOf(r: BridgeResult): ProducedSecret[] {
   return (Array.isArray(r.produced) ? r.produced : []).filter(
     (p): p is ProducedSecret => isPlainObject(p) && typeof p.value === 'string' && typeof p.label === 'string',
@@ -1704,7 +2045,36 @@ function failureMessage(r: BridgeResult): string {
   return r.error?.message || 'The work could not be done.';
 }
 
-export const approveAgentRequest: ApproveAgentRequest = async (ctx, id, rawInput, opts) => {
+export const approveAgentRequest: ApproveAgentRequest = (ctx, id, rawInput, opts) => approveRequest(ctx, id, rawInput, opts, null);
+
+/**
+ * A secret the operation's own route always takes (Operation.needsSecret) and the approver did not
+ * type: the commit would be refused for it with certainty (lib/agent/bridge.ts refuses a commit
+ * missing any of them), and the request would then fail for good. Sent back to the card first, while
+ * the request can still be approved. A desktop flow's secrets are not checked here: its flow asks for
+ * one only when the file turns out to be protected (lib/agent/operations/shell.ts, "a portable file
+ * saved with a password needs it"), so a yes without one is right for a file that has none.
+ */
+function checkTypedSecrets(target: Target, typed: Partial<Record<SecretKind, string>>): void {
+  if (target.kind !== 'operation' || target.op.kind !== 'route') return;
+  const missing = [...new Set(target.op.needsSecret ?? [])].filter((k) => !(typeof typed[k] === 'string' && typed[k]!.length > 0));
+  if (!missing.length) return;
+  const words = missing.map((k) => SECRET_WORDS[k] ?? 'a password');
+  const list = words.length > 1 ? `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}` : words[0];
+  throw validation(`Type ${list} on the card, then approve again. Nothing was done.`);
+}
+
+/**
+ * approveAgentRequest itself. `onClaim` hears the moment this call claims the request (batchApprove,
+ * so it can tell a request it claimed and then lost track of from one it never got to).
+ */
+async function approveRequest(
+  ctx: ServiceContext,
+  id: string,
+  rawInput: ApproveInput,
+  opts: { atHost: boolean },
+  onClaim: (() => void) | null,
+): Promise<ApproveResult> {
   const person = await requirePerson(ctx);
   const atHost = opts?.atHost === true;
   const input = cleanApproveInput(rawInput);
@@ -1722,7 +2092,7 @@ export const approveAgentRequest: ApproveAgentRequest = async (ctx, id, rawInput
 
   if (target.kind === 'proposal') {
     if (input.grant) throw validation('Standing permission cannot be given with this approval. Approve it once instead.');
-    return approveProposalCopy(person, row, target, input, atHost);
+    return approveProposalCopy(person, row, target, input, atHost, onClaim);
   }
 
   const needs = needsFor(row, target);
@@ -1736,6 +2106,10 @@ export const approveAgentRequest: ApproveAgentRequest = async (ctx, id, rawInput
     return showStale(person, row, atHost, now);
   }
 
+  // A desktop flow runs once, ever: its questions are answered before anything is claimed.
+  const shellDef = shellDefOf(target);
+  if (shellDef) checkFlowAnswers(shellDef.questions, input.answers);
+
   // Standing permission is checked before anything is claimed or run.
   const grant = meta.kind === 'grant' ? (input.grant ?? meta.grantAsked) : firstOfTwo ? null : (input.grant ?? null);
   if (meta.kind === 'grant' && !grant) throw validation('Say how long the standing permission lasts, in minutes, and approve again.');
@@ -1747,6 +2121,10 @@ export const approveAgentRequest: ApproveAgentRequest = async (ctx, id, rawInput
         : `Standing permission for this can last at most ${room} minutes from now. Choose a shorter time.`,
     );
   }
+
+  // What the run will be refused without is typed before anything is claimed (the first of two
+  // approvals types nothing: the second approver's run is the one that needs it).
+  if (!firstOfTwo && meta.kind === 'operation') checkTypedSecrets(target, input.secrets);
 
   if (firstOfTwo) {
     // D8: the first of two different people. Nothing runs yet; nothing typed is kept.
@@ -1798,36 +2176,102 @@ export const approveAgentRequest: ApproveAgentRequest = async (ctx, id, rawInput
   });
   if (!claimed) throw new ServiceError('CONFLICT', CHANGED_JUST_NOW_MESSAGE);
   wake(claimed);
+  onClaim?.();
+  try {
+    return await carryOut({ person, row, claimed, target, meta, input, grant, shellDef, atHost, now });
+  } catch (err) {
+    // Claimed, then stopped on something unexpected once its run had ended (the answer could not be
+    // kept, say): the request ends as failed now, its outcome unknown, rather than staying "being
+    // carried out" for hours with its input in clear. When even that cannot be written, the error
+    // goes on and the stuck-run rule settles it later.
+    const ended = await endLostClaim(person, claimed, target).catch(() => null);
+    if (!ended) throw err;
+    return { status: 'failed', request: await personView(person, ended, atHost), produced: [], effects: [] };
+  }
+}
+
+/** A request this approval claimed, with what the approval was given. */
+interface ClaimedRun {
+  person: Person;
+  row: Row;
+  claimed: Row;
+  target: Target;
+  meta: RequestMeta;
+  input: ReturnType<typeof cleanApproveInput>;
+  grant: RequestMeta['grantAsked'];
+  shellDef: ReturnType<typeof shellDefOf>;
+  atHost: boolean;
+  now: Date;
+}
+
+/**
+ * End, as failed with its outcome unknown and its input masked for good, a request this person's
+ * approval claimed and then lost track of. Only while it is still that claim (approved, by them);
+ * null when there was nothing to end (it was recorded after all, or went back to waiting).
+ */
+async function endLostClaim(person: Person, claimed: Row, target: Target): Promise<Row | null> {
+  const settled = settledInput(claimed, target);
+  const ended = await inTransaction(person.ctx, async (tx) => {
+    const [updated] = await tx.db
+      .update(agentPermissionRequests)
+      .set({ status: 'failed', error: LOST_TRACK_MESSAGE, input: settled.input, ...(settled.needs ? { needs: settled.needs } : {}) })
+      .where(
+        and(
+          eq(agentPermissionRequests.id, claimed.id),
+          eq(agentPermissionRequests.status, 'approved'),
+          or(eq(agentPermissionRequests.decidedBy, person.userId), eq(agentPermissionRequests.secondApprover, person.userId)),
+        ),
+      )
+      .returning();
+    if (!updated) return null;
+    await settleProposal(tx.db, claimed, 'failed', { decidedBy: person.userId, error: LOST_TRACK_MESSAGE });
+    await auditDecision(tx, claimed, { status: 'failed', approvedBy: claimed.decidedBy, outcomeUnknown: true, error: LOST_TRACK_MESSAGE });
+    return updated;
+  });
+  if (ended) wake(ended);
+  return ended;
+}
+
+/** Carry out a claimed request: give the standing permission it asks for, or run it, and record how it ended. */
+async function carryOut(c: ClaimedRun): Promise<ApproveResult> {
+  const { person, row, claimed, target, meta, input, grant, shellDef, atHost, now } = c;
 
   // Typed on the card: never in the row, the audit trail or an error. A desktop flow's answer named
-  // like a password counts too.
+  // like a password, or to a question that asks for one, counts too.
+  const passwordQuestions = new Set((shellDef?.questions ?? []).filter((q) => q.kind === 'password').map((q) => q.id));
   const typed = [
     ...Object.values(input.secrets),
     ...Object.entries(input.answers ?? {})
-      .filter(([k, v]) => isSecretField(k, v))
+      .filter(([k, v]) => isSecretField(k, v) || (passwordQuestions.has(k) && (typeof v === 'string' || typeof v === 'number')))
       .map(([, v]) => String(v)),
   ].filter((s): s is string => typeof s === 'string' && s.length > 0);
 
   if (meta.kind === 'grant') {
-    let grantId: string | null = null;
+    let made: Awaited<ReturnType<typeof createGrant>> | null = null;
     let error: string | null = null;
     try {
-      const made = await createGrant(person.ctx, meta.facts, {
+      made = await createGrant(person.ctx, meta.facts, {
         agentId: row.agentId,
         operation: row.operation,
         constraints: grant!.constraints,
         minutes: grant!.minutes,
         requestId: row.id,
       });
-      grantId = made.id;
     } catch (err) {
       error = scrubText(messageOf(err), typed, UNEXPECTED_MESSAGE);
     }
+    const grantId = made && typeof made.id === 'string' ? made.id : null;
+    if (!grantId && !error) error = UNEXPECTED_MESSAGE;
     const final = await record(person, claimed, target, {
       status: grantId ? 'executed' : 'failed',
       error,
-      result: null,
+      answer: null,
+      file: null,
+      posted: false,
+      entryIds: [],
       grantId,
+      grant: grantId ? grantGiven(made, grant!, now) : null,
+      grantError: null,
     });
     return { status: grantId ? 'executed' : 'failed', request: await personView(person, final, atHost), produced: [], effects: [] };
   }
@@ -1847,7 +2291,9 @@ export const approveAgentRequest: ApproveAgentRequest = async (ctx, id, rawInput
   const produced = producedOf(r);
   const hide = [...typed, ...produced.map((p) => p.value)];
 
-  if (r.mode === 'dry_run' && r.outcome === 'ok') {
+  // A desktop flow has no staleness key and is never previewed by running it: anything but a
+  // committed run that worked ends it as failed, for good, so it is never claimed or run again.
+  if (r.mode === 'dry_run' && r.outcome === 'ok' && !shellDef) {
     // The books changed since the agent asked (plan §7.4): nothing ran. The person sees what would
     // happen now and approves again with acceptStale; every approval so far is set aside.
     const back = await backToWaiting(person, claimed, target, r, hide);
@@ -1857,29 +2303,37 @@ export const approveAgentRequest: ApproveAgentRequest = async (ctx, id, rawInput
   // runApproved hands back a dry run only when the books changed. One that now fails or raises a
   // warning ends the request: approving the new preview could not go through either, and the
   // agent needs to know why (for a warning, to ask again with the flag).
-  const changedUnder = r.mode === 'dry_run';
-  const ok = r.outcome === 'ok' && !changedUnder;
-  let grantId: string | null = null;
+  const changedUnder = r.mode === 'dry_run' && !shellDef;
+  const ok = r.outcome === 'ok' && r.mode !== 'dry_run';
+  let made: Awaited<ReturnType<typeof createGrant>> | null = null;
   let grantError: string | null = null;
   if (ok && grant) {
     try {
-      const made = await createGrant(person.ctx, cleanFacts(r.facts ?? meta.facts), {
+      made = await createGrant(person.ctx, cleanFacts(r.facts ?? meta.facts), {
         agentId: row.agentId,
         operation: row.operation,
         constraints: grant.constraints,
         minutes: grant.minutes,
         requestId: row.id,
       });
-      grantId = made.id;
+      if (!made || typeof made.id !== 'string') throw new Error('no grant');
     } catch (err) {
-      grantError = scrubText(messageOf(err), hide, UNEXPECTED_MESSAGE);
+      // The work is done and stays done; the person is told why no standing permission came with it
+      // (never "send the request again": that would enter the work twice).
+      made = null;
+      const why = err instanceof ServiceError && err.message ? err.message : GRANT_NOT_GIVEN_MESSAGE;
+      grantError = scrubText(why, hide, GRANT_NOT_GIVEN_MESSAGE);
     }
   }
+  const failed = ok ? null : shellDef && r.mode === 'dry_run' && r.outcome === 'ok' ? UNEXPECTED_MESSAGE : failureMessage(r);
   const final = await record(person, claimed, target, {
     status: ok ? 'executed' : 'failed',
-    error: ok ? null : scrubText(changedUnder ? `${BOOKS_CHANGED_FAILED} ${failureMessage(r)}` : failureMessage(r), hide, UNEXPECTED_MESSAGE),
-    result: ok ? { answer: scrubDeep(stripSecrets(jsonCopy(r.result ?? null)), hide), file: r.file ? jsonCopy(r.file) : null } : null,
-    grantId,
+    error: failed === null ? null : scrubText(changedUnder ? `${BOOKS_CHANGED_FAILED} ${failed}` : failed, hide, UNEXPECTED_MESSAGE),
+    answer: ok ? scrubDeep(stripSecrets(jsonCopy(r.result ?? null)), hide) : null,
+    file: ok && r.file ? jsonCopy(r.file) : null,
+    ...committedLedger(r),
+    grantId: made ? made.id : null,
+    grant: made && grant ? grantGiven(made, grant, now) : null,
     grantError,
   });
   return {
@@ -1888,23 +2342,35 @@ export const approveAgentRequest: ApproveAgentRequest = async (ctx, id, rawInput
     produced: ok ? produced : [],
     effects: Array.isArray(r.effects) ? r.effects : [],
   };
-};
+}
 
-/** Write how an approved request ended, with its input masked for good, and the decision to the audit trail. */
+/**
+ * Write how an approved request ended, with its input masked for good, and the decision to the
+ * audit trail. The result column keeps the answer beside what the committed run posted and the
+ * standing permission given (StoredOutcome), for every reader of the request from then on.
+ */
 async function record(
   person: Person,
   claimed: Row,
   target: Target,
-  outcome: { status: 'executed' | 'failed'; error: string | null; result: unknown; grantId: string | null; grantError?: string | null },
+  outcome: { status: 'executed' | 'failed'; error: string | null; grantId: string | null } & StoredOutcome,
 ): Promise<Row> {
   const settled = settledInput(claimed, target);
+  const kept: StoredOutcome = {
+    answer: outcome.answer ?? null,
+    file: outcome.file ?? null,
+    // Kept only when known: a view of a row without them says nothing of what was posted.
+    ...(typeof outcome.posted === 'boolean' ? { posted: outcome.posted, entryIds: cleanEntryIds(outcome.entryIds) } : {}),
+    grant: outcome.grant ?? null,
+    grantError: outcome.grantError ?? null,
+  };
   const final = await inTransaction(person.ctx, async (tx) => {
     const [updated] = await tx.db
       .update(agentPermissionRequests)
       .set({
         status: outcome.status,
         error: outcome.error,
-        result: outcome.result,
+        result: kept,
         grantId: outcome.grantId,
         input: settled.input,
         ...(settled.needs ? { needs: settled.needs } : {}),
@@ -2009,6 +2475,22 @@ async function backToWaiting(person: Person, claimed: Row, target: Target, r: Br
   return back;
 }
 
+/**
+ * What the old path's run posted, read inside its own transaction (the entries it created carry
+ * the transaction's time, lib/agent/actions.ts changesInTransaction). Read under a savepoint, so a
+ * read that fails only leaves `posted` unknown (left out) and never undoes the work.
+ */
+async function postedInThisTransaction(tx: ServiceContext): Promise<Pick<StoredOutcome, 'posted' | 'entryIds'>> {
+  try {
+    return await tx.db.transaction(async (sp) => {
+      const changes = await changesInTransaction({ ...tx, db: sp as unknown as DB });
+      return { posted: changes.entries.length > 0, entryIds: cleanEntryIds(changes.entries.map((e) => e.journalEntryId)) };
+    });
+  } catch {
+    return {};
+  }
+}
+
 class ProposalAlreadyDecided extends Error {
   constructor(readonly proposalStatus: string) {
     super('decided');
@@ -2026,6 +2508,7 @@ async function approveProposalCopy(
   target: Extract<Target, { kind: 'proposal' }>,
   input: ApproveInput,
   atHost: boolean,
+  onClaim: (() => void) | null,
 ): Promise<ApproveResult> {
   const now = new Date();
   const claimed = await inTransaction(person.ctx, async (tx) => {
@@ -2038,6 +2521,7 @@ async function approveProposalCopy(
   });
   if (!claimed) throw new ServiceError('CONFLICT', CHANGED_JUST_NOW_MESSAGE);
   wake(claimed);
+  onClaim?.();
   const settled = settledInput(claimed, target);
 
   try {
@@ -2063,9 +2547,10 @@ async function approveProposalCopy(
         llmReasoning: 'Approved a proposal made by an agent (Agent requests).',
       });
       const answer = stripSecrets(maskSensitive(jsonCopy({ resultRef: done.resultRef, result: done.result ?? null }), NO_FLAGS));
+      const kept: Partial<StoredOutcome> = { answer, file: null, grant: null, grantError: null, ...(await postedInThisTransaction(tx)) };
       const [updated] = await tx.db
         .update(agentPermissionRequests)
-        .set({ status: 'executed', result: { answer, file: null }, input: settled.input, ...(settled.needs ? { needs: settled.needs } : {}) })
+        .set({ status: 'executed', result: kept, input: settled.input, ...(settled.needs ? { needs: settled.needs } : {}) })
         .where(and(eq(agentPermissionRequests.id, claimed.id), eq(agentPermissionRequests.status, 'approved')))
         .returning();
       await auditDecision(tx, claimed, { status: 'executed', approvedBy: person.userId, proposalId: p.id });
@@ -2129,7 +2614,8 @@ export const denyAgentRequest: DenyAgentRequest = async (ctx, id, rawNote) => {
   });
   if (!denied) throw new ServiceError('CONFLICT', CHANGED_JUST_NOW_MESSAGE);
   wake(denied);
-  return personView(person, denied, null);
+  // Settled: where the window is no longer changes what it shows.
+  return personView(person, denied, true);
 };
 
 /** Classes a batch may approve (plan §7.2): everyday entry and change, nothing riskier. */
@@ -2150,12 +2636,13 @@ export const batchApprove: BatchApprove = async (ctx, ids, opts) => {
     if (!found || !visibleTo(person, targetOf(found))) throw new ServiceError('NOT_FOUND', NOT_FOUND_MESSAGE);
     rows.push(await settleRow(person.ctx.db, found, now));
   }
-  // Every one must fit before any is approved: one operation, everyday classes, nothing that needs
-  // a password, two people or the host computer.
+  // What may be batched at all is checked for every one before any is approved: one operation,
+  // everyday classes, nothing that needs a password, two people, the host computer or a desktop
+  // flow's answers. Whether THIS person may approve each is that one's own approval below.
   const operation = rows[0].operation;
-  const env = await judgeEnv(person, rows, atHost, now);
   for (const row of rows) {
-    const needs = needsFor(row, targetOf(row));
+    const target = targetOf(row);
+    const needs = needsFor(row, target);
     const label = `"${row.summary}"`;
     if (row.operation !== operation) throw validation('Approve together only requests for the same kind of work. Approve the others one by one.');
     if (!BATCH_CLASSES.includes(classOf(row)) || metaOf(row).kind !== 'operation') {
@@ -2164,36 +2651,43 @@ export const batchApprove: BatchApprove = async (ctx, ids, opts) => {
     if (needs.secrets.length) throw validation(`${label} needs something typed in, so approve it on its own.`);
     if (needs.twoPerson) throw validation(`${label} needs two people to approve it, so approve it on its own.`);
     if (needs.hostOnly) throw validation(`${label} can be approved only at the host computer, so approve it on its own.`);
-    const j = await judge(row, targetOf(row), env);
-    if (!j.canApprove) throw new ServiceError(j.code ?? 'FORBIDDEN', `${label}: ${j.why ?? 'you cannot approve this request.'}`);
+    if (questionsOf(target).length) throw validation(`${label} has questions to answer, so approve it on its own.`);
   }
 
-  // Each on its own: one that fails or finds the books changed never stops the others.
+  // Each on its own: one that is not approved, fails or finds the books changed never stops the others.
   const results: ApproveResult[] = [];
   for (const row of rows) {
+    const track = { claimed: false };
     try {
-      results.push(await approveAgentRequest(ctx, row.id, {}, { atHost }));
+      results.push(await approveRequest(ctx, row.id, {}, { atHost }, () => (track.claimed = true)));
     } catch (err) {
       const current = await rowById(person.ctx.db, ctx.companyId, row.id);
-      results.push(batchOutcome(await personView(person, current ?? row, atHost), err));
+      results.push(batchOutcome(await personView(person, current ?? row, atHost), err, track.claimed));
     }
   }
   return results;
 };
 
 /**
- * What one approval of a batch came to when it was refused (someone else decided it first, the
- * agent was paused part way): read from where the request stands now, not assumed failed. A request
- * still waiting is reported as not done, with why in `error`, since the answer has no word for
- * "not approved".
+ * What one approval of a batch came to when it threw: read from where the request stands now, not
+ * assumed failed.
+ *  - Done or failed (by this batch or by someone else's approval): reported as such.
+ *  - Claimed by THIS batch and then lost track of (it threw after its run had ended, and even
+ *    ending the request failed): 'failed', saying the outcome cannot be told. Never "nothing ran":
+ *    the work may well have been done. One it sent back to waiting with a new preview is 'stale'.
+ *  - Anything else this batch never got to approve (this person may not, the agent was paused part
+ *    way, someone else denied, withdrew, expired or is carrying it out): 'not_approved', nothing ran
+ *    for it here, why in `error`; `request.status` says where it stands (still waiting, mostly).
  */
-function batchOutcome(view: AgentRequestForPerson, err: unknown): ApproveResult {
+function batchOutcome(view: AgentRequestForPerson, err: unknown, claimedHere: boolean): ApproveResult {
   const result = (status: ApproveResult['status'], request: AgentRequestForPerson): ApproveResult => ({ status, request, produced: [], effects: [] });
   if (view.status === 'executed') return result('executed', view);
   if (view.status === 'failed') return result('failed', view);
+  if (claimedHere && view.status === 'approved') return result('failed', { ...view, error: LOST_TRACK_MESSAGE });
+  if (claimedHere && view.status === 'pending' && view.stale) return result('stale', view);
   if (view.status === 'pending' && view.needs?.twoPerson && view.decidedByName) return result('needs_second_approver', view);
   const why = view.status === 'pending' ? (view.cannotApproveWhy ?? messageOf(err)) : STATUS_WHY[view.status] || messageOf(err);
-  return result('failed', { ...view, error: view.error ?? why });
+  return result('not_approved', { ...view, error: why });
 }
 
 export const expireRequests: ExpireRequests = async (ctx, now = new Date()) => {

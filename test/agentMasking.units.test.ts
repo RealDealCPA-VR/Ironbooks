@@ -11,13 +11,35 @@
  *
  * Each case: a caller without the right gets the masked form, a caller with it the full value, and
  * the text printed on the check is unchanged.
+ *
+ * The third wave closed what the second left open (_vr_tmp/WAVE2-NOTES.md, masking-fixes and
+ * effects-callers):
+ *
+ *   5. line memos already in the books ("Acct # …" on Sales Tax Payment entries posted before the
+ *      payment stopped copying it, or typed) were answered as stored by the journal entry, the
+ *      registers, the report lines, Check Detail and the journal lines Pay Bills / Receive Payments
+ *      list, and the memo filters let a caller test guesses at the hidden digits. The books keep
+ *      the stored text: a save as shown, Undo and a reversal never write the masked text;
+ *   6. the vendor lookup sent a payee's name to the company's SearXNG in an agent's preview.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { eq } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
+import { NextRequest } from 'next/server';
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, journalEntryLines, paymentChecks, users, vendors } from '@/lib/db/schema';
+import {
+  accounts,
+  bankAccounts,
+  bankTransactions,
+  journalEntries,
+  journalEntryLines,
+  paymentChecks,
+  users,
+  vendors,
+} from '@/lib/db/schema';
+import { effectsOfFailedRun, runWithEffects } from '@/lib/effects';
+import { isNotRunInPreview } from '@/lib/ai/outbound';
 import { fullAccess, type EffectiveAccess } from '@/lib/permissions/model';
 import type { ServiceContext } from '@/lib/services/_base';
 import { createCompany } from '@/lib/services/company';
@@ -34,11 +56,38 @@ import {
   paySalesTaxAgencies,
   voidPaymentCheck,
 } from '@/lib/services/liabilityPayments';
-import { getEntry } from '@/lib/services/journal';
+import {
+  accountRegister,
+  createManualEntry,
+  getAdjustingEntries,
+  getEntry,
+  getEntryForCaller,
+  ilikeMatches,
+  journalOpenItems,
+  lineMemoFor,
+  memoMayHoldAccountNumber,
+  reverseEntry,
+  updateEntry,
+  voidEntry,
+  type JournalEntryDetail,
+  type UpdateEntryInput,
+} from '@/lib/services/journal';
+import { listJournalOpenItems } from '@/lib/services/journalApplications';
+import { commitUndo, performUndo, prepareUndo } from '@/lib/services/undo';
+import { fetchGlLines, loadAccountMeta } from '@/lib/services/reportEngine';
+import { checkDetail, transactionDetail } from '@/lib/services/reportsExtra';
 import { checkPrintData, listPrintQueue, markPrinted } from '@/lib/services/printQueue';
 import { assignVendorType, createType } from '@/lib/services/typeLists';
 import { listStateTaxSettings, upsertStateTaxSetting } from '@/lib/services/payrollAdjustments';
 import { stateWageWorksheet } from '@/lib/services/payrollReports';
+import { setNetworkPolicy } from '@/lib/services/networkPolicy';
+import { clearVendorLookupCache, lookupVendor, VENDOR_LOOKUP_PURPOSE } from '@/lib/services/vendorLookup';
+import { llmSuggestBankCategory, suggestAccountForPayee } from '@/lib/services/aiCategorizer';
+
+/** The caller GET /api/journal-entries/[id] runs for in the route test (section 5). */
+let routeCtx: ServiceContext;
+vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) }));
+import { GET as entryGET } from '@/app/api/journal-entries/[id]/route';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-agent-masking-units');
 let db: DB;
@@ -221,13 +270,14 @@ describe('2. Sales Tax Payment checks', () => {
       { account: '2200 – Sales Tax Payable', description: `Acct # ${FULL_NUMBER}`, amount: '25.00' },
     ]);
 
-    // The journal entry's lines do not carry the number: the journal entry (GET
-    // /api/journal-entries/[id]), the General Ledger, the transaction reports and the assistant
-    // answer line memos unmasked, to every caller.
+    // The journal entry's lines do not carry the number: the payment no longer copies the check
+    // memo onto them, so nothing in the ledger holds it, whoever reads it and however (section 5
+    // covers lines that already hold one).
     const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, entryId));
     expect(lines.map((l) => l.memo).sort()).toEqual(['Sales Tax Payment — State Revenue Dept', 'Sales tax — State Revenue Dept']);
-    expect(JSON.stringify(await getEntry(masked, entryId))).not.toContain(FULL_NUMBER);
-    expect(JSON.stringify(await getEntry(full, entryId))).not.toContain(FULL_NUMBER);
+    expect(JSON.stringify(await getEntryForCaller(masked, entryId))).not.toContain(FULL_NUMBER);
+    expect(JSON.stringify(await getEntryForCaller(full, entryId))).not.toContain(FULL_NUMBER);
+    expect(JSON.stringify(await getEntry(ctx, entryId))).not.toContain(FULL_NUMBER);
 
     // GET /api/sales-tax/payments and /api/sales-tax/payments/[id].
     const listed = await listPaymentChecks(masked, { kind: 'sales_tax' });
@@ -332,5 +382,586 @@ describe('4. the state wage worksheet', () => {
     expect(hidden.accountNumber).toBe((await listStateTaxSettings(masked))[0].accountNumber);
     expect((await stateWageWorksheet(full, { state: 'NY', year: 2026, quarter: 1 })).accountNumber).toBe('987654321');
     expect((await stateWageWorksheet(ctx, { state: 'NY', year: 2026, quarter: 1 })).accountNumber).toBe('987654321');
+  });
+});
+
+/** What the journal window sends back on Save: the entry's lines as the caller was shown them. */
+function asShownOnSave(e: JournalEntryDetail): UpdateEntryInput {
+  return {
+    date: e.date,
+    description: e.description,
+    lines: e.lines.map((l) => ({
+      accountId: l.accountId,
+      debit: l.debit,
+      credit: l.credit,
+      memo: l.memo,
+      classId: l.classId,
+      entityType: l.entityType,
+      entityId: l.entityId,
+    })),
+  };
+}
+
+describe('5. line memos already in the books', () => {
+  const MEMO = `Acct # ${FULL_NUMBER}`;
+  const SHOWN = 'Acct # ••••6789';
+  // January 2027 holds only this section's lines.
+  const from = d('2027-01-01');
+  const to = d('2027-01-31');
+  let legacyEntryId: string;
+  let legacyCheckId: string;
+  let manualId: string;
+
+  /** The entry's line memos as stored, sorted. */
+  const storedMemos = async (entryId: string) =>
+    (await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, entryId))).map((l) => l.memo).sort();
+  /** The entry's line memos as stored, by account. */
+  const memoByAccount = async (entryId: string) =>
+    Object.fromEntries(
+      (await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, entryId)).orderBy(asc(journalEntryLines.createdAt))).map(
+        (l) => [l.accountId, l.memo],
+      ),
+    );
+
+  beforeAll(async () => {
+    await vendorWithNumber('County Tax Collector');
+    const agencyId = (await createTaxAgency(ctx, { name: 'County Tax Collector' })).id;
+    const paid = await paySalesTaxAgencies(ctx, {
+      date: d('2027-01-05'),
+      paymentAccountId: acct['1000'],
+      payments: [{ agencyId, amount: '40.00' }],
+      toPrint: true,
+    });
+    legacyEntryId = paid.checks[0].entryId;
+    legacyCheckId = paid.checks[0].id;
+    // What the payment wrote before the second wave: the check memo on its Dr 2200 line.
+    const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, legacyEntryId));
+    const dr = lines.find((l) => l.debit && Number(l.debit) > 0)!;
+    await db.update(journalEntryLines).set({ memo: MEMO }).where(eq(journalEntryLines.id, dr.id));
+    // And one typed on a General Journal entry.
+    const manual = await createManualEntry(ctx, {
+      date: d('2027-01-10'),
+      description: 'Utility deposit',
+      isAdjusting: true,
+      lines: [
+        { accountId: acct['6600'], debit: '15.00', memo: MEMO },
+        { accountId: acct['1000'], credit: '15.00', memo: 'Office rent' },
+      ],
+    });
+    manualId = manual.id;
+  });
+
+  it('lineMemoFor: the agent mask for a caller without the right, the stored text otherwise', () => {
+    expect(lineMemoFor(masked, MEMO)).toBe(SHOWN);
+    expect(lineMemoFor(masked, 'Paid in full, A/C No. 1234 5678')).toBe('Paid in full, A/C No. ••••5678');
+    expect(lineMemoFor(masked, 'Office rent')).toBe('Office rent');
+    expect(lineMemoFor(masked, SHOWN)).toBe(SHOWN);
+    expect(lineMemoFor(masked, null)).toBeNull();
+    expect(lineMemoFor(full, MEMO)).toBe(MEMO);
+    expect(lineMemoFor(ctx, MEMO)).toBe(MEMO);
+  });
+
+  it('ilikeMatches reads a pattern the way ILIKE does', () => {
+    expect(ilikeMatches(SHOWN, '%6789%')).toBe(true);
+    expect(ilikeMatches(SHOWN, '%acct # ••••%')).toBe(true);
+    expect(ilikeMatches(SHOWN, '%0001%')).toBe(false);
+    expect(ilikeMatches('Acct # 1_2', '%1\\_2%')).toBe(true);
+    expect(ilikeMatches('Acct # 1x2', '%1\\_2%')).toBe(false);
+    expect(ilikeMatches('Acct # 1x2', '%1_2%')).toBe(true);
+    expect(ilikeMatches('50% off (a.b)', '%50\\% off (a.b)%')).toBe(true);
+    expect(ilikeMatches(null, '%')).toBe(false);
+  });
+
+  it("ilikeMatches answers what the database's own ILIKE answers", async () => {
+    const texts = [SHOWN, 'Acct # 1_2', 'Acct # 1x2', '50% off (a.b)', 'abcabc', 'aaa', '', 'a\\b', 'Paid in full\nAcct # ••••6789'];
+    const patterns = [
+      '%', '%%', '', '_', '%6789%', '%ACCT # ••••%', 'a%c', 'a%c%c', '%b%b%', '___', '_%_', '%1\\_2%', '%50\\%%',
+      'a\\\\b', '%\\%', '%.%', '(a.b)', '%(a.b)', 'abc%', '%abc', 'a_c_bc', '%a%a%a%a', 'paid%6789', 'Paid in full_Acct%',
+    ];
+    for (const t of texts) {
+      for (const p of patterns) {
+        const { rows } = (await db.execute(sql`select ${t}::text ILIKE ${p}::text as hit`)) as unknown as { rows: Array<{ hit: boolean }> };
+        expect(ilikeMatches(t, p), `${JSON.stringify(t)} ILIKE ${JSON.stringify(p)}`).toBe(rows[0].hit);
+      }
+    }
+  });
+
+  it('ilikeMatches takes time in proportion to the text and the pattern, however many wildcards a search holds', () => {
+    // A search is passed as typed (Transaction Detail), "%" and "_" included, and matched on the one
+    // server every window uses: a pattern built to backtrack must not hold it.
+    const memo = lineMemoFor(masked, `Paid to the county for the third quarter, ref 2026-Q3 Acct # ${FULL_NUMBER}`)!;
+    expect(memo).not.toContain(FULL_NUMBER);
+    const long = `${'Paid to the county for the third quarter '.repeat(25)}${memo}`;
+    const started = performance.now();
+    for (const p of ['%_%_%_%_%_%_%_%_%_%_Q', `${'%_'.repeat(30)}Q`, `${'%a'.repeat(40)}Q`, `%${'_%'.repeat(200)}Q`]) {
+      expect(ilikeMatches(memo, p), p).toBe(false);
+      expect(ilikeMatches(long, p), p).toBe(false);
+    }
+    expect(ilikeMatches(long, `${'%_'.repeat(30)}6789`)).toBe(true);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it('Transaction Detail answers a search full of wildcards at once', async () => {
+    const started = performance.now();
+    const report = await transactionDetail(masked, { from, to, search: `${'%_'.repeat(30)}Q` });
+    expect(report.rows).toEqual([]);
+    expect(performance.now() - started).toBeLessThan(5000);
+  });
+
+  it('lineMemoFor: masks after "account #" too, chart numbers included (deliberate, fail closed)', () => {
+    // The end of a vendor's account number cannot be told from the words after it.
+    expect(lineMemoFor(masked, 'Reclass to account #6100 Office Supplies')).toBe('Reclass to account #••••lies');
+    // Without "#", "No" or "Number" the memo is shown as typed.
+    expect(lineMemoFor(masked, 'Reclass to account 6100 Office Supplies')).toBe('Reclass to account 6100 Office Supplies');
+    expect(lineMemoFor(masked, 'ONLINE TRANSFER TO ACCOUNT 4455')).toBe('ONLINE TRANSFER TO ACCOUNT 4455');
+    expect(lineMemoFor(full, 'Reclass to account #6100 Office Supplies')).toBe('Reclass to account #6100 Office Supplies');
+  });
+
+  it('the journal entry as answered to a caller (getEntryForCaller): masked without the right, as stored with it', async () => {
+    const hidden = await getEntryForCaller(masked, legacyEntryId);
+    expect(hidden.lines.map((l) => l.memo)).toContain(SHOWN);
+    expect(JSON.stringify(hidden)).not.toContain(FULL_NUMBER);
+    expect((await getEntryForCaller(full, legacyEntryId)).lines.map((l) => l.memo)).toContain(MEMO);
+    expect((await getEntryForCaller(ctx, legacyEntryId)).lines.map((l) => l.memo)).toContain(MEMO);
+    // getEntry is the stored read for work that keeps or copies the entry (Undo snapshots it):
+    // whoever it runs for, it holds the memo as stored. GET /api/journal-entries/[id] still answers
+    // it (the route is not this unit's; see the route test below).
+    expect((await getEntry(masked, legacyEntryId)).lines.map((l) => l.memo)).toContain(MEMO);
+    // The stored line is not touched by reading it.
+    const stored = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, legacyEntryId));
+    expect(stored.map((l) => l.memo)).toContain(MEMO);
+  });
+
+  describe('GET /api/journal-entries/[id] (the journal entry window)', () => {
+    const fromRoute = async (c: ServiceContext) => {
+      routeCtx = c;
+      const res = await entryGET(new NextRequest(`http://localhost/api/journal-entries/${legacyEntryId}`), {
+        params: Promise.resolve({ id: legacyEntryId }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { entry: JournalEntryDetail };
+      return { memos: body.entry.lines.map((l) => l.memo), text: JSON.stringify(body) };
+    };
+
+    it('a caller with the right reads the memo as stored', async () => {
+      expect((await fromRoute(full)).memos).toContain(MEMO);
+    });
+
+    // The route still answers getEntry (the stored read): app/api/journal-entries/[id]/route.ts is
+    // not this unit's file, so switching its GET to getEntryForCaller is handed off. `it.fails`
+    // keeps the gap visible here; once the route is switched this reports "expected to fail":
+    // then make it `it`. The test above proves the route itself answers under this mock.
+    it.fails('a caller without the right reads it masked (fails until the route answers getEntryForCaller)', async () => {
+      const { memos, text } = await fromRoute(masked);
+      expect(memos).toContain(SHOWN);
+      expect(text).not.toContain(FULL_NUMBER);
+    });
+  });
+
+  it('the register: masked, and its search finds what the caller sees, not what the mask hides', async () => {
+    const reg = await accountRegister(masked, acct['6600'], { from, to });
+    expect(reg.rows.map((r) => r.memo)).toEqual([SHOWN]);
+    expect(JSON.stringify(reg)).not.toContain(FULL_NUMBER);
+    expect((await accountRegister(masked, acct['6600'], { from, to, search: '0001234' })).rows).toEqual([]);
+    expect((await accountRegister(masked, acct['6600'], { from, to, search: '••••6789' })).rows).toHaveLength(1);
+    expect((await accountRegister(full, acct['6600'], { from, to, search: '0001234' })).rows.map((r) => r.memo)).toEqual([MEMO]);
+    expect((await accountRegister(full, acct['6600'], { from, to })).rows.map((r) => r.memo)).toEqual([MEMO]);
+  });
+
+  it('the Adjusting Journal Entries report', async () => {
+    const memos = async (c: ServiceContext) =>
+      (await getAdjustingEntries(c, { from, to })).entries.flatMap((e) => e.lines.map((l) => l.memo)).sort();
+    expect(await memos(masked)).toEqual([SHOWN, 'Office rent']);
+    expect(await memos(full)).toEqual([MEMO, 'Office rent']);
+  });
+
+  it('report lines (General Ledger, transaction reports): masked; the memo filter matches the memo as shown', async () => {
+    const memos = async (c: ServiceContext, memo?: string) =>
+      (await fetchGlLines(c, await loadAccountMeta(c), { from, to, ...(memo !== undefined ? { memo } : {}) })).lines
+        .map((l) => l.memo)
+        .sort();
+    expect(await memos(masked)).toEqual([SHOWN, SHOWN, 'Office rent', 'Sales Tax Payment — County Tax Collector']);
+    expect(JSON.stringify((await fetchGlLines(masked, await loadAccountMeta(masked), { from, to })).lines)).not.toContain(FULL_NUMBER);
+    expect(await memos(full)).toEqual([MEMO, MEMO, 'Office rent', 'Sales Tax Payment — County Tax Collector']);
+
+    // Guesses at the hidden digits find nothing...
+    for (const guess of [FULL_NUMBER, '0001', 'Acct # 0001', '23456789', '%0001%']) {
+      expect(await memos(masked, guess), guess).toEqual([]);
+    }
+    // ...what the caller sees is found...
+    expect(await memos(masked, '6789')).toEqual([SHOWN, SHOWN]);
+    expect(await memos(masked, 'acct # ••••')).toEqual([SHOWN, SHOWN]);
+    // ...other lines, and the entry's own description, match as before.
+    expect(await memos(masked, 'office RENT')).toEqual(['Office rent']);
+    expect(await memos(masked, 'Utility deposit')).toEqual([SHOWN, 'Office rent']);
+    // A caller with the right: the stored text, exactly as today.
+    expect(await memos(full, '0001')).toEqual([MEMO, MEMO]);
+    expect(await memos(full, '••••')).toEqual([]);
+  });
+
+  it('Transaction Detail: masked; its search matches the memo as shown', async () => {
+    const memos = async (c: ServiceContext, search?: string) =>
+      (await transactionDetail(c, { from, to, search })).rows.map((r) => r.memo).sort();
+    expect(await memos(masked)).toEqual([SHOWN, SHOWN, 'Office rent', 'Sales Tax Payment — County Tax Collector']);
+    for (const guess of [FULL_NUMBER, '0001', 'Acct # 0001%', '_cct # 0']) {
+      expect(await memos(masked, guess), guess).toEqual([]);
+    }
+    expect(await memos(masked, '6789')).toEqual([SHOWN, SHOWN]);
+    expect(await memos(masked, 'Utility')).toEqual([SHOWN, 'Office rent']);
+    expect(await memos(full, '0001')).toEqual([MEMO, MEMO]);
+    expect(await memos(full)).toEqual([MEMO, MEMO, 'Office rent', 'Sales Tax Payment — County Tax Collector']);
+  });
+
+  it('Check Detail: the Sales Tax Payment check memo is masked; the printed check keeps it', async () => {
+    const line = async (c: ServiceContext) =>
+      (await checkDetail(c, { from, to })).rows.find((r) => r.id === legacyCheckId)?.lines[0].description;
+    expect(await line(masked)).toBe(SHOWN);
+    expect(JSON.stringify(await checkDetail(masked, { from, to }))).not.toContain(FULL_NUMBER);
+    expect(await line(full)).toBe(MEMO);
+    expect((await checkPrintData(masked, 'payment_check', legacyCheckId)).memo).toBe(MEMO);
+  });
+
+  it('reversing an entry copies its memos as stored, whoever reverses it', async () => {
+    const reversal = await reverseEntry(masked, manualId);
+    const stored = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, reversal.id));
+    expect(stored.map((l) => l.memo).sort()).toEqual([MEMO, 'Office rent']);
+    expect((await getEntryForCaller(masked, reversal.id)).lines.map((l) => l.memo).sort()).toEqual([SHOWN, 'Office rent']);
+  });
+
+  it('saving an entry as shown keeps the stored memo; a memo typed over it is saved as typed', async () => {
+    const created = await createManualEntry(ctx, {
+      date: d('2027-03-10'),
+      description: 'Water deposit',
+      lines: [
+        { accountId: acct['6600'], debit: '20.00', memo: MEMO },
+        { accountId: acct['1000'], credit: '20.00', memo: 'Paid' },
+      ],
+    });
+
+    // 1. Same ledger, new description: the entry is kept and its memos are untouched.
+    const shown = await getEntryForCaller(masked, created.id);
+    expect(shown.lines.map((l) => l.memo).sort()).toEqual([SHOWN, 'Paid']);
+    await updateEntry(masked, created.id, { ...asShownOnSave(shown), description: 'Water deposit (refundable)' });
+    expect(await storedMemos(created.id)).toEqual([MEMO, 'Paid']);
+
+    // 2. New amounts: re-posted as a new entry, the memo still as stored.
+    const again = asShownOnSave(await getEntryForCaller(masked, created.id));
+    const replacement = await updateEntry(masked, created.id, {
+      ...again,
+      lines: again.lines.map((l) => (l.debit ? { ...l, debit: '21.00' } : { ...l, credit: '21.00' })),
+    });
+    expect(replacement.id).not.toBe(created.id);
+    expect(await storedMemos(replacement.id)).toEqual([MEMO, 'Paid']);
+
+    // 3. A memo the caller changed is saved as typed.
+    const third = asShownOnSave(await getEntryForCaller(masked, replacement.id));
+    await updateEntry(masked, replacement.id, {
+      ...third,
+      lines: third.lines.map((l) => (l.memo === SHOWN ? { ...l, memo: 'Deposit, refundable' } : l)),
+    });
+    expect(await storedMemos(replacement.id)).toEqual(['Deposit, refundable', 'Paid']);
+
+    // A caller with the right saves what they see, as today.
+    const withRight = asShownOnSave(await getEntryForCaller(full, replacement.id));
+    await updateEntry(full, replacement.id, {
+      ...withRight,
+      lines: withRight.lines.map((l) => (l.memo === 'Paid' ? { ...l, memo: MEMO } : l)),
+    });
+    expect(await storedMemos(replacement.id)).toEqual([MEMO, 'Deposit, refundable']);
+  });
+
+  it('a memo typed as shown on another line is saved as typed: a hidden number moves only with its own line', async () => {
+    const created = await createManualEntry(ctx, {
+      date: d('2027-03-11'),
+      description: 'Moved memo',
+      lines: [
+        { accountId: acct['6600'], debit: '9.00', memo: MEMO },
+        { accountId: acct['1000'], credit: '9.00', memo: 'Paid' },
+      ],
+    });
+    const shown = asShownOnSave(await getEntryForCaller(masked, created.id));
+    // The 6600 memo is retyped and the masked text is typed on the bank line.
+    await updateEntry(masked, created.id, {
+      ...shown,
+      lines: shown.lines.map((l) => ({ ...l, memo: l.memo === SHOWN ? 'Water' : SHOWN })),
+    });
+    expect(await memoByAccount(created.id)).toEqual({ [acct['6600']]: 'Water', [acct['1000']]: SHOWN });
+  });
+
+  it('a line moved to another account, its memo left as shown, keeps the stored memo', async () => {
+    const created = await createManualEntry(ctx, {
+      date: d('2027-03-13'),
+      description: 'Reclass',
+      lines: [
+        { accountId: acct['6600'], debit: '6.00', memo: MEMO },
+        { accountId: acct['1000'], credit: '6.00', memo: 'Paid' },
+      ],
+    });
+    const shown = asShownOnSave(await getEntryForCaller(masked, created.id));
+    const replacement = await updateEntry(masked, created.id, {
+      ...shown,
+      lines: shown.lines.map((l) => (l.accountId === acct['6600'] ? { ...l, accountId: acct['6700'] } : l)),
+    });
+    expect(await memoByAccount(replacement.id)).toEqual({ [acct['6700']]: MEMO, [acct['1000']]: 'Paid' });
+  });
+
+  it('a line of the same account keeps the memo before a new line that shows the same text', async () => {
+    const created = await createManualEntry(ctx, {
+      date: d('2027-03-14'),
+      description: 'Split',
+      lines: [
+        { accountId: acct['6600'], debit: '5.00', memo: MEMO },
+        { accountId: acct['1000'], credit: '5.00', memo: 'Paid' },
+      ],
+    });
+    const shown = asShownOnSave(await getEntryForCaller(masked, created.id));
+    const own = shown.lines.find((l) => l.accountId === acct['6600'])!;
+    // A copy of the line on 6700 listed first, the bank line doubled to balance.
+    const replacement = await updateEntry(masked, created.id, {
+      ...shown,
+      lines: [
+        { ...own, accountId: acct['6700'] },
+        own,
+        { ...shown.lines.find((l) => l.accountId === acct['1000'])!, credit: '10.00' },
+      ],
+    });
+    expect(await memoByAccount(replacement.id)).toEqual({ [acct['6700']]: SHOWN, [acct['6600']]: MEMO, [acct['1000']]: 'Paid' });
+  });
+
+  it('a line whose account and amounts both changed, memo left as shown, is saved as shown (deliberate)', async () => {
+    // Nothing tells which stored line it was: the number is not guessed onto it.
+    const created = await createManualEntry(ctx, {
+      date: d('2027-03-15'),
+      description: 'Reclass and new amount',
+      lines: [
+        { accountId: acct['6600'], debit: '4.00', memo: MEMO },
+        { accountId: acct['1000'], credit: '4.00', memo: 'Paid' },
+      ],
+    });
+    const shown = asShownOnSave(await getEntryForCaller(masked, created.id));
+    const replacement = await updateEntry(masked, created.id, {
+      ...shown,
+      lines: shown.lines.map((l) =>
+        l.accountId === acct['6600'] ? { ...l, accountId: acct['6700'], debit: '4.50' } : { ...l, credit: '4.50' },
+      ),
+    });
+    expect(await memoByAccount(replacement.id)).toEqual({ [acct['6700']]: SHOWN, [acct['1000']]: 'Paid' });
+  });
+
+  it('a hidden memo stays on its own line of the same account when the amounts change', async () => {
+    const created = await createManualEntry(ctx, {
+      date: d('2027-03-12'),
+      description: 'Same line, new amount',
+      lines: [
+        { accountId: acct['6600'], debit: '7.00', memo: MEMO },
+        { accountId: acct['1000'], credit: '7.00', memo: 'Paid' },
+      ],
+    });
+    const shown = asShownOnSave(await getEntryForCaller(masked, created.id));
+    const replacement = await updateEntry(masked, created.id, {
+      ...shown,
+      lines: shown.lines.map((l) => (l.debit ? { ...l, debit: '8.00' } : { ...l, credit: '8.00' })),
+    });
+    expect(await memoByAccount(replacement.id)).toEqual({ [acct['6600']]: MEMO, [acct['1000']]: 'Paid' });
+  });
+
+  describe('Undo by a caller without the right puts back the memo as stored', () => {
+    const entry = (date: string, description: string) =>
+      createManualEntry(ctx, {
+        date: d(date),
+        description,
+        lines: [
+          { accountId: acct['6600'], debit: '12.00', memo: MEMO },
+          { accountId: acct['1000'], credit: '12.00', memo: 'Paid' },
+        ],
+      });
+
+    it('Undo of a void re-enters the memo as stored, not as the caller saw it', async () => {
+      const je = await entry('2027-05-03', 'Undo void deposit');
+      const { token } = await prepareUndo(masked, { resource: 'journal-entries', kind: 'void', id: je.id });
+      await voidEntry(masked, je.id);
+      await commitUndo(masked, { resource: 'journal-entries', kind: 'void', token });
+      const out = await performUndo(masked, token);
+      expect(out.newId).toBeTruthy();
+      expect(await storedMemos(out.newId!)).toEqual([MEMO, 'Paid']);
+      // The caller still sees the number masked on the copy.
+      expect((await getEntryForCaller(masked, out.newId!)).lines.map((l) => l.memo).sort()).toEqual([SHOWN, 'Paid']);
+    });
+
+    it('Undo of a memo edit (same entry kept) puts the stored memo back', async () => {
+      const je = await entry('2027-05-04', 'Undo memo edit');
+      const { token } = await prepareUndo(masked, { resource: 'journal-entries', kind: 'update', id: je.id });
+      const shown = asShownOnSave(await getEntryForCaller(masked, je.id));
+      await updateEntry(masked, je.id, {
+        ...shown,
+        lines: shown.lines.map((l) => (l.memo === SHOWN ? { ...l, memo: 'Deposit returned' } : l)),
+      });
+      expect(await storedMemos(je.id)).toEqual(['Deposit returned', 'Paid']);
+      await commitUndo(masked, { resource: 'journal-entries', kind: 'update', token });
+      await performUndo(masked, token);
+      expect(await storedMemos(je.id)).toEqual([MEMO, 'Paid']);
+    });
+
+    it('Undo of an edit that cleared the memo and changed the amounts puts the stored memo back', async () => {
+      const je = await entry('2027-05-05', 'Undo amount edit');
+      const { token } = await prepareUndo(masked, { resource: 'journal-entries', kind: 'update', id: je.id });
+      const shown = asShownOnSave(await getEntryForCaller(masked, je.id));
+      const replacement = await updateEntry(masked, je.id, {
+        ...shown,
+        lines: shown.lines.map((l) => (l.debit ? { ...l, debit: '13.00', memo: null } : { ...l, credit: '13.00' })),
+      });
+      expect(await storedMemos(replacement.id)).toEqual(['Paid', null]);
+      await commitUndo(masked, { resource: 'journal-entries', kind: 'update', token });
+      await performUndo(masked, token);
+      const posted = await db
+        .select({ id: journalEntries.id })
+        .from(journalEntries)
+        .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.description, 'Undo amount edit'), eq(journalEntries.status, 'posted')));
+      expect(posted).toHaveLength(1);
+      expect(posted[0].id).not.toBe(replacement.id);
+      expect(await storedMemos(posted[0].id)).toEqual([MEMO, 'Paid']);
+    });
+  });
+
+  it('the journal lines Pay Bills and Receive Payments list (journalOpenItems): masked without the right', async () => {
+    const v = await vendorWithNumber('Gas Utility');
+    await createManualEntry(ctx, {
+      date: d('2027-05-07'),
+      description: 'Gas accrual',
+      lines: [
+        { accountId: acct['6600'], debit: '30.00', memo: 'Gas' },
+        { accountId: acct['2000'], credit: '30.00', memo: MEMO, entityType: 'vendor', entityId: v.id },
+      ],
+    });
+    // GET /api/bill-payments/journal-items.
+    const hidden = await listJournalOpenItems(masked, 'ap', v.id);
+    expect(hidden.charges.map((c) => c.memo)).toEqual([SHOWN]);
+    expect(JSON.stringify(hidden)).not.toContain(FULL_NUMBER);
+    expect((await listJournalOpenItems(full, 'ap', v.id)).charges.map((c) => c.memo)).toEqual([MEMO]);
+    expect((await journalOpenItems(ctx, 'ap', { entityId: v.id })).map((i) => i.memo)).toEqual([MEMO]);
+  });
+
+  it('the memo search reads only memos the mask may change; every memo it changes is read', async () => {
+    const memos = [
+      `Acct # ${FULL_NUMBER}`,
+      'A/C No. 1234 5678',
+      'acct.#5550001',
+      'Account Number: 99887766',
+      'BankAcct#12345678',
+      'Accountnumber 12345678',
+      'Paid in full, ACCTS # 0042',
+      'ONLINE TRANSFER TO ACCOUNT 4455',
+      'Reclass to account 6100 Office Supplies',
+      'Office rent',
+    ];
+    const je = await createManualEntry(ctx, {
+      date: d('2027-06-05'),
+      description: 'Label shapes',
+      lines: [
+        ...memos.map((memo) => ({ accountId: acct['6600'], debit: '1.00', memo })),
+        { accountId: acct['1000'], credit: String(memos.length) + '.00', memo: null },
+      ],
+    });
+    const read = await db
+      .select({ memo: journalEntryLines.memo })
+      .from(journalEntryLines)
+      .where(and(eq(journalEntryLines.journalEntryId, je.id), memoMayHoldAccountNumber()));
+    const readMemos = new Set(read.map((r) => r.memo));
+    for (const memo of memos) {
+      if (lineMemoFor(masked, memo) !== memo) expect(readMemos.has(memo), memo).toBe(true);
+    }
+    expect(readMemos.has('ONLINE TRANSFER TO ACCOUNT 4455')).toBe(false);
+    expect(readMemos.has('Reclass to account 6100 Office Supplies')).toBe(false);
+    expect(readMemos.has('Office rent')).toBe(false);
+
+    // The General Ledger's memo filter: guesses find nothing, what the caller sees is found.
+    const june = { from: d('2027-06-01'), to: d('2027-06-30') };
+    const gl = async (c: ServiceContext, memo: string) =>
+      (await fetchGlLines(c, await loadAccountMeta(c), { ...june, memo })).lines.map((l) => l.memo).sort();
+    expect(await gl(masked, '0001234')).toEqual([]);
+    expect(await gl(masked, '5550001')).toEqual([]);
+    expect(await gl(masked, '••••6789')).toEqual([`Acct # ••••6789`]);
+    expect(await gl(masked, '4455')).toEqual(['ONLINE TRANSFER TO ACCOUNT 4455']);
+    expect(await gl(full, '0001234')).toEqual([`Acct # ${FULL_NUMBER}`]);
+  });
+});
+
+describe('6. the vendor lookup in an agent preview', () => {
+  const SEARX = 'http://100.64.1.9:8080';
+  const HOST = '100.64.1.9:8080';
+  const FERGUSON = [
+    { title: 'Ferguson — Plumbing Supplies', url: 'https://www.ferguson.com/', content: 'Wholesale distributor of plumbing supplies.' },
+  ];
+  let calls: string[];
+  const fetchImpl = async (input: string) => {
+    calls.push(input);
+    return new Response(JSON.stringify({ results: FERGUSON }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  beforeAll(async () => {
+    await setNetworkPolicy(ctx, { mode: 'tailnet-only', cloudOptIn: { 'vendor-lookup': true }, vendorLookupUrl: SEARX });
+  });
+  beforeEach(() => {
+    clearVendorLookupCache();
+    calls = [];
+  });
+  afterAll(() => clearVendorLookupCache());
+
+  it('a preview sends nothing: it stops and says which computer the name would go to', async () => {
+    const err = await runWithEffects('capture', () => lookupVendor(ctx, 'SQ *FERGUSON SUPPLY #2231', { fetchImpl })).catch((e: unknown) => e);
+    expect(isNotRunInPreview(err)).toBe(true);
+    expect(calls).toEqual([]);
+    expect((err as Error).message).toBe(
+      `This would contact ${HOST} for ${VENDOR_LOOKUP_PURPOSE}. A preview does not contact other computers, so it stopped here.`,
+    );
+    expect(effectsOfFailedRun(err)?.effects).toEqual([
+      { kind: 'network', summary: `Contact ${HOST} for ${VENDOR_LOOKUP_PURPOSE}`, detail: { host: HOST, purpose: VENDOR_LOOKUP_PURPOSE, ran: false } },
+    ]);
+    // The approval card says where, never the name itself.
+    expect(JSON.stringify(effectsOfFailedRun(err))).not.toMatch(/ferguson/i);
+  });
+
+  it("an agent's real run looks the name up and records the call for the audit trail", async () => {
+    const run = await runWithEffects('defer', () => lookupVendor(ctx, 'Ferguson Supply', { fetchImpl }));
+    expect(calls).toHaveLength(1);
+    expect(run.value?.summary).toContain('plumbing supplies');
+    expect(run.effects).toEqual([
+      { kind: 'network', summary: `Contact ${HOST} for ${VENDOR_LOOKUP_PURPOSE}`, detail: { host: HOST, purpose: VENDOR_LOOKUP_PURPOSE, ran: true } },
+    ]);
+    expect(await run.release()).toEqual([expect.objectContaining({ status: 'sent', error: null, ranDuringOperation: true })]);
+    // A name already looked up is answered from memory: a preview then contacts nothing either.
+    const cached = await runWithEffects('capture', () => lookupVendor(ctx, 'ferguson supply', { fetchImpl }));
+    expect(cached.value).toEqual(run.value);
+    expect(cached.effects).toEqual([]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('the prefill and bank-category suggestions stop in a preview before any request leaves', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new Error('This test must not reach the network.');
+    });
+    try {
+      const prefill = await runWithEffects('capture', () =>
+        suggestAccountForPayee(ctx, { payee: 'Hydro Pipe Wholesale', amount: '12.00', ai: true }),
+      ).catch((e: unknown) => e);
+      expect(isNotRunInPreview(prefill)).toBe(true);
+      expect(effectsOfFailedRun(prefill)?.effects.map((e) => e.detail.purpose)).toEqual([VENDOR_LOOKUP_PURPOSE]);
+
+      const [bank] = await db
+        .insert(bankAccounts)
+        .values({ companyId: ctx.companyId, accountId: acct['1000'], bankName: 'Masking Bank', accountNumber: '4321' })
+        .returning();
+      const [txn] = await db
+        .insert(bankTransactions)
+        .values({ companyId: ctx.companyId, bankAccountId: bank.id, date: d('2027-04-02'), amount: '-12.00', payee: 'HYDRO PIPE WHOLESALE #77' })
+        .returning();
+      const suggest = await runWithEffects('capture', () => llmSuggestBankCategory(ctx, txn.id)).catch((e: unknown) => e);
+      expect(isNotRunInPreview(suggest)).toBe(true);
+      expect(effectsOfFailedRun(suggest)?.effects.map((e) => e.detail.purpose)).toEqual([VENDOR_LOOKUP_PURPOSE]);
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
