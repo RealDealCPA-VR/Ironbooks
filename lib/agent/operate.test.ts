@@ -38,6 +38,12 @@
  *    or done by what the run moved, and an unknown amount for a run that changed existing records
  *    outside the ledger; the warnings an agent's flags silenced shown on the card; the version the
  *    agent last read carried on every run; the route's 429 for an answer that carries the wait.
+ *  - (wave 5) the approval's try takes the typed closing-date password, so closed-period work is
+ *    judged on its real figures (on the real bridge too) and a wrong password stops there; the
+ *    one line names people, roles and sign-ins on the request a person is shown, but in what the
+ *    agent alone reads only what it may read itself; a revealed file whose time is up is neither
+ *    asked about, printed nor saved; the Admin's folders are looked at once per call, never for a
+ *    read, and one whose disk does not answer is left out.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -153,9 +159,10 @@ import {
   journalEntries,
   userCompanies,
   userRoleAssignments,
+  userSessions,
   users,
 } from '@/lib/db/schema';
-import { createCompany } from '@/lib/services/company';
+import { createCompany, setClosingDate } from '@/lib/services/company';
 import { resolveAccess } from '@/lib/services/access';
 import { maskedForAgent } from '@/lib/permissions/agentAccess';
 import { OPERATION_CLASSES } from '@/lib/agent/operations/classes';
@@ -177,6 +184,7 @@ import {
 import { ACTIVITIES, ACTIVITY_KEYS, supportedActions, type ActivityDef } from '@/lib/permissions/activities';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { REQUEST_ID_MESSAGE } from './actions';
+import { CLOSING_PASSWORD_WRONG_MESSAGE } from './bridge';
 import { resolvePolicy } from './policy';
 import type { AgentGrant, AgentPolicy, AgentPreset, Operation, RequestFacts } from './operations/types';
 import type { BridgeActor, BridgeMode, BridgeResult, OperationInput, OperationPreview, ShellOperationDef } from './contract';
@@ -192,6 +200,7 @@ import {
   intersectAccess,
   lowerRole,
   operate,
+  requestNames,
   resetAgentRateLimits,
   runApproved,
 } from './operate';
@@ -600,7 +609,8 @@ describe('operate', () => {
       approval: { approvedBy: null, requestId: null, grantId: null },
       reveal: false,
       secrets: {},
-      folders: [SAVE_DIR],
+      // A read saves nothing: no folders, and nobody waits while their disks are looked at.
+      folders: [],
       atHost: false,
     });
     // The role's rights stay; the View flags and the closed-period right are off.
@@ -647,6 +657,8 @@ describe('operate', () => {
   it('a real change needs a request id', async () => {
     const err = await expectError(operate(agentCtx, { operation: 'invoices.create', body: { total: '10' } }), 'VALIDATION');
     expect(err.message).toBe(REQUEST_ID_MESSAGE);
+    // Told apart from any other refused input by its field, as the curated actions say it.
+    expect((err.details as Out)?.fields?.requestId).toMatch(/request_id/);
     expect(m.runOperation).not.toHaveBeenCalled();
   });
 
@@ -1298,9 +1310,11 @@ describe('runApproved', () => {
     const input = { body: { total: '10' }, reveal: true };
     const r = await runApproved(approver, { id, agentId, operation: 'invoices.create', input }, { secrets: { closing_password: 'pw' }, answers: {} }, { atHost: true });
     expect(r.mode).toBe('commit');
-    // Tried first with the approver's rights (no reveal, no secrets), then run.
+    // Tried first with the approver's rights (no reveal; of the typed secrets, the closing-date
+    // password alone), then run.
     expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run', 'commit']);
-    expect(callsOf('dry_run')[0].actor).toMatchObject({ reveal: false, secrets: {}, userId: ownerId });
+    expect(callsOf('dry_run')[0].actor).toMatchObject({ reveal: false, userId: ownerId });
+    expect(callsOf('dry_run')[0].actor.secrets).toEqual({ closing_password: 'pw' });
     const [call] = callsOf('commit');
     expect(call.base).toBe(approver);
     expect(call.input).toEqual(input);
@@ -1361,8 +1375,10 @@ describe('runApproved', () => {
     expect(stale.mode).toBe('dry_run');
     expect(stale.preview?.ledger?.entries).toHaveLength(2);
     expect(callsOf('commit')).toHaveLength(0);
-    // That preview may be stored on the request, where the agent reads it: no reveal, no secrets.
-    expect(callsOf('dry_run')[0].actor).toMatchObject({ reveal: false, secrets: {}, userId: ownerId });
+    // That preview may be stored on the request, where the agent reads it: no reveal, and no secret
+    // but the closing-date password (a header, in no preview or answer).
+    expect(callsOf('dry_run')[0].actor).toMatchObject({ reveal: false, userId: ownerId });
+    expect(callsOf('dry_run')[0].actor.secrets).toEqual({ closing_password: 'pw' });
 
     // Every yes is checked against the key stored on the request, acceptStale or not...
     m.runOperation.mockClear();
@@ -1500,8 +1516,9 @@ describe('runApproved', () => {
     expect(JSON.stringify(back)).not.toContain('123-45-6789');
     expect(callsOf('commit')).toHaveLength(0);
     const [masked, revealed] = callsOf('dry_run');
-    expect(masked.actor).toMatchObject({ reveal: false, secrets: {} });
-    expect(revealed.actor).toMatchObject({ reveal: true, secrets: {}, userId: ownerId, approval: { approvedBy: ownerId, requestId: more } });
+    expect(masked.actor).toMatchObject({ reveal: false, secrets: { closing_password: 'pw' } });
+    expect(revealed.actor).toMatchObject({ reveal: true, userId: ownerId, approval: { approvedBy: ownerId, requestId: more } });
+    expect(revealed.actor.secrets).toEqual({ closing_password: 'pw' });
 
     // The real figures need two people where the request did not: asked again, saying why.
     usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
@@ -1525,7 +1542,8 @@ describe('runApproved', () => {
     const closed: Partial<BridgeResult> = { outcome: 'error', httpStatus: 400, result: null, preview: null, error: { message: 'The period is closed.', code: 'PERIOD_CLOSED', details: null } };
     const shownClosed = { amount: '10', closedPeriod: true };
     bridgeAnswers({ dry_run: () => closed });
-    // The closing-date override is the commit's alone: a dry run of closed-period work cannot pass.
+    // A dry run that still meets the closing date (the rights both sides have lack the
+    // closed-period right, say) goes on to the commit, which checks the password again.
     const id = await storedRequest(null, 'invoices.create', shownClosed);
     expect((await runApproved(approver, { id, agentId, operation: 'invoices.create', input: { body: { total: '10', date: '2026-03-01' } } }, { secrets: { closing_password: 'pw' } }, { atHost: true })).mode).toBe('commit');
     expect(callsOf('commit')[0].actor.secrets).toEqual({ closing_password: 'pw' });
@@ -1583,6 +1601,64 @@ describe('runApproved', () => {
       mode: 'dry_run',
       outcome: 'needs_confirmation',
     });
+    expect(callsOf('commit')).toHaveLength(0);
+  });
+
+  it('the approval dry run takes the typed closing-date password and no other secret: closed-period work is judged on its real figures, and a wrong password stops there', async () => {
+    const input = { body: { total: '10', date: '2026-03-01' } };
+    // Asked as closed-period work, so without a preview and with its amount unknown on the card.
+    const shownClosed = { amount: null, closedPeriod: true };
+    const realFacts = (amount: string) => facts({ amount, closedPeriod: true, date: '2026-03-01' });
+
+    // Every secret typed: the dry run gets the closing-date password alone, the commit all of them.
+    const typed = { closing_password: 'pw', file_password: 'fpw', mail_password: 'mpw' };
+    bridgeAnswers({ dry_run: () => ({ facts: realFacts('10.00') }) });
+    const id = await storedRequest(null, 'invoices.create', shownClosed);
+    expect((await runApproved(approver, { id, agentId, operation: 'invoices.create', input }, { secrets: typed }, { atHost: true })).mode).toBe('commit');
+    expect(callsOf('dry_run')[0].actor.secrets).toEqual({ closing_password: 'pw' });
+    expect(callsOf('commit')[0].actor.secrets).toEqual(typed);
+    // No password typed: none is made up for the dry run.
+    m.runOperation.mockClear();
+    const none = await storedRequest(null, 'invoices.create', shownClosed);
+    await runApproved(approver, { id: none, agentId, operation: 'invoices.create', input }, { secrets: { closing_password: '' } }, { atHost: true });
+    expect(callsOf('dry_run')[0].actor.secrets).toEqual({});
+
+    // The password gets the dry run past the closing date, so its real figures are seen: more than
+    // the summary line showed (the agent's 10) is shown to the person first, nothing done.
+    m.runOperation.mockClear();
+    bridgeAnswers({ dry_run: () => ({ facts: realFacts('9000.00'), stalenessKey: 'k-closed' }) });
+    const more = await storedRequest(null, 'invoices.create', shownClosed);
+    const back = await runApproved(approver, { id: more, agentId, operation: 'invoices.create', input }, { secrets: { closing_password: 'pw' } }, { atHost: true });
+    expect(back).toMatchObject({ mode: 'dry_run', outcome: 'ok', stalenessKey: 'k-closed', facts: { amount: '9000.00' } });
+    expect(callsOf('commit')).toHaveLength(0);
+
+    // A wrong password stops at the dry run, in the bridge's own words, never as "the books changed"
+    // (also when the person was shown a preview). Too many wrong ones: the limiter's words.
+    const stopped = (message: string, details: Record<string, unknown>): Partial<BridgeResult> => ({
+      outcome: 'error',
+      httpStatus: 0,
+      result: null,
+      preview: null,
+      stalenessKey: null,
+      error: { message, code: 'FORBIDDEN', details },
+    });
+    m.runOperation.mockClear();
+    bridgeAnswers({ dry_run: () => stopped(CLOSING_PASSWORD_WRONG_MESSAGE, { closingPassword: 'wrong' }) });
+    for (const key of [null, 'k1']) {
+      const asked = await storedRequest(key, 'invoices.create', shownClosed);
+      const err = await expectError(
+        runApproved(approver, { id: asked, agentId, operation: 'invoices.create', input }, { secrets: { closing_password: 'nope' } }, { atHost: true }),
+        'FORBIDDEN',
+      );
+      expect(err.message, String(key)).toBe(CLOSING_PASSWORD_WRONG_MESSAGE);
+    }
+    bridgeAnswers({ dry_run: () => stopped('Too many wrong closing-date passwords. Try again in 30 seconds.', { rateLimited: true, retryAfterSeconds: 30 }) });
+    const locked = await storedRequest(null, 'invoices.create', shownClosed);
+    await expectError(
+      runApproved(approver, { id: locked, agentId, operation: 'invoices.create', input }, { secrets: { closing_password: 'pw' } }, { atHost: true }),
+      'FORBIDDEN',
+      /^Too many wrong closing-date passwords/,
+    );
     expect(callsOf('commit')).toHaveLength(0);
   });
 
@@ -1679,6 +1755,53 @@ describe('runApproved', () => {
     expect(r).toMatchObject({ mode: 'commit', outcome: 'error', result: null });
     expect(r.error?.message).toMatch(/already a file called "Theirs\.pdf".*never replaces a file for an agent/);
     expect(fs.readFileSync(theirs, 'utf8')).toBe('a person saved this');
+  });
+
+  it("a revealed file whose time ran out after the agent asked is neither printed nor saved when a person approves, and is not asked about again", async () => {
+    const ENDED = /protected values a person let this agent see for a while, and that time is over/;
+    const fileId = 'a7'.repeat(16);
+    const file = { fileId, name: 'w9.pdf', type: 'application/pdf', size: 3 };
+    const [reveal] = await db
+      .insert(agentPermissionRequests)
+      .values({
+        companyId,
+        agentId,
+        requestKey: rid(),
+        operation: 'attachments.get',
+        class: 'read_sensitive',
+        summary: 'Download document',
+        status: 'executed',
+        result: { answer: null, file, revealUntil: new Date(Date.now() + 10 * 60_000).toISOString() },
+        expiresAt: new Date(Date.now() + 86_400_000),
+      })
+      .returning({ id: agentPermissionRequests.id });
+    // Within its time: the print is put to a person.
+    const asked = await operate(agentCtx, { operation: 'shell.print.file', body: { fileId }, requestId: rid(), reason: 'Print the W-9' });
+    expect(asked).toMatchObject({ outcome: 'asked' });
+
+    // The time runs out before anyone approves (the requests service has not removed the file yet).
+    await db
+      .update(agentPermissionRequests)
+      .set({ result: { answer: null, file, revealUntil: new Date(Date.now() - 1_000).toISOString() } })
+      .where(eq(agentPermissionRequests.id, reveal.id));
+    for (const [operation, body] of [
+      ['shell.print.file', { fileId }],
+      ['files.save', { fileId, folder: SAVE_DIR, name: 'W-9.pdf' }],
+    ] as const) {
+      const id = await storedRequest(null, operation);
+      const r = await runApproved(approver, { id, agentId, operation, input: { body } }, {}, { atHost: true });
+      expect(r, operation).toMatchObject({ mode: 'commit', outcome: 'error', result: null });
+      expect(r.error?.message, operation).toMatch(ENDED);
+    }
+    expect(m.runShellOperation).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(SAVE_DIR, 'W-9.pdf'))).toBe(false);
+
+    // Asked again now: refused before anyone is asked.
+    m.createAgentRequest.mockClear();
+    const again = await operate(agentCtx, { operation: 'shell.print.file', body: { fileId }, requestId: rid(), reason: 'Print the W-9' });
+    expect(again).toMatchObject({ outcome: 'refused' });
+    expect(again.note).toMatch(ENDED);
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
   });
 });
 
@@ -1863,7 +1986,9 @@ describe('handleVerb', () => {
         { body: { customerId: 'c-1', total: '10.00' }, confirm: ['allowDuplicateNumber'], note: 'A plain invoice' },
         { body: { customerId: 'c-2', total: '5.00' } },
       ]);
-      expect(d.notes.join(' ')).toMatch(/Each of examples is a request as run_operation takes it/);
+      expect(d.notes.join(' ')).toMatch(/Each of examples is a request as run_operation takes it: send its params, query, body, confirm and reveal as shown\./);
+      // Its words beside it are not part of the request (run_operation's arguments are strict).
+      expect(d.notes.join(' ')).toMatch(/Its title and note only explain it: leave them out when you send it\./);
       // Still the whole description beside them.
       expect(d).toMatchObject({ id: 'invoices.create', treatment: 'run', confirmFlags: ['allowDuplicateNumber'] });
     } finally {
@@ -2060,6 +2185,49 @@ describe('handleVerb', () => {
     await expectError(handleVerb(agentCtx, 'get_file', { fileId }), 'NOT_FOUND', /24 hours/);
   });
 
+  it("a staged file of an approved reveal whose time is up is neither fetched nor saved again, whether or not it was removed yet", async () => {
+    const file = (fileId: string) => ({ fileId, name: 'w9.pdf', type: 'application/pdf', size: 3 });
+    const revealRow = async (result: Record<string, unknown>, status = 'executed', agent = agentId) => {
+      const [row] = await db
+        .insert(agentPermissionRequests)
+        .values({ companyId, agentId: agent, requestKey: rid(), operation: 'attachments.get', class: 'read_sensitive', summary: 'Download document', status, result, expiresAt: new Date(Date.now() + 86_400_000) })
+        .returning({ id: agentPermissionRequests.id });
+      return row.id;
+    };
+    const ENDED = /protected values a person let this agent see for a while, and that time is over/;
+    const over = 'a1'.repeat(16);
+    const leftBehind = 'b2'.repeat(16);
+    const unreadable = 'c3'.repeat(16);
+    const still = 'd4'.repeat(16);
+    const plain = 'e5'.repeat(16);
+    const others = 'f6'.repeat(16);
+    await revealRow({ answer: null, file: file(over), revealUntil: new Date(Date.now() - 60_000).toISOString() });
+    await revealRow({ answer: null, file: null, revealEnded: true, revealFileLeft: leftBehind });
+    await revealRow({ answer: null, file: file(unreadable), revealUntil: 'soon' });
+    await revealRow({ answer: null, file: file(still), revealUntil: new Date(Date.now() + 10 * 60_000).toISOString() });
+    await revealRow({ answer: null, file: file(plain) });
+    // Another agent's ended reveal says nothing about this agent's file of the same id.
+    const otherAgent = { id: await agentHolding([]) };
+    await revealRow({ answer: null, file: file(others), revealUntil: new Date(Date.now() - 60_000).toISOString() }, 'executed', otherAgent.id);
+
+    for (const fileId of [over, leftBehind, unreadable]) {
+      m.stagedFileInfo.mockResolvedValue(file(fileId));
+      m.readStagedFile.mockResolvedValue({ file: file(fileId), bytes: new TextEncoder().encode('abc') });
+      await expectError(handleVerb(agentCtx, 'get_file', { fileId }), 'NOT_FOUND', ENDED);
+      const saved = (await handleVerb(agentCtx, 'save_file', { fileId, folder: SAVE_DIR, requestId: rid(), reason: 'Keep it' })) as Out;
+      expect(saved, fileId).toMatchObject({ outcome: 'refused' });
+      expect(saved.note).toMatch(ENDED);
+    }
+    expect(m.readStagedFile).not.toHaveBeenCalled();
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
+    // Still within its time, an ordinary file, or another agent's reveal: handed over as before.
+    for (const fileId of [still, plain, others]) {
+      m.stagedFileInfo.mockResolvedValue(file(fileId));
+      m.readStagedFile.mockResolvedValue({ file: file(fileId), bytes: new TextEncoder().encode('abc') });
+      expect(await handleVerb(agentCtx, 'get_file', { fileId }), fileId).toEqual({ file: file(fileId), base64: 'YWJj' });
+    }
+  });
+
   it('save_file asks to save into an allowed folder, with a preview of the save', async () => {
     const fileId = 'e'.repeat(32);
     m.readStagedFile.mockResolvedValue({ file: { fileId, name: 'report.pdf', type: 'application/pdf', size: 3 }, bytes: new TextEncoder().encode('pdf') });
@@ -2242,14 +2410,17 @@ describe('the hard floor for roles an agent holds (plan §4.6, D9)', () => {
     expect(m.describeRequest.mock.calls.every((c) => c.length <= 3)).toBe(true);
   });
 
-  it('the hard-floor note names the role as a person knows it, and by the id sent when it has no name here', async () => {
+  it('the hard-floor note names a role as its reader may know it: the agent its own roles and built-in ones, a person every one', async () => {
     usePolicy('full_with_asks');
     const [r] = await db.insert(companyRoles).values({ companyId, name: 'Day Clerk', permissions: {}, flags: {} }).returning();
     await agentHolding([r.id]);
+    // Another agent's role: the agent may not read the roles without asking (class 'admin'), so
+    // its note gives back the id it sent, never the name.
     const tried = await operate(agentCtx, { operation: 'roles.delete', params: { id: r.id }, dryRun: true });
     expect(tried).toMatchObject({ outcome: 'refused' });
-    expect(tried.note).toMatch(/^No agent may change or delete role "Day Clerk", because an agent holds it/);
-    // At approval too.
+    expect(tried.note).toMatch(new RegExp(`^No agent may change or delete role "${r.id}", because an agent holds it`));
+    expect(tried.note).not.toContain('Day Clerk');
+    // At approval a person reads it: by its name.
     const id = await storedRequest(null, 'roles.update', { amount: null });
     await expectError(
       runApproved(approver, { id, agentId, operation: 'roles.update', input: { params: { id: r.id }, body: { description: 'Wider' } } }, {}, { atHost: true }),
@@ -2260,6 +2431,20 @@ describe('the hard floor for roles an agent holds (plan §4.6, D9)', () => {
     const braces = `{${r.id}}`;
     const other = await operate(agentCtx, { operation: 'roles.delete', params: { id: braces }, dryRun: true });
     expect(other.note).toContain(`role "${braces}"`);
+    // A built-in role, by its own name (the product's, the same in every company file).
+    const builtin = await operate(agentCtx, { operation: 'roles.delete', params: { id: 'bookkeeper' }, dryRun: true });
+    expect(builtin.note).toMatch(/^No agent may change or delete role "Bookkeeper", because an agent holds it/);
+
+    // A role the agent itself holds, by its name: get_my_permissions shows the agent those names.
+    const [own] = await db.insert(companyRoles).values({ companyId, name: 'Robo Role', permissions: {}, flags: {} }).returning();
+    const [before] = await db.select({ roleKeys: agents.roleKeys }).from(agents).where(eq(agents.id, agentId));
+    await db.update(agents).set({ roleKeys: [...((before.roleKeys as string[]) ?? []), own.id.toUpperCase()] }).where(eq(agents.id, agentId));
+    try {
+      const mine = await operate(agentCtx, { operation: 'roles.update', params: { id: own.id }, body: {}, dryRun: true });
+      expect(mine.note).toMatch(/^No agent may change or delete role "Robo Role", because an agent holds it/);
+    } finally {
+      await db.update(agents).set({ roleKeys: before.roleKeys }).where(eq(agents.id, agentId));
+    }
     expect(m.runOperation).not.toHaveBeenCalled();
   });
 
@@ -2271,6 +2456,114 @@ describe('the hard floor for roles an agent holds (plan §4.6, D9)', () => {
     expect(d.decision).toMatchObject({ outcome: 'refuse', code: 'hard_floor' });
     expect(d.decision.outcome === 'refuse' && d.decision.message).toMatch(/because an agent holds it/);
     expect(m.runOperation).not.toHaveBeenCalled();
+  });
+});
+
+describe('the one line names people, agents and sign-ins as a person knows them (summaryNames)', () => {
+  // The area and action are the test's own, so the agent's role passes the ceiling.
+  const RESET = op({
+    id: 'users.reset-password',
+    route: '/api/users/[id]/reset-password',
+    params: ['id'],
+    rule: { area: 'customers', action: 'modify' },
+    action: 'modify',
+    class: 'admin',
+    describe: 'Set a new password for user {id}',
+  });
+  const SIGN_OUT = op({
+    id: 'sessions.sign-out',
+    route: '/api/sessions/[id]',
+    method: 'DELETE',
+    params: ['id'],
+    rule: { area: 'customers', action: 'delete' },
+    action: 'delete',
+    class: 'admin',
+    describe: 'Sign out session {id}',
+  });
+  const AGENT_GET = op({ id: 'agents.get', route: '/api/agents/[id]', method: 'GET', params: ['id'], class: 'admin', availability: 'hard_floor' });
+  const namesFor = (id: string) => m.describeRequest.mock.calls.map((c) => (c[3] as Out | undefined)?.[id]).filter((v) => v !== undefined);
+  const unnamed = () => m.describeRequest.mock.calls.every((c) => c.length <= 3 || c[3] === undefined);
+
+  beforeEach(() => {
+    for (const o of [RESET, SIGN_OUT]) m.ops.set(o.id, o);
+    usePolicy('full_with_asks');
+  });
+
+  /** The line of the request a person is shown (createAgentRequest's summary). */
+  const askedLine = () => (m.createAgentRequest.mock.calls.at(-1)?.[1] as Out | undefined)?.summary;
+
+  it('a person of this company by their name on the request a person is shown; never in what the agent alone reads; anyone else by nothing', async () => {
+    const pat = await member('Pat Lee', 'accountant');
+    // A dry run: nothing is asked or kept, and the agent may not read the users without asking
+    // (class 'admin'), so the id it sent is all its line shows.
+    const tried = await operate(agentCtx, { operation: RESET.id, params: { id: pat }, dryRun: true });
+    expect(tried.outcome).toBe('dry_run');
+    expect(m.describeRequest).toHaveBeenCalled();
+    expect(unnamed()).toBe(true);
+    // Refused for want of a reason: the agent alone reads that too.
+    m.describeRequest.mockClear();
+    const noReason = await operate(agentCtx, { operation: RESET.id, params: { id: pat }, requestId: rid() });
+    expect(noReason.outcome).toBe('refused');
+    expect(unnamed()).toBe(true);
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
+    // Asked: the person approving must know whose password it is.
+    m.describeRequest.mockClear();
+    m.describeRequest.mockImplementation((o: Operation, _i: unknown, _a: unknown, names?: Record<string, string>) => `Summary of ${o.id}${names ? ` for ${Object.values(names).join(', ')}` : ''}`);
+    const asked = await operate(agentCtx, { operation: RESET.id, params: { id: pat }, requestId: rid(), reason: 'Pat is locked out' });
+    expect(asked.outcome).toBe('asked');
+    expect(namesFor(pat)).toContain('Pat Lee');
+    expect(askedLine()).toBe('Summary of users.reset-password for Pat Lee');
+
+    // A login of no company here, and an id that is no one's: named by nothing, even when asked.
+    const [stranger] = await db.insert(users).values({ email: `${randomUUID()}@elsewhere.test`, name: 'Sam Stranger', passwordHash: 'x' }).returning();
+    m.describeRequest.mockClear();
+    await operate(agentCtx, { operation: RESET.id, params: { id: stranger.id }, requestId: rid(), reason: 'x' });
+    await operate(agentCtx, { operation: RESET.id, params: { id: randomUUID() }, requestId: rid(), reason: 'x' });
+    expect(m.describeRequest).toHaveBeenCalled();
+    expect(unnamed()).toBe(true);
+  });
+
+  it("whose sign-in a session is, only for an agent whose role is Admin: only an Admin sees whose sessions are whose", async () => {
+    const pat = await member('Pat Session', 'accountant');
+    const [session] = await db.insert(userSessions).values({ userId: pat, companyId }).returning();
+    await operate(agentCtx, { operation: SIGN_OUT.id, params: { id: session.id }, requestId: rid(), reason: 'Left the laptop open' });
+    await operate(agentCtx, { operation: SIGN_OUT.id, params: { id: session.id }, dryRun: true });
+    expect(m.describeRequest).toHaveBeenCalled();
+    expect(unnamed()).toBe(true);
+
+    // An Admin role reads who is signed in on its own (GET /api/sessions is a read its policy runs
+    // without asking), so what it alone reads may name the session too, as its request does.
+    m.agentCeiling.mockImplementation(async () => ({ access: fullAccess(), role: 'admin', roleNames: ['Admin'] }));
+    m.describeRequest.mockClear();
+    await operate(agentCtx, { operation: SIGN_OUT.id, params: { id: session.id }, dryRun: true });
+    expect(namesFor(session.id)).toContain('of Pat Session');
+    m.describeRequest.mockClear();
+    await operate(agentCtx, { operation: SIGN_OUT.id, params: { id: session.id }, requestId: rid(), reason: 'Left the laptop open' });
+    expect(namesFor(session.id)).toContain('of Pat Session');
+    // A session of someone of no company here: by nothing.
+    const [stranger] = await db.insert(users).values({ email: `${randomUUID()}@elsewhere.test`, name: 'Sam Elsewhere', passwordHash: 'x' }).returning();
+    const [theirs] = await db.insert(userSessions).values({ userId: stranger.id }).returning();
+    m.describeRequest.mockClear();
+    await operate(agentCtx, { operation: SIGN_OUT.id, params: { id: theirs.id }, requestId: rid(), reason: 'x' });
+    expect(unnamed()).toBe(true);
+  });
+
+  it('requestNames gives a later rebuild of the line the same names, an agent by its name too', async () => {
+    const pat = await member('Pat Later', 'accountant');
+    expect(await requestNames(approver, agentId, RESET, { params: { id: pat } })).toEqual({ [pat]: 'Pat Later' });
+    expect(await requestNames(approver, agentId, AGENT_GET, { params: { id: agentId } })).toEqual({ [agentId]: 'Robo' });
+    const [role] = await db.insert(companyRoles).values({ companyId, name: 'Late Clerk', permissions: {}, flags: {} }).returning();
+    expect(await requestNames(approver, agentId, op({ id: 'roles.delete', route: '/api/roles/[id]', method: 'DELETE', params: ['id'] }), { params: { id: role.id } })).toEqual({
+      [role.id]: 'Late Clerk',
+    });
+    // A session is named only when the agent's role is Admin, as at the door.
+    const [session] = await db.insert(userSessions).values({ userId: pat, companyId }).returning();
+    expect(await requestNames(approver, agentId, SIGN_OUT, { params: { id: session.id } })).toBeUndefined();
+    m.agentCeiling.mockImplementation(async () => ({ access: fullAccess(), role: 'admin', roleNames: ['Admin'] }));
+    expect(await requestNames(approver, agentId, SIGN_OUT, { params: { id: session.id } })).toEqual({ [session.id]: 'of Pat Later' });
+    // Nothing named in the path, or a route that names no one: nothing.
+    expect(await requestNames(approver, agentId, RESET, {})).toBeUndefined();
+    expect(await requestNames(approver, agentId, op(), { body: { total: '1' } })).toBeUndefined();
   });
 });
 
@@ -2404,6 +2697,60 @@ describe("a desktop operation's paths are checked against the agent's folders be
     expect(none.note).toMatch(/^"file" must be/);
     expect(m.createAgentRequest).toHaveBeenCalledTimes(1);
   });
+
+  it("a folder the Admin added that has come to hold Ironbooks' own data since is not used, nor handed on to any run", async () => {
+    // ROOT now holds this test's database folder (BKA_DATA_DIR): saved before, it would be refused today.
+    usePolicy('full_with_asks', { folders: [SAVE_DIR, ROOT] });
+    const no = await operate(agentCtx, { operation: COPY.id, body: { file: path.join(ROOT, 'Books copy.ironbooks') }, requestId: rid(), reason: 'Keep a copy' });
+    expect(no).toMatchObject({ outcome: 'refused' });
+    expect(m.allowedFolder).toHaveBeenLastCalledWith([SAVE_DIR], ROOT);
+    // The note offers only the folders it may use, and so does get_my_permissions.
+    expect(no.note).toContain(`a folder the Admin added for this agent (${SAVE_DIR})`);
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
+    expect(((await handleVerb(agentCtx, 'get_my_permissions', {})) as Out).folders).toEqual([SAVE_DIR]);
+
+    // Neither the agent's own runs nor an approved one get it.
+    await operate(agentCtx, { operation: 'invoices.create', body: { total: '1' }, dryRun: true });
+    expect(callsOf('dry_run')[0].actor.folders).toEqual([SAVE_DIR]);
+    const id = await storedRequest(null);
+    await runApproved(approver, { id, agentId, operation: 'invoices.create', input: { body: { total: '10' } } }, {}, { atHost: true });
+    expect(callsOf('commit')[0].actor.folders).toEqual([SAVE_DIR]);
+  });
+
+  it("the Admin's folders are looked at once per call and never for a read; one whose disk does not answer is left out for now, holding nobody up", { timeout: 30_000 }, async () => {
+    // A mapped network drive that is offline: its disk never answers.
+    const offline = path.join(ROOT, 'offline-drive', 'Agent');
+    usePolicy('full_with_asks', { folders: [SAVE_DIR, offline] });
+    const realLstat = fs.promises.lstat.bind(fs.promises);
+    const looked: string[] = [];
+    const spy = vi.spyOn(fs.promises, 'lstat').mockImplementation(((p: fs.PathLike, ...rest: never[]) => {
+      looked.push(String(p));
+      if (String(p) === offline) return new Promise(() => {});
+      return (realLstat as (...a: unknown[]) => Promise<fs.Stats>)(p, ...rest);
+    }) as typeof fs.promises.lstat);
+    try {
+      // A read saves nothing: no folders, and no disk looked at.
+      await operate(agentCtx, { operation: 'invoices.list' });
+      expect(callsOf('read')[0].actor.folders).toEqual([]);
+      expect(looked).toEqual([]);
+
+      // A real change: each folder looked at once for the whole call (its dry run and its run); the
+      // one that does not answer is left out, and the call goes on without it.
+      await operate(agentCtx, { operation: 'invoices.create', body: { total: '1' }, requestId: rid() });
+      expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['read', 'dry_run', 'commit']);
+      expect(callsOf('dry_run')[0].actor.folders).toEqual([SAVE_DIR]);
+      expect(callsOf('commit')[0].actor.folders).toEqual([SAVE_DIR]);
+      expect(looked.filter((p) => p === SAVE_DIR)).toHaveLength(1);
+      expect(looked.filter((p) => p === offline)).toHaveLength(1);
+
+      // The next call waits on that same look rather than starting another one at that disk.
+      await operate(agentCtx, { operation: 'invoices.create', body: { total: '1' }, dryRun: true });
+      expect(looked.filter((p) => p === offline)).toHaveLength(1);
+      expect(callsOf('dry_run')[1].actor.folders).toEqual([SAVE_DIR]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 describe('doorRun and doorDecision (the curated actions share the door\'s count, places and first look)', () => {
@@ -2520,6 +2867,9 @@ describe('ask_for_permission never asks a person for standing permission that co
     const within = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'customers.update', constraints: { maxAmount: '900' }, reason: 'Fix the addresses', requestId: rid() })) as Out;
     expect(within).toMatchObject({ outcome: 'asked' });
     expect(within.note).toMatch(/standing permission never covers it/);
+    // The person reads it on the card too, before saying yes.
+    const CARD_WARNING = /^Standing permission for "customers\.update" .*: amounts up to 900\. While the two-person limit is set, it never covers a change to an existing record that posts nothing to the ledger: two people still approve each of those\.$/;
+    expect(m.createAgentRequest.mock.calls.at(-1)?.[1].summary).toMatch(CARD_WARNING);
     // Work with an amount field, or that only makes new records, is not warned.
     const named = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'invoices.create', reason: 'x', requestId: rid() })) as Out;
     expect(named.note).toMatch(/max_amount at or below 1000/);
@@ -2529,6 +2879,7 @@ describe('ask_for_permission never asks a person for standing permission that co
     const free = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'customers.update', reason: 'Fix the addresses', requestId: rid() })) as Out;
     expect(free).toMatchObject({ outcome: 'asked' });
     expect(free.note ?? '').not.toMatch(/standing permission never covers it/);
+    expect(m.createAgentRequest.mock.calls.at(-1)?.[1].summary).toBe('Standing permission for "customers.update" (Change or void) for up to 60 minutes, with no other limits.');
   });
 
   it('limited by records on work that never counts them, host-only work and company-file work: refused for everyone', async () => {
@@ -2855,6 +3206,48 @@ describe('against the real bridge, on a PGlite company', () => {
       expect(String((r.preview?.routePreview as Out).note)).toMatch(/closing-date password/);
       expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run']);
       expect(await entriesNamed('Closed since it was asked')).toBe(0);
+    } finally {
+      await db.update(companies).set({ settings: before?.settings ?? null }).where(eq(companies.id, companyId));
+    }
+  });
+
+  it('closed-period work approved with the closing-date password is tried first on its real figures: more than the card showed comes back to the person, a wrong password stops there, nothing posted until it is right', async () => {
+    usePolicy('trusted_bookkeeper');
+    const PW = 'Close-the-books-7';
+    const [before] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, companyId));
+    // The books are closed through June, with a password, as a person sets it.
+    await setClosingDate(approver, { closingDate: '2026-06-30', password: PW });
+    try {
+      const input = { body: jeBody('5000.00', 'Accrual in a closed month') };
+      // Kept as the requests service keeps a request whose card said 250 and the closed period.
+      const understated = await storedRequest(null, JE, { amount: '250.00', closedPeriod: true });
+      m.runOperation.mockClear();
+      const back = await runApproved(approver, { id: understated, agentId, operation: JE, input }, { secrets: { closing_password: PW } }, { atHost: true });
+      expect(back, JSON.stringify(back.error)).toMatchObject({ mode: 'dry_run', outcome: 'ok', facts: { amount: '5000.00', closedPeriod: true } });
+      expect(back.preview?.ledger?.entries).toHaveLength(1);
+      expect(typeof back.stalenessKey).toBe('string');
+      expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run']);
+      // The password went to that try as a header only: it is nowhere in what came back.
+      expect(JSON.stringify(back)).not.toContain(PW);
+      expect(await entriesNamed('Accrual in a closed month')).toBe(0);
+
+      // A wrong password stops at the try, in the bridge's own words; nothing runs.
+      const shown = await storedRequest(null, JE, { amount: '5000.00', closedPeriod: true });
+      m.runOperation.mockClear();
+      await expectError(
+        runApproved(approver, { id: shown, agentId, operation: JE, input }, { secrets: { closing_password: 'not-the-password' } }, { atHost: true }),
+        'FORBIDDEN',
+        CLOSING_PASSWORD_WRONG_MESSAGE,
+      );
+      expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run']);
+      expect(await entriesNamed('Accrual in a closed month')).toBe(0);
+
+      // Shown as it really is, with the right password: tried, then posted.
+      m.runOperation.mockClear();
+      const done = await runApproved(approver, { id: shown, agentId, operation: JE, input }, { secrets: { closing_password: PW } }, { atHost: true });
+      expect(done, JSON.stringify(done.error)).toMatchObject({ mode: 'commit', outcome: 'ok' });
+      expect(m.runOperation.mock.calls.map((c) => c[3])).toEqual(['dry_run', 'commit']);
+      expect(await entriesNamed('Accrual in a closed month')).toBe(1);
     } finally {
       await db.update(companies).set({ settings: before?.settings ?? null }).where(eq(companies.id, companyId));
     }

@@ -13,7 +13,7 @@
  *    reset by an Admin of all of them (no cross-company account takeover).
  *  - Every change writes an audit row (passwords are never logged).
  */
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { agents, companies, companyRoles, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
 import { hashPassword, verifyPassword } from '@/lib/auth';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
@@ -737,8 +737,39 @@ export async function createRole(
 }
 
 /**
+ * A role key as the held-role rule compares it: lower case, and a custom role's uuid without its
+ * braces and hyphens. The database reads a uuid in other spellings too (capitals, braces, hyphens
+ * left out or moved), so every spelling of one id comes out the same here; a built-in role's key
+ * ("bookkeeper") is compared as written, ignoring case. Null for anything that is not a key. The
+ * same form as lib/agent/operate.ts roleKeyOf and lib/agent/bridge.ts roleKeyForm.
+ */
+export function heldRoleKeyForm(key: unknown): string | null {
+  if (typeof key !== 'string') return null;
+  const text = key.trim().toLowerCase();
+  if (!text) return null;
+  const hex = text.replace(/[{}-]/g, '');
+  return /^[0-9a-f]{32}$/.test(hex) ? hex : text;
+}
+
+/**
+ * How many agents of this company hold a role, by the one rule every check of a held role uses
+ * (plan 4.6, D9): every agent that is not removed (revokedAt empty; a paused agent still holds its
+ * roles), each of its role keys compared with the role's id by heldRoleKeyForm, so a key stored or
+ * sent in another spelling of the same uuid still counts. Agents of other companies do not.
+ */
+export async function agentsHoldingRole(db: ServiceContext['db'], companyId: string, roleId: string): Promise<number> {
+  const key = heldRoleKeyForm(roleId);
+  if (key === null) return 0;
+  const rows = await db
+    .select({ roleKeys: agents.roleKeys })
+    .from(agents)
+    .where(and(eq(agents.companyId, companyId), isNull(agents.revokedAt)));
+  return rows.filter((r) => (Array.isArray(r.roleKeys) ? (r.roleKeys as unknown[]) : []).some((k) => heldRoleKeyForm(k) === key)).length;
+}
+
+/**
  * Agent full access (plan 4.6, D9): a role an agent holds is part of what that agent may do, so no
- * agent may change or delete it, whichever agent holds it (agents.roleKeys; a paused agent still
+ * agent may change or delete it, whichever agent holds it (agentsHoldingRole: a paused agent still
  * holds its roles, a removed one no longer does). The agent door refuses this before anyone is
  * asked and again when a person approves; this is the service's own backstop. A person's change of
  * the role is not affected: the Agents tab and Users & Roles are where people change these.
@@ -749,20 +780,12 @@ async function refuseAgentOnAgentRole(
   doing: 'change' | 'delete',
 ): Promise<void> {
   if (!ctx.agent) return;
-  const holders = await ctx.db
-    .select({ id: agents.id })
-    .from(agents)
-    .where(
-      and(
-        eq(agents.companyId, ctx.companyId),
-        isNull(agents.revokedAt),
-        sql`${agents.roleKeys} @> ${JSON.stringify([role.id])}::jsonb`,
-      ),
-    );
-  if (!holders.length) return;
+  // The id as stored (role.id, read back from the row), whatever spelling the agent sent.
+  const holders = await agentsHoldingRole(ctx.db, ctx.companyId, role.id);
+  if (!holders) return;
   // Only an agent reads this note, and agents may not list agents: it counts them, never names them
   // (a name here would let an agent learn other agents' names by trying role ids).
-  const who = holders.length === 1 ? 'an agent holds it' : `${holders.length} agents hold it`;
+  const who = holders === 1 ? 'an agent holds it' : `${holders} agents hold it`;
   throw new ServiceError(
     'FORBIDDEN',
     `An agent cannot ${doing} the role "${role.name}": ${who}, and changing a role an agent holds changes what that agent may do. A person can ${doing} it under Users & Roles.`,
@@ -838,11 +861,15 @@ export async function deleteRole(ctx: ServiceContext, roleId: string): Promise<v
     .where(and(eq(companyRoles.id, roleId), eq(companyRoles.companyId, ctx.companyId)));
   if (!row) throw notFound('Role');
   await refuseAgentOnAgentRole(ctx, row, 'delete');
+  // The users who hold it, by the id as stored (row.id). The row above is found by the database's
+  // uuid reading, which also takes capitals, braces or a missing hyphen; role_key is plain text
+  // holding the stored id, so comparing the id as sent would find nobody and delete a role people
+  // still hold.
   const holders = await ctx.db
     .select({ userId: userRoleAssignments.userId })
     .from(userRoleAssignments)
     .where(
-      and(eq(userRoleAssignments.companyId, ctx.companyId), eq(userRoleAssignments.roleKey, roleId)),
+      and(eq(userRoleAssignments.companyId, ctx.companyId), eq(userRoleAssignments.roleKey, row.id)),
     );
   if (holders.length) {
     throw new ServiceError(

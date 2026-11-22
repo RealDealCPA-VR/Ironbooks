@@ -5,10 +5,10 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { agents, companyRoles } from '@/lib/db/schema';
+import { agents, companyRoles, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { makeTestCompany, type TestCompany } from './testkit.prefs';
-import { createRole, deleteRole, updateRole } from './users';
+import { agentsHoldingRole, createRole, deleteRole, heldRoleKeyForm, updateRole } from './users';
 
 const AGENT = { id: '00000000-0000-4000-8000-0000000000c4', name: 'Keeper', mode: 'post' as const };
 
@@ -19,7 +19,7 @@ let n = 0;
 async function role(name: string) {
   return createRole(t.ctx, { name, permissions: { customers: ['view'] } });
 }
-async function agentHolding(name: string, roleKeys: string[], revoked = false) {
+async function agentHolding(name: string, roleKeys: string[], revoked = false, paused = false) {
   n += 1;
   await t.db.insert(agents).values({
     companyId: t.ctx.companyId,
@@ -28,7 +28,18 @@ async function agentHolding(name: string, roleKeys: string[], revoked = false) {
     tokenHash: `${'0'.repeat(62)}${String(n).padStart(2, '0')}`,
     tokenPrefix: `ibk_test_${n}`,
     ...(revoked ? { revokedAt: new Date() } : {}),
+    ...(paused ? { pausedAt: new Date() } : {}),
   });
+}
+/** A person of this company who holds the role (the stored id, as Users & Roles writes it). */
+async function userHolding(roleKey: string) {
+  n += 1;
+  const [u] = await t.db
+    .insert(users)
+    .values({ email: `holder-${n}-${Date.now()}@test.local`, name: `Holder ${n}`, passwordHash: 'x' })
+    .returning();
+  await t.db.insert(userCompanies).values({ userId: u.id, companyId: t.ctx.companyId, role: 'viewer' });
+  await t.db.insert(userRoleAssignments).values({ userId: u.id, companyId: t.ctx.companyId, roleKey });
 }
 const stored = async (id: string) => (await t.db.select().from(companyRoles).where(eq(companyRoles.id, id)))[0];
 
@@ -75,6 +86,59 @@ describe('a role an agent holds', () => {
     await expect(updateRole(agentCtx, spare.key, { name: 'Spare 2' })).resolves.toMatchObject({ name: 'Spare 2' });
     await expect(deleteRole(agentCtx, spare.key)).resolves.toBeUndefined();
     expect(await stored(spare.key)).toBeUndefined();
+  });
+
+  it('one rule, however the id is spelled: the agent sends it or holds it in capitals, braces or without hyphens', async () => {
+    const spelled = await role('Spelled');
+    const hex = spelled.key.replace(/-/g, '');
+    // The agent sends the id in another spelling the database reads as the same uuid.
+    await agentHolding('Plain Holder', [spelled.key]);
+    for (const sent of [spelled.key.toUpperCase(), `{${spelled.key}}`, hex]) {
+      await expect(updateRole(agentCtx, sent, { name: 'Spelled 2' }), sent).rejects.toMatchObject({ code: 'FORBIDDEN', details: { hardFloor: true, roleId: spelled.key } });
+      await expect(deleteRole(agentCtx, sent), sent).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    }
+    // An agent whose stored key is another spelling of the id holds the role too.
+    const other = await role('Other spelling');
+    await agentHolding('Capitals Holder', [`{${other.key.toUpperCase()}}`]);
+    expect(await agentsHoldingRole(t.db, t.ctx.companyId, other.key)).toBe(1);
+    await expect(updateRole(agentCtx, other.key, { name: 'Other 2' })).rejects.toMatchObject({ message: expect.stringContaining('an agent holds it') });
+    // Removed agents do not count, in any spelling; nor do another company's agents.
+    const gone = await role('Gone spelling');
+    await agentHolding('Gone Capitals', [gone.key.toUpperCase()], true);
+    expect(await agentsHoldingRole(t.db, t.ctx.companyId, gone.key)).toBe(0);
+    expect(await agentsHoldingRole(t.db, '00000000-0000-4000-8000-0000000000ff', other.key)).toBe(0);
+    expect(heldRoleKeyForm(` {${other.key.toUpperCase()}} `)).toBe(heldRoleKeyForm(other.key));
+    expect(heldRoleKeyForm('Bookkeeper')).toBe('bookkeeper');
+    expect(heldRoleKeyForm('')).toBeNull();
+    expect(await stored(spelled.key)).toMatchObject({ name: 'Spelled' });
+  });
+
+  it('a paused agent still holds its roles (only a removed one gives them up)', async () => {
+    const held = await role('Paused hold');
+    await agentHolding('Paused Agent', [held.key], false, true);
+    expect(await agentsHoldingRole(t.db, t.ctx.companyId, held.key)).toBe(1);
+    await expect(updateRole(agentCtx, held.key, { name: 'Paused hold 2' })).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+      message: expect.stringContaining('an agent holds it'),
+      details: { hardFloor: true, roleId: held.key },
+    });
+    await expect(deleteRole(agentCtx, held.key)).rejects.toMatchObject({ code: 'FORBIDDEN', details: { hardFloor: true } });
+    expect(await stored(held.key)).toMatchObject({ name: 'Paused hold' });
+  });
+
+  it('a role users hold is not deleted, however its id is spelled (by a person or an agent)', async () => {
+    const used = await role('Used by people');
+    await userHolding(used.key);
+    const spellings = [used.key, used.key.toUpperCase(), `{${used.key}}`, used.key.replace(/-/g, '')];
+    for (const sent of spellings) {
+      for (const ctx of [t.ctx, agentCtx]) {
+        await expect(deleteRole(ctx, sent), sent).rejects.toMatchObject({
+          code: 'CONFLICT',
+          message: '"Used by people" is assigned to 1 user(s). Remove it from them first.',
+        });
+      }
+    }
+    expect(await stored(used.key)).toMatchObject({ name: 'Used by people' });
   });
 
   it('a person may delete a role only an agent holds (people manage agents and roles)', async () => {

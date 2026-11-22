@@ -19,9 +19,11 @@ import { createIronbooksServer } from '../../mcp/ironbooks-mcp.mjs';
 import { TOOLS } from '../../mcp/tools.mjs';
 import { AREAS, MAX_RESULT_CHARS, OPERATION_TOOLS, REQUEST_STATUSES, RISK_CLASSES, WAIT_MAX_SECONDS, cutToFit, holdToLimit, shapeRequest } from '../../mcp/operations-tools.mjs';
 import { FILE_TOOLS, STAGED_FILE_HOURS, UPLOAD_CHUNK_BYTES, UPLOAD_MAX_BYTES } from '../../mcp/files-tools.mjs';
+import { ENTRY_TOOLS } from '../../mcp/entry-tools.mjs';
 import {
   ADMIN_GIVES_STANDING,
   CLASS_MEANINGS,
+  DOOR_ENTRY_TOOLS,
   FIND_EXAMPLES,
   GUIDE_PROMPT_NAME,
   GUIDE_TEXT,
@@ -341,6 +343,28 @@ describe('run_operation', () => {
     // Empty confirm, reveal false: left out.
     await call(client, 'run_operation', { operation: 'reports.std.get', confirm: [], reveal: false });
     expect(acted[2]).toEqual({ verb: 'run_operation', operation: 'reports.std.get' });
+  });
+
+  it('sends the version of the record the agent read (expected_updated_at), when given, as the contract names it', async () => {
+    const VERSION = '2026-03-08T14:05:09.123Z';
+    const { client, acted } = fake({ act: (r) => ({ operation: r.operation, outcome: r.dryRun ? 'dry_run' : 'done', result: { ok: true } }) });
+    await call(client, 'run_operation', { operation: 'customers.update', params: { id: ID }, body: { phone: '555-0100' }, expected_updated_at: VERSION, request_id: 'c-1', reason: 'New phone.' });
+    expect(acted[0]).toEqual({ verb: 'run_operation', operation: 'customers.update', params: { id: ID }, body: { phone: '555-0100' }, expectedUpdatedAt: VERSION, requestId: 'c-1', reason: 'New phone.' });
+    // A dry run checks it too; left out, nothing is sent for it (it stays optional).
+    await call(client, 'run_operation', { operation: 'customers.update', params: { id: ID }, body: {}, expected_updated_at: VERSION, dry_run: true });
+    expect(acted[1]).toEqual({ verb: 'run_operation', operation: 'customers.update', params: { id: ID }, body: {}, expectedUpdatedAt: VERSION, dryRun: true });
+    await call(client, 'run_operation', { operation: 'customers.update', params: { id: ID }, body: {}, request_id: 'c-2' });
+    expect(acted[2]).not.toHaveProperty('expectedUpdatedAt');
+    expect((OPERATION_TOOLS as Any[]).find((t) => t.name === 'run_operation')!.inputSchema.required).toEqual(['operation']);
+    // Changed since: the route's "reload" becomes what an agent can do. Without a version sent, a 409 is passed on as it is.
+    const changed = 'This record was changed by Dana Lee at 03/08/2026 2:06 PM. Reload to see the latest.';
+    const conflict = fake({ act: () => new IronbooksError(changed, { status: 409, code: 'CONFLICT' }) });
+    const r = await call(conflict.client, 'run_operation', { operation: 'customers.update', params: { id: ID }, body: {}, expected_updated_at: VERSION, request_id: 'c-3' });
+    expect(r.isError).toBe(true);
+    expect(r.text).toBe(
+      `${changed} If it says the record was changed since you read it, nothing was changed: read the record again, make your change on what it says now, and send it with the updatedAt you read then (editedAt for an account or an item) as expected_updated_at and a NEW request_id.`,
+    );
+    expect((await call(conflict.client, 'run_operation', { operation: 'customers.update', params: { id: ID }, body: {}, request_id: 'c-4' })).text).toBe(changed);
   });
 
   it('answers each outcome with what to do next', async () => {
@@ -1091,6 +1115,11 @@ describe('the guide', () => {
       expect(GUIDE_TEXT, n).toContain(n);
     }
     expect(GUIDE_TEXT).toContain('Every named tool that changes the books takes dry_run, request_id and a reason, like run_operation.');
+    // What a missing reason does is said apart for the tools that go through the generic door (the
+    // door refuses to ask without one) and the curated ones (they ask, and the card says so).
+    expect(DOOR_ENTRY_TOOLS).toEqual((ENTRY_TOOLS as Any[]).map((t) => t.name));
+    expect(GUIDE_TEXT).toContain(`Without one, a request from ${DOOR_ENTRY_TOOLS.join(', ')} (these go through the generic door, like run_operation and the report tools) is not put to a person at all: Ironbooks refuses it and says to send it again with a reason.`);
+    expect(GUIDE_TEXT).not.toMatch(/without one it says that no reason was given/);
     // As the guide says: every named tool that changes something takes all three.
     const generic = new Set([...OPERATION_TOOLS, ...FILE_TOOLS].map((t: Any) => t.name));
     for (const t of (TOOLS as Any[]).filter((x) => x.changes === true && !generic.has(x.name))) {
@@ -1140,9 +1169,12 @@ describe.skipIf(!Ajv2020)(`every input schema is real JSON Schema, and says what
           { operation: 'invoices.email', params: { id: ID }, query: { a: 'b', c: ['d'] }, body: { to: 'x' }, dry_run: true },
           { operation: 'x', body: [1, 2], request_id: 'r-1', reason: 'why', confirm: ['allowZero'], reveal: true },
           { operation: 'x', body: 'text' },
+          { operation: 'x', params: { id: ID }, body: {}, expected_updated_at: '2026-03-08T14:05:09.123Z', request_id: 'r-1' },
         ],
         bad: [
           {},
+          { operation: 'x', expected_updated_at: '2026-03-08' },
+          { operation: 'x', expected_updated_at: `2026-03-08T14:05:09.123Z${'0'.repeat(20)}` },
           { operation: 'x', params: { id: 1 } },
           { operation: 'x', query: { a: 1 } },
           // More values for one query name than the door takes (lib/agent/operate.ts: at most 100).
@@ -1198,7 +1230,10 @@ describe('the new tools\' schemas and handlers agree', () => {
       act: (r) => (r.verb === 'upload_file' ? { uploadId: 'u', received: 3, file: { fileId: FILE, name: 'a', type: 'text/plain', size: 3 } } : { outcome: 'asked', requestId: ID, request: REQUEST }),
     });
     const full: Record<string, [Any, string[]]> = {
-      run_operation: [{ operation: 'x', params: { id: ID }, query: { q: 'a' }, body: { b: 1 }, request_id: 'r-1', reason: 'why', confirm: ['allowZero'], reveal: true }, ['operation', 'params', 'query', 'body', 'requestId', 'reason', 'confirm', 'reveal']],
+      run_operation: [
+        { operation: 'x', params: { id: ID }, query: { q: 'a' }, body: { b: 1 }, request_id: 'r-1', reason: 'why', confirm: ['allowZero'], reveal: true, expected_updated_at: '2026-03-08T14:05:09.123Z' },
+        ['operation', 'params', 'query', 'body', 'requestId', 'reason', 'confirm', 'reveal', 'expectedUpdatedAt'],
+      ],
       ask_for_permission: [{ operation: 'x', constraints: { max_uses: 1 }, minutes: 5, reason: 'why', request_id: 'g-1' }, ['operation', 'constraints', 'minutes', 'reason', 'requestId']],
       save_file: [{ file_id: FILE, folder: 'C:\\Books', name: 'b.pdf', request_id: 's-1', reason: 'why' }, ['fileId', 'folder', 'name', 'requestId', 'reason']],
       find_operations: [{ query: 'q', area: 'banking', class: 'read', limit: 3 }, ['query', 'area', 'class', 'limit']],

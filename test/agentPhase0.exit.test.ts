@@ -16,8 +16,11 @@
  *  - a read_only agent is refused (and is not even asked about);
  *  - a trusted_bookkeeper agent posts without asking, named "<agent> (agent)".
  *
+ *  - two waiting estimates, approved one after the other, both run: the number the first took does
+ *    not make the second stale (plan §7.4).
+ *
  * A step that does not behave as the plan says is kept as it.fails with a comment naming what is
- * wrong and where, never bent to pass.
+ * wrong and where, never bent to pass. None is left in this file (wave 5).
  *
  * Order: vitest runs the tests of this file one after the other, in the order written. Most share
  * only the asking agent (asker) and stand on their own; the few that build on an earlier test say
@@ -315,9 +318,10 @@ describe('Phase 0 exit: a denial, and asking twice', () => {
 });
 
 // Relies on order: the second test approves the estimate the first one asks for (second), after
-// the first one's yes.
+// the first one's yes, and compares it with the first one's estimate (firstId).
 describe('Phase 0: two estimates waiting, approved one after the other', () => {
   let second: AgentOperationAnswer | null = null;
+  let firstId: string | null = null;
 
   it('two estimates are asked for; the person approves the first', async () => {
     const body = (n: number) => ({ customerId: s.rich.customerId, date: '2026-11-08', lines: [{ description: `Quote ${n}`, quantity: '1', rate: '75.00' }] });
@@ -325,30 +329,33 @@ describe('Phase 0: two estimates waiting, approved one after the other', () => {
     second = await asker.run({ operation: 'estimates.create', body: body(2), requestId: 'p0-pair-2', reason: 'Two quotes from the same email.' });
     expect(first.outcome).toBe('asked');
     expect(second.outcome).toBe('asked');
+    firstId = first.requestId!;
     const r = await s.admin.approve(first.requestId!);
     expect(r.status).toBe('executed');
   });
 
-  // DOES NOT BEHAVE AS THE PLAN SAYS (plan §7.4: "the server compares the touched records'
-  // versions with the staleness key"; §7.2 "Approve" runs it). The second estimate touches no
-  // record the first one changed, yet its approval answers 'stale' and nothing runs: the person
-  // has to say yes again on a "the books changed" preview that shows the same estimate.
-  // Evidence: the only difference between the preview the agent asked with and the stale one is
-  // the estimate's own number (records: estimate.estimateNumber 2 -> 3). Same for purchase
-  // orders (purchase_order.poNumber 1 -> 2), and for anything that posts (journal_entry
-  // .entryNumber 15 -> 16: bills, invoices, transfers). Time entries, customers and mileage, which
-  // take no number, approve fine one after the other.
-  // Why: lib/agent/bridge.ts stalenessKeyOf hashes every audit row's new values through keyValue,
-  // which leaves out ids, times and secrets but not the next number the run takes for itself
-  // (estimateNumber, poNumber, entryNumber, the next invoice or check number). Any record of that
-  // kind made by anyone in between moves it. The bridge unit's WAVE2 notes leave this as an open
-  // question ("Is a re-preview whenever another posting changes the next document number
-  // acceptable noise?"); for the approval center it means only the first of several waiting
-  // estimates, orders or bills runs on a yes. See also test/agentPhase1.exit.test.ts (five bills).
-  it.fails('the second runs on the first yes', async () => {
+  // Plan §7.4: "the server compares the touched records' versions with the staleness key". The
+  // second estimate touches no record the first one changed; all that moved is the next estimate
+  // number, which the first one took (estimate.estimateNumber 2 -> 3). The staleness key leaves
+  // out what a run assigns itself (lib/agent/bridge.ts stalenessKeyOf / keyValue: a value of
+  // TAKEN_COLUMNS the run took is read as "#own"), so two waiting requests that each take "the
+  // next number" do not make each other stale. Was it.fails until wave 4. The key still moves for
+  // a record the request reads: see 'the books changed since the agent asked' below.
+  it('the second runs on the first yes', async () => {
     expect(second?.requestId).toBeTruthy();
     const r = await s.admin.approve(second!.requestId!);
-    expect(r.status).toBe('executed');
+    expect(r.status, JSON.stringify({ status: r.request.status, error: r.request.error, stale: r.request.stale })).toBe('executed');
+    expect(r.request.stale ?? false).toBe(false);
+    // In the books, with a number of its own: the next one after the first estimate's.
+    const id = createdId(r.request.result);
+    const [mine] = await s.db.select({ number: estimates.estimateNumber }).from(estimates).where(eq(estimates.id, id));
+    expect(mine, 'the second estimate is in the books').toBeTruthy();
+    const [firstRow] = await s.db
+      .select({ number: estimates.estimateNumber })
+      .from(estimates)
+      .where(eq(estimates.id, createdId((await s.admin.request(firstId!)).result)));
+    expect(mine.number).toBeGreaterThan(firstRow.number);
+    for (const a of await s.auditOf(id)) expect(a.agentRequestId).toBe(second!.requestId);
   });
 });
 

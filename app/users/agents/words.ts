@@ -135,12 +135,20 @@ export const VIEW_ONLY_NOTE =
 export const ADMIN_TO_PAUSE_ALL = 'Only an Admin can pause or resume all agents at once.';
 
 /**
- * Beside the server's "was not found" refusal when the folder it names is one the agent already
- * has: it was moved or deleted after it was given, and a save sends the whole list, which the
- * server checks folder by folder. Taking it off is open to anyone who may change the agent.
+ * After a save, beside Save: folders the agent had that Ironbooks took off its list itself
+ * (policyDraft.ts foldersTakenAway). The server does that, for a person who is not an Admin, to a
+ * folder that would be refused were it given today (agentPolicies.ts keptFolderRefusal: a share of
+ * this computer, a whole drive or a share's own folder, the books' or Ironbooks' own places); the
+ * rest of the save went through. The answer does not say which rule each one broke, so this names
+ * the rules and where the reason is written (the save's audit row, foldersTakenAway). The audit
+ * trail needs its own permission (lib/permissions/routes.ts), which a person who manages agents may
+ * not have, so the note says an Admin can look. What only an Admin may add is said as LimitsForm
+ * says it (ADMIN_TO_ADD_FOLDER): a folder inside one the agent still has is open to this person.
  */
-export function storedFolderGone(folder: string): string {
-  return `"${folder}" is already on this agent's list. If it was moved or deleted, take it off the list under Limits, then save again.`;
+export function foldersTakenAwayNote(folders: string[]): string {
+  const one = folders.length === 1;
+  const list = folders.map((f) => `"${f}"`).join(', ');
+  return `Saved. Ironbooks took ${one ? 'this folder' : 'these folders'} off the agent's list, because an agent may no longer be given ${one ? 'it' : 'them'}: ${list}. A folder is taken off when it is a whole drive or share, a share of this computer, or holds or is inside the company file's folders or Ironbooks' own data. The audit trail entry for this save says which; if you cannot open the audit trail, an Admin can. Only an Admin can give the agent a folder outside the ones it has.`;
 }
 
 /** Under the limits a person who is not an Admin may only lower. */
@@ -221,9 +229,14 @@ export const ROLE_AND_PRESET_NOTE =
 export const ROLE_HELP =
   'An agent sees what a person with this role sees, and can ask for no more than the role allows. Full Social Security numbers, full account numbers and work in a closed period never happen without a person saying yes, one request at a time.';
 
-/** D1: shown when the Admin role is ticked. */
+/**
+ * D1: shown when the Admin role is ticked, and on the page of an agent that holds it. Admin work
+ * (users and roles, the company file, passwords) stays on Never under "Ask for every change", the
+ * new agent's preset (PRESET_DEFAULTS, lib/agent/policy.ts), so the warning says the agent can ask
+ * for it only where its settings say Ask, as docs/agents-for-people/set-up-an-agent.md does.
+ */
 export const ADMIN_ROLE_WARNING =
-  'With the Admin role this agent can ask for anything an Admin can do: users and roles, backups, restoring, the company file and passwords. Every one of those requests still needs a person to say yes, and only an Admin can approve them. Choose it only if the agent needs that work.';
+  'With the Admin role this agent can ask for Admin work: users and roles, backups, restoring, the company file and passwords, wherever its settings say Ask for that work ("Ask for every change" keeps it on Never). Every one of those requests still needs a person to say yes, and only an Admin can approve them. Choose it only if the agent needs that work.';
 
 export const POLICY_INTRO =
   'For each kind of work: Allow lets the agent do it by itself, Ask makes it wait for a person, Never refuses it. A locked choice cannot be made for an agent. What you click is kept as chosen, even when it is the preset\'s own, so a later change of preset does not move it; "As the preset" makes it follow again.';

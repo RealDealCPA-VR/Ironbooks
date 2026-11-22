@@ -255,6 +255,14 @@ export function agentDirectReadAllowed(operation: AgentRouteOperation | null | u
  * Refused: every other method (HEAD too: it runs the GET handler and no agent needs it), pages,
  * the hard-floor routes, and any GET the lookup does not find, cannot classify or throws on.
  * Without a lookup only the door and the agent's own reads pass.
+ *
+ * It runs where a route asks for its context (lib/agentContext.ts, through getServerContext). A
+ * 'public' route that never calls getServerContext (the sign-in screen's file info, the desktop's
+ * start-up checks) never runs it, so it answers an agent's request the way it answers anything that
+ * reaches Ironbooks before anyone signs in, whatever the registry classes it. Such a route must hold
+ * nothing an agent may not see: GET /api/company-file/info, class file through the door, leaves out
+ * the folder for every request that is not the app's own window (lib/agentContext.test.ts checks
+ * that answer, and pins as a FINDING that it still answers an agent at all).
  */
 export function agentRouteAllowed(
   path: string | null | undefined,

@@ -51,9 +51,19 @@
  * that preview showed them; a further change is another stale round. So nobody ever approves a
  * preview other than the one on their screen.
  *
- * The table has no columns for the request's kind, its facts or the standing permission asked
- * for. They are kept in `needs`, under the key `request` (RequestMeta below), and left out of
- * every view's `needs`.
+ * The table has no columns for the request's kind, its facts or the standing permission asked for.
+ * They are kept in `needs`, under the key `request` (RequestMeta below), and left out of every
+ * view's `needs`.
+ *
+ * Where a line or the audit trail names the request's records again (a new preview's line, the
+ * words of a reveal), it reads their names from the books as they are now, the way the door named
+ * them when the agent asked (lib/agent/operate.ts requestNames): "Delete role Clerk", not a uuid,
+ * and a role renamed since by its new name. Today that knows roles, people, agents and sign-ins
+ * only; any other record is named by the request's summary, as before.
+ *
+ * The stored input keeps the version of the record the agent last read (OperationInput
+ * .expectedUpdatedAt), and the approved run sends it, so a person's edit made since is refused by
+ * the route, never overwritten. The summary is kept whole: it names every recipient.
  *
  * Requests copied from the old proposals (proposal_id set, operation "action:<name>") still run
  * the old way (runApprovedAgentAction in lib/agent/actions.ts, as Ask AI approves them) and settle
@@ -99,6 +109,7 @@ import {
   type FlowQuestion,
   type ListRequestsForAgent,
   type ListRequestsForPerson,
+  type NewAgentRequest,
   type OperationInput,
   type OperationPreview,
   type PendingCountForPerson,
@@ -135,9 +146,10 @@ import {
   routeWithoutRule,
 } from '@/lib/agent/policy';
 import { removeStagedFile } from '@/lib/agent/files';
-import { guardInput, maskSensitiveFields } from '@/lib/agent/guards';
+import { guardInput, maskAccountsInText, maskSensitiveFields } from '@/lib/agent/guards';
 import { describeRequest } from '@/lib/agent/describe';
-import { runApproved } from '@/lib/agent/operate';
+import { requestNames, runApproved } from '@/lib/agent/operate';
+import { OPTIONAL_ROUTE_SECRETS } from '@/lib/agent/bridge';
 import { agentAction, agentInputHash, changesInTransaction, runApprovedAgentAction, type AnyAction } from '@/lib/agent/actions';
 // The old proposals' actions run through the catalog, which registers itself when loaded (as
 // lib/services/aiAssistant.ts does for Ask AI's approvals).
@@ -164,8 +176,28 @@ const REQUEST_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:\-]{2,119}$/;
 /** Longest reason an agent may give, and longest note a person may leave it (plan §4.3). */
 export const REASON_MAX = 500;
 export const NOTE_MAX = 500;
-/** Longest summary kept (the card shows one line). */
-const SUMMARY_MAX = 500;
+/**
+ * Longest summary kept. Never a cut: the line (lib/agent/describe.ts describeRequest) keeps under
+ * 200 characters by cutting values, but never hides a recipient, a path or a server name, so a
+ * schedule emailed to many people makes a longer line, and every recipient must reach the card. So
+ * this is far above any line a request a person can review would make; a longer one is refused when
+ * the agent asks (split the work), and a new preview's line that long keeps the earlier summary.
+ */
+const SUMMARY_MAX = 64 * 1024;
+/**
+ * The names a request keeps of its records (RequestMeta.names): how many, and how long an id or a
+ * name may be.
+ */
+const NAMES_MAX = 50;
+const NAME_MAX = 200;
+const NAME_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:{}\-]{0,119}$/;
+/**
+ * The version of the record the agent last read (OperationInput.expectedUpdatedAt), as the bridge
+ * takes it (lib/agent/bridge.ts expectedVersionOf: keep the two the same): a time Date can read,
+ * written with the characters of a time, at most 40 of them.
+ */
+const VERSION_MAX = 40;
+const VERSION_RE = /^[0-9TZ:.+\- ]+$/;
 /** Largest input a request keeps, as JSON text. */
 const INPUT_MAX_CHARS = 512 * 1024;
 /** How often a waiting agent's request is read again, besides being woken. */
@@ -540,6 +572,16 @@ interface RequestMeta {
    * approve it with acceptStale; a new round starts the list again.
    */
   staleSeen: string[];
+  /**
+   * The name a person knows each of the request's records by, by id (lib/agent/describe.ts
+   * DescribeNames), as the asker read them when the agent asked, only when the asker passes them
+   * (`names` beside the request). NewAgentRequest has no field for them and the door does not pass
+   * them today, so a request made by the door keeps none. Only a fallback: the line of a new preview
+   * and the words of a reveal read the names as they are now (namesNow) and use these only for a
+   * record that read finds no name for (say, one deleted since). Never in a view: needs.request is
+   * left out of every view's needs.
+   */
+  names?: Record<string, string>;
 }
 
 type StoredNeeds = ApprovalNeeds & { request?: RequestMeta };
@@ -569,6 +611,26 @@ function cleanFacts(raw: unknown): RequestFacts {
     date: typeof f.date === 'string' ? f.date : null,
     closedPeriod: f.closedPeriod === true,
   };
+}
+
+/**
+ * Names of a request's records (RequestMeta.names, or as read now by namesNow), kept only as text a
+ * card can show: an id as the app writes one, and a name on one line, each at most NAME_MAX
+ * characters, at most NAMES_MAX of them. Undefined when there are none.
+ */
+function cleanNames(raw: unknown): Record<string, string> | undefined {
+  if (!isPlainObject(raw)) return undefined;
+  const out: Record<string, string> = {};
+  let kept = 0;
+  for (const [id, name] of Object.entries(raw)) {
+    if (kept >= NAMES_MAX) break;
+    if (!NAME_ID_RE.test(id) || typeof name !== 'string') continue;
+    const shown = oneLine(name).slice(0, NAME_MAX);
+    if (!shown) continue;
+    out[id] = shown;
+    kept++;
+  }
+  return kept ? out : undefined;
 }
 
 function cleanGrantAsked(raw: unknown): RequestMeta['grantAsked'] {
@@ -679,7 +741,13 @@ function metaOf(row: Row): RequestMeta {
     scrubbed: m.scrubbed === true,
     staleRound: typeof m.staleRound === 'number' && Number.isSafeInteger(m.staleRound) && m.staleRound > 0 ? m.staleRound : 0,
     staleSeen: Array.isArray(m.staleSeen) ? m.staleSeen.filter((x): x is string => typeof x === 'string' && UUID_RE.test(x)) : [],
+    ...namesPart(cleanNames(m.names)),
   };
+}
+
+/** `{ names }` when there are any, else nothing (a row without them keeps none). */
+function namesPart(names: Record<string, string> | undefined): Pick<RequestMeta, 'names'> {
+  return names ? { names } : {};
 }
 
 /** What an approver must have, read fail-closed. */
@@ -800,18 +868,12 @@ function questionsOf(target: Target): FlowQuestion[] {
 }
 
 /**
- * The secrets a route goes ahead without, as the bridge's commit rule has them (lib/agent/bridge.ts
- * OPTIONAL_ROUTE_SECRETS, which is private: keep the two the same). The sign-in of another company
- * file: a backup made in this same file needs none, and the route says so itself when one does.
- */
-const OPTIONAL_ROUTE_SECRETS: readonly SecretKind[] = ['archive_credentials'];
-
-/**
  * Which of a request's secrets the approver may leave empty (ApprovalNeeds.optionalSecrets, wave 4):
  *  - what the needs say, when they say it (`said`), and only of the secrets they list;
  *  - when they do not say (a request asked before wave 4, or a policy that does not tell): for a
- *    route, those its route goes ahead without (OPTIONAL_ROUTE_SECRETS; every other one it takes
- *    always, and the bridge refuses a commit without it); for a desktop flow, those its flow uses
+ *    route, those its route goes ahead without (the bridge's own commit rule, lib/agent/bridge.ts
+ *    OPTIONAL_ROUTE_SECRETS; every other one it takes always, and the bridge refuses a commit
+ *    without it); for a desktop flow, those its flow uses
  *    only at the prompt it meets (a portable file saved with a password needs it,
  *    lib/agent/operations/shell.ts), so a yes without one is right for a file that has none. That is
  *    how such a flow was approved before wave 4.
@@ -1780,6 +1842,32 @@ function expiryDays(v: unknown): number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 365 ? v : DEFAULT_REQUEST_EXPIRY_DAYS;
 }
 
+/** The bridge's words for a version it cannot send (lib/agent/bridge.ts expectedVersionOf). */
+const VERSION_MESSAGE =
+  'Send expectedUpdatedAt as the record\'s updatedAt exactly as Ironbooks answered it (for example "2026-11-22T14:05:09.123Z"), or leave it out.';
+const SUMMARY_TOO_LONG_MESSAGE =
+  'This request is too long to show a person on one approval card. Split the work into smaller requests (for example, fewer recipients in each), then ask again. Nobody was asked.';
+
+/**
+ * The input to keep, with the version of the record the agent last read
+ * (OperationInput.expectedUpdatedAt) kept as the door keeps it (lib/agent/operate.ts withVersion):
+ * guardInput keeps only the parts it knows, and this one is neither a secret nor anything only a
+ * person sets. Stored with the request, the approved run sends it on (runApproved), so a person's
+ * edit made after the agent read the record is refused by the route's own version check (409),
+ * never overwritten. One the bridge could not send is refused here, before anyone is asked: dropping
+ * it would let the run overwrite that edit, and keeping it would only fail the approved run.
+ */
+function withVersionKept(guarded: OperationInput, given: OperationInput): OperationInput {
+  const own = (guarded as { expectedUpdatedAt?: unknown }).expectedUpdatedAt;
+  const v = own !== undefined && own !== null && own !== '' ? own : (given as { expectedUpdatedAt?: unknown }).expectedUpdatedAt;
+  const out: OperationInput = { ...guarded };
+  delete out.expectedUpdatedAt;
+  if (v === undefined || v === null || v === '') return out;
+  const s = typeof v === 'string' ? v.trim() : '';
+  if (!s || s.length > VERSION_MAX || !VERSION_RE.test(s) || !Number.isFinite(Date.parse(s))) throw validation(VERSION_MESSAGE);
+  return { ...out, expectedUpdatedAt: v as string };
+}
+
 export const createAgentRequest: CreateAgentRequest = async (ctx, req) => {
   const agent = requireAgent(ctx);
   if (inServiceScope()) throw forbidden(IN_SCOPE_MESSAGE);
@@ -1805,15 +1893,23 @@ export const createAgentRequest: CreateAgentRequest = async (ctx, req) => {
   }
 
   // The caller already guarded the input; guard it again, then drop anything named like a secret.
-  const guarded = guardInput(op, isPlainObject(req.input) ? (req.input as OperationInput) : {});
+  // The version of the record the agent last read goes with it (withVersionKept).
+  const sent = isPlainObject(req.input) ? (req.input as OperationInput) : {};
+  const guarded = guardInput(op, sent);
   if (guarded.refused) throw forbidden(guarded.refused);
-  const input = withoutSecretFields(jsonCopy(guarded.input ?? {})) as OperationInput;
+  const input = withVersionKept(withoutSecretFields(jsonCopy(guarded.input ?? {})) as OperationInput, sent);
   if (JSON.stringify(input).length > INPUT_MAX_CHARS) {
     throw validation('This request is too large to keep for a person to approve. Split the work into smaller requests.');
   }
 
   const reason = cleanReason(req.reason);
-  const summary = oneLine(typeof req.summary === 'string' ? req.summary : '').slice(0, SUMMARY_MAX) || `${RISK_CLASS_LABELS[op.class] ?? 'Work'}: ${op.id}`;
+  // Kept whole, never cut (SUMMARY_MAX): a cut could leave recipients off the card.
+  const said = oneLine(typeof req.summary === 'string' ? req.summary : '');
+  if (said.length > SUMMARY_MAX) throw validation(SUMMARY_TOO_LONG_MESSAGE);
+  const summary = said || `${RISK_CLASS_LABELS[op.class] ?? 'Work'}: ${op.id}`;
+  // Only when the asker passes them beside the request (the contract has no field for them, and the
+  // door passes none today): a fallback for a record the names read later finds no name for.
+  const names = cleanNames((req as NewAgentRequest & { names?: unknown }).names);
   const facts = cleanFacts(req.facts);
   const grantAsked = cleanGrantAsked(req.grantAsked);
   if (kind === 'grant' && !grantAsked) throw validation('Say how long the standing permission should last, in minutes.');
@@ -1826,7 +1922,7 @@ export const createAgentRequest: CreateAgentRequest = async (ctx, req) => {
 
   const masked = maskedInput(input, op.sensitiveFields ?? []);
   const inputHash = agentInputHash(op.id, { kind, input: masked, grantAsked });
-  const meta: RequestMeta = { kind, facts, grantAsked, inputHash, area: op.area ?? null, scrubbed: false, staleRound: 0, staleSeen: [] };
+  const meta: RequestMeta = { kind, facts, grantAsked, inputHash, area: op.area ?? null, scrubbed: false, staleRound: 0, staleSeen: [], ...namesPart(names) };
 
   const db = await writableDb(ctx);
   const now = new Date();
@@ -2134,8 +2230,11 @@ export const requestForPerson: RequestForPerson = async (ctx, id, opts = {}) => 
 /** How many waiting requests the badge judges, newest first, and how many rows it reads to find them. */
 const BADGE_COUNT_MAX = 500;
 const BADGE_READ_MAX = 2000;
-/** How often the badge brings the company's requests up to date (settleCompany), at most. */
-const BADGE_SETTLE_EVERY_MS = 60_000;
+/**
+ * How often the badge brings the company's requests up to date (settleCompany), at most. Exported
+ * for the load test (test/agentLoad.test.ts), which moves its clock past it before a settling read.
+ */
+export const BADGE_SETTLE_EVERY_MS = 60_000;
 
 /**
  * When the badge last settled each company (by company id). On globalThis: Next can load this
@@ -2359,11 +2458,15 @@ export const approveAgentRequest: ApproveAgentRequest = (ctx, id, rawInput, opts
  * it, and the request would then fail for good (a desktop flow is never run twice under one id).
  * Sent back to the card first, while the request can still be approved.
  *  - A route: every secret the operation lists (Operation.needsSecret: lib/agent/bridge.ts refuses
- *    a commit missing one).
+ *    a commit missing one), and every one the needs list for this request alone (the closing-date
+ *    password for work in a closed period, lib/agent/policy.ts approvalNeeds: the route refuses
+ *    such work without it, and the request would end failed instead of waiting for the password).
  *  - A desktop flow: every secret it or its password questions name, and every one the needs list.
  * Less, for both, what the approver may leave empty (optionalSecretsOf: what the needs say, wave 4;
- * when they do not say, a desktop flow's secrets it uses only at the prompt it meets). A secret the
- * flow needs every time (alwaysNeedsSecret) is never left empty, whatever the needs say.
+ * when they do not say, for a route the bridge's commit rule, OPTIONAL_ROUTE_SECRETS, and for a
+ * desktop flow its secrets it uses only at the prompt it meets). The card asks for exactly these
+ * (viewNeeds). A secret the flow needs every time (alwaysNeedsSecret) is never left empty, whatever
+ * the needs say.
  */
 function checkTypedSecrets(target: Target, needs: ApprovalNeeds, typed: Partial<Record<SecretKind, string>>): void {
   if (target.kind !== 'operation') return;
@@ -2372,7 +2475,9 @@ function checkTypedSecrets(target: Target, needs: ApprovalNeeds, typed: Partial<
   if (def) {
     const flowSecrets = [...(def.needsSecret ?? []), ...(def.alwaysNeedsSecret ?? []), ...flowPasswordSecrets(def.questions), ...needs.secrets];
     for (const k of flowSecrets) if (isSecretKind(k)) wanted.add(k);
-  } else if (target.op.kind !== 'route') {
+  } else if (target.op.kind === 'route') {
+    for (const k of needs.secrets) if (isSecretKind(k)) wanted.add(k);
+  } else {
     return;
   }
   const optional = optionalSecretsOf([...wanted], needs.optionalSecrets, target);
@@ -2682,8 +2787,11 @@ async function carryOut(c: ClaimedRun): Promise<ApproveResult> {
 /**
  * The audit trail's words for an approved reveal (plan §5.9): "Revealed <which kinds of values> of
  * <record or report> to agent <name>, approved by <person>", with the kinds beside it on their own.
- * The record or report is the request's summary (the app's own words from the operation, never the
- * agent's reason). Names as they are now; a name that cannot be read is said plainly.
+ * The record or report is named by its own name where one is known (recordNamesOf, with the names
+ * read as they are now, namesNow), else by the request's summary (the app's own words from the
+ * operation, never the agent's reason). Today namesNow knows roles, people, agents and sign-ins
+ * only, so an employee's, a vendor's or a bank account's reveal is named by its summary. The agent
+ * and the approvers by their names as they are now; a name that cannot be read is said plainly.
  */
 async function revealAudit(person: Person, claimed: Row, target: Target): Promise<Record<string, unknown>> {
   const kinds = revealedKinds(claimed, target);
@@ -2700,11 +2808,53 @@ async function revealAudit(person: Person, claimed: Row, target: Target): Promis
   } catch {
     // The words below still say what was revealed and that a person approved it.
   }
-  const of = oneLine(claimed.summary).slice(0, 200) || claimed.operation;
+  const of = recordNamesOf(claimed, await namesNow(person, claimed, target)) ?? (oneLine(claimed.summary).slice(0, 200) || claimed.operation);
   return {
     revealed: `Revealed ${kinds} of "${of}" to agent ${agentName}, approved by ${approvers}.`,
     revealedFields: kinds,
   };
+}
+
+/**
+ * The names a person knows the request's records by, read from the books as they are now, the way
+ * the door named them when the agent asked (lib/agent/operate.ts requestNames; the agent's role
+ * decides whether a sign-in is named, as at the door, since a new preview's line goes to the agent
+ * too). So a role renamed since the ask is shown by its new name on the preview a person approves
+ * again. A name the request keeps (RequestMeta.names) stands in only for a record this read finds
+ * none for. Only words: a read that fails leaves the kept names, or none (the line shows the ids).
+ */
+async function namesNow(person: Person, row: Row, target: Target): Promise<Record<string, string> | undefined> {
+  const kept = metaOf(row).names;
+  if (target.kind !== 'operation') return kept;
+  let now: Record<string, string> | undefined;
+  try {
+    now = cleanNames(await requestNames(person.ctx, row.agentId, target.op, storedInput(row)));
+  } catch {
+    now = undefined;
+  }
+  return now || kept ? { ...(kept ?? {}), ...(now ?? {}) } : undefined;
+}
+
+/**
+ * The record or report a request is about, by the name a person knows it by, where one is known:
+ * the names (namesNow) of the ids its path and its query name, in that order, each once. Null when
+ * none is known. An account number typed into a name is masked, as the summary masks it.
+ */
+function recordNamesOf(row: Row, names: Record<string, string> | undefined): string | null {
+  if (!names) return null;
+  const input = storedInput(row);
+  const ids: string[] = [];
+  const add = (v: unknown) => {
+    if (typeof v === 'string' && v.trim()) ids.push(v.trim());
+  };
+  for (const v of Object.values(isPlainObject(input.params) ? input.params : {})) add(v);
+  for (const v of Object.values(isPlainObject(input.query) ? input.query : {})) (Array.isArray(v) ? v : [v]).forEach(add);
+  const said: string[] = [];
+  for (const id of ids) {
+    const name = Object.prototype.hasOwnProperty.call(names, id) ? names[id] : undefined;
+    if (name && !said.includes(name)) said.push(name);
+  }
+  return said.length ? oneLine(maskAccountsInText(said.join(', '))).slice(0, 200) || null : null;
 }
 
 /**
@@ -2798,8 +2948,12 @@ async function backToWaiting(person: Person, claimed: Row, target: Target, r: Br
   let summary = claimed.summary;
   if (target.kind === 'operation') {
     try {
-      const line = oneLine(describeRequest(target.op, storedInput(claimed), r.result ?? undefined)).slice(0, SUMMARY_MAX);
-      if (line) summary = scrubText(line, hide, claimed.summary);
+      // With the records' names as they are now (namesNow), as the door named them when the agent
+      // asked: "Delete role Clerk", not a uuid. Never cut (SUMMARY_MAX): a line longer than that
+      // keeps the earlier one.
+      const names = await namesNow(person, claimed, target);
+      const line = oneLine(describeRequest(target.op, storedInput(claimed), r.result ?? undefined, names));
+      if (line && line.length <= SUMMARY_MAX) summary = scrubText(line, hide, claimed.summary);
     } catch {
       // Keep the summary the request was asked with.
     }

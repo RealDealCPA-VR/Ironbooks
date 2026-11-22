@@ -51,6 +51,16 @@ import type { ClassificationMap } from '../types';
  */
 const INVOICE_FLAGS: readonly string[] = ['allowDuplicateNumber', 'overrideCreditLimit', 'allowOverBilling'];
 
+/**
+ * Editing a received payment (PUT and PATCH are one handler): updatePayment takes the old
+ * applications back and applies the saved ones again, earlier-payment credits included, so an edit
+ * can apply a large credit as a new payment can. It answers creditsApplied as receivePayment does.
+ */
+const PAYMENT_EDIT_AMOUNT =
+  "Voids the payment's entry and posts it again at the new figures, and applies its credits again. The amount is the larger of the cash and the credits the edited payment uses, as for receiving one. " +
+  'The answer is { payment, entry, creditsApplied }: creditsApplied is one total of every credit the saved payment uses (credit memos, earlier payments, General Journal credits and the offsets it kept), and applying them posts no new entry, so amountField names it. ' +
+  'The bridge takes the larger of that and the largest entry the edit posted or voided (the payment at its new and its old cash amount). So a $1 edit that applies a $50,000 credit is judged at $50,000. Until the dry run has answered, the amount is unknown and counts as over every amount limit.';
+
 export const SALES_CLASSES: ClassificationMap = {
   // customers: the Customer Center list, one customer, and Add/Edit Multiple List Entries
   'GET /api/customers': { class: 'read', describe: 'List customers' },
@@ -346,15 +356,17 @@ export const SALES_CLASSES: ClassificationMap = {
   'PUT /api/payments/[id]': {
     class: 'change',
     describe: 'Edit payment {id}',
+    why: PAYMENT_EDIT_AMOUNT,
     // removeFromDeposit answers the "this payment is in a bank deposit" warning.
     confirmFlags: ['allowReconciledEdit', 'removeFromDeposit'],
-    amountField: 'amount',
+    amountField: 'creditsApplied',
   },
   'PATCH /api/payments/[id]': {
     class: 'change',
     describe: 'Edit payment {id}',
+    why: PAYMENT_EDIT_AMOUNT,
     confirmFlags: ['allowReconciledEdit', 'removeFromDeposit'],
-    amountField: 'amount',
+    amountField: 'creditsApplied',
   },
   'DELETE /api/payments/[id]': {
     class: 'change',

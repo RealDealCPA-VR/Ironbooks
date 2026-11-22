@@ -1,7 +1,7 @@
 /**
- * Receive Payments answers `creditsApplied` (lib/services/payments.ts receivePayment): one total of
- * the credits the save used (credit memos, earlier payments, General Journal credits), as Pay Bills
- * answers it. Applying a credit posts no new entry, so the cash amount alone would judge a $1
+ * Receive Payments answers `creditsApplied` (lib/services/payments.ts receivePayment, and an edit,
+ * updatePayment): one total of the credits the save used (credit memos, earlier payments, General
+ * Journal credits), as Pay Bills answers it. Applying a credit posts no new entry, so the cash amount alone would judge a $1
  * payment that applies a $150 credit at $1.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -12,7 +12,7 @@ import { createCustomer } from './customers';
 import { createInvoice } from './invoices';
 import { createCreditMemo } from './creditMemos';
 import { createManualEntry } from './journal';
-import { receivePayment } from './payments';
+import { receivePayment, updatePayment } from './payments';
 
 let t: TestCompany;
 let customerId: string;
@@ -127,5 +127,36 @@ describe('creditsApplied', () => {
     });
     expect(r.payment.amount).toBe('10.00');
     expect(r.creditsApplied).toBe('50.00');
+
+    // An edit answers it too (updatePayment). One that does not mention the General Journal offsets
+    // keeps them, and they count: the edit applied them again.
+    const edited = await updatePayment(t.ctx, r.payment.id, {
+      customerId,
+      date: day('2026-08-06'),
+      method: 'check',
+      amount: '10.00',
+      applications: [{ invoiceId: inv.id, amountApplied: '10.00' }],
+      journalCredits: [{ journalLineId: toInvoice, invoiceId: inv.id, amount: '30.00' }],
+    });
+    expect(edited.payment.amount).toBe('10.00');
+    expect(edited.creditsApplied).toBe('50.00');
+  });
+
+  it('an edit to a $1 payment that applies a $150 credit memo answers the $150', async () => {
+    const inv = await invoice('300.00', '2026-09-01');
+    const memo = await createCreditMemo(t.ctx, {
+      customerId,
+      date: day('2026-09-02'),
+      lines: [{ description: 'Return', quantity: 1, rate: 150, taxable: false }],
+    });
+    const base = { customerId, date: day('2026-09-05'), method: 'check' as const, amount: '1.00', applications: [{ invoiceId: inv.id, amountApplied: '1.00' }] };
+    const first = await receivePayment(t.ctx, base);
+    expect(first.creditsApplied).toBe('0.00');
+    const edited = await updatePayment(t.ctx, first.payment.id, { ...base, credits: [{ creditMemoId: memo.id, invoiceId: inv.id, amount: '150' }] });
+    expect(edited.payment.amount).toBe('1.00');
+    expect(edited.creditsApplied).toBe('150.00');
+    // Taking the credit off again: the edit applies none.
+    const plain = await updatePayment(t.ctx, first.payment.id, base);
+    expect(plain.creditsApplied).toBe('0.00');
   });
 });

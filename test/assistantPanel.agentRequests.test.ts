@@ -13,12 +13,15 @@
  *    nothing), so it does not wait in the panel for good. When Decline is refused because the row
  *    moved on since the list was read, the row shows where it stands now, from the refusal: the
  *    link to Agent requests (its request still waiting there), or settled and gone from the
- *    waiting list (its request decided, or someone else declined it first).
+ *    waiting list (its request decided, or someone else declined it first). When someone already
+ *    declined it, the toast says so gently ("Someone already declined this one."), not as an error;
+ *    settled any other way (done, failed, withdrawn, expired), it says only that it was settled.
  */
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import {
+  ALREADY_DECLINED_MESSAGE,
   AgentRequestRow,
   ProposalItem,
   WaitingProposals,
@@ -26,6 +29,7 @@ import {
   agentRequestsHref,
   canOnlyDecline,
   declineAgentProposal,
+  declineAndShow,
   isAgentProposal,
   requestFromRefusal,
   shownAfterRefusal,
@@ -212,13 +216,80 @@ describe("an agent's request in Ask AI", () => {
       expect(text).not.toContain('Decline');
     });
 
-    it('declined by someone else first (a conflict): settled, its Decline button gone', async () => {
+    it('declined by someone else first (a conflict): settled, its Decline button gone, and said gently', async () => {
       const now = asked({ status: 'rejected', error: null, agentRequest: null });
       const r = await declineAgentProposal(leftover(), refusedWith(409, 'CONFLICT', { agentRequests: true, agentRequestId: null, proposal: now }));
-      expect(r).toMatchObject({ ok: false, message: 'Proposal is already rejected.' });
+      // Not the server's "Proposal is already rejected." as an error: what the person wanted is done.
+      expect(r).toMatchObject({ ok: false, message: 'Someone already declined this one.', tone: 'info' });
+      expect(ALREADY_DECLINED_MESSAGE).toBe('Someone already declined this one.');
       expect(r.shown).toEqual(now);
       expect(updatePending([leftover()], r.shown!)).toEqual([]);
       expect(render(createElement(AgentRequestRow, { p: r.shown!, onChange: () => {} }))).not.toContain('<button');
+    });
+
+    it('denied in Agent requests meanwhile reads the same; a plain conflict keeps the server words', async () => {
+      const denied = asked({ status: 'rejected', error: null, agentRequest: { id: REQUEST_ID, status: 'denied' } });
+      const r = await declineAgentProposal(leftover(), refusedWith(403, 'FORBIDDEN', { agentRequests: true, agentRequestId: REQUEST_ID, proposal: denied }));
+      expect(r).toMatchObject({ ok: false, message: 'Someone already declined this one.', tone: 'info' });
+      // A conflict without the row (an older answer) leaves the row as it is, with the server's words.
+      const bare = await declineAgentProposal(leftover(), refusedWith(409, 'CONFLICT', null));
+      expect(bare).toEqual({ shown: null, message: 'Proposal is already rejected.', ok: false, tone: 'danger' });
+    });
+
+    it('settled some other way meanwhile (done, failed, withdrawn, expired): said gently, never called a decline', async () => {
+      const request = (status: string) => ({ id: REQUEST_ID, status, href: `/agent-requests?id=${REQUEST_ID}` });
+      const ends: Array<[Proposal, string]> = [
+        [asked({ status: 'approved', agentRequest: request('executed') }), 'Done'],
+        [asked({ status: 'failed', error: 'That name is already used.', agentRequest: request('failed') }), 'Failed'],
+        [asked({ status: 'rejected', error: 'The agent withdrew this request.', agentRequest: request('cancelled') }), 'The agent withdrew this request.'],
+        [asked({ status: 'rejected', error: 'This request expired before anyone decided it.', agentRequest: request('expired') }), 'This request expired'],
+      ];
+      for (const [now, rowSays] of ends) {
+        const r = await declineAgentProposal(leftover(), refusedWith(403, 'FORBIDDEN', { agentRequests: true, agentRequestId: REQUEST_ID, proposal: now }));
+        // Not the server's "Open it there" in red: the row shows it settled, and the toast agrees.
+        expect(r).toEqual({ shown: now, message: 'This one was already settled in Agent requests.', ok: false, tone: 'info' });
+        expect(r.message).not.toMatch(/declined|Open it there/);
+        expect(updatePending([own(), leftover()], r.shown!).map((x) => x.id)).toEqual(['own-1']);
+        const text = textOf(render(createElement(AgentRequestRow, { p: r.shown!, onChange: () => {} })));
+        expect(text).toContain(rowSays);
+        expect(text).not.toContain('Decline');
+      }
+      // Settled with no request in Agent requests (a conflict): not said to be there.
+      const doneHere = asked({ status: 'approved', agentRequest: null });
+      const h = await declineAgentProposal(leftover(), refusedWith(409, 'CONFLICT', { agentRequests: true, agentRequestId: null, proposal: doneHere }));
+      expect(h).toEqual({ shown: doneHere, message: 'This one was already settled.', ok: false, tone: 'info' });
+      // Still waiting there (approved, being carried out): not settled, so the server's words stay.
+      const carrying = asked({ agentRequest: request('approved') });
+      const c = await declineAgentProposal(leftover(), refusedWith(403, 'FORBIDDEN', { agentRequests: true, agentRequestId: REQUEST_ID, proposal: carrying }));
+      expect(c).toMatchObject({ shown: carrying, ok: false, tone: 'danger' });
+      expect(c.message).toMatch(/Agent requests/);
+    });
+
+    it('the click: the row shown is handed to the list and the toast says what came of it', async () => {
+      const changed: Proposal[] = [];
+      const toasts: Array<[string, string]> = [];
+      const onChange = (np: Proposal) => changed.push(np);
+      const show = (message: string, tone: string) => toasts.push([message, tone]);
+      // Declined now.
+      await declineAndShow(leftover(), onChange, show, async () => ({ proposal: asked({ status: 'rejected', agentRequest: null }) }));
+      // Someone else declined it first.
+      const now = asked({ status: 'rejected', error: null, agentRequest: null });
+      await declineAndShow(leftover(), onChange, show, refusedWith(409, 'CONFLICT', { agentRequests: true, agentRequestId: null, proposal: now }));
+      // Offline: the row stays as it is, nothing handed to the list.
+      await declineAndShow(leftover(), onChange, show, async () => {
+        throw new TypeError('Failed to fetch');
+      });
+      expect(changed.map((x) => [x.id, x.status])).toEqual([
+        ['agent-1', 'rejected'],
+        ['agent-1', 'rejected'],
+      ]);
+      expect(toasts).toEqual([
+        ['Declined. Nothing was entered.', 'info'],
+        ['Someone already declined this one.', 'info'],
+        ['It could not be declined. Try again.', 'danger'],
+      ]);
+      // The waiting list the panel keeps drops the row either way.
+      expect(changed.reduce((list, np) => updatePending(list, np), [own(), leftover()]).map((x) => x.id)).toEqual(['own-1']);
     });
 
     it('a refusal without the row still links a named request; anything else leaves the row as it is', async () => {
@@ -231,7 +302,7 @@ describe("an agent's request in Ask AI", () => {
       const offline = await declineAgentProposal(leftover(), async () => {
         throw new TypeError('Failed to fetch');
       });
-      expect(offline).toEqual({ shown: null, message: 'It could not be declined. Try again.', ok: false });
+      expect(offline).toEqual({ shown: null, message: 'It could not be declined. Try again.', ok: false, tone: 'danger' });
     });
   });
 

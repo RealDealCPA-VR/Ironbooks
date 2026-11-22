@@ -5,7 +5,7 @@
     "want is the answer on Windows. On every other system the answer is false for every case: no path is a Windows share there.",
     "A path may name this computer through a template, filled in by the test that reads the table; a case whose template cannot be filled on the computer running the test is skipped.",
     "A case with env is judged with those environment values in place (a port that takes its environment as an option is given them).",
-    "since says in which wave a case was added; a port written before that wave may not hold it yet. A test that meets a template it does not know (a path still holding a { after filling) skips that case and says so: it never judges the template's own words.",
+    "since says in which wave a case was added; a port written before that wave may not hold it yet. A test that reads the table fills every template listed under templates (it reads the list, never a copy of it). A template listed there that the test cannot fill, or a case naming one not listed there (a path still holding a { after filling), fails the test: no port is held to less than the table says, and no case is judged by a template's own words.",
     "Device paths: the rule judges a UNC path, and a UNC path written as a device path in the \\\\?\\UNC\\ form (also \\\\.\\UNC\\ and \\??\\UNC\\). Every other device path is answered false here, although some reach this computer's shares too (\\\\?\\GLOBALROOT\\Device\\Mup\\localhost\\c$, and more spellings than any table could hold). So every caller of the rule, and of every port, must refuse every device path on its own, by the words, before anything is looked at, as lib/agent/files.ts does (overlapsAppData, allowedFolder, the staging folder)."
   ],
   "templates": {

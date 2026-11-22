@@ -44,6 +44,15 @@
  * floor refusing at approval; a batch that finds a request approved already says so plainly.
  * Staged files live in a folder of their own here (BKA_AGENT_FILES_DIR); removeStagedFile is the
  * real one unless a test makes it fail.
+ *
+ * Wave 5: the version of the record the agent last read is kept and sent with the approved run;
+ * the summary is kept whole (every recipient of a long list); a new preview's line and a reveal's
+ * audit words name the records as they are now, read by the real requestNames (lib/agent/operate.ts)
+ * from this company's roles and people, with names passed beside a request (no asker passes any
+ * today) only standing in for a record that read finds none for; a password the needs add for one
+ * request (closed-period work) is typed before the claim; a reveal's own timer ends it when nothing
+ * reads it. Not covered here: a request asked through the door itself (operate.ts askPerson), which
+ * passes no names; its tests are lib/agent/operate.test.ts.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -65,13 +74,16 @@ const m = vi.hoisted(() => ({
   ops: new Map<string, unknown>(),
   policies: new Map<string, Record<string, unknown>>(),
   runApproved: vi.fn(),
+  // The names of a request's records as they are now: the real lib/agent/operate.ts requestNames
+  // (loaded once the modules are, beforeAll), unless a test makes it fail.
+  requestNames: vi.fn(),
   createGrant: vi.fn(),
   grantWindowReader: vi.fn(),
   sendMail: vi.fn(),
   removeStagedFile: vi.fn(),
   // The real ones, kept by the mocks below: the card's window comes from the real grantWindowReader,
   // and a reveal's file is removed by the real removeStagedFile unless a test says otherwise.
-  real: {} as { createGrant?: AnyFn; grantWindowReader?: AnyFn; removeStagedFile?: AnyFn },
+  real: {} as { createGrant?: AnyFn; grantWindowReader?: AnyFn; removeStagedFile?: AnyFn; requestNames?: AnyFn },
 }));
 
 vi.mock('@/lib/agent/operations/registry', async (importOriginal) => ({
@@ -80,18 +92,23 @@ vi.mock('@/lib/agent/operations/registry', async (importOriginal) => ({
 }));
 vi.mock('@/lib/agent/operate', () => ({
   runApproved: m.runApproved,
+  requestNames: (...args: never[]) => m.requestNames(...args),
   operate: vi.fn(),
   handleVerb: vi.fn(),
 }));
 vi.mock('@/lib/agent/guards', async (importOriginal) => ({
   // The real helpers (the summary of a stale request is built with them), and a stand-in guard.
   ...(await importOriginal<Record<string, unknown>>()),
-  // The guard unit strips secret fields and refuses the hard floor; a stand-in that does both.
-  guardInput:(_op: unknown, input: { body?: Record<string, unknown> }) => {
+  // The guard unit strips secret fields and refuses the hard floor; a stand-in that does both. Like
+  // the guard before wave 5 it keeps only the parts it knows: the version of the record the agent
+  // last read (expectedUpdatedAt) is not among them, so the request store must keep it itself.
+  guardInput:(_op: unknown, input: { body?: Record<string, unknown>; expectedUpdatedAt?: unknown }) => {
     const body = { ...(input?.body ?? {}) };
     if (body.hardFloor) return { input, refused: 'Agents can never do this.', stripped: [] };
     delete body.password;
-    return { input: { ...input, body }, refused: null, stripped: ['password'] };
+    const known: Record<string, unknown> = { ...input, body };
+    delete known.expectedUpdatedAt;
+    return { input: known, refused: null, stripped: ['password'] };
   },
   applySecrets: vi.fn(),
   redactAnswer: vi.fn(),
@@ -142,6 +159,7 @@ import {
   aiProposals,
   auditLogs,
   companies,
+  companyRoles,
   customers,
   userCompanies,
   userRoleAssignments,
@@ -159,7 +177,9 @@ import { agentAccess, createAgent } from './agents';
 import { resolveAccess } from './access';
 import { endSession, startSession } from './sessions';
 import { ServiceError, type ServiceContext } from './_base';
+import { describeRequest } from '@/lib/agent/describe';
 import {
+  BADGE_SETTLE_EVERY_MS,
   REVEAL_KEPT_MINUTES,
   approveAgentRequest,
   badgeForPerson,
@@ -240,7 +260,15 @@ function facts(over: Partial<RequestFacts> = {}): RequestFacts {
   return { confirm: [], reveal: false, amount: '10.00', count: null, entityIds: [], accountIds: [], date: null, closedPeriod: false, ...over };
 }
 
-function ask(agent: string, opId: string, over: Partial<NewAgentRequest> = {}) {
+/**
+ * What a test may ask with: the contract's request, plus names of its records passed beside it
+ * (`names`, lib/agent/describe.ts DescribeNames). The contract has no field for them and the door
+ * passes none today; the store keeps them only as a fallback for a record the names read later
+ * (requestNames) finds no name for.
+ */
+type Asked = Partial<NewAgentRequest> & { names?: Record<string, string> };
+
+function ask(agent: string, opId: string, over: Asked = {}) {
   seq += 1;
   return createAgentRequest(agentCtx[agent], {
     kind: 'operation',
@@ -356,6 +384,8 @@ async function makeAgent(key: string, opts: { unattended?: boolean } = {}): Prom
 
 beforeAll(async () => {
   fs.rmSync(ROOT, { recursive: true, force: true });
+  // The real requestNames, loaded now that every module is (it lives beside runApproved, mocked).
+  m.real.requestNames = (await vi.importActual<typeof import('@/lib/agent/operate')>('@/lib/agent/operate')).requestNames as unknown as AnyFn;
   db = await getDb(TEST_DIR);
   const [ada] = await db.insert(users).values({ email: 'ada@requests.test', name: 'Ada Admin', passwordHash: 'x' }).returning();
   const company = await createCompany(db, { name: 'Requests Co', ownerId: ada.id });
@@ -406,6 +436,8 @@ afterAll(async () => {
 beforeEach(() => {
   m.runApproved.mockReset();
   m.runApproved.mockResolvedValue(bridge());
+  m.requestNames.mockReset();
+  m.requestNames.mockImplementation((...args: never[]) => m.real.requestNames!(...args));
   m.createGrant.mockReset();
   // A stand-in that answers as createGrant does (an AgentGrant), without writing one.
   m.createGrant.mockImplementation(
@@ -516,6 +548,117 @@ describe('an agent asks', () => {
     const [rlo, pdf, zwsp, bom] = [0x202e, 0x202c, 0x200b, 0xfeff].map((n) => String.fromCodePoint(n));
     const view = await ask('a', 'test.enter', { reason: `Pay ${rlo}txt.exe${pdf} the${zwsp} vendor${bom}\r\nLine two` });
     expect(view.reason).toBe('Pay txt.exe the vendor\nLine two');
+  });
+
+  it('keeps the version of the record the agent last read, and the run a person approves sends it', async () => {
+    const VERSION = '2026-11-22T14:05:09.123Z';
+    const view = await ask('a', 'test.change', { input: { params: { id: 'rec-9' }, body: { name: 'Renamed', amount: '10.00' }, expectedUpdatedAt: VERSION } });
+    expect((await rowOf(view.id)).input).toMatchObject({ params: { id: 'rec-9' }, expectedUpdatedAt: VERSION });
+    expect(view.input?.expectedUpdatedAt).toBe(VERSION);
+    expect((await approveAgentRequest(people.bo, view.id, {}, { atHost: true })).status).toBe('executed');
+    expect(m.runApproved.mock.calls[0][1].input).toMatchObject({ params: { id: 'rec-9' }, expectedUpdatedAt: VERSION });
+
+    // Part of the request: the same request id with another version is other work.
+    const key = 'version-key-1';
+    const first = await ask('a', 'test.change', { requestKey: key, input: { body: { name: 'A', amount: '1.00' }, expectedUpdatedAt: VERSION } });
+    expect((await ask('a', 'test.change', { requestKey: key, input: { body: { name: 'A', amount: '1.00' }, expectedUpdatedAt: VERSION } })).id).toBe(first.id);
+    await expectError(
+      ask('a', 'test.change', { requestKey: key, input: { body: { name: 'A', amount: '1.00' }, expectedUpdatedAt: '2026-11-22T14:06:00.000Z' } }),
+      'CONFLICT',
+      /already used/,
+    );
+
+    // None sent, or an empty one: none kept, and the run sends none.
+    for (const input of [{ body: { name: 'B', amount: '1.00' } }, { body: { name: 'C', amount: '1.00' }, expectedUpdatedAt: '' }]) {
+      const plain = await ask('a', 'test.change', { input });
+      expect((await rowOf(plain.id)).input).not.toHaveProperty('expectedUpdatedAt');
+    }
+
+    // One the bridge could not send is refused before anyone is asked: dropping it would let the
+    // run overwrite a person's edit.
+    for (const bad of ['yesterday', 'x'.repeat(41), 20261122, `${VERSION}\nX-Other: 1`]) {
+      await expectError(
+        ask('a', 'test.change', { input: { body: { name: 'D', amount: '1.00' }, expectedUpdatedAt: bad as string } }),
+        'VALIDATION',
+        /^Send expectedUpdatedAt as the record's updatedAt/,
+      );
+    }
+  });
+
+  it('keeps the whole summary, every recipient of a long list included; one too long for any card is refused', async () => {
+    op('test.schedule', { route: '/api/report-schedules', describe: 'Email the report {name} to {emailTo}', amountField: null });
+    const domains = Array.from({ length: 20 }, (_, i) => `books.client-${String(i + 1).padStart(2, '0')}.example-company.com`);
+    const input = { body: { name: 'Monthly P&L', emailTo: domains.map((d) => `pat@${d}`).join(', ') } };
+    const summary = describeRequest(m.ops.get('test.schedule') as Operation, input);
+    // Longer than the 500 characters a summary was once cut to.
+    expect(summary.length).toBeGreaterThan(500);
+    for (const d of domains) expect(summary).toContain(d);
+    const view = await ask('a', 'test.schedule', { input, summary, facts: facts({ amount: null }) });
+    expect((await rowOf(view.id)).summary).toBe(summary);
+    expect(view.summary).toBe(summary);
+
+    // The books changed: the new preview's line keeps all of them too.
+    m.runApproved.mockResolvedValueOnce(bridge({ mode: 'dry_run', stalenessKey: 'v2', result: { id: 'sched-1' } }));
+    expect((await approveAgentRequest(people.bo, view.id, {}, { atHost: true })).status).toBe('stale');
+    const again = (await rowOf(view.id)).summary;
+    for (const d of domains) expect(again).toContain(d);
+
+    await expectError(ask('a', 'test.schedule', { input, summary: 'Email the report to '.padEnd(64 * 1024 + 1, 'x') }), 'VALIDATION', /too long to show a person/);
+  });
+
+  it('a new preview\'s line names the records as they are now, read from the books, never by a uuid', async () => {
+    op('test.roledelete', {
+      class: 'change',
+      method: 'DELETE',
+      route: '/api/roles/[id]',
+      params: ['id'],
+      body: 'none',
+      describe: 'Delete role {id}',
+      rule: { area: 'customers', action: 'modify' },
+      action: 'modify',
+      amountField: null,
+    });
+    const [role] = await db.insert(companyRoles).values({ companyId, name: 'Clerk', permissions: {}, flags: {} }).returning();
+    // The books change under each approval: back to waiting with a new line (Bo was shown the last
+    // preview, so his yes with acceptStale runs again and finds them changed again).
+    const staleRound = async (id: string) => {
+      m.runApproved.mockResolvedValueOnce(bridge({ mode: 'dry_run', stalenessKey: `v${++seq}`, result: { ok: true } }));
+      const stale = await approveAgentRequest(people.bo, id, { acceptStale: true }, { atHost: true });
+      expect(stale.status).toBe('stale');
+      return stale.request.summary;
+    };
+
+    // Asked as the door asks: its own line, and no names beside it.
+    const view = await ask('a', 'test.roledelete', { input: { params: { id: role.id } }, summary: 'Delete role Clerk', facts: facts({ amount: null }) });
+    expect(await staleRound(view.id)).toBe('Delete role Clerk');
+    // The names were read with the approver's context, for this agent, from the stored request.
+    expect(m.requestNames).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: people.bo.userId, companyId }),
+      agentCtx.a.agent!.id,
+      expect.objectContaining({ id: 'test.roledelete' }),
+      expect.objectContaining({ params: { id: role.id } }),
+    );
+    // Renamed since: the line a person is asked to approve again names it as it is now.
+    await db.update(companyRoles).set({ name: 'Front desk' }).where(eq(companyRoles.id, role.id));
+    expect(await staleRound(view.id)).toBe('Delete role Front desk');
+
+    // Names passed beside a request (no asker passes any today) are kept out of every view, only as
+    // text for an id as the app writes one, and only stand in where the read finds no name.
+    const gone = crypto.randomUUID();
+    const names = { [role.id]: 'Old clerk', [gone]: 'Temp', ['bad id with spaces']: 'Nobody', [`${gone}x`]: '   ' };
+    const kept = await ask('a', 'test.roledelete', { input: { params: { id: role.id } }, summary: 'Delete role Front desk', names, facts: facts({ amount: null }) });
+    const stored = (await rowOf(kept.id)).needs as unknown as { request: { names?: Record<string, string> } };
+    expect(stored.request.names).toEqual({ [role.id]: 'Old clerk', [gone]: 'Temp' });
+    expect(JSON.stringify(kept.needs)).not.toContain('Old clerk');
+    expect(JSON.stringify((await requestForPerson(people.bo, kept.id)).needs)).not.toContain('Old clerk');
+    expect(await staleRound(kept.id)).toBe('Delete role Front desk');
+    const missing = await ask('a', 'test.roledelete', { input: { params: { id: gone } }, summary: 'Delete role Temp', names, facts: facts({ amount: null }) });
+    expect(await staleRound(missing.id)).toBe('Delete role Temp');
+    // A read that fails leaves the kept name; with none kept, the line shows the id.
+    m.requestNames.mockRejectedValueOnce(new Error('the file is busy'));
+    expect(await staleRound(kept.id)).toBe('Delete role Old clerk');
+    const unnamed = await ask('a', 'test.roledelete', { input: { params: { id: gone } }, summary: 'Delete role x', facts: facts({ amount: null }) });
+    expect(await staleRound(unnamed.id)).toBe(`Delete role ${gone}`);
   });
 
   it('an agent only ever sees its own requests', async () => {
@@ -673,7 +816,7 @@ describe('the answer of an approved reveal', () => {
   const SSN = '123-45-6789';
 
   const FILE = { fileId: 'f-1', name: 'w2.pdf', type: 'application/pdf', size: 10 };
-  const askReveal = (agent: string, over: Partial<NewAgentRequest> = {}) =>
+  const askReveal = (agent: string, over: Asked = {}) =>
     ask(agent, 'test.reveal', {
       effectiveClass: 'read_sensitive',
       input: { query: { id: 'emp-1' }, reveal: true },
@@ -908,6 +1051,96 @@ describe('the answer of an approved reveal', () => {
     );
   });
 
+  it('the audit trail names the record by its own name where one is known', async () => {
+    await makeAgent('reveal5');
+    const executedAudit = async (id: string) => {
+      const audit = await db.select().from(auditLogs).where(and(eq(auditLogs.entityType, 'agent_permission_request'), eq(auditLogs.entityId, id)));
+      return audit.find((a) => (a.newValues as { status?: string }).status === 'executed')?.newValues as { revealed?: string } | undefined;
+    };
+    m.runApproved.mockResolvedValue(bridge({ mode: 'read', result: { employee: { name: 'Dana Lee', ssn: SSN } } }));
+    // A record the books know a name for (here a person of this company, read by the real
+    // requestNames as it is now): named by it, as the door's line names it.
+    op('test.userreveal', {
+      class: 'read',
+      method: 'GET',
+      route: '/api/users/[id]',
+      params: ['id'],
+      rule: { area: 'customers', action: 'view' },
+      action: 'view',
+      reveal: 'ssn',
+      sensitiveFields: ['ssn'],
+      dryRun: 'none',
+      amountField: null,
+    });
+    const user = await ask('reveal5', 'test.userreveal', {
+      effectiveClass: 'read_sensitive',
+      input: { params: { id: people.bo.userId! }, reveal: true },
+      facts: facts({ reveal: true, amount: null }),
+      summary: `Show user ${people.bo.userId}`,
+    });
+    await approveAgentRequest(people.ada, user.id, {}, { atHost: true });
+    expect((await executedAudit(user.id))?.revealed).toBe('Revealed full SSNs and tax IDs of "Bo" to agent "Agent reveal5", approved by Ada Admin.');
+
+    // An employee: nothing reads an employee's name for a request today, so the summary, as before.
+    const plain = await askReveal('reveal5');
+    await approveAgentRequest(people.ada, plain.id, {}, { atHost: true });
+    expect((await executedAudit(plain.id))?.revealed).toBe('Revealed full SSNs and tax IDs of "Read employee emp-1" to agent "Agent reveal5", approved by Ada Admin.');
+    // A name passed beside the request (no asker passes any today) stands in for the id it names.
+    const named = await askReveal('reveal5', { names: { 'emp-1': 'Dana Lee', 'emp-2': 'Lee Park' } });
+    await approveAgentRequest(people.ada, named.id, {}, { atHost: true });
+    expect((await executedAudit(named.id))?.revealed).toBe('Revealed full SSNs and tax IDs of "Dana Lee" to agent "Agent reveal5", approved by Ada Admin.');
+    // Names of other ids only: the summary.
+    const other = await askReveal('reveal5', { names: { 'emp-2': 'Lee Park' } });
+    await approveAgentRequest(people.ada, other.id, {}, { atHost: true });
+    expect((await executedAudit(other.id))?.revealed).toBe('Revealed full SSNs and tax IDs of "Read employee emp-1" to agent "Agent reveal5", approved by Ada Admin.');
+  });
+
+  it('ends on time by its own timer when nothing reads it: masked in the row, and its file gone so get_file no longer has it', () =>
+    frozenAt(new Date(), async (moveTo) => {
+      await makeAgent('revealtimer');
+      const owner = { companyId, agentId: agentCtx.revealtimer.agent!.id };
+      const scan = await stageFile(owner, { name: 'w2.pdf', type: 'application/pdf', bytes: new Uint8Array([37, 80, 68, 70, 4]) });
+      const view = await askReveal('revealtimer');
+      m.runApproved.mockResolvedValue(bridge({ mode: 'read', result: { employee: { name: 'Dana Lee', ssn: SSN } }, file: scan }));
+      // The reveal's timer is caught (every other timer runs as usual) so that the test fires it,
+      // rather than waiting the real 15 minutes.
+      const realSetTimeout = globalThis.setTimeout;
+      const caught: Array<{ fire: () => void; ms: number }> = [];
+      const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fire: () => void, ms?: number, ...rest: unknown[]) => {
+        if (typeof ms === 'number' && ms >= REVEAL_KEPT_MINUTES * 60_000) {
+          caught.push({ fire, ms });
+          return realSetTimeout(() => undefined, 0);
+        }
+        return realSetTimeout(fire, ms, ...rest);
+      }) as typeof setTimeout);
+      try {
+        expect((await approveAgentRequest(people.ada, view.id, {}, { atHost: true })).status).toBe('executed');
+      } finally {
+        spy.mockRestore();
+      }
+      // One timer, set for just after the time is up, never before it.
+      expect(caught).toHaveLength(1);
+      expect(caught[0].ms).toBeGreaterThan(REVEAL_KEPT_MINUTES * 60_000);
+      expect(caught[0].ms).toBeLessThanOrEqual(REVEAL_KEPT_MINUTES * 60_000 + 5_000);
+
+      // When it fires, nothing else has read the request: the row and the file are as the run left them.
+      moveTo(caught[0].ms);
+      expect(JSON.stringify((await rowOf(view.id)).result)).toContain(SSN);
+      expect(await readStagedFile(owner, scan.fileId)).not.toBeNull();
+      caught[0].fire();
+      await vi.waitFor(
+        async () => {
+          const row = await rowOf(view.id);
+          expect(JSON.stringify(row.result)).not.toContain(SSN);
+          expect(row.result).toMatchObject({ file: null, revealEnded: true });
+          expect(row.result).not.toHaveProperty('revealFileLeft');
+        },
+        { timeout: 10_000, interval: 50 },
+      );
+      expect(await readStagedFile(owner, scan.fileId)).toBeNull();
+      expect(m.removeStagedFile).toHaveBeenCalledTimes(1);
+    }));
+
   it('an ordinary answer is masked by the reader\'s own flags', async () => {
     const view = await ask('b', 'test.enter');
     m.runApproved.mockResolvedValue(bridge({ result: { vendor: { name: 'Acme', taxId: '987-65-4321' } } }));
@@ -1117,6 +1350,11 @@ describe('approving', () => {
     expect(again.status).toBe('stale');
     expect(again.request.preview).toMatchObject({ routePreview: { total: '30.00' } });
     expect(m.runApproved).toHaveBeenCalledTimes(2);
+    // Still marked stale in the second round, and nobody counts as having approved it (the
+    // connector reads a first of two approvals from decidedBy on a waiting request).
+    expect(again.request.stale).toBe(true);
+    expect((await requestForAgent(agentCtx.b, view.id))?.stale).toBe(true);
+    expect((await rowOf(view.id)).decidedBy).toBeNull();
     // Bo said yes to P2 only: his acceptStale is not a yes to P3.
     const boShown = await approveAgentRequest(people.bo, view.id, { acceptStale: true }, { atHost: true });
     expect(boShown.status).toBe('stale');
@@ -2017,6 +2255,8 @@ describe('the badge', () => {
 
   it('marks what is overdue at most once a minute, masking for good what the request kept for its run', () =>
     frozenAt(fresh(), async (moveTo) => {
+      // Once a minute: the moves below are within it, then past it.
+      expect(BADGE_SETTLE_EVERY_MS).toBe(60_000);
       await badgeForPerson(people.bo, { atHost: true });
       const view = await ask('badge', 'test.vendor', { input: { body: { name: 'V', amount: '1.00', taxId: '987-65-1111', accountNumber: '000999888777' } } });
       // Kept in the row while it can still run (the run must enter what the agent asked for).
@@ -2438,6 +2678,22 @@ describe('a password the run cannot do without', () => {
     expect(m.runApproved).not.toHaveBeenCalled();
     expect((await rowOf(view.id)).status).toBe('pending');
     const done = await approveAgentRequest(people.bo, view.id, { secrets: { closing_password: 'Close-2026!' } }, { atHost: true });
+    expect(done.status).toBe('executed');
+    expect(m.runApproved.mock.calls[0][2].secrets).toEqual({ closing_password: 'Close-2026!' });
+  });
+
+  it('a password the needs add for this request alone is typed first too: closed-period work and its closing-date password', async () => {
+    // test.enter's route lists no secret; work dated in a closed period needs the password (policy.ts).
+    const view = await ask('pw', 'test.enter', { facts: facts({ closedPeriod: true, date: '2020-01-31' }) });
+    const card = await requestForPerson(people.ada, view.id);
+    expect(card.needs?.secrets).toContain('closing_password');
+    expect(card.needs?.optionalSecrets ?? []).not.toContain('closing_password');
+    for (const secrets of [{}, { closing_password: '' }]) {
+      await expectError(approveAgentRequest(people.ada, view.id, { secrets }, { atHost: true }), 'VALIDATION', /^Type the closing-date password on the card, then approve again\. Nothing was done\.$/);
+    }
+    expect(m.runApproved).not.toHaveBeenCalled();
+    expect(await rowOf(view.id)).toMatchObject({ status: 'pending', decidedBy: null });
+    const done = await approveAgentRequest(people.ada, view.id, { secrets: { closing_password: 'Close-2026!' } }, { atHost: true });
     expect(done.status).toBe('executed');
     expect(m.runApproved.mock.calls[0][2].secrets).toEqual({ closing_password: 'Close-2026!' });
   });

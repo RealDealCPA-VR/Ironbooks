@@ -11,14 +11,21 @@
  *    an email recipient that is not one or more plain addresses (RECIPIENT_FIELDS: the line
  *    shows each one's domain in full, and a plain address is read the same way by the mailer),
  *    and a file path that is not plain (pathRefusal: a ".." or a device prefix would make the
- *    start and end the line shows another place than where the file goes).
+ *    start and end the line shows another place than where the file goes), or, for a desktop or
+ *    backup operation, not a full path by the rules of the system this server runs on
+ *    (FULL_PATH_FIELDS, notFullPath: where a relative one goes depends on the folder or drive the
+ *    app is working in). It keeps the version of the record the agent last read
+ *    (OperationInput.expectedUpdatedAt) when it is a plain ISO time, so a stored request still
+ *    has it when a person approves.
  *  - applySecrets: puts what the approving person typed on the card exactly where the route reads
  *    it (a header or a body field). The agent never sees it and it is never stored.
  *  - redactAnswer: takes every secret the route produced out of the answer (the approver sees it
  *    once, on their own screen) and masks protected values unless a person approved a reveal.
  *
  * Pure: no database, no Node, no Next, so the door, the bridge, the request store and the pages can
- * all use it. The tables below are keyed by operation ("METHOD /api/pattern"); each entry was read
+ * all use it. The one thing it reads from where it runs is which system that is (process.platform,
+ * when there is a process: hostPlatform), because a full path is written differently on Windows
+ * than on a Mac. The tables below are keyed by operation ("METHOD /api/pattern"); each entry was read
  * off the route handler it names, and guards.test.ts holds them against the registry. Fail closed:
  * a field name that holds a secret is removed from every operation's input, listed or not.
  */
@@ -448,22 +455,161 @@ export const DEVICE_PATH_PREFIX = /^(?:[\\/]{2}[?.](?:[\\/]|$)|[\\/]\?\?(?:[\\/]
 /** A folder of only dots and spaces ("..", ".", "...", ".. "): Windows reads some of them as a step up. */
 export const DOTS_ONLY_FOLDER = /^[. ]*\.[. ]*$/;
 
-/** What is not plain about a path an agent gave, or null. The line removes what nobody can see, so a mark is first. */
+/**
+ * The server of a share ("\\server\share", "//server/share") written plainly: names of ASCII
+ * letters, digits, "_" and "-" parted by single dots, or an IP address, then at most Windows' own
+ * "@SSL" and "@port" of a web folder. No letter from another alphabet: a Cyrillic "і" in
+ * "\\fіles.acme.com" reads as files.acme.com on the line, and every copy would go to another
+ * computer (hostShownInFull holds mail servers to the same). No "$", "%" or trailing dot either:
+ * those are other spellings of a server (lib/agent/files.ts judges this computer's own).
+ */
+const SHARE_SERVER = /^(?:[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?)*|\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*)(?:@SSL)?(?:@\d{1,5})?$/i;
+/** The longest server name a share may have (a DNS name is at most 253 characters). */
+const SHARE_SERVER_MAX = 253;
+
+/**
+ * Characters that look like "/" or "\" but are not one: the fraction and division slashes, set
+ * minus, the solidus operators, the wide and small ones, the box-drawing diagonals, the Kangxi and
+ * CJK strokes, the Philippine punctuation and the combining overlays that draw a slash through a
+ * letter. "C:\Users\Pat", a wide backslash (U+FF3C), "Documents\Ironbooks Backups" reads as
+ * C:\Users\Pat\Documents\…, but every backup would go to a new folder of that whole name right
+ * under C:\Users. Built from numbers (charClass): none of them sits in this file as itself.
+ */
+const SLASH_LIKE = charClass(
+  [
+    [0x0337, 0x0338],
+    [0x1735, 0x1735],
+    [0x2044, 0x2044],
+    [0x20e5, 0x20e5],
+    [0x20eb, 0x20eb],
+    [0x2215, 0x2216],
+    [0x244a, 0x244a],
+    [0x2571, 0x2572],
+    [0x27cb, 0x27cb],
+    [0x27cd, 0x27cd],
+    [0x29f5, 0x29f9],
+    [0x2f03, 0x2f03],
+    [0x31d3, 0x31d3],
+    [0xfe68, 0xfe68],
+    [0xff0f, 0xff0f],
+    [0xff3c, 0xff3c],
+  ],
+  '',
+);
+
+/**
+ * The system this server runs on, as Node names it ("win32", "darwin", "linux"). The path rules
+ * follow it: an agent's path is used by this same process (the backup settings, the restores) or
+ * by the desktop shell on this same computer, which reads it by the same system's rules (electron/
+ * agentShell.js cleanPath). Anything but "win32" is read as a Mac or Linux computer, as Node's own
+ * `path` does; '' where there is no process (a browser loads this module for encodeSecretParts).
+ */
+function hostPlatform(): string {
+  return typeof process !== 'undefined' && typeof process.platform === 'string' ? process.platform : '';
+}
+
+/** Full paths an agent might send, written the way this system writes them, for the refusals. */
+function pathExamples(platform: string): string {
+  return platform === 'win32'
+    ? 'C:\\Users\\Pat\\Documents\\Ironbooks Backups or \\\\server\\share\\Ironbooks Backups'
+    : '/Users/pat/Documents/Ironbooks Backups';
+}
+
+/**
+ * What is not plain about a path an agent gave, or null. The line removes what nobody can see, so
+ * a mark is first. The line also shows every run of spaces as one, and any other space (a no-break
+ * space, a wide one) as an ordinary one, so neither is plain: "Ironbooks  Backups" is another
+ * folder than the "Ironbooks Backups" it would show. A character that only looks like a slash
+ * would show other folders than the ones the file goes to.
+ */
 function pathOddity(value: string): string | null {
   if (new RegExp(INVISIBLE.source, 'u').test(value) || new RegExp(LINE_BREAKS.source, 'u').test(value)) {
     return 'it holds a line break, a control character or an invisible mark, which the person approving could not see';
   }
+  if (SLASH_LIKE.test(value)) return 'it holds a character that looks like a slash but is not one, so it would show other folders than the ones the file goes to';
   if (DEVICE_PATH_PREFIX.test(value)) return 'it starts with \\\\?\\ or \\\\.\\ (a device path)';
   if (/^[\\/]{3}/.test(value)) return 'it starts with three slashes or more';
   if (value.split(/[\\/]/).some((s) => DOTS_ONLY_FOLDER.test(s))) return 'it holds "." or ".." as a folder';
+  if (/[^\S ]/u.test(value)) return 'it holds a space that is not an ordinary one (a no-break or wide space), which shows as an ordinary space';
+  if (/ {2}/.test(value)) return 'it holds two spaces in a row, which show as one';
+  if (/^ | $/.test(value)) return 'it starts or ends with a space, which does not show';
+  if (/^[\\/]{2}/.test(value)) {
+    const server = /^[\\/]{2}([^\\/]*)/.exec(value)?.[1] ?? '';
+    if (server.length > SHARE_SERVER_MAX || !SHARE_SERVER.test(server)) {
+      return "its server's name holds something other than the letters A to Z, digits, hyphens, underscores and single dots (a letter from another alphabet can look like one of these)";
+    }
+  }
   return null;
 }
 
-/** Why a path an agent gave cannot be used as it is, or null. */
-function pathProblem(where: string, value: string): string | null {
+/**
+ * Operations that name a file or folder on this computer, or on a share it reaches, for the company
+ * file itself, beside every desktop operation (kind 'shell', lib/agent/operations/shell.ts: its
+ * 'path' fields file, target and folder): where each one's paths are, "body." or "query." first.
+ * Read off each handler. Every field named like a path (PATH_FIELD_NAME) in their body and query
+ * counts too, at any depth.
+ *  - PUT /api/backups: body.folder, where every automatic backup of the whole file is written.
+ *  - POST /api/portable/restore and POST /api/accountant-copy/open: ?target= (a folder) and ?packAs=
+ *    (the new .ironbooks file). Only the desktop shell's own call is given them today; an agent's
+ *    run is restored beside the open file, but a path it names is still held to the rule.
+ *  - POST /api/company-file/save-as: ?target= (the shell's call; refused to agents anyway).
+ */
+export const FULL_PATH_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'PUT /api/backups': ['body.folder'],
+  'POST /api/portable/restore': ['query.target', 'query.packAs'],
+  'POST /api/accountant-copy/open': ['query.target', 'query.packAs'],
+  'POST /api/company-file/save-as': ['query.target'],
+});
+
+/**
+ * Whether every path this operation's input names must be a full one: a desktop operation, or one
+ * of FULL_PATH_FIELDS. Their paths say where the company file, a copy of it or its backups go.
+ */
+function needsFullPaths(operation: Pick<Operation, 'kind' | 'method' | 'route'>): boolean {
+  return operation.kind === 'shell' || hasOwn(FULL_PATH_FIELDS, routeKey(operation));
+}
+
+/**
+ * Why a path is not a full one on `platform` (hostPlatform: the system this server runs on, which
+ * reads the path), or null. Anything that is not full is read from the folder or drive the app
+ * happens to be working in.
+ *  - Windows: a drive ("C:\" or "C:/") or a share with its shared folder ("\\server\share",
+ *    "//server/share"). Not "Backups", "Books\x", "~/x", "C:Backups" (the drive's current
+ *    folder), and not "\Backups" or "/Backups": Windows puts those on whichever drive Ironbooks
+ *    runs from (the backup settings would save C:\Backups, or D:\Backups, while the line shows
+ *    "/Backups").
+ *  - Mac and Linux: "/" and a folder, with no "\" (there a "\" is part of a name, and the line
+ *    would show it as a step into a folder). Not "//nas/books": it reads as a share, but these
+ *    systems read it as the folder /nas/books on this computer. Not "C:\Backups" either: there
+ *    that is a name inside the working folder.
+ */
+export function notFullPath(value: string, platform: string = hostPlatform()): string | null {
+  const relative = 'so where it goes would depend on the folder Ironbooks is working in';
+  if (platform === 'win32') {
+    if (/^[A-Za-z]:[\\/]/.test(value)) return null;
+    if (/^[\\/]{2}/.test(value)) return /^[\\/]{2}[^\\/]+[\\/]+[^\\/]/.test(value) ? null : 'it names a server but no shared folder on it';
+    if (/^[\\/]/.test(value)) return 'it starts with a slash but names no drive, so Windows puts it on whichever drive Ironbooks runs from';
+    return `it does not start with a drive such as C:\\ or a share such as \\\\server\\share (this computer runs Windows), ${relative}`;
+  }
+  if (/^\/\//.test(value)) {
+    return 'it starts with two slashes, which a Mac or Linux computer reads as one: that is a folder on this computer, not a share (a share is used through the folder it is mounted at, such as /Volumes/books)';
+  }
+  if (/^\//.test(value)) return value.includes('\\') ? 'it holds a \\, which a Mac or Linux computer reads as part of a name, not as a step into a folder' : null;
+  return `it does not start with / (this computer runs macOS or Linux, where every full path does), ${relative}`;
+}
+
+/**
+ * Why a path an agent gave cannot be used as it is, or null. `full`: it must also be a full path
+ * (needsFullPaths) on `platform`, the system this server runs on.
+ */
+function pathProblem(where: string, value: string, full: boolean, platform: string): string | null {
   const why = pathOddity(value);
-  if (why === null) return null;
-  return `${where} is not a plain path: ${why}. Send the full path written the plain way, such as C:\\Users\\Pat\\Documents\\Ironbooks Backups or \\\\server\\share\\Ironbooks Backups, so the person approving sees exactly where the file goes.`;
+  if (why !== null) {
+    return `${where} is not a plain path: ${why}. Send the full path written the plain way, such as ${pathExamples(platform)}, so the person approving sees exactly where the file goes.`;
+  }
+  const partial = full ? notFullPath(value, platform) : null;
+  if (partial === null) return null;
+  return `${where} is not a full path: ${partial}. Send the whole path, such as ${pathExamples(platform)}, so the person approving sees exactly where the file goes.`;
 }
 
 /**
@@ -472,9 +618,15 @@ function pathProblem(where: string, value: string): string | null {
  * part it leaves out, a device path's prefix or a mark nobody can see would make what it shows
  * another place than where the file goes (C:\Users\VR\Documents\…\..\..\Public\x is in
  * C:\Users\Public). A plain path reads the same whole or cut. Every field named like a path, at
- * any depth, for every operation (the shell's file and target, the backups' folder).
+ * any depth, for every operation, when its text has a "/" or "\" (a memorized report's group
+ * "Monthly" is a name). For a desktop or backup operation (needsFullPaths) every such field, and
+ * the ones FULL_PATH_FIELDS names, is a path whatever its text, and must be a full one ("" is none
+ * given: the backups' folder then goes back to the default) by the rules of the system this server
+ * runs on (notFullPath).
  */
-function pathRefusal(input: OperationInput): string | null {
+function pathRefusal(operation: Pick<Operation, 'kind' | 'method' | 'route'>, input: OperationInput, platform: string = hostPlatform()): string | null {
+  const full = needsFullPaths(operation);
+  const listed = FULL_PATH_FIELDS[routeKey(operation)] ?? [];
   let found: string | null = null;
   const walk = (node: unknown, trail: string[]) => {
     if (found !== null) return;
@@ -486,11 +638,12 @@ function pathRefusal(input: OperationInput): string | null {
     for (const k of Object.keys(node)) {
       const v = node[k];
       const p = [...trail, k];
+      const where = p.join('.');
       const texts = typeof v === 'string' ? [v] : Array.isArray(v) && v.every((x) => typeof x === 'string') ? (v as string[]) : null;
-      if (texts && PATH_FIELD_NAME.test(k)) {
+      if (texts && (PATH_FIELD_NAME.test(k) || listed.includes(where))) {
         for (const text of texts) {
-          if (!/[\\/]/.test(text)) continue;
-          found = pathProblem(p.join('.'), text);
+          if (full ? text === '' : !/[\\/]/.test(text)) continue;
+          found = pathProblem(where, text, full, platform);
           if (found !== null) return;
         }
       } else walk(v, p);
@@ -760,7 +913,34 @@ function stripInput(operation: Operation, input: OperationInput, stripped: strin
 
   if (input.confirm !== undefined || confirm.length > 0) out.confirm = confirm;
   if (input.reveal !== undefined) out.reveal = input.reveal === true;
+  const version = plainIsoTime(input.expectedUpdatedAt);
+  if (version !== null) out.expectedUpdatedAt = version;
   return out;
+}
+
+/** Longest version text kept: an ISO time with nanoseconds and an offset is 35 characters. */
+export const VERSION_TEXT_MAX = 40;
+
+/**
+ * A plain ISO time: date, "T", hours and minutes, seconds and a fraction when given, then "Z" or
+ * an offset ("2026-11-22T14:05:09.123Z", "2026-11-22T15:05:09+01:00"). How Ironbooks answers a
+ * record's updatedAt. No zone is not one: Date would read it in this computer's own time zone.
+ */
+const PLAIN_ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/;
+
+/**
+ * OperationInput.expectedUpdatedAt as guardInput keeps it (contract, wave 4): the version of the
+ * record the agent last read, as a plain ISO time Date can read (spaces around it taken off); null
+ * for anything else, which is dropped. Kept, the request a person approves later still carries it
+ * (lib/services/agentRequests.ts guards a stored request again, and so does the approved run), and
+ * the route compares it when the work runs: a person's edit made in between is a 409, never
+ * written over. The bridge checks it again before it becomes a header (bridge.ts expectedVersionOf).
+ */
+export function plainIsoTime(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const v = value.trim();
+  if (v.length > VERSION_TEXT_MAX || !PLAIN_ISO_TIME.test(v)) return null;
+  return Number.isFinite(Date.parse(v)) ? v : null;
 }
 
 /** The first refusal that applies, or null. Order: the biggest reason first. */
@@ -792,7 +972,7 @@ function refusalOf(operation: Operation, raw: OperationInput, cleaned: Operation
   if (recipient) return recipient;
   // Every path an agent gives is a plain one, so the start and end the line shows are where the
   // file goes: refused before anyone is asked, and again when a person approves.
-  const path = pathRefusal(cleaned);
+  const path = pathRefusal(operation, cleaned);
   if (path) return path;
 
   if (raw.params !== undefined && !isPlainObject(raw.params)) return REFUSE.notAnObject;

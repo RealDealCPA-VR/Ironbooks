@@ -80,7 +80,19 @@ describe('classification: documents', () => {
     const answers = [
       redactAnswer(op('receipts.list'), { receipts: [receipt, { ...receipt, id: 'r2' }] }, { reveal: false }).answer,
       redactAnswer(op('receipts.get'), { receipt, suggestions: null }, { reveal: false }).answer,
+      // Every other answer that carries the receipt: the upload, the reading and the save. The
+      // service gives an agent no text today (receiptTextFor); the door is the backstop.
+      redactAnswer(op('receipts.create'), { receipt }, { reveal: false }).answer,
+      redactAnswer(op('receipts.extract'), { receipt }, { reveal: false }).answer,
+      redactAnswer(op('receipts.save'), { receipt, txnType: 'expense', txnId: 'e1' }, { reveal: false }).answer,
     ];
+    // Every operation of the bucket whose answer carries a receipt names its text.
+    for (const id of ['receipts.create', 'receipts.extract', 'receipts.save']) {
+      expect(op(id).sensitiveFields, id).toContain('receipt.rawText');
+      // ... and offers no reveal of it: that is receipts.get's.
+      expect(op(id).reveal ?? null, id).toBeNull();
+      expect(guardInput(op(id), { params: { id: 'r1' }, reveal: true }).refused, id).not.toBeNull();
+    }
     for (const answer of answers) {
       expect(JSON.stringify(answer)).not.toContain('123-45');
       expect(JSON.stringify(answer)).not.toContain('Form W-9');
@@ -134,6 +146,9 @@ describe('classification: documents', () => {
     expect(proposals.availability).toBe('hard_floor');
     expect(proposals.why).toMatch(/approved or denied in Agent requests/);
     expect(proposals.why).not.toMatch(/agent proposals live here/);
+    // The list answers an agent only the proposals it made itself (lib/services/aiAssistant.ts), and says so.
+    expect(op('ai.proposals')).toMatchObject({ method: 'GET', class: 'read' });
+    expect(op('ai.proposals').describe).toBe('List the AI and agent proposals (an agent sees only its own)');
   });
 
   it('classes the File Utilities reads of the QuickBooks conversion and Rebuild Data file', () => {

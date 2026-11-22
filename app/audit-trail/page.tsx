@@ -38,6 +38,13 @@ interface AuditLogRow {
   oldValues?: unknown;
   newValues?: unknown;
   llmReasoning?: string | null;
+  /**
+   * The entry in words, where the server gives it (lib/services/auditTrail.ts AuditLogRow.summary):
+   * a person's approval of an agent's reveal ("Revealed full SSNs and tax IDs of … to agent …,
+   * approved by …"), or "Details hidden …" for a reader who may not see what it was about. Left
+   * out of every other entry, which shows as it always has.
+   */
+  summary?: string;
 }
 
 interface ListResult {
@@ -242,6 +249,8 @@ function AuditRow({
 
   const shownDetail = detail ?? row;
   const entity = entityLabels.get(`${row.entityType}:${row.entityId}`);
+  // The server's own words for the entry, as text (never markup): the list's, or the full entry's.
+  const summary = shownDetail.summary || row.summary || '';
 
   return (
     <>
@@ -299,6 +308,11 @@ function AuditRow({
               Copy record ID
             </button>
           )}
+          {summary && (
+            <span className="mt-0.5 block text-xs text-navy/60" data-audit-summary="">
+              {summary}
+            </span>
+          )}
         </Td>
       </Tr>
 
@@ -312,6 +326,11 @@ function AuditRow({
                 </div>
               ) : (
                 <>
+                  {summary && (
+                    <p className="mb-3 text-sm font-medium text-navy" data-audit-summary-detail="">
+                      {summary}
+                    </p>
+                  )}
                   {shownDetail.oldValues == null && shownDetail.newValues == null ? (
                     <p className="text-sm text-navy/40 italic">No value snapshot recorded.</p>
                   ) : (

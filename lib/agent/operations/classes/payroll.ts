@@ -38,19 +38,19 @@
  *
  * Payroll adjustments change the W-2, the 941 and the 940 whether or not they post, so entering one
  * and voiding one both always ask, and so does voiding a paycheck, since that route voids any
- * payroll row, an adjustment too. Entering one names grossPay, and the bridge takes the larger of
- * that and the entry the run posts. A year-to-date adjustment's grossPay is its gross wages; its
- * entry, when affectsAccounts posts one, debits the wages and the employer taxes. So a posting one
- * is sized by its entry, and one that posts nothing by its gross wages. A liability adjustment
- * answers grossPay 0, so only its entry sizes it. One that posts no entry (entered without
- * affectsAccounts, or whose lines net to nothing on every account, so netLines posts nothing)
- * reads "0.00", and so does a year-to-date one that posts nothing and holds only employer
- * contribution lines, although their lines still change the 941 and the 940. No single answer
- * field is right for both kinds: adding up the lines (lines.*.amount, the field before) counted a
- * year-to-date adjustment's withholding a second time. Every adjustment still asks a person
- * (alwaysAsk, so no standing permission covers one); the lower figure reaches only the two-person
- * rule and the amount the card shows. Voiding answers the bare row: no amountField, and the entry
- * the void touched decides (unknown when there is none).
+ * payroll row, an adjustment too. As decided, an adjustment that posts no entry has an UNKNOWN
+ * amount, never "0.00": entered without affectsAccounts, or with lines that net to nothing on every
+ * account (netLines then posts nothing), it still moves the 941 and the 940 by its lines. No answer
+ * field gives that and nothing else: grossPay is 0 on every liability adjustment (and only the gross
+ * wages of a year-to-date one), and adding up the lines (lines.*.amount) counts a year-to-date
+ * adjustment's withholding a second time. And with no amountField the bridge reads a run that only
+ * made new records and posted nothing as "0.00". So entering one names the lines list itself, which
+ * is never one figure: facts.ts cannot read it, before the dry run or after, and the amount of every
+ * adjustment, posting or not, stays unknown (fail closed: over every two-person limit, "unknown" on
+ * the card). A posting one loses its entry's figure there, though the card's ledger preview still
+ * shows that entry; keeping it needs the bridge to tell a run that posted nothing apart. Voiding
+ * answers the bare row: no amountField, and the entry the void touched decides (unknown when there
+ * is none).
  *
  * Payroll items (the cross-bucket rule, with planning.ts): an item edit stays 'change', since plan
  * §8 lists payroll items with the list entries and an item's rate is not what paychecks charge. But
@@ -198,8 +198,18 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   'POST /api/payroll/adjustments': {
     class: 'enter',
     describe: 'Enter a payroll adjustment for employee {employeeId} dated {date} (type: {type})',
-    why: "Year-to-date amounts land on the employee's W-2, the 941 and 940, and the wage bases of later checks. With affectsAccounts, a year-to-date adjustment posts net pay out of a bank account like a paycheck, and a liability adjustment moves what payroll owes. So it always asks, like a paycheck. The amount is the answer's grossPay, or the entry the dry run posts when that is larger, as it is for every posting adjustment (a year-to-date entry debits the wages and the employer taxes; a liability adjustment has grossPay 0, so only its entry counts). A year-to-date adjustment that posts nothing is sized by its gross wages, what the W-2 gains. A liability adjustment that posts nothing (no affectsAccounts, or lines that net to nothing on every account), and a year-to-date one that posts nothing and holds only employer contribution lines, read 0.00, although their lines still change the 941 and the 940; it still asks a person, and its lines are in the request. Adding up the lines instead would count a year-to-date adjustment's withholding a second time.",
-    amountField: 'grossPay',
+    why: "Year-to-date amounts land on the employee's W-2, the 941 and 940, and the wage bases of later checks. With affectsAccounts, a year-to-date adjustment posts net pay out of a bank account like a paycheck, and a liability adjustment moves what payroll owes. So it always asks, like a paycheck. " +
+      'The amount is unknown, before the dry run and after it: it counts as over every two-person limit, and the approval card says the amount is unknown. ' +
+      'An adjustment that posts no entry (no affectsAccounts, or lines that net to nothing on every account) still changes the 941 and the 940 by its lines, so its amount is unknown, never 0.00 (fail closed). ' +
+      "No figure of the answer is right for every adjustment: grossPay is 0 on a liability adjustment, and adding up the lines counts a year-to-date adjustment's withholding a second time. " +
+      'So amountField names the lines list itself, which is never one figure and cannot be read as an amount. That also leaves an adjustment that does post without a figure; the person approving sees its entry in the ledger preview. ' +
+      'Its lines, with their amounts, are in the request.',
+    // Not a figure on purpose: lib/agent/facts.ts reads a list as no amount, in the body and in the
+    // answer, so the amount stays unknown (bridge.ts factsFor then keeps it unknown, entry or not).
+    // A stand-in: the contract has no way to say "unknown when the run posted nothing, else its
+    // entry", nor an "amount always unknown" flag, so this field marks it. operate.ts notesFor still
+    // tells the agent the amount "is read from" this field, which does not hold here.
+    amountField: 'lines',
     alwaysAsk: true,
   },
   'DELETE /api/payroll/adjustments/[id]': {

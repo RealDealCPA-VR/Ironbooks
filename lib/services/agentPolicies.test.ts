@@ -443,7 +443,13 @@ describe('saving a policy', () => {
     expect(row.folders).toEqual([path.resolve(receipts), path.resolve(statements)]);
 
     await expectError(saveAgentPolicy(admin, agent.id, { folders: ['receipts'] }), 'VALIDATION', /not a full folder path/);
-    await expectError(saveAgentPolicy(admin, agent.id, { folders: [path.join(FOLDERS, 'missing')] }), 'VALIDATION', /was not found on this computer/);
+    // The Agents screen finds the folder by `"<folder>" was not found` to add its own hint.
+    const missing = path.join(FOLDERS, 'missing');
+    await expectError(
+      saveAgentPolicy(admin, agent.id, { folders: [missing] }),
+      'VALIDATION',
+      new RegExp(`"${missing.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}" was not found on this computer\\. Check the path, make the folder first, or take it off the list\\.`),
+    );
     await expectError(saveAgentPolicy(admin, agent.id, { folders: [''] }), 'VALIDATION', /empty/);
     // The company's own data folder, a folder that holds it, and one inside it.
     await expectError(saveAgentPolicy(admin, agent.id, { folders: [TEST_DIR] }), 'VALIDATION', /holds the company file/);
@@ -690,6 +696,87 @@ describe('saving a policy', () => {
       await saveAgentPolicy(manager, agent.id, { requestExpiryDays: 2 });
       expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual(stored);
       expect((await saveAgentPolicy(manager, agent.id, { folders: stored })).policy.folders).toEqual([receipts]);
+    } finally {
+      fs.rmSync(path.join(path.dirname(TEST_DIR), 'backups'), { recursive: true, force: true });
+    }
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('a folder it already has is judged in every spelling that may name the same folder, by the words alone', async () => {
+    const { agent } = await newAgent('Kept nearly', ['view_only']);
+    const own = /one of the folders Ironbooks keeps its own data in .* Choose another folder for the agent\./;
+    const receipts = path.resolve(FOLDERS, 'receipts');
+    // The backups folder the shell names (BKA_BACKUP_DIR), with an accented name in one Unicode
+    // form; the agent's folder is the same name in the other form (as a paste from another program
+    // can give it), in another case, with the long s that Windows takes as an s (lower case keeps
+    // them apart, Windows' upper case does not), and with a trailing dot (Windows drops it; on every
+    // platform, as overlapsAppData judges it). None of them exists: only the words are judged, the
+    // way overlapsAppData judges them.
+    const backups = path.join(FOLDERS, 'Sauvegardes-é');
+    const spellings = [
+      path.join(FOLDERS, 'Sauvegardes-é'),
+      path.join(FOLDERS, 'SAUVEGARDES-É'),
+      path.join(FOLDERS, 'Sauvegardeſ-é'),
+      `${backups}.`,
+    ];
+    const saved = process.env.BKA_BACKUP_DIR;
+    try {
+      // Until the shell names that backups folder, each is an ordinary folder it already has.
+      delete process.env.BKA_BACKUP_DIR;
+      await db.update(agents).set({ folders: [...spellings, receipts] }).where(eq(agents.id, agent.id));
+      await saveAgentPolicy(admin, agent.id, { folders: [...spellings, receipts] });
+      expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([...spellings, receipts]);
+
+      process.env.BKA_BACKUP_DIR = backups;
+      for (const spelling of spellings) {
+        await db.update(agents).set({ folders: [spelling, receipts], requestExpiryDays: 7 }).where(eq(agents.id, agent.id));
+        // An Admin is told, and nothing is saved.
+        await expectError(saveAgentPolicy(admin, agent.id, { folders: [spelling, receipts] }), 'VALIDATION', own);
+        expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([spelling, receipts]);
+        // Anyone else has it taken away, and nothing is looked at for it.
+        scope.looked = [];
+        const view = await saveAgentPolicy(manager, agent.id, { folders: [spelling, receipts], requestExpiryDays: 3 });
+        expect(view.policy).toMatchObject({ folders: [receipts], requestExpiryDays: 3 });
+        expect(scope.looked).toEqual([]);
+      }
+      const rows = await auditRowsFor(agent.id);
+      const takenAway = rows.flatMap((r) => ((r.newValues as Record<string, unknown> | null)?.foldersTakenAway as Array<{ folder: string }> | undefined) ?? []);
+      expect(takenAway.map((t) => t.folder).sort()).toEqual([...spellings].sort());
+    } finally {
+      if (saved === undefined) delete process.env.BKA_BACKUP_DIR;
+      else process.env.BKA_BACKUP_DIR = saved;
+    }
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('a new folder is judged by the same near match, so one taken when it is added is never refused at the next save', async () => {
+    const { agent } = await newAgent('New nearly', ['view_only']);
+    const own = /one of the folders Ironbooks keeps its own data in .* Choose another folder for the agent\./;
+    // A backups folder chosen on this computer (Back Up settings), with an accented name in one
+    // Unicode form. Beside it, folders whose names may be the same one: the other Unicode form (NTFS
+    // keeps both apart), another case (Linux keeps both apart) and the long s Windows takes as an s.
+    // Where the disk folds them they are the chosen folder itself; either way each is refused when it
+    // is added, as it would be refused once kept (the test above).
+    const office = path.join(FOLDERS, 'office-near');
+    const chosen = path.join(office, 'Sauvegardes-é');
+    const twins = [
+      path.join(office, 'Sauvegardes-é'),
+      path.join(office, 'sauvegardes-é'),
+      path.join(office, 'Sauvegardeſ-é'),
+    ];
+    const ordinary = path.join(office, 'receipts-near');
+    for (const d of [chosen, ...twins, path.join(twins[0], 'inside'), ordinary]) fs.mkdirSync(d, { recursive: true });
+    try {
+      rememberChosenFolder(chosen);
+      for (const folder of [...twins, path.join(twins[0], 'inside')]) {
+        await expectError(saveAgentPolicy(admin, agent.id, { folders: [folder] }), 'VALIDATION', own);
+        expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([]);
+      }
+      // A folder beside them is taken, and an Admin's next save that sends it back keeps it.
+      const taken = (await saveAgentPolicy(admin, agent.id, { folders: [ordinary] })).policy.folders;
+      expect(taken).toEqual([path.resolve(ordinary)]);
+      const again = await saveAgentPolicy(admin, agent.id, { folders: taken, requestExpiryDays: 3 });
+      expect(again.policy).toMatchObject({ folders: taken, requestExpiryDays: 3 });
     } finally {
       fs.rmSync(path.join(path.dirname(TEST_DIR), 'backups'), { recursive: true, force: true });
     }

@@ -19,6 +19,7 @@ import {
   clearSetting,
   differingCount,
   draftFrom,
+  foldersTakenAway,
   inheritedSetting,
   insideFolder,
   isChanged,
@@ -39,6 +40,8 @@ import {
   type PolicyDraft,
 } from '@/app/users/agents/policyDraft';
 import {
+  ADMIN_ROLE_WARNING,
+  ADMIN_TO_ADD_FOLDER,
   ADMIN_TO_LOOSEN,
   ADMIN_TO_RESUME_ADMIN_AGENT,
   CLASS_HELP,
@@ -50,6 +53,7 @@ import {
   adjustedTitle,
   adminOnlyNote,
   adminToRaiseUsualCap,
+  foldersTakenAwayNote,
   presetLabelOf,
   presetSummary,
 } from '@/app/users/agents/words';
@@ -95,10 +99,12 @@ describe('the Agents tab', () => {
       'Pause all agents follows at once when an Admin makes the first agent or removes the last',
       'someone who may only see Users sees each agent, and is offered nothing the server would refuse',
       "the server's folder refusals are shown beside Save as they come",
+      'a folder Ironbooks takes off the list on a save is named beside Save, with why',
       'Users & Roles shows the Agents tab to whoever may view Users, once it knows who is signed in',
       'the audit trail opens the entry its address names, expanded and scrolled to',
       'an audit trail entry that cannot be found is said once, and the whole trail is shown; another failure is said as it is, with Try again',
       'an audit trail row whose details cannot be loaded stays closed and says why; a second click asks again',
+      "the audit trail shows an entry's own words in the list and in its details",
     ]);
   }, 300_000);
 });
@@ -458,6 +464,40 @@ describe('the detail page: the unsaved policy and what a save sends', () => {
     expect(insideFolder('/home/pat/Receipts/2026', '/home/pat/Receipts')).toBe(true);
     expect(insideFolder('/home/pat/receipts/2026', '/home/pat/Receipts')).toBe(false);
     expect(insideFolder('/home/pat', '/')).toBe(false);
+  });
+
+  it('a folder the agent had that the server took off the list on a save is found, and said with why', () => {
+    const saved = { ...start(), folders: ['C:\\Receipts', '\\\\localhost\\c$\\Scans', 'D:\\Old'] };
+    // Nothing sent: the server looked at no folder.
+    expect(foldersTakenAway(saved, undefined, [])).toEqual([]);
+    // An answer without its folder list says nothing either way.
+    expect(foldersTakenAway(saved, ['C:\\Receipts'], undefined)).toEqual([]);
+    // Sent back, and not in the answer: taken away. Taken off by the person: not.
+    expect(foldersTakenAway(saved, ['C:\\Receipts', '\\\\localhost\\c$\\Scans'], ['C:\\Receipts'])).toEqual(['\\\\localhost\\c$\\Scans']);
+    // Compared as the words of a folder: either slash, a trailing one, letter case on Windows.
+    expect(foldersTakenAway(saved, ['c:/receipts/', 'D:\\Old'], ['C:\\RECEIPTS'])).toEqual(['D:\\Old']);
+    // A new folder is stored as the disk names it, so it is never taken for one taken away.
+    expect(foldersTakenAway(saved, ['C:\\Receipts', 'e:/scans'], ['C:\\Receipts', 'E:\\Scans'])).toEqual([]);
+    expect(foldersTakenAway({ ...saved, folders: ['/home/pat/Receipts'] }, ['/home/pat/Receipts/'], ['/home/pat/Receipts'])).toEqual([]);
+    expect(foldersTakenAway({ ...saved, folders: ['/home/pat/Receipts'] }, ['/home/pat/Receipts'], ['/home/pat/receipts'])).toEqual(['/home/pat/Receipts']);
+
+    expect(foldersTakenAwayNote(['\\\\localhost\\c$\\Scans'])).toBe(
+      'Saved. Ironbooks took this folder off the agent\'s list, because an agent may no longer be given it: "\\\\localhost\\c$\\Scans". A folder is taken off when it is a whole drive or share, a share of this computer, or holds or is inside the company file\'s folders or Ironbooks\' own data. The audit trail entry for this save says which; if you cannot open the audit trail, an Admin can. Only an Admin can give the agent a folder outside the ones it has.',
+    );
+    // Held to what the rest of the page says: a folder inside one the agent still has is open to
+    // this person (ADMIN_TO_ADD_FOLDER), so the note never says only an Admin may add any folder.
+    expect(ADMIN_TO_ADD_FOLDER).toContain('a folder outside the ones it has');
+    expect(foldersTakenAwayNote(['D:\\Old'])).toContain('a folder outside the ones it has');
+    expect(foldersTakenAwayNote(['D:\\Old'])).not.toContain('another folder');
+    expect(foldersTakenAwayNote(['C:\\', 'D:\\Books'])).toMatch(/^Saved\. Ironbooks took these folders off the agent's list, because an agent may no longer be given them: "C:\\", "D:\\Books"\./);
+  });
+
+  it('the Admin role warning says the agent asks for Admin work only where its settings say Ask', () => {
+    // Under "Ask for every change", the new agent's preset, Admin work stays on Never.
+    for (const cls of ['admin', 'file', 'secret'] as const) expect(resolvePolicy('ask_every_change', [], {}).classes[cls]).toBe('never');
+    expect(ADMIN_ROLE_WARNING).toContain('wherever its settings say Ask for that work');
+    expect(ADMIN_ROLE_WARNING).toContain('"Ask for every change" keeps it on Never');
+    expect(ADMIN_ROLE_WARNING).not.toContain('anything an Admin can do');
   });
 
   it("Resume's reason for a person who is not an Admin is the server's own words", () => {

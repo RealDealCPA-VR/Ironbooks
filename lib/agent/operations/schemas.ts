@@ -74,12 +74,16 @@ async function loadRef(ref: string, operation: Operation): Promise<ZodTypeAny> {
   return schema;
 }
 
-/** What each kind of shell input field is, in words an agent can act on. */
+/**
+ * What each kind of shell input field is, in words an agent can act on. A path says the rule the
+ * guards hold every desktop operation's paths to (lib/agent/guards.ts needsFullPaths, notFullPath),
+ * so an agent learns it here rather than from a refusal.
+ */
 const SHELL_FIELD_NOTES: Record<ShellOperationDef['input'][string]['type'], string> = {
   string: '',
   number: '',
   boolean: '',
-  path: 'A folder or file path on this computer.',
+  path: 'A full path as this computer sees it, starting with a drive such as C:\\, a share such as \\\\server\\share, or / on a Mac or Linux computer.',
   fileId: 'The fileId of a file you staged with upload_file.',
 };
 

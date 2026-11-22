@@ -158,17 +158,24 @@ export const RECIPIENTS_SHOWN: Readonly<Record<string, ReadonlyArray<{ placehold
  * Operations that make or change a memorized transaction, and where the route's answer holds the
  * template row (the schedule as saved: frequency, nextRunDate, anchorDay, remaining, mode,
  * isActive). Their line ends with the next three dates (RUN_DATES). `fromBody`: before its dry run
- * (no answer yet) the dates can be worked out from the body alone, because the body is the whole
- * schedule (a new one, anchored as createTemplate anchors it). A change cannot: updateTemplate
- * keeps the stored day of the month (a template on the 31st, moved to 2027-02-28, runs on 03-31,
- * not 03-28), the stored mode and the stored count left, none of which the body holds, so its
- * line shows no dates until the dry run's answer says what was saved.
+ * (no answer yet) the dates are worked out from the body alone, for a new schedule (anchored as
+ * createTemplate anchors it), from only the fields its route reads from the body, which are
+ * listed: a field it ignores must not change the line (body.remaining: 1 on the AI's memorize
+ * would read "its last date" for a schedule saved with no limit). Every other schedule field is as
+ * createTemplate saves a new one: active, no limit, and a mode that enters or reminds on each
+ * date. A change cannot (null): updateTemplate keeps the stored day of the month (a template on
+ * the 31st, moved to 2027-02-28, runs on 03-31, not 03-28), the stored mode and the stored count
+ * left, none of which the body holds, so its line shows no dates until the dry run's answer says
+ * what was saved.
  */
-export const RECURRING_SCHEDULES: Readonly<Record<string, { answer: string | null; fromBody: boolean }>> = Object.freeze({
-  'POST /api/recurring': { answer: null, fromBody: true },
-  'PATCH /api/recurring/[id]': { answer: null, fromBody: false },
+export const RECURRING_SCHEDULES: Readonly<Record<string, { answer: string | null; fromBody: readonly string[] | null }>> = Object.freeze({
+  // createRecurringTemplateSchema; isActive is not one of its fields: createTemplate saves it active.
+  'POST /api/recurring': { answer: null, fromBody: ['frequency', 'nextRunDate', 'mode', 'remaining'] },
+  'PATCH /api/recurring/[id]': { answer: null, fromBody: null },
   // { template } (lib/services/aiRecurring.ts memorizeSuggestion through createTemplate).
-  'POST /api/ai/recurring': { answer: 'template', fromBody: true },
+  // memorizeSuggestionSchema takes no mode, count left or isActive (autoEnter only picks
+  // automatic or remind, both of which run on each date).
+  'POST /api/ai/recurring': { answer: 'template', fromBody: ['frequency', 'nextRunDate'] },
 });
 
 /** The placeholder the run dates fill (not a field of any body). */
@@ -278,6 +285,31 @@ function withNames(raw: unknown, names: DescribeNames | undefined): unknown {
     return typeof named === 'string' && named.trim() !== '' ? named : v;
   };
   return Array.isArray(raw) ? raw.map(one) : one(raw);
+}
+
+/**
+ * Placeholders that say what a record will be called after the change, and the path parameter
+ * that names the record: they show only when the request renames it. The route's answer holds the
+ * record's name whether or not it changed, so a change of a role's permissions alone would read
+ * "Change what role Clerk allows (called Clerk after the change)". So the name must be in the
+ * body, and not be the name the record has now (DescribeNames, as the door read it); then the
+ * answer's name, what was saved, shows as usual. Missing, the template's aside goes with it.
+ */
+export const RENAMED_TO: Readonly<Record<string, { placeholder: string; param: string }>> = Object.freeze({
+  'PATCH /api/roles/[id]': { placeholder: 'name', param: 'id' },
+});
+
+/** Whether this request renames the record (RENAMED_TO): a name in its body other than the one it has now. */
+function renames(operation: Operation, input: OperationInput, names: DescribeNames | undefined, spot: { placeholder: string; param: string }): boolean {
+  const fields = bodyFields(operation, input);
+  const given = isPlainObject(fields) && Object.prototype.hasOwnProperty.call(fields, spot.placeholder) ? fields[spot.placeholder] : undefined;
+  if (typeof given !== 'string' || cleanText(given, Number.POSITIVE_INFINITY) === '') return false;
+  const id = isPlainObject(input.params) ? input.params[spot.param] : undefined;
+  const key = typeof id === 'string' ? id.trim() : '';
+  const now = names && key !== '' && Object.prototype.hasOwnProperty.call(names, key) ? names[key] : undefined;
+  // Compared as written (only the ends trimmed): a name that differs by a mark nobody can see is
+  // still a rename, and the aside then says one happens.
+  return !(typeof now === 'string' && now.trim() === given.trim());
 }
 
 /**
@@ -415,8 +447,10 @@ function runDatesText(operation: Operation, input: OperationInput, answer: unkno
   const body = isPlainObject(fields) ? fields : {};
   const answered = answer === undefined ? undefined : spot.answer === null ? answer : valuesAt(answer, spot.answer)[0];
   const row = isPlainObject(answered) && 'nextRunDate' in answered ? answered : null;
-  if (!row && !spot.fromBody) return '';
-  const get = (k: string): unknown => (row ? row[k] : body[k]);
+  const reads = spot.fromBody;
+  if (!row && reads === null) return '';
+  // The saved row as it is; before the dry run, only what the route reads from the body.
+  const get = (k: string): unknown => (row ? row[k] : reads !== null && reads.includes(k) ? body[k] : undefined);
 
   const frequency = get('frequency');
   const start = scheduleDate(get('nextRunDate'));
@@ -692,6 +726,8 @@ function valueOf(operation: Operation, input: OperationInput, answer: unknown, n
     const text = runDatesText(operation, input, answer);
     return { raw: text, fixed: text !== '' };
   }
+  const rename = RENAMED_TO[routeKey(operation)];
+  if (rename && rename.placeholder === name && !renames(operation, input, names, rename)) return { raw: undefined, fixed: false };
   const found = lookup(operation, input, answer, name);
   const named = withNames(found, names);
   const raw = named === found ? nameFromAnswer(operation, input, answer, name, found) : named;

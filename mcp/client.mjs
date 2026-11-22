@@ -133,7 +133,10 @@ export const BAD_TOKEN_MESSAGE = 'The access token is not in the form Ironbooks 
 
 /** A failure with a message meant for the agent to read. */
 export class IronbooksError extends Error {
-  /** @param {string} message @param {{ status?: number, code?: string, notConnected?: boolean, retryAfter?: number }} [info] */
+  /**
+   * @param {string} message
+   * @param {{ status?: number, code?: string, notConnected?: boolean, retryAfter?: number, fields?: Record<string, string> }} [info]
+   */
   constructor(message, info = {}) {
     super(message);
     this.name = 'IronbooksError';
@@ -144,7 +147,25 @@ export class IronbooksError extends Error {
     this.notConnected = info.notConnected === true;
     /** Seconds Ironbooks asked to hold off before trying again (its Retry-After), or 0. */
     this.retryAfter = info.retryAfter ?? 0;
+    /**
+     * The input fields a refusal names, each with what is wrong with it (the answer's
+     * details.fields), or an empty object. It tells, for one, the door's request-id check
+     * (fields.requestId) from any other refusal of the input, without reading the words.
+     */
+    this.fields = info.fields ?? {};
   }
+}
+
+/**
+ * The fields a refused answer names (its details.fields), text values only; an empty object when
+ * it names none. Nothing else of the details is kept: the message already says it in words.
+ * @param {unknown} body
+ * @returns {Record<string, string>}
+ */
+function fieldsOf(body) {
+  const f = /** @type {any} */ (body)?.details?.fields;
+  if (!f || typeof f !== 'object' || Array.isArray(f)) return {};
+  return Object.fromEntries(Object.entries(f).filter(([k, v]) => typeof k === 'string' && typeof v === 'string').slice(0, 50));
 }
 
 /** A Retry-After header in whole seconds (0 when absent or not a number of seconds; at most an hour). */
@@ -708,7 +729,7 @@ export class IronbooksClient {
       );
     }
     if (res.status >= 500) throw new IronbooksError('Ironbooks could not answer that. Try again, or try a shorter date range.', { status: res.status, code });
-    throw new IronbooksError(message || `Ironbooks refused the request (${res.status}).`, { status: res.status, code });
+    throw new IronbooksError(message || `Ironbooks refused the request (${res.status}).`, { status: res.status, code, fields: fieldsOf(body) });
   }
 }
 

@@ -27,7 +27,9 @@
  * card or changes the filter. Once a card is opened from ?id=, the address drops it, so the same
  * link followed again opens the card again. A link never swaps out a card while its answer is on
  * its way or while it shows a secret the run produced: the request from the link opens once the
- * person closes that card.
+ * person closes that card. If someone else answered that request meanwhile, its card opens all the
+ * same and shows where it stands (RequestCard loads its own copy first, and nothing on the list's
+ * older copy can be answered).
  */
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';

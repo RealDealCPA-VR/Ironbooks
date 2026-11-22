@@ -241,7 +241,9 @@ A company file with no agents behaves exactly as before.
   saving it to a folder is approved separately.
 - The approval card shows every recipient with their domain in full, the subject and the
   attachments, or the computer a call goes to. An agent may only name plain email addresses: no
-  display names, quotes, brackets or comments that could hide where a message really goes.
+  display names, quotes, angle or square brackets, parentheses or comments that could hide where a
+  message really goes, and one address where a field takes one. The card never hides a recipient
+  behind "and 2 more".
 - An approved send goes through the same gates as a person's: the company's own mail server, its AI
   settings and the Privacy & Network rules on this page. A dry run sends nothing, and a run that
   fails sends nothing.
@@ -266,6 +268,10 @@ A company file with no agents behaves exactly as before.
 
 - The agent reaches the books through the app's own server on this computer (`127.0.0.1`). Nothing
   new listens on the network, and an agent does not work through multi-user hosting.
+- One read answers an agent directly, with nobody asked, because the sign-in screen needs it before
+  anyone signs in: the company file's name, its id, and whether it has users, a password or
+  protection. It never shows the folder the file is in. This is a known gap, closed once that read
+  refuses a request that carries an agent's token.
 - While a company file with an agent is open and someone has signed in, Ironbooks writes one small
   file in your own profile folder (`%LOCALAPPDATA%\Ironbooks\agent-endpoints`) so the agent's
   connector can find the app. It holds the app's local port and a check value for that run, nothing

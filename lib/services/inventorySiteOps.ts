@@ -17,7 +17,7 @@ import { Money } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { type AdjustmentDimensions, adjustInventory, cogsAccountForItem, inventoryDate, inventoryNumber } from './inventory';
 import { consumeStock, receiveStock, seedOpeningLayer } from './fifo';
-import { type InventoryLineDetail, ensureDefaultSite, getSite, recordMovements } from './inventorySites';
+import { type InventoryLineDetail, defaultSiteForRead, getSite, recordMovements } from './inventorySites';
 
 export interface SiteAdjustmentInput extends InventoryLineDetail, AdjustmentDimensions {
   /**
@@ -164,13 +164,18 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
  * (Edit Item; the reorder list and Create Purchase Orders use it): it is shown from the item,
  * also when the default site has no settings row yet, so the Reorder Points screen and the
  * reorder reports never disagree about it.
+ *
+ * A read: the default site comes from defaultSiteForRead, so an agent's or a read-only read made
+ * before anyone opened the sites makes no "Main Warehouse". It answers as if no site exists yet:
+ * only the stored rows (the item's own reorder point is not at any site until the default exists).
  */
 export async function listSiteReorderPoints(ctx: ServiceContext, opts?: { itemId?: string; siteId?: string }) {
   const conds = [eq(itemSiteSettings.companyId, ctx.companyId)];
   if (opts?.itemId) conds.push(eq(itemSiteSettings.itemId, opts.itemId));
   if (opts?.siteId) conds.push(eq(itemSiteSettings.siteId, opts.siteId));
   const rows = await ctx.db.select().from(itemSiteSettings).where(and(...conds));
-  const defaultSite = await ensureDefaultSite(ctx);
+  const defaultSite = await defaultSiteForRead(ctx);
+  if (!defaultSite) return rows;
   if (opts?.siteId && opts.siteId !== defaultSite.id) return rows;
   const itemConds = [eq(items.companyId, ctx.companyId), eq(items.type, 'inventory')];
   if (opts?.itemId) itemConds.push(eq(items.id, opts.itemId));

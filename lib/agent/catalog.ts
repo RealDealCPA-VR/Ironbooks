@@ -23,7 +23,7 @@ import { z } from 'zod';
 import { accounts, customers, vendors } from '@/lib/db/schema';
 import { Money, toDecimal, type MoneyInput } from '@/lib/money';
 import { type ServiceContext, validation } from '@/lib/services/_base';
-import { assertCurrentVersion, withVersionCheck, type VersionedEntity } from '@/lib/services/concurrency';
+import { withVersionCheck, type VersionedEntity } from '@/lib/services/concurrency';
 import { createManualEntry, updateEntry, voidEntry } from '@/lib/services/journal';
 import { createInvoice, updateInvoice, voidInvoice } from '@/lib/services/invoices';
 import { createSalesReceipt, updateSalesReceipt, voidSalesReceipt } from '@/lib/services/salesReceipts';
@@ -165,24 +165,20 @@ const editSchema = <S extends z.ZodTypeAny>(changes: S) => z.object({ id: zUuid,
 const targetSchema = z.object({ id: zUuid, expectedUpdatedAt: expectedVersion }).strict();
 
 /**
- * The version the agent last read goes with the request to the route (versioned below): the
- * bridge sends it as x-expected-updated-at, and the route's own withVersionCheck compares it inside
- * the transaction that commits, so a person's edit made at any moment before the commit is refused
- * with 409 (details.staleVersion) instead of overwritten, as a person's window is. That is the real
- * guard, for the agent's own run and for a run a person approved later alike.
+ * The version the agent last read, as the door takes it (OperationInput.expectedUpdatedAt), when it
+ * sent one. It goes with the request to the route: the bridge sends it as x-expected-updated-at,
+ * and the route's own withVersionCheck compares it inside the transaction that commits, so a
+ * person's edit made at any moment before the commit is refused with 409 instead of overwritten,
+ * as a person's window is. That is the only check of the version, for the door's dry run, the
+ * agent's own run and a run a person approved later alike.
  *
- * This check is only the quick first answer, before the door's dry run and decision: a request
- * that is already stale is told so at once. It runs only for a request the policy does not refuse
- * (lib/agent/actions.ts throughDoor): its answer names who changed the record last, which an agent
- * refused the work must not learn.
+ * There is no check of the action's own before it. One could answer differently from the route,
+ * and so from run_operation: with details of who changed the record last that the route does not
+ * give (the customer's route answers without them), ahead of the bridge's own refusals that no
+ * version changes (a feature switched off, the Accountant's Copy rule), or at once where the door
+ * asks a person without trying the work first (dated on or before the closing date; the approved
+ * run then meets the route's compare).
  */
-const versionCheck =
-  (entity: VersionedEntity) =>
-  async (ctx: ServiceContext, i: { id: string; expectedUpdatedAt?: string | null }): Promise<void> => {
-    if (i.expectedUpdatedAt) await assertCurrentVersion(ctx, entity, i.id, i.expectedUpdatedAt);
-  };
-
-/** The version the agent last read, as the door takes it (OperationInput.expectedUpdatedAt), when it sent one. */
 const versioned = (i: { expectedUpdatedAt?: string | null }) => (i.expectedUpdatedAt ? { expectedUpdatedAt: i.expectedUpdatedAt } : {});
 
 interface RecordKind {
@@ -304,7 +300,6 @@ function editAction(kind: RecordKind): AgentActionDef<Any> {
     route: { path: `${kind.path}/[id]`, method: kind.editMethod },
     schema: editSchema(kind.editSchema),
     describe: (_ctx, i) => `Edit ${kind.label} ${i.id}`,
-    check: versionCheck(kind.entity),
     request: (i) => ({ params: { id: i.id }, body: i.changes, ...versioned(i) }),
     answer: (r) => kind.shape(r),
     run: async (ctx, i) => kind.shape(await withVersionCheck(ctx, kind.entity, i.id, i.expectedUpdatedAt ?? null, (c) => kind.edit(c, i.id, i.changes))),
@@ -318,7 +313,6 @@ function removeAction(kind: RecordKind, verb: 'void' | 'deactivate'): AgentActio
     route: { path: `${kind.path}/[id]`, method: 'DELETE' },
     schema: targetSchema,
     describe: (_ctx, i) => `${verb === 'void' ? 'Void' : 'Make inactive:'} ${kind.label} ${i.id}`,
-    check: versionCheck(kind.entity),
     request: (i) => ({ params: { id: i.id }, ...versioned(i) }),
     answer: (r) => kind.shape(r),
     run: async (ctx, i) => kind.shape(await withVersionCheck(ctx, kind.entity, i.id, i.expectedUpdatedAt ?? null, (c) => kind.remove(c, i.id))),

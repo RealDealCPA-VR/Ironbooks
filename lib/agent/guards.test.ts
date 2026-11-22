@@ -3,7 +3,7 @@
  * §5.8, §5.9, §11.2). Table-driven: one case per rule, and the secret tables held against the
  * registry, so a new operation that needs or produces a secret cannot be forgotten.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   LOGIN_HEADER,
   PASSWORD_HEADER,
@@ -13,6 +13,7 @@ import {
 } from '@/lib/net/archiveCredentials';
 import { CLOSING_PASSWORD_HEADER as CLIENT_CLOSING_HEADER } from '@/lib/client';
 import { allOperations, operationForRoute } from './operations/registry';
+import { SHELL_OPERATIONS } from './operations/shell';
 import type { Operation, SecretKind } from './operations/types';
 import type { OperationInput } from './contract';
 import {
@@ -22,6 +23,7 @@ import {
   ARCHIVE_PASSWORD_HEADER,
   ARCHIVE_RECOVERY_KEY_HEADER,
   CLOSING_PASSWORD_HEADER,
+  FULL_PATH_FIELDS,
   MAIL_SERVER_PATHS,
   MASKED_TEXT,
   PRODUCED_SECRET_TABLE,
@@ -39,9 +41,43 @@ import {
   maskAccountsInText,
   maskInput,
   maskSensitiveFields,
+  notFullPath,
   plainAddress,
   redactAnswer,
 } from './guards';
+
+/**
+ * Makes this process read as running on `platform` until the returned function puts it back. The
+ * path rules follow the system the server runs on (guards.ts notFullPath reads process.platform
+ * when it judges a path), so each path test says which system it means and means the same on any
+ * computer it runs on.
+ */
+function stubPlatform(platform: string): () => void {
+  const was = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: platform, configurable: true, enumerable: true, writable: false });
+  return () => {
+    if (was) Object.defineProperty(process, 'platform', was);
+  };
+}
+
+/** `run` as if this server ran on `platform`. */
+function onPlatform<T>(platform: string, run: () => T): T {
+  const restore = stubPlatform(platform);
+  try {
+    return run();
+  } finally {
+    restore();
+  }
+}
+
+/** The path tests below are written for Windows (the office's computers) unless a case says otherwise. */
+function asWindows(): void {
+  let restore: () => void = () => {};
+  beforeEach(() => {
+    restore = stubPlatform('win32');
+  });
+  afterEach(() => restore());
+}
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -677,6 +713,7 @@ describe('guardInput: email recipients an agent sends', () => {
 });
 
 describe('guardInput: file paths an agent sends', () => {
+  asWindows();
   const shellOp = (id: string) => {
     const found = allOperations().find((o) => o.id === id);
     if (!found) throw new Error(`No registry operation ${id}`);
@@ -722,11 +759,18 @@ describe('guardInput: file paths an agent sends', () => {
     }
   });
 
+  it('on a Mac or Linux computer the refusal shows a path the way that computer writes one', () => {
+    for (const platform of ['darwin', 'linux']) {
+      const r = onPlatform(platform, () => refused(backups(), { folder: '/Users/pat/../Shared/Backups' })) ?? '';
+      expect(r, platform).toMatch(/is not a plain path: .*"\." or "\.\." as a folder\. Send the full path written the plain way, such as \/Users\/pat\/Documents\/Ironbooks Backups, so/);
+      expect(r, platform).not.toMatch(/C:\\/);
+    }
+  });
+
   it.each([
     ['C:\\Users\\Pat\\Documents\\Ironbooks Backups\\Books backup.ironbooks'],
     ['\\\\nas\\books\\Ironbooks Backups'],
     ['//nas/books/Ironbooks Backups'],
-    ['/Users/pat/Documents/Ironbooks Backups/'],
     ['C:\\Users\\Pat\\Books v1.2\\x.ironbooks'],
     ['C:\\Users\\Pat\\.hidden\\x.ironbooks'],
     ['C:\\Users\\Pat\\x..ironbooks'],
@@ -734,6 +778,50 @@ describe('guardInput: file paths an agent sends', () => {
   ])('%j is a plain path (or none), so the request goes on', (value) => {
     expect(refused(saveCopy(), { file: value })).toBeNull();
     expect(refused(backups(), { schedule: 'daily', keep: 14, folder: value })).toBeNull();
+  });
+
+  it.each([
+    ['/Users/pat/Documents/Ironbooks Backups/'],
+    ['/Volumes/books/Ironbooks Backups'],
+    ['/home/pat/Books v1.2/x.ironbooks'],
+    [null],
+  ])('%j is a plain path (or none) on a Mac or Linux computer, so the request goes on', (value) => {
+    for (const platform of ['darwin', 'linux']) {
+      expect(onPlatform(platform, () => refused(saveCopy(), { file: value })), platform).toBeNull();
+      expect(onPlatform(platform, () => refused(backups(), { schedule: 'daily', keep: 14, folder: value })), platform).toBeNull();
+    }
+  });
+
+  // The reviewer's probe (wave 5, guards): a character that only looks like a slash. The line would
+  // read C:\Users\Pat\Documents\Ironbooks Backups, but the backups would go to a new folder named
+  // "Pat(wide backslash)Documents" right under C:\Users (backupHistory makes the folder it is given).
+  it.each([
+    ['FF3C', 'fullwidth reverse solidus'],
+    ['FF0F', 'fullwidth solidus'],
+    ['2215', 'division slash'],
+    ['2216', 'set minus'],
+    ['2044', 'fraction slash'],
+    ['29F5', 'reverse solidus operator'],
+    ['29F8', 'big solidus'],
+    ['29F9', 'big reverse solidus'],
+    ['FE68', 'small reverse solidus'],
+    ['2571', 'box drawing diagonal'],
+    ['2572', 'box drawing diagonal, the other way'],
+    ['0338', 'combining long solidus overlay'],
+    ['20E5', 'combining reverse solidus overlay'],
+  ])('U+%s (%s) inside a folder is not a plain path: refused for the file, the folder and any operation', (hex, name) => {
+    const look = String.fromCharCode(parseInt(hex, 16));
+    const value = `C:\\Users\\Pat${look}Documents\\Ironbooks Backups`;
+    for (const [o, body] of [
+      [saveCopy(), { file: `${value}\\Books copy.ironbooks` }],
+      [backups(), { schedule: 'daily', keep: 14, folder: value }],
+      [op({ id: 'x.export', route: '/api/x/export' }), { exportFolder: value }],
+    ] as const) {
+      const r = refused(o, body);
+      expect(r, `${o.id} ${name}`).toMatch(/is not a plain path: it holds a character that looks like a slash but is not one/);
+    }
+    // On a Mac or Linux computer too.
+    expect(onPlatform('darwin', () => refused(backups(), { folder: `/Users/pat${look}Documents/Ironbooks Backups` })), name).toMatch(/looks like a slash/);
   });
 
   it('any field named like a path, at any depth of the body or in the query, for every operation; other fields are not judged', () => {
@@ -752,6 +840,239 @@ describe('guardInput: file paths an agent sends', () => {
     const r = refused(saveCopy(), { file: `C:\\${'secret-folder\\'.repeat(20)}..\\x` }) ?? '';
     expect(r).not.toMatch(/secret-folder/);
     expect(r.length).toBeLessThan(400);
+  });
+
+  // The reviewer's probes (wave 4, guards): what makes the line read as another place.
+  it.each([
+    // A Cyrillic "і" in the server: the line reads files.acme.com, the copies go elsewhere.
+    [`\\\\f${String.fromCharCode(0x456)}les.acme.com\\backups\\Ironbooks`, /server's name/],
+    [`//f${String.fromCharCode(0x456)}les.acme.com/backups/Ironbooks`, /server's name/],
+    [`\\\\${String.fromCharCode(0xff4e, 0xff41, 0xff53)}\\books\\Ironbooks`, /server's name/],
+    ['\\\\files.acme.com.\\backups\\Ironbooks', /server's name/],
+    ['\\\\nas$NOCSC$\\backups\\Ironbooks', /server's name/],
+    ['\\\\nas%20x\\backups\\Ironbooks', /server's name/],
+    [`\\\\${'a'.repeat(254)}\\backups`, /server's name/],
+    // Spaces the line shows otherwise: a run of them as one, a no-break or wide one as an ordinary one.
+    ['C:\\Users\\Pat\\Ironbooks  Backups', /two spaces in a row/],
+    [`C:\\Users\\Pat\\Ironbooks${String.fromCharCode(0xa0)}Backups`, /not an ordinary one/],
+    [`C:\\Users\\Pat\\Ironbooks${String.fromCharCode(0x3000)}Backups`, /not an ordinary one/],
+    [`C:\\Users\\Pat\\Ironbooks${String.fromCharCode(0x2007)}Backups`, /not an ordinary one/],
+    ['C:\\Users\\Pat\\Ironbooks Backups ', /starts or ends with a space/],
+    [' C:\\Users\\Pat\\Ironbooks Backups', /starts or ends with a space/],
+  ])('%j is not a plain path: refused for the file and for the folder, and for any operation', (value, why) => {
+    for (const [o, body] of [
+      [saveCopy(), { file: value }],
+      [backups(), { schedule: 'daily', keep: 14, folder: value }],
+      [op({ id: 'x.export', route: '/api/x/export' }), { exportFolder: value }],
+    ] as const) {
+      const r = refused(o, body);
+      expect(r, o.id).toMatch(/is not a plain path/);
+      expect(r, o.id).toMatch(why);
+    }
+  });
+
+  it.each([
+    ['\\\\nas\\books\\Ironbooks Backups'],
+    ['\\\\files.acme.com\\backups\\Ironbooks'],
+    ['\\\\FILE_SERVER-2\\Shared\\Ironbooks'],
+    ['\\\\192.168.1.10\\Shared\\Ironbooks'],
+    ['\\\\files.acme.com@SSL\\DavWWWRoot\\Ironbooks'],
+    ['\\\\files.acme.com@SSL@8443\\DavWWWRoot\\Ironbooks'],
+    ['//nas/books/Ironbooks Backups'],
+    [`C:\\Users\\Jos${String.fromCharCode(0xe9)}\\Documents\\Ironbooks Backups`],
+  ])("%j: a share's server written plainly, or a folder in another language, goes on", (value) => {
+    expect(refused(saveCopy(), { file: value })).toBeNull();
+    expect(refused(backups(), { schedule: 'daily', keep: 14, folder: value })).toBeNull();
+  });
+});
+
+describe('guardInput: a desktop or backup operation takes only full paths', () => {
+  asWindows();
+  const byId = (id: string) => {
+    const found = allOperations().find((o) => o.id === id);
+    if (!found) throw new Error(`No registry operation ${id}`);
+    return found;
+  };
+  /** Every desktop operation of the registry with the 'path' fields of its shell definition. */
+  const desktop = () =>
+    SHELL_OPERATIONS.map((d) => ({ operation: byId(d.id), fields: Object.entries(d.input).filter(([, f]) => f.type === 'path').map(([k]) => k) })).filter((d) => d.fields.length > 0);
+
+  /** Not full on a Windows computer: each is read from the folder or the drive Ironbooks works in. */
+  const RELATIVE_ON_WINDOWS = [
+    ['Books copy.ironbooks', /does not start with a drive .*\(this computer runs Windows\), so where it goes would depend on the folder Ironbooks is working in/],
+    ['Backups\\Books copy.ironbooks', /does not start with a drive/],
+    ['Backups/Books copy.ironbooks', /does not start with a drive/],
+    ['~/Documents/Books copy.ironbooks', /does not start with a drive/],
+    ['C:Backups\\Books copy.ironbooks', /does not start with a drive/],
+    ['C:', /does not start with a drive/],
+    ['file:///C:/Backups/Books copy.ironbooks', /does not start with a drive/],
+    ['\\\\nas', /names a server but no shared folder/],
+    ['\\\\nas\\', /names a server but no shared folder/],
+    // The reviewer's probes (wave 5): a leading "/" is the drive Ironbooks runs from, as "\" is.
+    ['\\Backups\\Books copy.ironbooks', /starts with a slash but names no drive, so Windows puts it on whichever drive Ironbooks runs from/],
+    ['/Backups', /starts with a slash but names no drive/],
+    ['/Users/pat/Books copy.ironbooks', /starts with a slash but names no drive/],
+    ['/Users/pat\\Books copy.ironbooks', /starts with a slash but names no drive/],
+  ] as const;
+  /** Not full on a Mac or Linux computer. */
+  const RELATIVE_ON_MAC_OR_LINUX = [
+    ['Books copy.ironbooks', /does not start with \/ \(this computer runs macOS or Linux, where every full path does\), so where it goes would depend on the folder Ironbooks is working in/],
+    ['Backups/Books copy.ironbooks', /does not start with \//],
+    ['~/Documents/Books copy.ironbooks', /does not start with \//],
+    ['C:\\Users\\Pat\\Books copy.ironbooks', /does not start with \//],
+    ['C:/Users/Pat/Books copy.ironbooks', /does not start with \//],
+    ['\\\\nas\\books\\Books copy.ironbooks', /does not start with \//],
+    // Reads as a share, but these systems read it as /nas/books on this computer.
+    ['//nas/books/Books copy.ironbooks', /starts with two slashes, which a Mac or Linux computer reads as one: that is a folder on this computer, not a share/],
+    ['/Users/pat\\Books copy.ironbooks', /holds a \\, which a Mac or Linux computer reads as part of a name/],
+  ] as const;
+  const FULL_ON_WINDOWS = ['C:\\Users\\Pat\\Books copy.ironbooks', 'C:/Users/Pat/Books copy.ironbooks', '\\\\nas\\books\\Books copy.ironbooks', '//nas/books/Books copy.ironbooks'];
+  const FULL_ON_MAC_OR_LINUX = ['/Users/pat/Books copy.ironbooks', '/Volumes/books/Ironbooks Backups/Books copy.ironbooks', '/home/pat/Books copy.ironbooks'];
+  const CASES = [
+    ...RELATIVE_ON_WINDOWS.map(([value, why]) => ['win32', value, why] as const),
+    ...RELATIVE_ON_MAC_OR_LINUX.flatMap(([value, why]) => [['darwin', value, why] as const, ['linux', value, why] as const]),
+  ];
+  const examples: Record<string, RegExp> = {
+    win32: /Send the whole path, such as C:\\Users\\Pat\\Documents\\Ironbooks Backups or \\\\server\\share\\Ironbooks Backups, so/,
+    darwin: /Send the whole path, such as \/Users\/pat\/Documents\/Ironbooks Backups, so/,
+    linux: /Send the whole path, such as \/Users\/pat\/Documents\/Ironbooks Backups, so/,
+  };
+
+  it('names only operations the registry has, and every desktop operation has its path fields judged', () => {
+    for (const key of Object.keys(FULL_PATH_FIELDS)) expect(reg(key), key).toBeTruthy();
+    expect(desktop().length).toBeGreaterThanOrEqual(7);
+  });
+
+  it.each(CASES)('on %s, %j is refused for every path field of every desktop operation, before a person is asked', (platform, value, why) => {
+    onPlatform(platform, () => {
+      for (const { operation, fields } of desktop()) {
+        for (const field of fields) {
+          const r = guardInput(operation, { body: { [field]: value } }).refused;
+          expect(r, `${operation.id} ${field}`).toMatch(new RegExp(`^body\\.${field} is not a full path`));
+          expect(r, `${operation.id} ${field}`).toMatch(why);
+          expect(r, `${operation.id} ${field}`).toMatch(examples[platform]);
+        }
+      }
+    });
+  });
+
+  it.each(CASES)("on %s, %j is refused for the backups folder, and for the restores' target and packAs", (platform, value, why) => {
+    onPlatform(platform, () => {
+      expect(guardInput(reg('PUT /api/backups'), { body: { schedule: 'daily', folder: value } }).refused).toMatch(why);
+      for (const key of ['POST /api/portable/restore', 'POST /api/accountant-copy/open']) {
+        for (const name of ['target', 'packAs']) {
+          const r = guardInput(reg(key), { query: { [name]: value } }).refused;
+          expect(r, `${key} ${name}`).toMatch(new RegExp(`^query\\.${name} is not a full path`));
+          expect(r, `${key} ${name}`).toMatch(why);
+        }
+      }
+    });
+  });
+
+  it('the reviewer\'s probes (wave 5): on Windows, "/Backups" and ?target=/Users/x are refused before anyone is asked', () => {
+    // backupHistory would save path.resolve('/Backups'): C:\Backups, or D:\Backups when Ironbooks
+    // runs from D:, while the line shows "/Backups".
+    expect(guardInput(reg('PUT /api/backups'), { body: { folder: '/Backups' } }).refused).toMatch(/^body\.folder is not a full path: it starts with a slash but names no drive/);
+    expect(guardInput(reg('POST /api/portable/restore'), { query: { target: '/Users/x' } }).refused).toMatch(/^query\.target is not a full path: it starts with a slash but names no drive/);
+    // The same paths are full on a Mac.
+    expect(onPlatform('darwin', () => guardInput(reg('PUT /api/backups'), { body: { folder: '/Backups' } }).refused)).toBeNull();
+    expect(onPlatform('darwin', () => guardInput(reg('POST /api/portable/restore'), { query: { target: '/Users/x' } }).refused)).toBeNull();
+  });
+
+  it('a full path goes on; an empty one is none given (the backups go back to their default folder)', () => {
+    for (const [platform, full] of [['win32', FULL_ON_WINDOWS], ['darwin', FULL_ON_MAC_OR_LINUX], ['linux', FULL_ON_MAC_OR_LINUX]] as const) {
+      onPlatform(platform, () => {
+        for (const value of full) {
+          for (const { operation, fields } of desktop()) {
+            for (const field of fields) expect(guardInput(operation, { body: { [field]: value } }).refused, `${platform} ${operation.id} ${field} ${value}`).toBeNull();
+          }
+          expect(guardInput(reg('PUT /api/backups'), { body: { folder: value } }).refused, `${platform} ${value}`).toBeNull();
+          expect(guardInput(reg('POST /api/portable/restore'), { query: { target: value, packAs: value } }).refused, `${platform} ${value}`).toBeNull();
+        }
+        expect(guardInput(reg('PUT /api/backups'), { body: { schedule: 'off', folder: '' } }).refused, platform).toBeNull();
+        expect(guardInput(reg('PUT /api/backups'), { body: { schedule: 'off', folder: null } }).refused, platform).toBeNull();
+      });
+    }
+  });
+
+  it('notFullPath judges by the system it is given, and by the one this server runs on when given none', () => {
+    expect(notFullPath('/Backups', 'win32')).toMatch(/names no drive/);
+    expect(notFullPath('/Backups', 'darwin')).toBeNull();
+    expect(notFullPath('/Backups', 'linux')).toBeNull();
+    expect(notFullPath('C:\\Backups', 'win32')).toBeNull();
+    expect(notFullPath('C:\\Backups', 'darwin')).toMatch(/does not start with \//);
+    expect(notFullPath('//nas/books', 'win32')).toBeNull();
+    expect(notFullPath('//nas/books', 'linux')).toMatch(/two slashes/);
+    expect(notFullPath('\\\\nas\\books', 'win32')).toBeNull();
+    expect(notFullPath('\\\\nas\\books', 'darwin')).toMatch(/does not start with \//);
+    // Any system but Windows is read as a Mac or Linux one, as Node's own path module reads it.
+    expect(notFullPath('/Backups', 'freebsd')).toBeNull();
+    expect(notFullPath('/Backups', '')).toBeNull();
+    // Given none: the system this process reports.
+    expect(onPlatform('win32', () => notFullPath('/Backups'))).toMatch(/names no drive/);
+    expect(onPlatform('darwin', () => notFullPath('/Backups'))).toBeNull();
+  });
+
+  it('packAs, which is not named like a path, is held to the plain-path rules too', () => {
+    expect(guardInput(reg('POST /api/portable/restore'), { query: { packAs: '\\\\?\\C:\\Books\\New.ironbooks' } }).refused).toMatch(/^query\.packAs is not a plain path: .*device path/);
+    expect(guardInput(reg('POST /api/accountant-copy/open'), { query: { target: 'C:\\Books\\..\\Windows', packAs: 'C:\\Books\\New.ironbooks' } }).refused).toMatch(/^query\.target is not a plain path/);
+  });
+
+  it('other operations keep their names: a field named like a path with no slash is not judged', () => {
+    const o = op({ id: 'reports.memorized.create', route: '/api/reports/memorized' });
+    expect(guardInput(o, { body: { folder: 'Monthly', file: 'March.pdf' } }).refused).toBeNull();
+    expect(guardInput(o, { body: { folder: 'Banking/Monthly' } }).refused).toBeNull();
+  });
+});
+
+describe('guardInput: the version of the record the agent last read (OperationInput.expectedUpdatedAt)', () => {
+  const update = () => reg('PATCH /api/customers/[id]');
+  const params = { id: 'c-1' };
+
+  it.each([
+    ['2026-11-22T14:05:09.123Z', '2026-11-22T14:05:09.123Z'],
+    ['2026-11-22T15:05:09.123+01:00', '2026-11-22T15:05:09.123+01:00'],
+    ['2026-11-22T09:05:09-0500', '2026-11-22T09:05:09-0500'],
+    ['2026-11-22T14:05:09Z', '2026-11-22T14:05:09Z'],
+    ['2026-11-22T14:05Z', '2026-11-22T14:05Z'],
+    ['2026-11-22T14:05:09.123456789Z', '2026-11-22T14:05:09.123456789Z'],
+    [' 2026-11-22T14:05:09.123Z ', '2026-11-22T14:05:09.123Z'],
+  ])('keeps %j, a plain ISO time, as %j: the stored request still has it when a person approves', (given, kept) => {
+    const g = guardInput(update(), { params, body: { phone: '555-0400' }, expectedUpdatedAt: given });
+    expect(g).toMatchObject({ refused: null, stripped: [] });
+    expect(g.input.expectedUpdatedAt).toBe(kept);
+    // Guarded again (the request store, then the approved run): still there.
+    expect(guardInput(update(), g.input).input.expectedUpdatedAt).toBe(kept);
+    // The input the bridge runs with, and the request as stored and shown.
+    expect(applySecrets(update(), g.input, {}).input.expectedUpdatedAt).toBe(kept);
+    expect(maskInput(update(), g.input).expectedUpdatedAt).toBe(kept);
+  });
+
+  it.each([
+    [5],
+    [null],
+    [''],
+    [{ at: '2026-11-22T14:05:09.123Z' }],
+    [['2026-11-22T14:05:09.123Z']],
+    ['yesterday'],
+    ['2026-11-22'],
+    ['2026-11-22T14:05:09'],
+    ['2026-11-22 14:05:09.123+00'],
+    ['2026-11-22t14:05:09.123z'],
+    ['2026-13-01T00:00:00Z'],
+    ['2026-11-22T25:05:09Z'],
+    ['2026-11-22T14:05:09.123+01'],
+    ['1795356309123'],
+    ['2026-11-22T14:05:09.123Z\r\nx-closing-password: 1'],
+    [`2026-11-22T14:05:09.${'1'.repeat(30)}Z`],
+  ])('drops %j, which is not one: nothing is refused or reported as taken out', (given) => {
+    const g = guardInput(update(), { params, body: { phone: '555-0400' }, expectedUpdatedAt: given } as unknown as OperationInput);
+    expect(g).toMatchObject({ refused: null, stripped: [] });
+    expect('expectedUpdatedAt' in g.input).toBe(false);
+  });
+
+  it('left out, there is none', () => {
+    expect('expectedUpdatedAt' in guardInput(update(), { params, body: {} }).input).toBe(false);
   });
 });
 

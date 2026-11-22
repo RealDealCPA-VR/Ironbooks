@@ -401,8 +401,9 @@ export const SHELL_OPERATIONS: readonly ShellOperationEntry[] = [
     describe: 'Print file {fileId} on a printer',
     why:
       "Prints a PDF the agent staged (a report, a form, checks) on this computer's default printer, or the printer the request " +
-      'names, without a print dialog. Printing records nothing by itself: check numbers are recorded only by a separate ' +
-      'request ("Did the checks print OK?" or marking a check printed).',
+      'names, without a print dialog. Printing records nothing by itself: check numbers are recorded only by separate work ' +
+      '("Did the checks print OK?", or marking a check printed), which, when the agent asks for it, its settings treat like ' +
+      'any other change. Nothing here checks what came out of the printer.',
     input: {
       fileId: { type: 'fileId', required: true, describe: 'The PDF to print.' },
       printer: { type: 'string', required: false, describe: "The printer's name as this computer lists it; leave out for the default printer." },

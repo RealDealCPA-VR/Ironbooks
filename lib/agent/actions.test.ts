@@ -25,23 +25,11 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
 import { NextRequest } from 'next/server';
 
-const h = vi.hoisted(() => ({ cookies: new Map<string, string>(), headers: new Map<string, string>(), quickCheckOff: false }));
+const h = vi.hoisted(() => ({ cookies: new Map<string, string>(), headers: new Map<string, string>() }));
 vi.mock('next/headers', () => ({
   cookies: async () => ({ get: (n: string) => (h.cookies.has(n) ? { name: n, value: h.cookies.get(n)! } : undefined) }),
   headers: async () => new Headers([...h.headers.entries()]),
 }));
-// The action's own quick version check (lib/agent/catalog.ts versionCheck, the one caller of
-// assertCurrentVersion from outside lib/services/concurrency.ts besides a batch void) can be
-// switched off for one test, to show that what stops a stale edit is the route's own compare
-// inside the run. The route's withVersionCheck calls the module's own assertCurrentVersion, which
-// this leaves as it is. Off only while h.quickCheckOff is set.
-vi.mock('@/lib/services/concurrency', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/lib/services/concurrency')>();
-  return {
-    ...actual,
-    assertCurrentVersion: (...args: Parameters<typeof actual.assertCurrentVersion>) => (h.quickCheckOff ? Promise.resolve() : actual.assertCurrentVersion(...args)),
-  };
-});
 
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-agent-actions');
 const TEST_DIR = path.join(ROOT, 'data');
@@ -164,7 +152,7 @@ const NEVER = /An Admin has not allowed agents to/;
 const ROLE = /Your role does not allow this/;
 /** A version older than any record: the record was changed since the agent "read" it. */
 const STALE = '2020-01-01T00:00:00.000Z';
-/** What a stale-version answer says about the record (lib/services/concurrency.ts assertCurrentVersion). */
+/** What a stale-version answer may say about the record (lib/services/concurrency.ts assertCurrentVersion). */
 const RECORD_FACTS = /changedBy|changedAt|currentUpdatedAt|staleVersion|was changed by/;
 
 /** An invoice of the fixture company, to edit or void. */
@@ -374,6 +362,10 @@ describe('Trusted bookkeeper', () => {
       const r = await act(tokens.poster, { action: 'enter_journal_entry', input: journal('2026-03-03', '12.00'), ...(requestId === undefined ? {} : { requestId }) });
       expect(r.status, String(requestId)).toBe(400);
       expect(r.json.error).toMatch(/request_id/);
+      // Every refusal of the id names the field, whether the action refused it (not text, longer
+      // than any kept) or the door did (missing, too short, not of the allowed characters), so a
+      // client (mcp/client.mjs) can tell it from a refusal of the rest of the input.
+      expect(r.json.details?.fields, String(requestId)).toHaveProperty('requestId');
     }
     expect(await fingerprint()).toEqual(before);
   });
@@ -536,6 +528,8 @@ describe('Trusted bookkeeper', () => {
       requestId: 'je-edit-1-stale',
       input: { id: made.result.id, expectedUpdatedAt: '2020-01-01T00:00:00.000Z', changes: journal('2026-03-12', '30.00', 'Edited by a stale agent') },
     });
+    // The route's own compare inside the run (lib/services/concurrency.ts withVersionCheck), as a
+    // person's window meets it: the journal entry's route says which version is there now.
     expect(stale.status).toBe(409);
     expect(stale.json.details).toMatchObject({ staleVersion: true });
     expect(await fingerprint()).toEqual(before);
@@ -546,8 +540,9 @@ describe('Trusted bookkeeper', () => {
       input: { id: made.result.id, expectedUpdatedAt: made.result.updated_at, changes: journal('2026-03-12', '30.00', 'Edited description') },
     });
     expect(edited.operation).toBe('journal-entries.update');
-    // Only its description changed: whether that counts as posting is the door's to say. The
-    // measure is run_operation's answer to the very same edit of a twin entry.
+    // Only its description changed: the entry keeps its lines (lib/services/journal.ts updateEntry
+    // keeps the same entry when the date and the lines are unchanged), so nothing is posted. The
+    // action answers as run_operation answers the very same edit of a twin entry.
     const twin = await ok(tokens.poster, { action: 'enter_journal_entry', requestId: 'je-edit-1-twin', input: journal('2026-03-12', '30.00', 'To be edited') });
     const generic = await ok(tokens.poster, {
       verb: 'run_operation',
@@ -557,8 +552,8 @@ describe('Trusted bookkeeper', () => {
       expectedUpdatedAt: twin.result.updated_at,
       requestId: 'je-edit-1-twin-memo',
     });
-    expect(['posted', 'done'], JSON.stringify(generic).slice(0, 300)).toContain(generic.outcome);
-    expect(edited.outcome).toBe(generic.outcome);
+    expect(generic.outcome, JSON.stringify(generic).slice(0, 300)).toBe('done');
+    expect(edited.outcome, JSON.stringify(edited).slice(0, 300)).toBe('done');
     const [row] = await db.select().from(journalEntries).where(eq(journalEntries.id, edited.result.id));
     expect(row.description).toBe('Edited description');
 
@@ -669,10 +664,10 @@ describe('Trusted bookkeeper', () => {
   it('making a customer inactive is treated like a delete: it always asks a person', async () => {
     const out = await ok(tokens.fullPoster, { action: 'deactivate_customer', input: { id: rich.customerId }, requestId: 'cust-off-1' });
     expect(out).toMatchObject({ outcome: 'asked', operation: 'customers.delete', status: 'pending' });
-    // A request with no reason field at all (a connector older than the field) is said as such
-    // on the card, never made up.
+    // A request with no reason field at all (the agent gave none, or a connector older than the
+    // field) is said as such on the card, never made up.
     const [asked] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.id, out.requestId));
-    expect(asked.reason).toMatch(/No reason given: the agent used the "deactivate_customer" tool/);
+    expect(asked.reason).toBe('No reason given: the agent did not say why.');
   });
 
   it("the agent's own reason goes to the card; a reason sent empty is not made up", async () => {
@@ -912,15 +907,11 @@ describe('Ask for every change', () => {
     expect((await db.select().from(aiProposals)).length).toBe(proposalsBefore);
   });
 
-  // FAILS today (wave 4, curated): the version reaches the door and the route for the agent's own
-  // run and its dry run, but lib/services/agentRequests.ts createAgentRequest guards the input
-  // again (guardInput keeps params, query, body, confirm and reveal only), so the stored request
-  // has no expectedUpdatedAt ({"body":{"phone":"555-0400"},"params":{"id":…}}). runApproved
-  // (lib/agent/operate.ts withVersion) then has none to send, and once the person says yes on the
-  // "books changed" preview the agent's edit is written over theirs. Keeping expectedUpdatedAt in
-  // the stored input (as operate.ts withVersion does after its guards) makes this pass: then it.fails
-  // becomes it.
-  it.fails("a person's edit made after the agent asked is never overwritten: the version the agent read is compared when the work runs", async () => {
+  // The stored request keeps the version the agent read (lib/services/agentRequests.ts
+  // createAgentRequest), and the approved run sends it (lib/agent/operate.ts runApproved,
+  // withVersion), so the route's own compare refuses the run even after the person says yes again
+  // on the "books changed" preview.
+  it("a person's edit made after the agent asked is never overwritten: the version the agent read is compared when the work runs", async () => {
     const [read] = await db.select({ updatedAt: customers.updatedAt }).from(customers).where(eq(customers.id, rich.customerId));
     const out = await ok(tokens.proposer, {
       action: 'edit_customer',
@@ -938,13 +929,47 @@ describe('Ask for every change', () => {
         return `threw ${(err as { code?: string }).code ?? ''}`;
       }
     };
-    let status = await approve({});
+    const seen = [await approve({})];
     // Shown the books changed, the person says yes again on what they now see: still not run over
     // the version the agent read.
-    if (status === 'stale') status = await approve({ acceptStale: true });
-    expect(status).not.toBe('executed');
+    if (seen[0] === 'stale') seen.push(await approve({ acceptStale: true }));
+    // Today the first yes already meets the route's compare ('failed'); a "books changed" round
+    // first would do as well, so long as the work ends refused by that compare and never runs over
+    // the person's edit. Anything else that stops it (a throw, a version the route cannot read)
+    // would not show the version was compared, so the reason is pinned too.
+    expect(seen.at(-1), seen.join(' then ')).toBe('failed');
+    const [request] = await db
+      .select({ status: agentPermissionRequests.status, error: agentPermissionRequests.error })
+      .from(agentPermissionRequests)
+      .where(eq(agentPermissionRequests.id, out.requestId));
+    expect(request.status, seen.join(' then ')).toBe('failed');
+    // The route's own CONFLICT (lib/services/concurrency.ts): "This record was changed by …".
+    expect(request.error, seen.join(' then ')).toMatch(/was changed by/);
     const [now] = await db.select({ phone: customers.phone }).from(customers).where(eq(customers.id, rich.customerId));
     expect(now.phone).toBe('555-0500');
+  });
+
+  it('the same approved edit with the version the agent read runs when nobody changed the record meanwhile', async () => {
+    // The control of the case above: the version travels with the approved run and matches, so the
+    // compare lets it through. A customer of its own, so no other case's record is touched.
+    const made = await createCustomer(admin, { displayName: 'Approved Version Customer' } as Parameters<typeof createCustomer>[1]);
+    const [read] = await db.select({ updatedAt: customers.updatedAt }).from(customers).where(eq(customers.id, made.id));
+    const out = await ok(tokens.proposer, {
+      action: 'edit_customer',
+      input: { id: made.id, expectedUpdatedAt: read.updatedAt.toISOString(), changes: { phone: '555-0410' } },
+      requestId: 'prop-cust-phone-ok',
+      reason: 'The new phone number on the April remittance.',
+    });
+    expect(out).toMatchObject({ outcome: 'asked', operation: 'customers.update', status: 'pending' });
+    const approved = await approveAgentRequest(admin, out.requestId, {}, { atHost: true });
+    const [request] = await db
+      .select({ status: agentPermissionRequests.status, error: agentPermissionRequests.error })
+      .from(agentPermissionRequests)
+      .where(eq(agentPermissionRequests.id, out.requestId));
+    expect(approved.status, JSON.stringify(request)).toBe('executed');
+    expect(request).toMatchObject({ status: 'executed', error: null });
+    const [now] = await db.select({ phone: customers.phone }).from(customers).where(eq(customers.id, made.id));
+    expect(now.phone).toBe('555-0410');
   });
 });
 
@@ -1033,17 +1058,14 @@ describe('an agent with the Admin role', () => {
         const generic = await act(tokens[who], { verb: 'run_operation', operation: p.operation, ...p.request, dryRun: true });
         const label = `${who} ${p.action}: ${JSON.stringify(curated.json).slice(0, 300)} / ${JSON.stringify(generic.json).slice(0, 300)}`;
         if (p.stale && generic.json.outcome !== 'refused') {
-          // A stale version is a 409 either way. Here the action's is its quick first check's
-          // (with the details); run_operation's is the route's own compare inside the run. That
-          // the action's request carries the version to the route too is shown by "the version
-          // the agent last read" below, with the quick check switched off.
-          expect(curated.status, label).toBe(409);
-          expect(curated.json.details, label).toMatchObject({ staleVersion: true });
-          // The route's own answer, as it gives it to a person's window too (some routes, the
-          // customer's among them, answer without the details).
+          // A stale version is the route's own 409 (its compare inside the run), as it gives it to
+          // a person's window too: some routes, the customer's among them, answer without details.
+          // The action has no check of its own before it, so its answer is the same word for word.
           expect(generic.status, label).toBe(409);
           expect(generic.json.code, label).toBe('CONFLICT');
           expect(generic.json.error, label).toMatch(/was changed by/);
+          expect(curated.status, label).toBe(409);
+          expect(curated.json, label).toEqual(generic.json);
           seen.set(who, (seen.get(who) ?? new Set()).add(`${p.action}:stale`));
           continue;
         }
@@ -1074,7 +1096,8 @@ describe('an agent with the Admin role', () => {
     expect(seen.get('adminAsks')).toContain('enter_journal_entry:ask');
     // Statement lines: whatever the registry says of a rows import (the loop above holds the
     // action to run_operation's own answer for the same request), "Full, with asks" does it
-    // itself, since it allows both bulk work within its cap and prepare work.
+    // itself: it is prepare work (lib/agent/operations/classes/documents.ts), which that preset
+    // allows, as it would bulk work within its cap.
     expect(seen.get('adminFull')).toContain('import_statement_lines:run');
     expect(await fingerprint(['agent_requests'])).toEqual(before);
   });
@@ -1097,36 +1120,35 @@ describe('an agent with the Admin role', () => {
 });
 
 describe('the version the agent last read', () => {
-  it("goes with the action's request to the door and the route, not only to the action's own quick check", async () => {
+  it("goes with the action's request to the door and the route, whose own compare is what refuses a stale one", async () => {
     resetAgentRateLimits();
     const made = await createCustomer(admin, { displayName: 'Version Check Customer' } as Parameters<typeof createCustomer>[1]);
     const current = async () => (await db.select({ updatedAt: customers.updatedAt, phone: customers.phone }).from(customers).where(eq(customers.id, made.id)))[0];
     const read = await current();
     const version = read.updatedAt.toISOString();
 
-    // With the action's quick check off, a stale version is still refused, now by the route's own
-    // compare inside the run (lib/services/concurrency.ts withVersionCheck): the real guard
-    // against writing over a person's edit made after the check. It is run_operation's 409 word
-    // for word, for a dry run and for a real request alike.
-    h.quickCheckOff = true;
-    try {
-      for (const [how, genericHow] of [
-        [{ dryRun: true }, { dryRun: true }],
-        [{ requestId: 'version-route-1' }, { requestId: 'version-route-2' }],
-      ] as Array<[Out, Out]>) {
-        const curated = await act(tokens.adminTrusted, { action: 'edit_customer', input: { id: made.id, expectedUpdatedAt: STALE, changes: { phone: '555-0601' } }, ...how });
-        const generic = await act(tokens.adminTrusted, { verb: 'run_operation', operation: 'customers.update', params: { id: made.id }, body: { phone: '555-0601' }, expectedUpdatedAt: STALE, ...genericHow });
-        const label = `${JSON.stringify(how)}: ${JSON.stringify(curated.json).slice(0, 300)} / ${JSON.stringify(generic.json).slice(0, 300)}`;
-        expect(curated.status, label).toBe(409);
-        expect(curated.json.code, label).toBe('CONFLICT');
-        expect(curated.json.error, label).toMatch(/was changed by/);
-        expect(generic.status, label).toBe(409);
-        expect(curated.json.error, label).toBe(generic.json.error);
-      }
-    } finally {
-      h.quickCheckOff = false;
+    // A stale version is refused by the route's own compare inside the run (lib/services/
+    // concurrency.ts withVersionCheck), the one guard against writing over a person's edit: the
+    // action checks nothing of the record first. It is run_operation's 409 word for word, for a dry
+    // run and for a real request alike. Were the version left out of the action's request, the
+    // edit would go through here.
+    for (const [how, genericHow] of [
+      [{ dryRun: true }, { dryRun: true }],
+      [{ requestId: 'version-route-1' }, { requestId: 'version-route-2' }],
+    ] as Array<[Out, Out]>) {
+      const curated = await act(tokens.adminTrusted, { action: 'edit_customer', input: { id: made.id, expectedUpdatedAt: STALE, changes: { phone: '555-0601' } }, ...how });
+      const generic = await act(tokens.adminTrusted, { verb: 'run_operation', operation: 'customers.update', params: { id: made.id }, body: { phone: '555-0601' }, expectedUpdatedAt: STALE, ...genericHow });
+      const label = `${JSON.stringify(how)}: ${JSON.stringify(curated.json).slice(0, 300)} / ${JSON.stringify(generic.json).slice(0, 300)}`;
+      expect(curated.status, label).toBe(409);
+      expect(curated.json.code, label).toBe('CONFLICT');
+      expect(curated.json.error, label).toMatch(/was changed by/);
+      expect(generic.status, label).toBe(409);
+      expect(curated.json, label).toEqual(generic.json);
     }
     expect((await current()).phone).toBe(read.phone);
+    // Nothing is kept under a request id the route refused: the same id is free for the change on
+    // what the record says now.
+    expect(await db.select().from(agentRequests).where(and(eq(agentRequests.agentId, agentIds.adminTrusted), eq(agentRequests.requestKey, 'version-route-1')))).toEqual([]);
 
     // The request the door keeps under the request id is the action's request with its version:
     // run_operation with that same version is the same request (given again), without it a
@@ -1200,7 +1222,8 @@ describe('too much at once', () => {
     const bank = await newBank('Count Test');
     const lines = { bankAccountId: bank, kind: 'bank', openingBalance: '0.00', closingBalance: '-4.00', rows: [{ date: '2026-03-22', description: 'FEE', amount: '-4.00' }] };
     const sent: Array<[string, Out, number]> = [
-      // Answered by the action's own check: counted all the same, so it cannot be repeated without limit.
+      // Answered by the route's own compare (the door's dry run): counted all the same, so it
+      // cannot be repeated without limit.
       ['adminFull', { action: 'edit_customer', input: { id: rich.customerId, expectedUpdatedAt: STALE, changes: { phone: '555-0103' } }, requestId: 'count-edit-1' }, 409],
       ['adminReader', { action: 'edit_customer', input: { id: rich.customerId, expectedUpdatedAt: STALE, changes: { phone: '555-0103' } }, requestId: 'count-edit-2' }, 200],
       ['adminFull', { action: 'enter_journal_entry', input: journal('2026-03-22', '4.00'), dryRun: true }, 200],

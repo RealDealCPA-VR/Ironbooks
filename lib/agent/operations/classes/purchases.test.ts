@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { amountOf } from '@/lib/agent/facts';
 import { defaultSiteForRead } from '@/lib/services/inventorySites';
@@ -30,16 +32,25 @@ describe('classification: purchases', () => {
   });
 
   it('keeps the inventory site lists and reports reads (an agent\'s read never makes the default site)', () => {
-    for (const id of ['inventory-sites.list', 'inventory-sites.reorder-points', 'inventory-sites.reports']) {
+    const ids = ['inventory-sites.list', 'inventory-sites.reorder-points', 'inventory-sites.reports'];
+    for (const id of ids) {
       expect(op(id), id).toMatchObject({ class: 'read', method: 'GET', dryRun: 'none' });
       expect(op(id).why, id).toMatch(/read-only/);
     }
-    // The list and the reports read through defaultSiteForRead, which makes the site for a person only.
+    // All three read through defaultSiteForRead, which makes the site for a person only.
     expect(typeof defaultSiteForRead).toBe('function');
-    for (const id of ['inventory-sites.list', 'inventory-sites.reports']) {
+    for (const id of ids) {
       expect(op(id).why, id).toMatch(/defaultSiteForRead/);
-      expect(op(id).why, id).not.toMatch(/has no read-only guard/);
+      expect(op(id).why, id).not.toMatch(/has no read-only guard|read fails/);
     }
+    // The reorder points read the default site the same way (lib/services/inventorySiteOps.ts).
+    const src = fs.readFileSync(path.join(process.cwd(), 'lib/services/inventorySiteOps.ts'), 'utf8');
+    const start = src.indexOf('export async function listSiteReorderPoints(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nexport ', start + 1);
+    const body = src.slice(start, end === -1 ? undefined : end);
+    expect(body).toMatch(/defaultSiteForRead\(ctx\)/);
+    expect(body).not.toMatch(/ensureDefaultSite\(/);
   });
 
   it('names the preview option of the bulk vendor save and the bill for received items', () => {

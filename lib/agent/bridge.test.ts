@@ -39,6 +39,18 @@
  *    never the scope; ledger lines name who they are for and their class; a wrong closing-date
  *    password typed on the card is refused before the route runs and counted once, and Set Closing
  *    Date does not count it again; no agent changes or deletes a role an agent holds.
+ *  - Wave 5: the key leaves out only what the run assigns itself: the next free number or position
+ *    where the services take it (a check number, a bank rule's priority, an account's number, the
+ *    number a check that was there before takes when it is marked printed), and only under a key
+ *    of the column it was taken in, not one it copies (from the input, from a record it changes,
+ *    or onto a record nobody numbers: a reference, a P.O. that happens to equal the entry number,
+ *    an account, routing, tax, serial or lot number); a version sent back is no date the input
+ *    gives; an "…At" time of a record
+ *    that was there before counts; a date filled in as today is the run's own (the next day agrees),
+ *    one the input gives is not. A removed agent holds no role (any spelling of its id). An entry a
+ *    run voided or changed carries what the amount counts of it. A wrong closing-date password on a
+ *    real closed-period void sent with only an id says so. A folder still to be made where Ironbooks
+ *    keeps its own data is refused.
  *  - Refusals before running, an edited copy of an operation, the gates a scope skips, time limits
  *    (reports longer), preview limits, staged files in and out, allowed folders (a folder still to
  *    be made included), grants, produced secrets, a dry run stopped at a call to another computer
@@ -152,7 +164,8 @@ import { PREVIEW_ROW_LIMIT, type BridgeActor, type OperationInput } from './cont
 import { PRODUCED_SECRET_TEXT, SECRET_HEADERS, encodeSecretParts } from './guards';
 import { allowedFolder, stageFile } from './files';
 import { postJournalEntry } from '@/lib/services/posting';
-import { CLOSING_PASSWORD_WRONG_MESSAGE, IRREVERSIBLE_COMMIT_TIME_LIMIT_MS, runOperation } from './bridge';
+import { localDateISO } from '@/lib/dates';
+import { CLOSING_PASSWORD_WRONG_MESSAGE, IRREVERSIBLE_COMMIT_TIME_LIMIT_MS, OPTIONAL_ROUTE_SECRETS, runOperation } from './bridge';
 
 type Out = Record<string, any>;
 let db: DB;
@@ -976,7 +989,9 @@ describe('secrets come only from the approving person, on a commit', () => {
 
     it('never from the agent alone, never in a dry run; a commit without them runs without any (the route needs none for a backup of this same file)', async () => {
       // A commit with nothing typed: the sign-in of another file is optional to the route
-      // (ApprovalNeeds.optionalSecrets), so it runs, and with none of what the agent planted.
+      // (ApprovalNeeds.optionalSecrets), so it runs, and with none of what the agent planted. The
+      // list is exported for the requests service, which keeps the same commit rule.
+      expect(OPTIONAL_ROUTE_SECRETS).toEqual(['archive_credentials']);
       h.handler = archiveSpy;
       const without = await run(op('backups.restore'), { ...planted, body: { id: 'backup-1' } } as unknown as OperationInput, 'commit', everything);
       h.handler = null;
@@ -1108,6 +1123,47 @@ describe('secrets come only from the approving person, on a commit', () => {
       const ok = await run(op('estimates.create'), { body: estimateBody() }, 'commit', { ...everything, userId: owner, secrets: { closing_password: 'right-pw-3' } });
       expect(ok.outcome, JSON.stringify(ok.error)).toBe('ok');
       expect(got).toEqual([{ request: true, override: true }]);
+    } finally {
+      await db.update(companies).set({ settings: original }).where(eq(companies.id, rich.ctx.companyId));
+      (globalThis as unknown as { __bkaLoginLimiter?: unknown }).__bkaLoginLimiter = undefined;
+    }
+  });
+
+  it('the real route: a void of a closed-period entry sent with only its id, a wrong password says the password is not correct; the right one voids it', async () => {
+    const owner = rich.ctx.userId!;
+    const entry = await postJournalEntry(admin, {
+      date: new Date('2025-11-14T00:00:00Z'),
+      description: 'Closed-period entry',
+      lines: [
+        { accountId: rich.acct['6300'], debit: '80.00' },
+        { accountId: rich.acct['1000'], credit: '80.00' },
+      ],
+    });
+    const [company] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, rich.ctx.companyId));
+    const original = company.settings;
+    (globalThis as unknown as { __bkaLoginLimiter?: unknown }).__bkaLoginLimiter = undefined;
+    await db
+      .update(companies)
+      .set({ settings: { ...((original ?? {}) as Record<string, unknown>), closingDate: '2025-12-31', closingDatePasswordHash: await hashPassword('right-pw-4') } })
+      .where(eq(companies.id, rich.ctx.companyId));
+    const status = async () =>
+      ((await db.execute(sql`select status::text as s from journal_entries where id = ${entry.id}`)) as unknown as { rows: Array<{ s: string }> }).rows[0]?.s;
+    try {
+      const voidIt = (mode: 'dry_run' | 'commit', closing_password?: string) =>
+        run(op('journal-entries.delete'), { params: { id: entry.id } }, mode, { ...everything, userId: owner, secrets: closing_password ? { closing_password } : {} });
+      // Nothing in the input says it is closed-period work: its facts do not show it.
+      const asked = await voidIt('dry_run');
+      expect(asked.facts.closedPeriod).toBe(false);
+      for (const mode of ['dry_run', 'commit'] as const) {
+        const r = await voidIt(mode, 'not-it-either');
+        expect(r.outcome, mode).toBe('error');
+        expect(r.error!.message, mode).toBe(CLOSING_PASSWORD_WRONG_MESSAGE);
+        expect(r.error!.details).toEqual({ closingPassword: 'wrong' });
+      }
+      expect(await status()).toBe('posted');
+      const done = await voidIt('commit', 'right-pw-4');
+      expect(done.outcome, JSON.stringify(done.error)).toBe('ok');
+      expect(await status()).toBe('void');
     } finally {
       await db.update(companies).set({ settings: original }).where(eq(companies.id, rich.ctx.companyId));
       (globalThis as unknown as { __bkaLoginLimiter?: unknown }).__bkaLoginLimiter = undefined;
@@ -1439,6 +1495,8 @@ describe('the amount: the whole of what the run moves in the ledger (factsFor)',
     expect(shown, JSON.stringify(dry.preview!.ledger)).toMatchObject({
       status: 'void',
       touched: 'voided',
+      // What of it the amount counts, so the door can tell a run that posted from a retitle.
+      counted: '50000.00',
       date: '2026-03-03',
       description: 'Voided by this request: Check 1042 to Paper Supply',
       lines: expect.arrayContaining([expect.objectContaining({ accountId: rich.acct['6300'], debit: '50000.00', credit: null })]),
@@ -1464,7 +1522,7 @@ describe('the amount: the whole of what the run moves in the ledger (factsFor)',
     const touchedOnly = await run(op('journal-entries.delete'), { params: { id } }, 'dry_run');
     expect(touchedOnly.outcome, JSON.stringify(touchedOnly.error)).toBe('ok');
     expect(touchedOnly.preview!.ledger!.entries).toEqual([
-      expect.objectContaining({ journalEntryId: id, status: 'void', touched: 'changed', description: 'Changed by this request: Check 1042 to Paper Supply' }),
+      expect.objectContaining({ journalEntryId: id, status: 'void', touched: 'changed', counted: null, description: 'Changed by this request: Check 1042 to Paper Supply' }),
     ]);
     expect(touchedOnly.facts.amount).toBe('0.00');
   });
@@ -1485,6 +1543,7 @@ describe('the amount: the whole of what the run moves in the ledger (factsFor)',
         journalEntryId: id,
         status: 'posted',
         touched: 'changed',
+        counted: '700.00',
         description: 'Changed by this request: Rent for March',
         lines: expect.arrayContaining([expect.objectContaining({ memo: 'moved', debit: '700.00' })]),
       }),
@@ -1543,7 +1602,7 @@ describe('the amount: the whole of what the run moves in the ledger (factsFor)',
     const r = await run(op('journal-entries.update'), { params: { id }, body: {} }, 'dry_run');
     expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
     expect(r.preview!.ledger!.entries).toEqual([
-      expect.objectContaining({ journalEntryId: id, status: 'posted', touched: 'changed', description: 'Changed by this request: Rent for April, office' }),
+      expect.objectContaining({ journalEntryId: id, status: 'posted', touched: 'changed', counted: null, description: 'Changed by this request: Rent for April, office' }),
     ]);
     expect(r.facts.amount).toBe('0.00');
   });
@@ -1853,6 +1912,32 @@ describe("files are looked at only inside the agent's folders, and saved only wh
     expect(fs.existsSync(path.join(outbox, 'never-looked-at'))).toBe(false);
   });
 
+  it("a folder still to be made where Ironbooks keeps its own data (a backups folder not made yet, inside an agent's folder) is refused; another one is made", async () => {
+    const root = path.join(outbox, 'beside-the-books');
+    fs.mkdirSync(root, { recursive: true });
+    const before = process.env.BKA_BACKUP_DIR;
+    process.env.BKA_BACKUP_DIR = path.join(root, 'future-backups');
+    const saver = (dir: string) => async () => {
+      await effects.writeFile({ dir, name: 'report.txt', bytes: 'hello' });
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    try {
+      for (const dir of [path.join(root, 'future-backups'), path.join(root, 'future-backups', '2026')]) {
+        h.handler = saver(dir);
+        const refused = await run(op('estimates.create'), { body: estimateBody() }, 'commit', { folders: [root] });
+        expect(refused.error?.code, dir).toBe('FOLDER_NOT_ALLOWED');
+      }
+      expect(fs.existsSync(path.join(root, 'future-backups'))).toBe(false);
+      h.handler = saver(path.join(root, 'reports', '2026'));
+      const saved = await run(op('estimates.create'), { body: estimateBody() }, 'commit', { folders: [root] });
+      expect(saved.outcome, JSON.stringify(saved.error)).toBe('ok');
+      expect(fs.readFileSync(path.join(root, 'reports', '2026', 'report.txt'), 'utf8')).toBe('hello');
+    } finally {
+      if (before === undefined) delete process.env.BKA_BACKUP_DIR;
+      else process.env.BKA_BACKUP_DIR = before;
+    }
+  });
+
   it('a file the work asks for while the folders are being checked is checked too, and refused outside them', async () => {
     const allowed = path.join(outbox, 'late-allowed');
     const outside = path.join(outbox, 'late-outside');
@@ -2125,21 +2210,16 @@ describe('the staleness key leaves out what the run assigns to itself, and still
     expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
     return r.stalenessKey!;
   };
-  /** A check the run makes (an audit 'create' with its number as `reference`) and its entry. */
-  const checkProbe = (o: { number: string; entryReference: string; accountNumber?: string }) => async () => {
+  /** A record the run makes that is not numbered by the services (an audit 'create' only), and an entry. */
+  const madeProbe = (o: { values: Record<string, unknown>; entryReference?: string }) => async () => {
     const ctx = await getServerContext();
     const id = randomUUID();
-    await writeAudit(ctx, {
-      action: 'create',
-      entityType: 'bridge_check',
-      entityId: id,
-      newValues: { reference: o.number, accountNumber: o.accountNumber ?? '000123456789', amount: '40.00' },
-    });
+    await writeAudit(ctx, { action: 'create', entityType: 'bridge_payment', entityId: id, newValues: { ...o.values, amount: '40.00' } });
     await postJournalEntry(ctx, {
       date: new Date('2026-03-05'),
-      description: `Check ${o.number}`,
-      reference: o.entryReference,
-      sourceRef: `bridge_check:${id}`,
+      description: 'A payment the run records',
+      reference: o.entryReference ?? null,
+      sourceRef: `bridge_payment:${id}`,
       lines: [
         { accountId: rich.acct['6300'], debit: '40.00' },
         { accountId: rich.acct['1000'], credit: '40.00' },
@@ -2147,16 +2227,147 @@ describe('the staleness key leaves out what the run assigns to itself, and still
     });
     return NextResponse.json({ id }, { status: 201 });
   };
+  /**
+   * A real check the run writes (lib/services/expenses.ts createExpense): with no `reference` it
+   * takes the account's next number. `voids`: first it changes a check that was there before, whose
+   * old number its audit row keeps.
+   */
+  const checkWork = (o: { reference?: string; heldBefore?: string }) => async () => {
+    const ctx = await getServerContext();
+    if (o.heldBefore) {
+      await writeAudit(ctx, { action: 'void', entityType: 'expense', entityId: rich.customerId, oldValues: { reference: o.heldBefore }, newValues: { voided: true } });
+    }
+    const { createExpense } = await import('@/lib/services/expenses');
+    const e = await createExpense(ctx, {
+      vendorId: rich.vendorId,
+      date: new Date('2026-03-05T00:00:00Z'),
+      method: 'check',
+      paymentAccountId: rich.acct['1000'],
+      lines: [{ accountId: rich.acct['6300'], amount: '45.00' }],
+      ...(o.reference ? { reference: o.reference } : {}),
+    });
+    return NextResponse.json({ id: (e as { id?: string }).id ?? null }, { status: 201 });
+  };
 
-  it("the check number a run takes goes from its entry's reference too; a reference it copies, or a number it does not take, stays", async () => {
-    // The next check number, on the check and its entry: another number, the same key.
-    const took = await probeKey(checkProbe({ number: '1001', entryReference: '1001' }));
-    expect(await probeKey(checkProbe({ number: '1002', entryReference: '1002' }))).toBe(took);
-    // A reference the run copied from somewhere else (a bank line's check number): another one, another key.
-    const copied = await probeKey(checkProbe({ number: '1001', entryReference: 'BANK-501' }));
-    expect(await probeKey(checkProbe({ number: '1001', entryReference: 'BANK-502' }))).not.toBe(copied);
-    // An account number the run copies onto what it makes is not a number it took: it counts.
-    expect(await probeKey(checkProbe({ number: '1001', entryReference: '1001', accountNumber: '000999999999' }))).not.toBe(took);
+  it("the check number a run takes goes from the check and its entry; a number it copies, or one it does not take, stays", async () => {
+    // A check numbered by the service (the next number), another check approved in between: the same key.
+    const took = await probeKey(checkWork({}));
+    const between = await run(operationForRoute('POST', '/api/expenses')!, {
+      body: { vendorId: rich.vendorId, date: '2026-03-02', method: 'check', paymentAccountId: rich.acct['1000'], lines: [{ accountId: rich.acct['6300'], amount: '45.00' }] },
+    }, 'commit');
+    expect(between.outcome, JSON.stringify(between.error)).toBe('ok');
+    expect(await probeKey(checkWork({}))).toBe(took);
+    // The number of a check the run voids or replaces, written on the check it makes: copied, not
+    // the next free one, so it counts (another number taken is still left out).
+    const copied = await probeKey(checkWork({ heldBefore: 'R-501', reference: 'R-501' }));
+    const fresh = await probeKey(checkWork({ heldBefore: 'R-501', reference: 'R-777' }));
+    expect(fresh).not.toBe(copied);
+    expect(await probeKey(checkWork({ heldBefore: 'R-501', reference: 'R-778' }))).toBe(fresh);
+
+    // On a record the services do not number, a number under the same keys is copied (a customer's
+    // check number, a P.O., a vendor's bill number) or not a number at all: another one, another key.
+    // So is an account, routing, tax, serial or lot number, and a reference copied onto the entry.
+    const pairs: Array<[string, string, string]> = [
+      ['reference', 'BANK-501', 'BANK-502'],
+      ['poNumber', 'PO-77', 'PO-78'],
+      ['refNumber', 'V-100', 'V-101'],
+      ['number', '1043', '1044'],
+      ['code', 'X-1', 'X-2'],
+      ['accountNumber', '000123456789', '000999999999'],
+      ['routingNumber', '021000021', '011000015'],
+      ['taxNumber', '12-3456789', '98-7654321'],
+      ['serialNumber', 'SN-1', 'SN-2'],
+      ['lotNumber', 'LOT-1', 'LOT-2'],
+    ];
+    for (const [key, a, b] of pairs) {
+      const one = await probeKey(madeProbe({ values: { [key]: a } }));
+      expect(await probeKey(madeProbe({ values: { [key]: b } })), key).not.toBe(one);
+    }
+    const onEntry = await probeKey(madeProbe({ values: {}, entryReference: 'BANK-501' }));
+    expect(await probeKey(madeProbe({ values: {}, entryReference: 'BANK-502' }))).not.toBe(onEntry);
+  });
+
+  it('a new bank rule\'s next position and a new account\'s next number are the run\'s own: another request approved in between changes nothing', async () => {
+    const rule = (name: string) => ({ name, matchField: 'description', matchOperator: 'contains', matchValue: name.toUpperCase(), setAccountId: rich.acct['6300'] });
+    const cases: Array<[string, unknown, unknown]> = [
+      ['bank-rules.create', rule('Fuel stop'), rule('Toll road')],
+      ['accounts.create', { name: 'Bridge tolls', type: 'expense' }, { name: 'Bridge parking', type: 'expense' }],
+    ];
+    for (const [id, asked, other] of cases) {
+      const shown = await keyOf(id, asked);
+      const first = await run(op(id), { body: other }, 'commit');
+      expect(first.outcome, `${id}: ${JSON.stringify(first.error)}`).toBe('ok');
+      expect(await keyOf(id, asked), `${id}: the key moved with the next position`).toBe(shown);
+    }
+    // A position the agent gives is its own: another one gives another key.
+    const at = await keyOf('bank-rules.create', { ...rule('Fixed place'), priority: 500 });
+    expect(await keyOf('bank-rules.create', { ...rule('Fixed place'), priority: 501 })).not.toBe(at);
+  });
+
+  it('a check that was there before, marked printed with no number given, takes the next one as its own: another printed in between changes nothing; a number the input gives counts', async () => {
+    const { createExpense } = await import('@/lib/services/expenses');
+    const queued = async () =>
+      (await createExpense(admin, {
+        vendorId: rich.vendorId,
+        date: new Date('2026-03-05T00:00:00Z'),
+        method: 'check',
+        toPrint: true,
+        paymentAccountId: rich.acct['1000'],
+        lines: [{ accountId: rich.acct['6300'], amount: '45.00' }],
+      })) as { id: string };
+    const waiting = await queued();
+    const other = await queued();
+    const printed = op('print-queue.mark-printed');
+    const keyOfPrint = async (body: Record<string, unknown> = {}) => {
+      const r = await run(printed, { body: { source: 'expense', id: waiting.id, ...body } }, 'dry_run');
+      expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+      expect(r.stalenessKey).toMatch(/^[0-9a-f]{64}$/);
+      return r.stalenessKey!;
+    };
+    const asked = await keyOfPrint();
+    // Another waiting request, approved first, takes the number this one would have taken.
+    const first = await run(printed, { body: { source: 'expense', id: other.id } }, 'commit');
+    expect(first.outcome, JSON.stringify(first.error)).toBe('ok');
+    expect(await keyOfPrint(), 'the key moved with the next check number').toBe(asked);
+    // A number the input gives is the agent's, not the next free one: another one, another key.
+    const given = await keyOfPrint({ checkNumber: '7001' });
+    expect(await keyOfPrint({ checkNumber: '7002' })).not.toBe(given);
+  });
+
+  it('a number the run takes in one column is left out only under a key of that column: a P.O. it copies that equals its entry number stays', async () => {
+    let entryNumber = '';
+    const invoiceWith = (poNumber: string) => async () => {
+      const ctx = await getServerContext();
+      const entry = await postJournalEntry(ctx, {
+        date: new Date('2026-03-05'),
+        description: 'An invoice the run records',
+        lines: [
+          { accountId: rich.acct['6300'], debit: '40.00' },
+          { accountId: rich.acct['1000'], credit: '40.00' },
+        ],
+      });
+      entryNumber = String((entry as { entryNumber?: unknown }).entryNumber ?? '');
+      await writeAudit(ctx, { action: 'create', entityType: 'bridge_invoice', entityId: randomUUID(), newValues: { poNumber, amount: '40.00' } });
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    // Learn the entry number the run takes, then copy a customer's P.O. that happens to be the same.
+    await probeKey(invoiceWith('PO-1'));
+    const po = entryNumber;
+    expect(po).toMatch(/^\d+$/);
+    const asked = await probeKey(invoiceWith(po));
+    // An entry posted elsewhere in between: the run takes the next number; the P.O. it copies is the same.
+    await postJournalEntry(admin, {
+      date: new Date('2026-03-04'),
+      description: 'Stamps',
+      lines: [
+        { accountId: rich.acct['6400'], debit: '3.00' },
+        { accountId: rich.acct['1010'], credit: '3.00' },
+      ],
+    });
+    expect(await probeKey(invoiceWith(po))).toBe(asked);
+    expect(entryNumber).not.toBe(po);
+    // Another P.O. is another key.
+    expect(await probeKey(invoiceWith(`${po}0`))).not.toBe(asked);
   });
 
   it("times: the run's own time goes everywhere; a date on what it makes counts by its day; a time of a record that was there before counts as it is", async () => {
@@ -2181,6 +2392,59 @@ describe('the staleness key leaves out what the run assigns to itself, and still
     expect(await probeKey(stamp({ made: { dueOn: inDays(30) } }))).toBe(due);
     // Another day on what it makes: another key.
     expect(await probeKey(stamp({ made: { dueOn: '2026-05-02T04:00:00.000Z' } }))).not.toBe(await probeKey(stamp({ made: { dueOn: '2026-05-01T04:00:00.000Z' } })));
+
+    // Under an "…At" key of a record that was there before: a time from before the run counts as
+    // it is, before and after the change; the run's own clock there does not.
+    const sentBefore = (sentAt: string) => async () => {
+      const ctx = await getServerContext();
+      await writeAudit(ctx, { action: 'update', entityType: 'customer', entityId: rich.customerId, oldValues: { sentAt }, newValues: { sentAt: new Date().toISOString(), note: 'sent again' } });
+      return NextResponse.json({ ok: true });
+    };
+    const sent = await probeKey(sentBefore('2026-01-05T10:00:00.000Z'));
+    await sleep(15);
+    expect(await probeKey(sentBefore('2026-01-05T10:00:00.000Z'))).toBe(sent);
+    expect(await probeKey(sentBefore('2026-01-05T10:00:01.000Z'))).not.toBe(sent);
+    // On what the run makes, an "…At" time is the run's own, whatever it says.
+    const madeAt = await probeKey(stamp({ made: { sentAt: '2026-01-05T10:00:00.000Z', note: 'made' } }));
+    expect(await probeKey(stamp({ made: { sentAt: '2026-02-07T11:00:00.000Z', note: 'made' } }))).toBe(madeAt);
+  });
+
+  it("a date the run fills in as today is the run's own, so a request that waits past midnight is not stale for it; a date the input gives, or another day, counts as it is", async () => {
+    const DAY_MS = 86_400_000;
+    const realNow = Date.now();
+    const dated = (date: string) => async () => {
+      const ctx = await getServerContext();
+      await writeAudit(ctx, { action: 'create', entityType: 'bridge_probe', entityId: randomUUID(), newValues: { date, note: 'dated' } });
+      return NextResponse.json({ ok: true });
+    };
+    const keyed = async (date: string, input: OperationInput = { body: {} }) => {
+      h.handler = dated(date);
+      const r = await run(op('journal-entries.create'), input, 'dry_run');
+      expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+      return r.stalenessKey!;
+    };
+    const today = localDateISO(new Date(realNow));
+    const filledIn = await keyed(today);
+    const given = await keyed(today, { body: { date: today } });
+    // A version the agent sends back (today's updatedAt) is no date it gives the work.
+    const stamped: OperationInput = { body: { updatedAt: new Date(realNow).toISOString() } };
+    expect(await keyed(today, stamped)).toBe(filledIn);
+    // Another day on what it makes, not today: another key.
+    const otherDay = localDateISO(new Date(realNow - 2 * DAY_MS));
+    expect(await keyed(otherDay)).not.toBe(filledIn);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(realNow + DAY_MS);
+      // The next day the same request fills in that day: the same key as yesterday's preview.
+      expect(await keyed(localDateISO(new Date()))).toBe(filledIn);
+      expect(await keyed(localDateISO(new Date()), stamped)).toBe(filledIn);
+      // The date the input gives stays the input's, the next day too.
+      expect(await keyed(today, { body: { date: today } })).toBe(given);
+      // A day the run did not fill in as today counts as it is.
+      expect(await keyed(otherDay)).not.toBe(filledIn);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('an id of a row that was there before the run stays as it is: pointing at another one gives another key', async () => {
@@ -2499,5 +2763,17 @@ describe('no agent may change or delete a role an agent holds (plan §4.6, D9)',
     const other = await run(op('roles.update'), { params: { id: free }, body: { name: 'Fine' } }, 'commit', everything);
     expect(other.outcome, JSON.stringify(other.error)).toBe('ok');
     expect(ran).toBe(1);
+
+    // A paused agent still holds its roles; a removed one holds none, as lib/services/users.ts and
+    // the door judge it.
+    await db.update(agents).set({ roleKeys: ['full_access', held], pausedAt: new Date() }).where(eq(agents.id, holder.agent.id));
+    h.handler = spy;
+    const paused = await run(op('roles.delete'), { params: { id: held.toUpperCase() } }, 'commit', approved);
+    expect(paused.error?.details).toMatchObject({ hardFloor: true, roleHeldByAgent: held });
+    await db.update(agents).set({ revokedAt: new Date() }).where(eq(agents.id, holder.agent.id));
+    h.handler = spy;
+    const removed = await run(op('roles.update'), { params: { id: `{${held.toUpperCase()}}` }, body: { name: 'Wider' } }, 'commit', approved);
+    expect(removed.outcome, JSON.stringify(removed.error)).toBe('ok');
+    expect(ran).toBe(2);
   });
 });

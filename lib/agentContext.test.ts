@@ -134,6 +134,8 @@ import { DELETE as agentDELETE } from '@/app/api/agents/[id]/route';
 import { PUT as policyPUT } from '@/app/api/network-policy/route';
 import { PUT as aiSettingsPUT } from '@/app/api/ai/settings/route';
 import { PUT as emailPUT } from '@/app/api/email/settings/route';
+import { GET as companyFileInfoGET } from '@/app/api/company-file/info/route';
+import { middleware } from '@/middleware';
 
 const ID = '11111111-2222-4333-8444-555555555555';
 /** A concrete path for a route pattern ("/api/invoices/[id]" -> "/api/invoices/1111…"). */
@@ -393,7 +395,9 @@ describe('after a person signed in', () => {
       // A person's own account ('self'): the company files they belong to, who can open the file.
       ['/api/companies', 'read', 'person_only'],
       ['/api/file-protection', 'read', 'person_only'],
-      // The sign-in screen's read of the company file's name: through the door, where an Admin is asked.
+      // The sign-in screen's read of the company file's name: class file, so the way in sends it to
+      // the door, where an Admin is asked. The route itself is public and never asks for a context,
+      // so this refusal never runs for it: see the two tests of what the route answers, below.
       ['/api/company-file/info', 'file', 'agent'],
       // The raw transaction log cannot be masked: never for an agent.
       ['/api/transaction-log/download', 'file', 'hard_floor'],
@@ -420,6 +424,36 @@ describe('after a person signed in', () => {
     }
     request('GET', '/api/accounts', { token });
     expect((await getServerContext()).agent?.id).toBe(agentId);
+  });
+
+  it("the company file's name: whatever an agent's own request gets, it never shows the folder", async () => {
+    // The registry classes it file (classes/admin.ts), but the route is public and never calls
+    // getServerContext, so the way-in check above does not run for it. Today it answers an agent's
+    // request as it answers anything that reaches Ironbooks before anyone signs in (the FINDING
+    // below). Answered or refused, what must always hold is that an agent is never the app's own
+    // window, so nothing in the answer shows the folder the file is in.
+    expect(operationForRoute('GET', '/api/company-file/info')).toMatchObject({ rule: 'public', class: 'file' });
+    request('GET', '/api/company-file/info', { token });
+    const res = await companyFileInfoGET();
+    const body = (await res.json()) as Record<string, unknown>;
+    if (res.ok) expect(body).toMatchObject({ remote: true, location: null });
+    const showsAFolder = Object.values(body).filter((v) => typeof v === 'string' && v.includes(ROOT));
+    expect(showsAFolder).toEqual([]);
+  });
+
+  // FINDING (known gap, for the owner of app/api/company-file/info/route.ts and middleware.ts): the
+  // class says an Admin approves this read through the door, yet an agent's own GET still gets the
+  // company file's name, whether it has a password or protection, and its id, with nobody asked.
+  // The app's own window and the desktop shell never send Authorization, so either place can refuse
+  // every request to this route that carries one. Once one does, this case fails: flip it.fails to it.
+  it.fails("FINDING: an agent's own request for the company file's name is refused, at the edge or in the route", async () => {
+    const edge = middleware(
+      new NextRequest('http://localhost:45123/api/company-file/info', { headers: { host: 'localhost:45123', authorization: `Bearer ${token}` } }),
+    );
+    const passedEdge = edge.status === 200 && edge.headers.get('x-middleware-next') === '1';
+    request('GET', '/api/company-file/info', { token });
+    const answered = passedEdge ? (await companyFileInfoGET()).ok : false;
+    expect(answered, "the company file's name was answered to an agent with nobody asked").toBe(false);
   });
 
   it('hands the rule the registry lookup lib/net/agentOrigin.test.ts checks it with', () => {

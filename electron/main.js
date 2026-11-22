@@ -4497,15 +4497,18 @@ async function agentRequestCountForNotice() {
 // The desktop notice when an agent asks while the window is not in front: minimized, in the tray
 // or behind others (lib/desktop/agentNotice.ts, plan 7.2). The page only says when; the words come
 // from this app's own server (the newest request's agent and the summary the server built, never
-// the agent's own words), so no text of the page reaches the notice. Clicking it brings the window
-// forward on the approval center. Never while the app runs hidden for an agent.
+// the agent's own words), so no text of the page reaches the notice. The page may say which request
+// it found new (its id): the agent and the summary are named only when this app's own read finds
+// that same one newest, and each request is announced once (agentShell.noticeFromCount, showNotice).
+// Clicking it brings the window forward on the approval center. Never while the app runs hidden for
+// an agent.
 ipcMain.handle('agent:notice', async (e, ask) => {
   if (!fromLocalApp(e) || agentServiceHidden) return false;
   const count = await agentRequestCountForNotice();
   return agentShell.showNotice({
     Notification: require('electron').Notification,
     win: mainWindow,
-    notice: agentShell.noticeFromCount(count, ask && typeof ask === 'object' ? ask.href : null),
+    notice: agentShell.noticeFromCount(count, ask && typeof ask === 'object' ? ask.href : null, ask && typeof ask === 'object' ? ask.id : null),
     open: (route) => agentShell.showWindowOn(mainWindow, route, navigate),
   });
 });

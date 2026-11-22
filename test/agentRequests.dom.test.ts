@@ -109,6 +109,8 @@ describe('the approval center', () => {
       "a new user's password is typed twice, compared on the card, and goes as the one password",
       'a link followed while a card is answering waits: that card keeps its answer, and the linked one opens once it is closed',
       'after a refused approval nothing is approvable until the card has loaded the request again, and a failed load says so',
+      'a link to a request someone else answered meanwhile opens once the open card is closed, and shows where it stands, with no error',
+      "Deny waits for the card's own copy too; an answer refused because someone else got there first is a note beside where it stands, not an error",
     ]);
   }, 300_000);
 });

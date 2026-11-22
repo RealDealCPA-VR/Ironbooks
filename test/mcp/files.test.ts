@@ -591,31 +591,71 @@ interface ShareCase {
   templated?: boolean;
 }
 
+/** A template as a case's path names it: "{hostname}", "{ownIPv4:hex}". */
+const TEMPLATE = /\{[^{}]+\}/g;
+
 /**
- * A share of this very computer, by the words alone: the connector's port (mcp/files-tools.mjs
- * isThisComputerShare) and the app's rule (lib/agent/files.ts) are both held to the one table,
- * lib/agent/thisComputerShares.json, so the two cannot drift apart. Its templates are filled in
- * for this computer as lib/agent/files.test.ts fills them; a case whose template cannot be filled
- * here is left out.
+ * What this test puts in place of each template the table may name, for this computer, as
+ * lib/agent/files.test.ts fills them (the table's "templates" says what each stands for). null when
+ * it cannot be filled here (no such address, no COMPUTERNAME): a case naming it is left out.
  */
-function thisComputerCases(): ShareCase[] {
+function templateValues(): Record<string, string | null> {
   let ownIPv4: string | null = null;
+  let ownIPv6: string | null = null;
   for (const list of Object.values(os.networkInterfaces())) {
-    for (const a of list ?? []) if (!ownIPv4 && a.family === 'IPv4' && !a.internal) ownIPv4 = a.address;
+    for (const a of list ?? []) {
+      // Node names the family 'IPv4' or 'IPv6' (a number in some older versions).
+      const family = String(a.family);
+      if (!ownIPv4 && (family === 'IPv4' || family === '4') && !a.internal) ownIPv4 = a.address;
+      if (!ownIPv6 && (family === 'IPv6' || family === '6') && !a.internal) ownIPv6 = a.address.replace(/%.*$/, '');
+    }
   }
+  const v4Number = ownIPv4 === null ? null : ownIPv4.split('.').reduce((n, part) => n * 256 + Number(part), 0);
   const host = os.hostname();
-  const fill: Record<string, string | null> = {
+  return {
     '{hostname}': host,
     '{hostname:lower}': host.toLowerCase(),
     '{hostname:upper}': host.toUpperCase(),
     '{COMPUTERNAME}': process.env.COMPUTERNAME?.trim() || null,
     '{ownIPv4}': ownIPv4,
+    '{ownIPv4:number}': v4Number === null ? null : String(v4Number),
+    '{ownIPv4:hex}': v4Number === null ? null : `0x${v4Number.toString(16)}`,
+    '{ownIPv6}': ownIPv6,
+    '{ownIPv6:literal}': ownIPv6 === null ? null : `${ownIPv6.replace(/:/g, '-')}.ipv6-literal.net`,
   };
+}
+
+/**
+ * The templates the table names (its "templates" list, and any a case's path uses) that this test
+ * does not know how to fill. Never judged by their own words: a new template fails the test until
+ * templateValues learns it, so a case the port cannot hold is never quietly left out.
+ */
+function unknownTemplates(): string[] {
+  const fill = templateValues();
+  const named = new Set(Object.keys(thisComputerShares.templates));
+  for (const c of thisComputerShares.cases as ShareCase[]) for (const t of c.path.match(TEMPLATE) ?? []) named.add(t);
+  return [...named].filter((t) => !Object.prototype.hasOwnProperty.call(fill, t));
+}
+
+/**
+ * A share of this very computer, by the words alone: the connector's port (mcp/files-tools.mjs
+ * isThisComputerShare) and the app's rule (lib/agent/files.ts) are both held to the one table,
+ * lib/agent/thisComputerShares.json, so the two cannot drift apart. Every template the table names
+ * is filled in for this computer (templateValues); a case whose template cannot be filled here is
+ * left out, and a template this test does not know throws.
+ */
+function thisComputerCases(): ShareCase[] {
+  const unknown = unknownTemplates();
+  if (unknown.length) {
+    throw new Error(`lib/agent/thisComputerShares.json names templates test/mcp/files.test.ts cannot fill: ${unknown.join(', ')}. Teach templateValues each one.`);
+  }
+  const fill = templateValues();
   const out: ShareCase[] = [];
   for (const c of thisComputerShares.cases as ShareCase[]) {
-    let p: string | null = c.path;
-    for (const [t, v] of Object.entries(fill)) if (p?.includes(t)) p = v === null ? null : p.split(t).join(v);
-    if (p !== null) out.push({ ...c, path: p, templated: p !== c.path });
+    const used = c.path.match(TEMPLATE) ?? [];
+    if (used.some((t) => fill[t] === null)) continue;
+    const p = c.path.replace(TEMPLATE, (t) => fill[t] as string);
+    out.push({ ...c, path: p, templated: used.length > 0 });
   }
   return out;
 }
@@ -635,6 +675,15 @@ function withEnv(values: Record<string, string> | undefined, fn: () => void): vo
 }
 
 describe('a share of this very computer (\\\\localhost, a loopback address, its own name) is never read from', () => {
+  it('every template the table names is one this test fills: none is left out, none judged by its own words', () => {
+    expect(Object.keys(thisComputerShares.templates).length).toBeGreaterThan(0);
+    expect(unknownTemplates()).toEqual([]);
+    const cases = thisComputerCases();
+    for (const c of cases) expect(c.path, c.path).not.toMatch(/\{[^{}]+\}/);
+    // The machine-specific cases are judged here: this computer's own name at least.
+    expect(cases.some((c) => c.templated && c.path.includes(os.hostname()))).toBe(true);
+  });
+
   it('the connector\'s rule answers every case of the app\'s table as the app does, by the words alone', () => {
     const cases = thisComputerCases();
     expect(cases.length).toBeGreaterThan(50);

@@ -11,17 +11,19 @@
  *    amount, or for another vendor, asks again; once the grant is taken back, or its hour is up
  *    (the clock faked), the next one asks;
  *  - batch approval: five requests of the same operation approved in one call, each run on its own
- *    with its own audit row; a request that needs two people is refused in a batch (and two
- *    different people approve it on its own);
+ *    with its own audit row (time entries, and bills, which post: the entry number one takes does
+ *    not make the next stale, nor does a posting elsewhere in the books); a request that needs two
+ *    people is refused in a batch (and two different people approve it on its own);
  *  - confirmation flags: a duplicate bill number answers needs_confirmation, and runs when sent
- *    again with confirm (straight away for a trusted agent; after a person's yes for one that asks);
- *    a duplicate a person enters while the agent waits makes the yes fail with the app's own
- *    warning, which the agent reads;
+ *    again with confirm (straight away for a trusted agent; after a person's yes for one that asks,
+ *    whose card shows the warning in the app's own words); a duplicate a person enters while the
+ *    agent waits makes the yes fail with the app's own warning, which the agent reads;
+ *  - a memorized transaction always asks, and its card shows the schedule and the next 3 dates;
  *  - one round trip per area of plan §8 that Phase 1 covers: sales, purchases, banking,
  *    inventory, lists, time and sales tax (find, dry run, ask, approve, in the books, named).
  *
  * A step that does not behave as the plan says is kept as it.fails with a comment naming what is
- * wrong and where, never bent to pass.
+ * wrong and where, never bent to pass. None is left in this file (wave 5).
  *
  * Order: vitest runs the tests of this file one after the other, in the order written, and some
  * build on the ones before them in their describe (a grant given, a request asked for, a card
@@ -584,39 +586,38 @@ describe('Phase 1 exit: batch approval', () => {
       expect(new Set(asked.map((a) => a.requestId)).size).toBe(5);
     });
 
-    // DOES NOT BEHAVE AS THE PLAN SAYS (plan §7.2 batch approve, Phase 1 exit "five same-operation
-    // requests approved in one call"). Only the first of the five runs: the other four come back
-    // 'stale' (request.stale true, status pending), nothing ran for them, and each needs a second
-    // yes on a "the books changed" preview that shows the very same bill. Seen here: statuses
-    // ['executed', 'stale', 'stale', 'stale', 'stale'] and one bill more instead of five. The same
-    // happens to any two waiting requests that post, approved one after the other (the second is
-    // stale), and whenever anyone posts anything in between.
-    // Why: the staleness key (lib/agent/bridge.ts stalenessKeyOf) hashes the new values of every
-    // audit row the run writes, and the journal entry's audit row (lib/services/posting.ts
-    // postJournalEntry, newValues.entryNumber) holds the next entry number, MAX(entry_number)+1.
-    // Any posting in between moves it, so every waiting request that posts gets another key,
-    // though none of its records changed (plan §7.4 speaks of "the touched records' versions").
-    // Checked field by field: the preview the second bill was asked with and its stale preview
-    // differ only in journal_entry.entryNumber (15 -> 16) once ids and times are left out. The same
-    // holds for the document numbers a run takes itself: two estimates (estimateNumber 2 -> 3) and
-    // two purchase orders (poNumber 1 -> 2) go stale the same way (test/agentPhase0.exit.test.ts,
-    // "two estimates waiting"). The bridge unit's WAVE2 notes left this open ("Is a re-preview
-    // whenever another posting changes the next document number acceptable noise?").
-    // A fix: leave numbers the run assigns itself (entryNumber, and the estimate, PO, invoice and
-    // check numbers when the agent's input did not give one) out of the key in keyValue, as ids and
-    // times already are. Five time entries (no number, nothing posted) batch fine, above.
-    it.fails('are approved in one call, each with its own audit row', async () => {
+    // Plan §7.2 batch approve, Phase 1 exit "five same-operation requests approved in one call",
+    // for work that posts. Each bill's run takes the next journal entry number, which the bill
+    // before it moved (lib/services/posting.ts postJournalEntry, MAX(entry_number)+1). The
+    // staleness key leaves out what a run assigns itself (lib/agent/bridge.ts stalenessKeyOf: an
+    // entry's number is not read; keyValue reads a number of TAKEN_COLUMNS the run took as
+    // "#own"), so none of the five makes the next one stale (plan §7.4, "the touched records'
+    // versions"). Was it.fails until wave 4: then only the first ran and four came back 'stale'.
+    it('are approved in one call, each with its own audit row', async () => {
       expect(asked).toHaveLength(5);
       const before = await billCount();
       const results = await s.admin.batch(asked.map((a) => a.requestId!));
       expect(results.map((r) => r.status)).toEqual(['executed', 'executed', 'executed', 'executed', 'executed']);
       expect(await billCount()).toBe(before + 5);
-      for (const r of results) {
-        for (const a of await s.auditOf(createdId(r.request.result))) {
+      const entries = new Set<string>();
+      for (let i = 0; i < 5; i++) {
+        const r = results[i];
+        expect(r.request.id).toBe(asked[i].requestId);
+        expect(r.request.posted).toBe(true);
+        // Its own bill, of its own amount, with its own ledger entry.
+        const [bill] = await s.db.select().from(bills).where(eq(bills.id, createdId(r.request.result)));
+        expect(bill.billNumber).toBe(`P1-BATCH-BILL-${i + 1}`);
+        expect(bill.total).toBe(`${11 + i}.00`);
+        expect(bill.postedEntryId).toMatch(UUID);
+        expect(r.request.entryIds).toContain(bill.postedEntryId);
+        entries.add(bill.postedEntryId!);
+        for (const a of await s.auditOf(bill.id)) {
           expect(a.agentId).toBe(agent.id);
           expect(a.agentRequestId).toBe(r.request.id);
+          expect(a.approvedBy).toBe(s.admin.id);
         }
       }
+      expect(entries.size).toBe(5);
     });
   });
 
@@ -638,17 +639,22 @@ describe('Phase 1 exit: batch approval', () => {
       });
     });
 
-    // DOES NOT BEHAVE AS THE PLAN SAYS (plan §7.4: "the server compares the touched records'
-    // versions with the staleness key"). Nothing the bill reads or writes changed (another expense
-    // account, the savings account, no vendor), yet the approval answers 'stale'. The only thing
-    // that moved is the next journal entry number, which the bill's own entry takes: see the test
-    // above (lib/agent/bridge.ts stalenessKeyOf hashes the journal entry audit row's
-    // newValues.entryNumber, lib/services/posting.ts). In a company where people work while an
-    // agent waits, every waiting request that posts goes stale at the first entry anyone makes.
-    it.fails('leaves the waiting bill as it was: it runs on the first yes', async () => {
+    // Plan §7.4: "the server compares the touched records' versions with the staleness key".
+    // Nothing the bill reads or writes changed (another expense account, the savings account, no
+    // vendor); only the next journal entry number moved, which the bill's own entry takes, and the
+    // staleness key leaves that out (lib/agent/bridge.ts stalenessKeyOf, see the test above). So a
+    // posting anyone makes elsewhere while an agent waits leaves the request as it was. Was it.fails
+    // until wave 4. A change to what the request reads still makes it stale: the Phase 0 exit test
+    // 'the books changed since the agent asked' (an item's price).
+    it('leaves the waiting bill as it was: it runs on the first yes', async () => {
       expect(asked?.requestId).toBeTruthy();
       const r = await s.admin.approve(asked!.requestId!);
-      expect(r.status).toBe('executed');
+      expectExecuted(r);
+      expect(r.request.stale ?? false).toBe(false);
+      const [bill] = await s.db.select().from(bills).where(eq(bills.id, createdId(r.request.result)));
+      expect(bill.billNumber).toBe('P1-ELSEWHERE-1');
+      expect(bill.total).toBe('33.00');
+      expect(r.request.posted).toBe(true);
     });
   });
 });
@@ -718,27 +724,20 @@ describe('Phase 1 exit: confirmation flags', () => {
     expect(await billCount()).toBe(before + 1);
   });
 
-  // DOES NOT BEHAVE AS THE PLAN SAYS (plan §5.6: "The warning text appears on the approval card, so
-  // the person answers the same question they would have answered in the window"). The card's
-  // preview.warnings is [] for every request, so the warning's own words never reach the card; it
-  // has only input.confirm, the bare flag name. Two places, and both need fixing:
-  //  - lib/agent/bridge.ts never fills preview.warnings. Every preview it builds hard-codes
-  //    warnings: [] (the transaction preview builder, about line 1813, the described-not-run
-  //    preview, about 2153, and the other run previews, about 2250, 2291 and 2344). A warning is
-  //    only ever carried in BridgeResult.warnings at the top level (interpret(), about line 1971),
-  //    and only on a needs_confirmation answer, which has no request behind it.
-  //  - lib/agent/operate.ts change() (about line 1314) stores the request with the preview of a
-  //    dry run made WITH the flag (runOperation(..., 'dry_run') on the flagged input). With the flag
-  //    set the route raises no 409, so even a bridge that filled preview.warnings would find none.
-  // A fix: when the input carries confirm flags, change() also dry runs it without them (or the
-  // bridge keeps the warnings a sent flag silenced), and those warnings are copied into the
-  // request's preview.warnings. (The card, app/agent-requests/RequestCard.tsx, shows input.confirm
-  // only inside the raw input JSON; Preview.tsx shows preview.warnings, so it then shows them.)
+  // Plan §5.6: "The warning text appears on the approval card, so the person answers the same
+  // question they would have answered in the window". The request's preview comes from a dry run
+  // made WITH the flag, where the route raises no warning; lib/agent/operate.ts change() dry runs
+  // the input once more without the agent's flags (silencedWarnings) and adds the warnings they
+  // silenced to the stored preview (withWarnings, each flag once), which the card's Preview.tsx
+  // lists. Was it.fails until wave 4, when preview.warnings was always [].
   // Relies on order: the test above checks the steps before this claim and fills flaggedCard and
   // warningMessage.
-  it.fails('the approval card shows the warning the agent accepted (plan §5.6)', async () => {
+  it('the approval card shows the warning the agent accepted (plan §5.6)', async () => {
     expect(flaggedCard && warningMessage).toBeTruthy();
-    expect(flaggedCard!.preview?.warnings ?? []).toContainEqual(expect.objectContaining({ flag: 'allowDuplicateNumber', message: warningMessage }));
+    const warnings = flaggedCard!.preview?.warnings ?? [];
+    // The app's own words, the same the agent was shown on its needs_confirmation answer, once.
+    expect(warnings).toContainEqual(expect.objectContaining({ flag: 'allowDuplicateNumber', message: warningMessage }));
+    expect(warnings.filter((w) => w.flag === 'allowDuplicateNumber')).toHaveLength(1);
   });
 
   it('a person enters the same bill while the agent waits: the yes fails with the app\'s own warning, and the agent is told (plan §7.2)', async () => {
@@ -815,21 +814,18 @@ describe('Phase 1: a memorized transaction an agent makes always asks (plan §8)
     }
   });
 
-  // DOES NOT BEHAVE AS THE PLAN SAYS (plan §8, Recurring: "Creating or changing one is always Ask,
-  // and the card shows the schedule and the next 3 dates"). The card shows the frequency (the
-  // describe template of POST /api/recurring, lib/agent/operations/classes/banking.ts) and the
-  // first run date (in the record diff of the dry run), but nothing works out or stores the next
-  // three dates: no code under lib/agent, lib/services/agentRequests.ts or app/agent-requests
-  // computes them, and the preview holds only the created template row. A fix: have the
-  // recurring operations' preview (or the request's summary) list the next three run dates from
-  // the template's own schedule (lib/services/recurring.ts advanceDate / projectOccurrences already
-  // work them out). Relies on order: the test above checks the steps before this claim and asks
-  // for the request (asked) this one reads.
-  it.fails('the card shows the next 3 dates of the schedule', async () => {
+  // Plan §8, Recurring: "Creating or changing one is always Ask, and the card shows the schedule
+  // and the next 3 dates". The request's summary, Ironbooks' own line at the top of the card, ends
+  // with them (lib/agent/describe.ts runDatesText / nextRunDates, a copy of recurring.ts's schedule
+  // helpers kept in step by its own parity test). Only the summary is read here: the preview's
+  // record diff holds the first date (nextRunDate) anyway, but never the two after it. Was it.fails
+  // until wave 4. Relies on order: the test above checks the steps before this claim and asks for
+  // the request (asked) this one reads.
+  it('the card shows the next 3 dates of the schedule', async () => {
     expect(asked?.requestId).toBeTruthy();
     const card = await s.admin.request(asked.requestId!);
-    const shown = `${card.summary} ${JSON.stringify(card.preview ?? {})}`;
-    for (const day of ['2026-12-01', '2027-01-01', '2027-02-01']) expect(shown).toContain(day);
+    expect(card.summary).toMatch(/monthly/);
+    expect(card.summary).toMatch(/2026-12-01, 2027-01-01, 2027-02-01/);
   });
 });
 

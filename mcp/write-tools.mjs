@@ -351,28 +351,21 @@ const versionOf = (/** @type {Record<string, any>} */ a) => (a.expected_updated_
 /**
  * A read sent without a request id meets the door's request-id check only when the door would file
  * it for a person (an Admin set that read to Ask): it asks for a request id, as a 400 VALIDATION,
- * before anything is read (lib/agent/operate.ts change). A route's own 400 for the read looks the
- * same, so the door is asked which it was, with the same read as a dry run: a read the door runs on
- * its own is simply read again ('read', or the same error), while one it would put to a person is
- * not tried at all ('dry_run'). So it is told by the door's outcome, never by the wording of its
- * message, which may change. The cost: a route's own 400 (dates out of order, say) is read twice,
- * and counts twice against the agent's calls per minute. It stays until the door gives its
- * request-id check a code of its own, which the connector could then read instead.
+ * before anything is read (lib/agent/operate.ts change). The door names the field it wants in that
+ * refusal (details.fields.requestId, carried as client.mjs IronbooksError.fields), as
+ * lib/agent/actions.ts does, and that is what tells it from a route's own 400 for the read (dates
+ * out of order, say): never the words of the message, which may change. Nothing more is sent to
+ * find out. The connector ships with the app, whose door always names the field, so a 400 that
+ * names no request id is the read's own: it is passed on as it is, read once and counted once
+ * against the agent's calls per minute. (Before the door named the field, the same read was sent
+ * again as a dry run to tell the two apart, which cost a second read.)
  * @param {unknown} err  what the read threw
- * @param {() => Promise<any>} asDryRun  the same read, sent as a dry run
- * @returns {Promise<any | null>} the dry run's answer: 'dry_run' (a person must approve this read),
- *   or 'read' / 'refused' (answer with it). Null when `err` is something else: throw it as it is.
+ * @returns {boolean} true: a person must approve this read, and it was sent without a request id
  */
-export async function askedReadCheck(err, asDryRun) {
+export function wantsRequestId(err) {
   const e = /** @type {any} */ (err);
-  if (!e || e.isIronbooksError !== true || e.status !== 400 || e.code !== 'VALIDATION') return null;
-  let answer;
-  try {
-    answer = await asDryRun();
-  } catch {
-    return null;
-  }
-  return answer && typeof answer === 'object' && ['dry_run', 'read', 'refused'].includes(answer.outcome) ? answer : null;
+  if (!e || e.isIronbooksError !== true || e.status !== 400 || e.code !== 'VALIDATION') return false;
+  return !!e.fields && typeof e.fields === 'object' && typeof e.fields.requestId === 'string';
 }
 
 /** A tool that enters one new record. `rename` maps tool fields whose app name is not the camelCase of theirs. */

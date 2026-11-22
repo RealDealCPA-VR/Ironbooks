@@ -50,11 +50,13 @@
  * without (OPTIONAL_ROUTE_SECRETS: a backup made in this same file needs no sign-in) is not asked
  * for before the route runs; the route says so if it needs it after all.
  *
- * The closing-date password the approver typed is checked ONCE, here, before the route runs, with
- * the one limiter of that password (lib/closingPasswordLimiter.ts) under the approving person's own
- * keys, read outside the scope: a wrong one refuses the run at once, whatever the work (a password
- * typed on the card is taken as needed), a locked limiter refuses even the right one, so approvals
- * cannot be used to try passwords. A right one sets the closing-date
+ * The closing-date password the approver typed is checked ONCE per run, here, before the route
+ * runs, with the one limiter of that password (lib/closingPasswordLimiter.ts) under the approving
+ * person's own keys, read outside the scope: a wrong one refuses the run at once, whatever the work
+ * (a password typed on the card is taken as needed), a locked limiter refuses even the right one,
+ * so approvals cannot be used to try passwords. (An approval runs the work twice, the rolled-back
+ * try and the commit: a right password is counted right twice, a wrong one stops the first.) A
+ * right one sets the closing-date
  * override for an access holding the closed-period right, and the scope is marked as having
  * checked it, so Set Closing Date takes that same password as its current one without counting it
  * a second time, in the scope's realm (lib/serviceScope.ts closingPasswordCheckedInScope).
@@ -62,15 +64,20 @@
  * The staleness key (plan §7.4) covers the records the run reads and changes that existed before
  * it: the versions of the records the input names (read in the same transaction, before the handler
  * runs), the ledger lines it posts, the field values of every record it writes, and the emails,
- * files and print jobs it asks for. What the run assigns to itself is left out: the next document
- * or entry number it takes (and that number where its own text repeats it, "Invoice #1043"), every
- * id that did not exist before the run, wherever it shows (a value, a source reference, a journal
- * reference made of its first 8 hex digits), and the run's own times. Every other number and time
- * stays (a reference the run copies, an account number, a date of a record that was there before).
- * So two runs over the same books agree, two
- * waiting requests that each take "the next number" do not make each other stale, a posting
- * elsewhere that touches none of the request's records changes nothing, and a price, a rate or a
- * named record changed in between gives another key.
+ * files and print jobs it asks for. What the run assigns to itself is left out, and only that: the
+ * next free document, check or entry number it takes, or the next position (a new bank rule's
+ * priority, a new account's number), from the columns where the services take it (TAKEN_COLUMNS),
+ * on what it makes and on a record that was there before with no number (a check marked printed),
+ * left out only under a key naming that column, and that number where its own text repeats it
+ * ("Invoice #1043"); every id that did not exist
+ * before the run, wherever it shows (a value, a source reference, a journal reference made of its
+ * first 8 hex digits); the times on what it makes, a date it fills in as today, and its own clock.
+ * Every other number and time stays (a reference or a P.O. number the run copies, an account,
+ * routing, tax, serial or lot number, any time of a record that was there before). So two runs
+ * over the same books agree, two waiting requests that each take "the next number" do not make
+ * each other stale, nor does midnight, a posting elsewhere that touches none of the request's
+ * records changes nothing, and a price, a rate or a named record changed in between gives another
+ * key.
  *
  * The handler's request also carries, besides the scope's headers:
  *  - the version of the record the agent last read (OperationInput.expectedUpdatedAt), as
@@ -88,7 +95,8 @@
  *
  * No agent may change or delete a role any agent holds (plan §4.6, D9): such a run is refused
  * here, on every way in (a dry run, a run, a run under standing permission, an approved run), and
- * however the role's id is written (upper case, braces or no hyphens name the same role).
+ * however the role's id is written (upper case, braces or no hyphens name the same role). The
+ * agents counted are those not removed, as everywhere else a held role is judged.
  *
  * Files an operation saves (effects.writeFile) must land inside one of the agent's folders
  * (lib/agent/files.ts allowedFolder): the folder itself, or, when it does not exist yet, its
@@ -171,11 +179,12 @@ import {
 } from '@/lib/context';
 import { AGENT_NOT_READY_MESSAGE, AGENT_SANDBOX_MESSAGE } from '@/lib/agentContext';
 import { limitClosingPasswordGuess } from '@/lib/closingPasswordLimiter';
+import { localDateISO } from '@/lib/dates';
 import { currentEffects, effectsOfFailedRun, pinFile, runWithEffects, type EffectReport, type EffectsMode, type EffectsRun } from '@/lib/effects';
 import { featureOffError } from '@/lib/featureGate';
 import { Money, toAmountString } from '@/lib/money';
 import { LAUNCH_PASS_HEADER, expectedLaunchPass } from '@/lib/net/launchPass';
-import { blockingFeatureGate, resolveCompanyPreferences } from '@/lib/preferences';
+import { blockingFeatureGate, resolveCompanyPreferences, todayInTimeZone } from '@/lib/preferences';
 import { authorizeRequest } from '@/lib/permissions/enforce';
 import { isSecretKey, maskSensitive } from '@/lib/permissions/mask';
 import { legacyRoleFor, type EffectiveAccess } from '@/lib/permissions/model';
@@ -190,6 +199,7 @@ import { lineMemoFor, resolveEntityNames } from '@/lib/services/journal';
 import { assertPasswordChangeNotRequired } from '@/lib/services/passwordPolicy';
 import { isSandboxActive } from '@/lib/services/sandboxState';
 import { getSingleUserMode } from '@/lib/services/sessions';
+import { agentsHoldingRole, heldRoleKeyForm } from '@/lib/services/users';
 import { ServiceError, translateLedgerDbError, type ServiceContext } from '@/lib/services/_base';
 import { changesInTransaction, type ChangePreview, type PostingEntry, type PostingLine } from './actions';
 import {
@@ -210,7 +220,7 @@ import {
 } from './contract';
 import { personSignedIn } from './endpointFile';
 import { factsOf } from './facts';
-import { allowedFolder, readStagedFile, stageFile } from './files';
+import { allowedFolder, overlapsAppData, readStagedFile, stageFile } from './files';
 import { applySecrets, guardInput, maskAccountsInText, redactAnswer } from './guards';
 import { loadRouteHandler, operationById, operationForPath, type RouteHandler, type RouteParams } from './operations/registry';
 import type { EffectKind, EffectPreview, Operation, RecordDiff, RequestFacts, RiskClass, SecretKind, WarningPreview } from './operations/types';
@@ -491,6 +501,8 @@ function handlerContext(db: DB, parts: RunContextParts, readOnly: boolean): Serv
 
 interface Gates {
   closingDate: string | null;
+  /** The company's time zone (its "today" for a date a service fills in), or null. */
+  timeZone: string | null;
 }
 
 /**
@@ -558,7 +570,11 @@ async function settleGates(
     if (err instanceof ServiceError) return { refusal: serviceErrorAsBridgeError(err) };
     throw err;
   }
-  return { closingDate: typeof settings.closingDate === 'string' ? settings.closingDate : null };
+  const zone = resolveCompanyPreferences(settings).timezone;
+  return {
+    closingDate: typeof settings.closingDate === 'string' ? settings.closingDate : null,
+    timeZone: typeof zone === 'string' && zone.trim() ? zone : null,
+  };
 }
 
 /** What the closing-date password the approving person typed does for this run. */
@@ -618,7 +634,7 @@ async function closingPasswordCheck(
  * when it does need one. Every other secret a route lists, it always needs: a commit without it is
  * refused before anything runs.
  */
-const OPTIONAL_ROUTE_SECRETS: readonly SecretKind[] = ['archive_credentials'];
+export const OPTIONAL_ROUTE_SECRETS: readonly SecretKind[] = ['archive_credentials'];
 
 /**
  * A run a person approved at the host computer's own window: the approver is the actor's person,
@@ -651,12 +667,11 @@ function expectedVersionOf(input: OperationInput): { value: string | null } | { 
  * A role key as the held-role check compares it: lower case, and a uuid without its braces and
  * hyphens. The role route reads the id as a Postgres uuid, which takes upper case, braces and
  * missing hyphens alike ("{0A1B…}" and "0a1b…" name the same role), so the check must not tell
- * them apart either. The SQL in heldRoleRefusal reads the stored keys the same way.
+ * them apart either. The one form every check of a held role uses (lib/services/users.ts
+ * heldRoleKeyForm), so they cannot drift apart.
  */
 function roleKeyForm(key: string): string {
-  const text = key.trim().toLowerCase();
-  const hex = text.replace(/[{}-]/g, '');
-  return /^[0-9a-f]{32}$/.test(hex) ? hex : text;
+  return heldRoleKeyForm(key) ?? key.trim().toLowerCase();
 }
 
 /** The canonical uuid text of a role key in roleKeyForm, or null when it is not a uuid. */
@@ -669,27 +684,18 @@ function canonicalUuidOf(form: string): string | null {
  * No agent may change or delete a role that any agent holds (plan §4.6, D9): changing it would
  * change what that agent, perhaps the very one asking, may do. A hard-floor refusal on every way
  * in, whatever the approval: the role editor of Users & Roles (PATCH, PUT or DELETE /api/roles/[id])
- * naming a role in any agent's roleKeys, however the id is written (roleKeyForm). Null when the
- * run may go on.
+ * naming a role in the roleKeys of an agent of this company, however the id is written
+ * (roleKeyForm: the role compared by its canonical id). A held role is judged the same way
+ * everywhere, by the one count lib/services/users.ts refuseAgentOnAgentRole uses too
+ * (agentsHoldingRole): the agents that are not removed (revoked). A paused agent still holds its
+ * roles; a removed one holds none. Null when the run may go on.
  */
 async function heldRoleRefusal(db: DB, companyId: string, operation: Operation, params: RouteParams): Promise<BridgeError | null> {
   if (operation.route !== '/api/roles/[id]' || operation.method === 'GET') return null;
   const key = typeof params.id === 'string' ? params.id : '';
   if (!key.trim()) return null;
   const form = roleKeyForm(key);
-  const res = (await db.execute(sql`
-    SELECT count(*)::int AS n
-      FROM agents a
-     WHERE a.company_id = ${companyId}
-       AND EXISTS (
-             SELECT 1
-               FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(a.role_keys) = 'array' THEN a.role_keys ELSE '[]'::jsonb END) AS k(v)
-              WHERE CASE WHEN regexp_replace(lower(btrim(k.v)), '[{}-]', '', 'g') ~ '^[0-9a-f]{32}$'
-                         THEN regexp_replace(lower(btrim(k.v)), '[{}-]', '', 'g')
-                         ELSE lower(btrim(k.v)) END = ${form})`)) as unknown as {
-    rows: Array<{ n: number }>;
-  };
-  if (!(Number(res.rows[0]?.n ?? 0) > 0)) return null;
+  if (!((await agentsHoldingRole(db, companyId, key)) > 0)) return null;
   const canonical = canonicalUuidOf(form);
   let name = canonical ?? key;
   if (canonical) {
@@ -1164,9 +1170,17 @@ async function walkAllowed(folders: readonly string[], base: string, parts: read
     }
   }
   if (missing.length > MAX_NEW_FOLDERS || !missing.every(plainNewFolder)) return null;
-  // Once more on the folder found, links and all, exactly as save_file and the shell are checked.
+  // Once more on the folder found, links and all, exactly as save_file and the shell are checked
+  // (allowedFolder: never inside the books or Ironbooks' own data, as the folder is now).
   const real = await allowedFolder(folders, at);
-  return real ? path.join(real, ...missing) : null;
+  if (!real) return null;
+  const target = path.join(real, ...missing);
+  // Folders still to be made are not on the disk for allowedFolder to judge: one that would be, lie
+  // inside or hold a place of Ironbooks' own (a backups folder not made yet, beside the books in an
+  // agent's folder) is refused by its words (lib/agent/files.ts overlapsAppData), as the folder is
+  // now, whatever was true when the agent's folders were saved.
+  if (missing.length && overlapsAppData(target)) return null;
+  return target;
 }
 
 /**
@@ -1735,6 +1749,7 @@ async function touchedPreview(ctx: ServiceContext, touched: readonly TouchedEntr
     source: t.source,
     lines: (lines.get(t.id.toLowerCase()) ?? []).map((l) => l.line),
     touched: t.how,
+    counted: t.counted,
   }));
 }
 
@@ -1784,9 +1799,13 @@ async function nameLines(ctx: ServiceContext, lines: ReadonlyArray<{ line: Named
 /**
  * A ledger preview entry the run did not make but voided, deleted or changed. `touched` says
  * which, so a reader can tell it from the entries the run made without reading its words (an
- * agent writes descriptions too). An addition to actions.ts PostingEntry, which has no such field.
+ * agent writes descriptions too). `counted` is what of it the amount counts (TouchedEntry.counted):
+ * its total when the run moved its money (a void, a delete, lines rewritten, a draft posted), null
+ * when it did not (a new title, number, link or line memo, an entry already void, a draft voided),
+ * so lib/agent/operate.ts can tell a run that posted from one that only retitled an entry, also for
+ * an operation with an amount field. Additions to actions.ts PostingEntry, which has neither field.
  */
-export type TouchedPostingEntry = PostingEntry & { touched: 'voided' | 'deleted' | 'changed' };
+export type TouchedPostingEntry = PostingEntry & { touched: 'voided' | 'deleted' | 'changed'; counted: string | null };
 
 /** What the run moves in the ledger, for the facts (lib/money.ts throughout, never a float). */
 interface LedgerTotals {
@@ -1945,16 +1964,21 @@ async function versionsOf(db: DB, companyId: string, ids: readonly string[]): Pr
 // or numbers something, so it is left out, everywhere it shows:
 //  - every id that did not exist before the run (runIdsOf): written "new:<kinds>", whole, inside a
 //    value ("bill:<id>"), or cut to its first 8 hex digits (a paycheck's journal reference);
-//  - the numbers it takes for itself on what it makes (OWN_NUMBER_KEYS: the next estimate, purchase
-//    order, invoice, sales receipt, credit memo, sales order, transfer, payment, check or journal
-//    entry number, read from the audit rows and the rows of what it makes, and a General Journal
-//    entry's Entry No.), and those numbers where the text of what it makes repeats them ("Invoice
-//    #1043", the reference of the check's own entry). Every other number stays: an account,
-//    routing, tax, serial or lot number, a bill number, a journal reference the run copied;
-//  - times: a key ending in At; a moment of the run itself (from the start of its transaction to
-//    the end), wherever it shows; and on what the run makes, a moment is read as its day only
-//    (a due date the run works out from today). A moment of a record that was there before, from
-//    before the run, stays as it is.
+//  - the next free number or position it takes for what it makes, and only that (TAKEN_COLUMNS:
+//    the next estimate, purchase order, invoice, sales receipt, credit memo, sales order, transfer,
+//    loan payment, check or journal entry number, a General Journal entry's Entry No., a new bank
+//    rule's next position, a new account's next number), read from the rows of what it makes (and
+//    of a record that was there before with no number, given the next one: a check marked
+//    printed), left out under the keys that name the column it was taken in (columnsOfKey), and
+//    the numbers where the text of what it makes repeats them ("Invoice #1043", the reference of
+//    the check's own entry). Every other number stays, also on what the run makes: an account,
+//    routing, tax, serial or lot number, a bill number, a customer's P.O. or check number, a
+//    journal reference the run copied from its input or from a record that was there before;
+//  - times, on what the run makes: a key ending in At, and a moment read as its day only (a due
+//    date the run works out from today); a date it fills in as today because the input gave none
+//    ('<today>', so a request that waits past midnight is not stale for that alone). The run's own
+//    clock (a moment from the start of its transaction to the end) wherever it shows. A time of a
+//    record that was there before, from before the run, stays as it is, under any key.
 
 /** A whole value that is a moment (an ISO date and time). */
 const MOMENT = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}(?::?\d{2})?)?$/;
@@ -1966,15 +1990,73 @@ const MOMENT_ZONE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
 const RUN_SPAN_SLACK_MS = 1000;
 
 /**
- * Keys of a record the run makes that hold a number it takes for itself (lib/services/docNumbers.ts
- * allocateDocNumber, lib/services/checkNumbers.ts allocateCheckNumber, posting's next entry number),
- * or one the agent gave (left out too: the input is the same on every run). A check's number is its
- * `reference` (expenses, bill payments, liability checks); the reference of an entry the run makes
- * is not read here but through the ledger part of the key (keyText), where only the numbers taken
- * here and the run's own id prefixes go. Listed one by one, so a number the run copies from
- * somewhere else (an account or routing number, a serial or lot number) stays in the key.
+ * Where the services take the next free number or position for a row they make, by table: the
+ * columns that hold it (lib/services/docNumbers.ts allocateDocNumber, its text number and its
+ * legacy integer; lib/services/checkNumbers.ts allocateCheckNumber, a check's `reference` or
+ * `check_number`; lib/services/posting.ts nextEntryNumber; lib/services/inventoryTransfers.ts and
+ * lib/services/loans.ts, max + 1). `inText`: the number shows in the text of what the run makes
+ * too ("Invoice #1043", "Check 1001"), so it goes from there as well; a position or an account's
+ * number only counts where it stands on its own (TAKEN_KEYS).
+ *
+ * Only these columns, of rows the run made (takenOfRows) or of a record that was there before and
+ * had no number until the run gave it one (takenOnExisting): a column of the same name elsewhere
+ * holds a number copied from the input or from another record (an invoice's or a sales order's
+ * `po_number` is the customer's P.O., a payment's `reference` the customer's check number, a
+ * vendor credit's `ref_number` the vendor's), and stays in the key. A number taken in one column
+ * is left out only under a key that names that column (columnsOfKey). In these columns too, a
+ * number the input gives under the same key, or that a record the run voided, deleted or changed
+ * held before it (a check
+ * written again with the number of the one it replaces), is copied, not the next free one: it
+ * stays (heldBeforeRun). A number the services copy from a record the run neither names nor
+ * changes cannot be told from the next free one in the row, and is left out; no service of these
+ * columns does that today.
  */
-const OWN_NUMBER_KEYS: ReadonlySet<string> = new Set([
+const TAKEN_COLUMNS: Readonly<Record<string, ReadonlyArray<{ column: string; inText: boolean }>>> = {
+  journal_entries: [{ column: 'entry_number', inText: true }],
+  estimates: [
+    { column: 'estimate_number', inText: true },
+    { column: 'ref_number', inText: true },
+  ],
+  invoices: [
+    { column: 'invoice_number', inText: true },
+    { column: 'ref_number', inText: true },
+  ],
+  sales_receipts: [
+    { column: 'receipt_number', inText: true },
+    { column: 'ref_number', inText: true },
+  ],
+  credit_memos: [
+    { column: 'memo_number', inText: true },
+    { column: 'ref_number', inText: true },
+  ],
+  sales_orders: [
+    { column: 'order_number', inText: true },
+    { column: 'ref_number', inText: true },
+  ],
+  purchase_orders: [
+    { column: 'po_number', inText: true },
+    { column: 'ref_number', inText: true },
+  ],
+  inventory_transfers: [{ column: 'transfer_number', inText: true }],
+  loan_payments: [{ column: 'payment_number', inText: true }],
+  expenses: [{ column: 'reference', inText: true }],
+  bill_payments: [{ column: 'reference', inText: true }],
+  payment_checks: [{ column: 'reference', inText: true }],
+  paychecks: [{ column: 'check_number', inText: true }],
+  // A new bank rule goes above every other (lib/services/bankRules.ts topPriority + 1).
+  transaction_rules: [{ column: 'priority', inText: false }],
+  // A new account with no number gets the next free one of its range (accounts.ts nextAccountNumber).
+  accounts: [{ column: 'code', inText: false }],
+};
+
+/**
+ * Keys under which a record the run makes (its audit row) holds a number or position it took, as
+ * the services name them: only a value the run took (TAKEN_COLUMNS, read from its rows) is left out
+ * under them, never the key itself. A check's number is its `reference` (expenses, bill payments,
+ * liability checks); the reference of an entry the run makes is read through the ledger part of the
+ * key (keyText), where only the numbers taken and the run's own id prefixes go.
+ */
+const TAKEN_KEYS: ReadonlySet<string> = new Set([
   'number',
   'docNumber',
   'doc_number',
@@ -2002,7 +2084,42 @@ const OWN_NUMBER_KEYS: ReadonlySet<string> = new Set([
   'check_number',
   'checkNo',
   'reference',
+  'priority',
+  'code',
 ]);
+
+/** The TAKEN_COLUMNS that hold a document's own number, as keyForm writes them. */
+const DOCUMENT_NUMBER_COLUMNS: readonly string[] = [
+  'refnumber',
+  'estimatenumber',
+  'invoicenumber',
+  'receiptnumber',
+  'memonumber',
+  'ordernumber',
+  'ponumber',
+  'transfernumber',
+  'paymentnumber',
+  'entrynumber',
+];
+
+/**
+ * The TAKEN_COLUMNS (as keyForm writes them) a value under a key of TAKEN_KEYS may have been taken
+ * in: the column of the same name ("poNumber" is po_number, "priority" is priority), and for the
+ * names the services give a document's own number whatever its table calls it ("number",
+ * "docNumber", "refNumber") every column of a document number, and for a check's number its
+ * `reference` too. So a number the run took in one column is never taken for a number under an
+ * unrelated key that happens to be the same (a customer's P.O. that equals the run's entry number,
+ * a payment's reference that equals a new rule's position "3").
+ */
+function columnsOfKey(key: string): readonly string[] {
+  const form = keyForm(key);
+  if (form === 'number' || form === 'docnumber' || form === 'refnumber') return DOCUMENT_NUMBER_COLUMNS;
+  if (form === 'checknumber' || form === 'checkno') return ['checknumber', 'reference'];
+  return [form];
+}
+
+/** A whole value that is a calendar day. */
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Keys of free text where a record or an entry the run makes may repeat its own number. */
 const OWN_TEXT_KEY = /(?:memo|description|reference|source|sourceRef|source_ref|notes?|title|subject|name|attachments)$/i;
@@ -2019,10 +2136,20 @@ interface KeyRules {
   made: ReadonlyMap<string, string>;
   /** The first 8 hex digits of each id the run made, as the key writes that id. */
   prefixes: ReadonlyMap<string, string>;
-  /** The numbers the run took for itself, longest first. */
+  /** The numbers the run took for itself that its text may repeat (TAKEN_COLUMNS inText), longest first. */
   numbers: readonly string[];
+  /**
+   * Every number and position the run took for itself, by the column it took it in: "<keyForm of
+   * the column>:<value>" ("checknumber:1001"). Left out under a key of TAKEN_KEYS whose columns
+   * (columnsOfKey) include that one.
+   */
+  taken: ReadonlySet<string>;
   /** The run's own time span (milliseconds since 1970): from its transaction's start to now. */
   span: { from: number; to: number };
+  /** The run's today, as the services may write it (this computer's day, the UTC day, the company's). */
+  today: ReadonlySet<string>;
+  /** The days the input gives (a date the agent sent is the input's, never the run's today). */
+  givenDays: ReadonlySet<string>;
 }
 
 /** How the key writes an id the run made: "new:" and the kinds of record it is, sorted. */
@@ -2068,16 +2195,26 @@ function momentMs(s: string): number {
 }
 
 /**
+ * A day on something the run made, as the key reads it: '<today>' when it is the run's today and
+ * the input does not give it (the run filled it in: a date left out defaults to today), so the same
+ * request run tomorrow agrees; any other day as it is (one the input gives, or copied from a record
+ * that was there before).
+ */
+function keyDay(day: string, rules: KeyRules): string {
+  return rules.today.has(day) && !rules.givenDays.has(day) ? '<today>' : day;
+}
+
+/**
  * A moment as the key reads it: '<time>' when it falls in the run's own time span (when the run
  * happened, never what it did, wherever it shows); on something the run made (`made`), its day only
  * (a date it works out from today agrees all day, and a date it copies from elsewhere still
- * counts); on a record that was there before, as it is.
+ * counts), read through keyDay; on a record that was there before, as it is.
  */
 function keyMoment(s: string, rules: KeyRules, made: boolean): string {
   const ms = momentMs(s);
   if (Number.isFinite(ms) && ms >= rules.span.from - RUN_SPAN_SLACK_MS && ms <= rules.span.to + RUN_SPAN_SLACK_MS) return '<time>';
   if (!made) return s;
-  return Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : s.slice(0, 10);
+  return keyDay(Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : s.slice(0, 10), rules);
 }
 
 /**
@@ -2087,6 +2224,7 @@ function keyMoment(s: string, rules: KeyRules, made: boolean): string {
 function keyText(s: string, rules: KeyRules, made: boolean, ownText: boolean): string {
   const t = s.trim();
   if (MOMENT.test(t)) return keyMoment(t, rules, made);
+  if (made && DAY.test(t)) return keyDay(t, rules);
   let out = s.replace(UUID_IN_TEXT, (m) => rules.made.get(m.toLowerCase()) ?? m.toLowerCase());
   if (rules.prefixes.size) out = out.replace(HEX8_TOKEN, (m, lead: string, hex: string) => `${lead}${rules.prefixes.get(hex.toLowerCase()) ?? hex}`);
   if (ownText && rules.numbers.length) out = withoutOwnNumbers(out, rules.numbers);
@@ -2094,11 +2232,25 @@ function keyText(s: string, rules: KeyRules, made: boolean, ownText: boolean): s
 }
 
 /**
- * A value as the key reads it. Keys that hold an id of a record's own row ("id"), the time of a
- * change ("…At") or a secret are left out; texts go through keyText. `own`: the value is of a
- * record (or an entry) the run made, so the numbers it took are left out too (OWN_NUMBER_KEYS), its
- * free text loses them (OWN_TEXT_KEY), and its moments are read as their day. References to
- * records that already existed stay as they are.
+ * A whole value (text or number) under `key` that is a number or position the run took for itself
+ * in one of that key's columns (columnsOfKey): the same text taken in another column does not count.
+ */
+function takenValue(v: unknown, key: string, rules: KeyRules): boolean {
+  if (typeof v !== 'string' && typeof v !== 'number') return false;
+  const s = typeof v === 'number' ? (Number.isFinite(v) ? String(v) : '') : v.trim();
+  return s !== '' && columnsOfKey(key).some((c) => rules.taken.has(`${c}:${s}`));
+}
+
+/**
+ * A value as the key reads it. Keys that hold an id of a record's own row ("id") or a secret are
+ * left out; texts go through keyText. `own`: the value is of a record (or an entry) the run made,
+ * so what it assigned itself goes: the time of a change ("…At"), a number or position it took (a
+ * value of TAKEN_COLUMNS under a key of TAKEN_KEYS naming the column it was taken in, written
+ * "#own"), those numbers in its free text (OWN_TEXT_KEY), and its moments are read as their day.
+ * On a record that was there before, every time stays (an "…At" too), except the run's own clock
+ * (keyMoment), and so does every number, except one the run gave it in place of none (taken
+ * earlier, by takenOnExisting, and written "#own" by the key before this reads it); references to
+ * records that already existed stay as they are, everywhere.
  */
 function keyValue(v: unknown, rules: KeyRules, own = false, key = '', depth = 0): unknown {
   if (typeof v === 'string') return keyText(v, rules, own, own && OWN_TEXT_KEY.test(key));
@@ -2107,8 +2259,12 @@ function keyValue(v: unknown, rules: KeyRules, own = false, key = '', depth = 0)
   if (isObject(v)) {
     const out: Record<string, unknown> = {};
     for (const [k, item] of Object.entries(v)) {
-      if (k === 'id' || TIME_KEY.test(k) || isSecretKey(k) || SECRET_WORDS.test(k)) continue;
-      if (own && OWN_NUMBER_KEYS.has(k)) continue;
+      if (k === 'id' || isSecretKey(k) || SECRET_WORDS.test(k)) continue;
+      if (own && TIME_KEY.test(k)) continue;
+      if (own && TAKEN_KEYS.has(k) && takenValue(item, k, rules)) {
+        out[k] = '#own';
+        continue;
+      }
       out[k] = keyValue(item, rules, own, k, depth + 1);
     }
     return out;
@@ -2127,25 +2283,6 @@ function idsIn(v: unknown, into: Set<string>, depth = 0): void {
   }
 }
 
-/**
- * The numbers (as text) a record the run made holds under OWN_NUMBER_KEYS, at any depth. `entry`:
- * the record is a journal entry, whose reference is not a number it took (a bill's number, a
- * paycheck's id cut short, a reference the run copied): that one is read through the ledger part of
- * the key, and only what the run took elsewhere (the check's own number) goes from it there.
- */
-function ownNumbersIn(v: unknown, into: Set<string>, entry: boolean, depth = 0): void {
-  if (depth > 32) return;
-  if (Array.isArray(v)) {
-    for (const item of v) ownNumbersIn(item, into, entry, depth + 1);
-  } else if (isObject(v)) {
-    for (const [k, item] of Object.entries(v)) {
-      const taken = OWN_NUMBER_KEYS.has(k) && !(entry && k === 'reference');
-      if (taken && (typeof item === 'string' || typeof item === 'number')) addOwnNumber(item, into);
-      else ownNumbersIn(item, into, entry, depth + 1);
-    }
-  }
-}
-
 function addOwnNumber(v: unknown, into: Set<string>): void {
   const s = typeof v === 'number' ? (Number.isFinite(v) ? String(v) : '') : typeof v === 'string' ? v.trim() : '';
   if (s && s.length <= MAX_OWN_NUMBER && !UUID.test(s)) into.add(s);
@@ -2155,40 +2292,18 @@ function addOwnNumber(v: unknown, into: Set<string>): void {
 interface IdTable {
   name: string;
   createdAt: 'timestamp' | 'timestamptz' | null;
-  /** Its OWN_NUMBER_COLUMNS (journal_entries without its reference). */
-  numbers: readonly string[];
+  /** Its TAKEN_COLUMNS that the table really has. */
+  taken: ReadonlyArray<{ column: string; inText: boolean }>;
 }
-
-/**
- * Columns of a row the run makes that hold a number it takes for itself: OWN_NUMBER_KEYS as the
- * database names them. Read from the rows themselves (ownNumbersOfRows), as an audit row does not
- * always carry the number a document shows (an invoice's audit row has its legacy invoiceNumber, its
- * entry the document number "INV-0003"). A journal entry's own reference is not one (ownNumbersIn).
- */
-const OWN_NUMBER_COLUMNS = [
-  'number',
-  'doc_number',
-  'ref_number',
-  'entry_number',
-  'estimate_number',
-  'invoice_number',
-  'receipt_number',
-  'memo_number',
-  'order_number',
-  'po_number',
-  'transfer_number',
-  'payment_number',
-  'check_number',
-  'reference',
-] as const;
 
 /** The tables with a uuid `id` (the schema is the migrations', the same for every company file). */
 let idTableList: readonly IdTable[] | null = null;
 
 async function idTables(db: DB): Promise<readonly IdTable[]> {
   if (idTableList) return idTableList;
+  const names = [...new Set(Object.values(TAKEN_COLUMNS).flatMap((cols) => cols.map((c) => c.column)))];
   const own = sql.join(
-    OWN_NUMBER_COLUMNS.map((c) => sql`${c}`),
+    names.map((c) => sql`${c}`),
     sql`, `,
   );
   const res = (await db.execute(sql`
@@ -2203,34 +2318,218 @@ async function idTables(db: DB): Promise<readonly IdTable[]> {
      ORDER BY c.table_name`)) as unknown as { rows: Array<{ name: string; created_at: string | null; numbers: string | null }> };
   const list = res.rows
     .filter((r) => /^[a-z_][a-z0-9_]*$/.test(r.name))
-    .map((r): IdTable => ({
-      name: r.name,
-      createdAt: r.created_at === 'timestamp without time zone' ? 'timestamp' : r.created_at === 'timestamp with time zone' ? 'timestamptz' : null,
-      numbers: (r.numbers ?? '')
-        .split(',')
-        .filter((c) => (OWN_NUMBER_COLUMNS as readonly string[]).includes(c))
-        // An entry's reference is read through the ledger part of the key, never as a number it took.
-        .filter((c) => !(r.name === 'journal_entries' && c === 'reference')),
-    }));
+    .map((r): IdTable => {
+      const has = new Set((r.numbers ?? '').split(','));
+      return {
+        name: r.name,
+        createdAt: r.created_at === 'timestamp without time zone' ? 'timestamp' : r.created_at === 'timestamp with time zone' ? 'timestamptz' : null,
+        taken: (Object.hasOwn(TAKEN_COLUMNS, r.name) ? TAKEN_COLUMNS[r.name] : []).filter((c) => has.has(c.column)),
+      };
+    });
   if (list.length) idTableList = list;
   return list;
 }
 
+/** The numbers and positions the run took for itself: all of them, and those its text may repeat. */
+interface Taken {
+  /** By the column taken in: "<keyForm of the column>:<value>" (KeyRules.taken). */
+  all: Set<string>;
+  /** As text only (KeyRules.numbers). */
+  inText: Set<string>;
+}
+
 /**
- * The numbers the rows the run made hold in their OWN_NUMBER_COLUMNS, read inside its transaction.
- * Only rows of ids the run made (runIdsOf), so a number of a record that was there before is never
- * taken for one the run took.
+ * The numbers and positions the rows the run made hold in their TAKEN_COLUMNS, read inside its
+ * transaction. Only rows of ids the run made (runIdsOf), so a number of a record that was there
+ * before is never taken for one the run took. And never one the input gives, or that a record the
+ * run voided, deleted or changed held before it, under the same key (`heldBefore`, heldBeforeRun):
+ * a check written again with the number of the one it replaces copies that number, it does not
+ * take the next free one.
  */
-async function ownNumbersOfRows(ctx: ServiceContext, made: ReadonlyMap<string, ReadonlySet<string>>, into: Set<string>): Promise<void> {
+async function takenOfRows(ctx: ServiceContext, made: ReadonlyMap<string, ReadonlySet<string>>, heldBefore: ReadonlySet<string>, into: Taken): Promise<void> {
   const ids = [...made.keys()].filter((id) => UUID.test(id)).slice(0, MAX_LOOKED_UP_IDS);
   if (!ids.length) return;
-  const tables = (await idTables(ctx.db)).filter((t) => t.numbers.length);
+  const tables = (await idTables(ctx.db)).filter((t) => t.taken.length);
   if (!tables.length) return;
   // Every id passed the UUID pattern and every name the identifier pattern, so both are written in place.
   const list = `ARRAY[${ids.map((id) => `'${id}'`).join(',')}]::uuid[]`;
-  const parts = tables.flatMap((t) => t.numbers.map((c) => `SELECT "${c}"::text AS n FROM "${t.name}" WHERE id = ANY(${list}) AND "${c}" IS NOT NULL`));
-  const res = (await ctx.db.execute(sql.raw(parts.join(' UNION ALL ')))) as unknown as { rows: Array<{ n: string | null }> };
-  for (const r of res.rows) addOwnNumber(r.n, into);
+  const parts = tables.flatMap((t) =>
+    t.taken.map(
+      (c) => `SELECT '${c.column}' AS c, "${c.column}"::text AS n, ${c.inText ? 'true' : 'false'} AS in_text FROM "${t.name}" WHERE id = ANY(${list}) AND "${c.column}" IS NOT NULL`,
+    ),
+  );
+  const res = (await ctx.db.execute(sql.raw(parts.join(' UNION ALL ')))) as unknown as {
+    rows: Array<{ c: string; n: string | null; in_text: boolean }>;
+  };
+  for (const r of res.rows) {
+    const one = new Set<string>();
+    addOwnNumber(r.n, one);
+    for (const n of one) {
+      if (heldBefore.has(`${keyForm(r.c)}:${n}`)) continue;
+      into.all.add(`${keyForm(r.c)}:${n}`);
+      if (r.in_text) into.inText.add(n);
+    }
+  }
+}
+
+/** An audit row's value that stands for "no number yet": absent, null or blank. */
+function blankNumber(v: unknown): boolean {
+  return v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+}
+
+/**
+ * The next free number the run gave a record that was there before and had none: a check marked
+ * printed with no number given (lib/services/printQueue.ts markPrinted: allocateCheckNumber, then
+ * the number on the check and an audit 'update' from none to it). Two waiting requests that each
+ * print a check take "the next number", so it is the run's own on that record too.
+ *
+ * Only exactly that: a key of TAKEN_KEYS at the top of an audit row other than 'create' of a
+ * record the run did not make, whose old values hold that same key with no number (so the change
+ * shows: a key the audit row leaves out of its old values could have held the same number before),
+ * whose new value the record's row now holds in a column of TAKEN_COLUMNS that key may name
+ * (columnsOfKey, read in the run's transaction), and that neither the input nor a record the run
+ * changed held under any key (`heldBefore`: a number copied from either stays). A number changed
+ * from one to another stays too (a renumbering is asked for, never the next free one by itself),
+ * as does a number on a record of any other table.
+ *
+ * Adds what it finds to `into` (by its column, as takenOfRows does) and answers the audit keys to
+ * write "#own" on those records, as "<record id> <key>".
+ */
+async function takenOnExisting(
+  ctx: ServiceContext,
+  audit: readonly AuditRow[],
+  made: ReadonlyMap<string, ReadonlySet<string>>,
+  heldBefore: ReadonlySet<string>,
+  into: Taken,
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  // Whatever key held it: a number the input or an earlier record gives is copied, not taken.
+  const heldValues = new Set([...heldBefore].map((h) => h.slice(h.indexOf(':') + 1)));
+  const candidates: Array<{ id: string; key: string; value: string }> = [];
+  for (const r of audit) {
+    if (r.action === 'create') continue;
+    const id = r.entity_id.toLowerCase();
+    if (!UUID.test(id) || made.has(id) || !isObject(r.old_values) || !isObject(r.new_values)) continue;
+    for (const [k, v] of Object.entries(r.new_values)) {
+      if (!TAKEN_KEYS.has(k) || !Object.hasOwn(r.old_values, k) || !blankNumber(r.old_values[k])) continue;
+      const one = new Set<string>();
+      addOwnNumber(v, one);
+      for (const n of one) if (!heldValues.has(n)) candidates.push({ id, key: k, value: n });
+    }
+  }
+  if (!candidates.length) return out;
+  const ids = [...new Set(candidates.map((c) => c.id))].slice(0, MAX_LOOKED_UP_IDS);
+  const tables = (await idTables(ctx.db)).filter((t) => t.taken.length);
+  if (!tables.length) return out;
+  // Every id passed the UUID pattern and every name the identifier pattern, so both are written in place.
+  const list = `ARRAY[${ids.map((id) => `'${id}'`).join(',')}]::uuid[]`;
+  const parts = tables.flatMap((t) =>
+    t.taken.map(
+      (c) =>
+        `SELECT id::text AS id, '${c.column}' AS c, "${c.column}"::text AS n, ${c.inText ? 'true' : 'false'} AS in_text FROM "${t.name}" WHERE id = ANY(${list}) AND "${c.column}" IS NOT NULL`,
+    ),
+  );
+  const res = (await ctx.db.execute(sql.raw(parts.join(' UNION ALL ')))) as unknown as {
+    rows: Array<{ id: string; c: string; n: string | null; in_text: boolean }>;
+  };
+  const held = new Map<string, Array<{ column: string; inText: boolean }>>();
+  for (const r of res.rows) {
+    const n = typeof r.n === 'string' ? r.n.trim() : '';
+    if (!n) continue;
+    const at = `${r.id.toLowerCase()} ${n}`;
+    held.set(at, [...(held.get(at) ?? []), { column: keyForm(r.c), inText: r.in_text === true }]);
+  }
+  for (const c of candidates) {
+    const columns = columnsOfKey(c.key);
+    const found = (held.get(`${c.id} ${c.value}`) ?? []).filter((h) => columns.includes(h.column));
+    if (!found.length) continue;
+    for (const f of found) {
+      into.all.add(`${f.column}:${c.value}`);
+      if (f.inText) into.inText.add(c.value);
+    }
+    out.add(`${c.id} ${c.key}`);
+  }
+  return out;
+}
+
+/**
+ * An existing record's audit values with the numbers the run gave it in place of none
+ * (takenOnExisting) written "#own"; every other value as it is.
+ */
+function withTakenOnExisting(values: unknown, id: string, keys: ReadonlySet<string>): unknown {
+  if (!keys.size || !isObject(values)) return values;
+  let out: Record<string, unknown> | null = null;
+  for (const k of Object.keys(values)) {
+    if (!keys.has(`${id} ${k}`)) continue;
+    out ??= { ...values };
+    out[k] = '#own';
+  }
+  return out ?? values;
+}
+
+/**
+ * A General Journal entry's reference is its Entry No., the next one when the input gives none
+ * (lib/services/journal.ts nextManualJournalNumber, entries with sourceRef 'manual'): a number the
+ * run took, unless the input gives it or an entry the run changed held it (`heldBefore`).
+ */
+function takenOfManualEntries(ledger: readonly LedgerRow[], heldBefore: ReadonlySet<string>, into: Taken): void {
+  for (const l of ledger) {
+    if (l.source_ref !== 'manual' || !l.reference) continue;
+    const one = new Set<string>();
+    addOwnNumber(l.reference, one);
+    for (const n of one) {
+      if (heldBefore.has(`reference:${n}`)) continue;
+      into.all.add(`reference:${n}`);
+      into.inText.add(n);
+    }
+  }
+}
+
+/** A key or column name as heldBeforeRun compares them: "ref_number" and "refNumber" alike. */
+function keyForm(k: string): string {
+  return k.replace(/_/g, '').toLowerCase();
+}
+
+/** Every value under TAKEN_KEYS in `v`, at any depth, as "<keyForm>:<value>" ("refnumber:1043"). */
+function numbersUnderKeys(v: unknown, into: Set<string>, depth = 0): void {
+  if (depth > 32 || into.size > 5000) return;
+  if (Array.isArray(v)) {
+    for (const item of v) numbersUnderKeys(item, into, depth + 1);
+  } else if (isObject(v)) {
+    for (const [k, item] of Object.entries(v)) {
+      if (TAKEN_KEYS.has(k) && (typeof item === 'string' || typeof item === 'number')) {
+        const one = new Set<string>();
+        addOwnNumber(item, one);
+        for (const n of one) into.add(`${keyForm(k)}:${n}`);
+      } else {
+        numbersUnderKeys(item, into, depth + 1);
+      }
+    }
+  }
+}
+
+/**
+ * What a record that was there before held under TAKEN_KEYS, as the run's audit rows of it kept
+ * them (old values of a record it voided, deleted or changed), and what the input gives under them
+ * (`given`, givenNumbersOf): a number the run copies from either is not the next free one.
+ */
+function heldBeforeRun(audit: readonly AuditRow[], made: ReadonlyMap<string, ReadonlySet<string>>, given: ReadonlySet<string>): Set<string> {
+  const out = new Set<string>(given);
+  for (const r of audit) if (r.action !== 'create' && !made.has(r.entity_id.toLowerCase())) numbersUnderKeys(r.old_values, out);
+  return out;
+}
+
+/**
+ * The numbers the input gives under TAKEN_KEYS (a typed invoice number, check number, account
+ * number or rule position): the agent's, never the next free one, so they count where they show.
+ * By key and value, so a P.O. number the input gives is never taken for an invoice number the run
+ * took that happens to be the same.
+ */
+function givenNumbersOf(input: OperationInput): Set<string> {
+  const out = new Set<string>();
+  numbersUnderKeys(input.body, out);
+  numbersUnderKeys(input.query, out);
+  return out;
 }
 
 /**
@@ -2343,15 +2642,15 @@ async function runIdsOf(
 
 /**
  * The rules the key reads values through: the ids the run made, their 8-digit prefixes, the
- * numbers it took for itself (on the records it made, as their audit rows and their own rows hold
- * them: a journal entry's reference is not one, see ownNumbersIn), and its own time span.
+ * numbers and positions it took for itself (`taken`: TAKEN_COLUMNS of the rows it made, read by
+ * takenOfRows; a journal entry's reference is not one, but a General Journal entry's Entry No. is),
+ * its own time span and its today.
  */
 function keyRulesOf(
   made: ReadonlyMap<string, ReadonlySet<string>>,
-  audit: readonly AuditRow[],
-  ledger: readonly LedgerRow[],
-  rowNumbers: ReadonlySet<string>,
+  taken: Taken,
   span: KeyRules['span'],
+  days: { today: ReadonlySet<string>; givenDays: ReadonlySet<string> },
 ): KeyRules {
   const ids = new Map<string, string>();
   const prefixes = new Map<string, string>();
@@ -2360,18 +2659,66 @@ function keyRulesOf(
     ids.set(id, p);
     prefixes.set(id.slice(0, 8), p);
   }
-  const numbers = new Set<string>(rowNumbers);
-  for (const r of audit) {
-    if (!made.has(r.entity_id.toLowerCase())) continue;
-    const entry = r.entity_type === 'journal_entry';
-    ownNumbersIn(r.old_values, numbers, entry);
-    ownNumbersIn(r.new_values, numbers, entry);
+  return {
+    made: ids,
+    prefixes,
+    numbers: [...taken.inText].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0)),
+    taken: taken.all,
+    span,
+    today: days.today,
+    givenDays: days.givenDays,
+  };
+}
+
+/**
+ * The run's today, as a service may write a date it fills in: this computer's calendar day
+ * (lib/dates.ts todayISO, reportEngine localToday, inventory todayCalendarDay), the UTC day
+ * (`new Date().toISOString().slice(0, 10)`, recurring todayUtcMidnight) and the company's own
+ * (lib/preferences.ts todayInTimeZone), at the run's start and at its end (the app's own clock).
+ */
+function todayOf(times: readonly number[], timeZone: string | null): Set<string> {
+  const out = new Set<string>();
+  for (const t of times) {
+    if (!Number.isFinite(t)) continue;
+    const d = new Date(t);
+    out.add(localDateISO(d));
+    out.add(d.toISOString().slice(0, 10));
+    out.add(todayInTimeZone(timeZone, d));
   }
-  // A General Journal entry's reference is its Entry No., the next one when the input gives none
-  // (lib/services/journal.ts nextManualJournalNumber, entries with sourceRef 'manual'): a number it
-  // took. (One the input gave is the same on every run, so nothing is lost leaving it out.)
-  for (const l of ledger) if (l.source_ref === 'manual' && l.reference) addOwnNumber(l.reference, numbers);
-  return { made: ids, prefixes, numbers: [...numbers].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0)), span };
+  return out;
+}
+
+/**
+ * Every day the input gives (as a date, or as the day of a moment), at any depth. Not under a key
+ * of a record's version or time stamp ("updatedAt", "expectedUpdatedAt", "version", any "…At"): a
+ * version the agent sends back is not a date it gives the work, and taking today's for one would
+ * keep the date the run fills in as today in the key, so the request would go stale at midnight.
+ */
+function givenDaysOf(input: OperationInput): Set<string> {
+  const out = new Set<string>();
+  const walk = (v: unknown, depth: number) => {
+    if (depth > 32 || out.size > 1000) return;
+    if (typeof v === 'string') {
+      const t = v.trim();
+      if (DAY.test(t)) out.add(t);
+      else if (MOMENT.test(t)) {
+        out.add(t.slice(0, 10));
+        const ms = momentMs(t);
+        if (Number.isFinite(ms)) out.add(new Date(ms).toISOString().slice(0, 10));
+      }
+    } else if (Array.isArray(v)) {
+      for (const item of v) walk(item, depth + 1);
+    } else if (isObject(v)) {
+      for (const [k, item] of Object.entries(v)) {
+        if (TIME_KEY.test(k) || (VERSION_KEYS as readonly string[]).includes(k)) continue;
+        walk(item, depth + 1);
+      }
+    }
+  };
+  walk(input.params, 0);
+  walk(input.query, 0);
+  walk(input.body, 0);
+  return out;
 }
 
 /**
@@ -2438,10 +2785,14 @@ function stalenessKeyOf(parts: {
   effects: readonly EffectPreview[];
   touched: readonly TouchedEntry[];
   made: ReadonlyMap<string, ReadonlySet<string>>;
-  rowNumbers: ReadonlySet<string>;
+  taken: Taken;
+  /** The numbers the run gave records that were there before, in place of none (takenOnExisting). */
+  takenOnRecords: ReadonlySet<string>;
   span: KeyRules['span'];
+  today: ReadonlySet<string>;
+  givenDays: ReadonlySet<string>;
 }): string {
-  const rules = keyRulesOf(parts.made, parts.audit, parts.ledger, parts.rowNumbers, parts.span);
+  const rules = keyRulesOf(parts.made, parts.taken, parts.span, { today: parts.today, givenDays: parts.givenDays });
 
   // The ledger: every line of every entry made, by account, amount, memo and name, with its date
   // (its day), description, status, source and reference. Its entry number is the run's own (the
@@ -2479,19 +2830,21 @@ function stalenessKeyOf(parts: {
 
   // The records written: their values, and the version each record that already existed had
   // before the run (the earliest its audit rows show: a record changed twice shows its in-run
-  // version on the second row). A record the run made is written by its kinds, never its id.
+  // version on the second row). A record the run made is written by its kinds, never its id. On a
+  // record that already existed, a number the run gave it in place of none is its own.
   const records: string[] = [];
   const firstVersion = new Map<string, string>();
   for (const r of parts.audit) {
     const id = r.entity_id.toLowerCase();
     const own = rules.made.get(id);
+    const after = own === undefined ? withTakenOnExisting(r.new_values, id, parts.takenOnRecords) : r.new_values;
     records.push(
       stableJson({
         action: r.action,
         kind: r.entity_type,
         id: own ?? id,
         before: keyValue(r.old_values, rules, own !== undefined),
-        after: keyValue(r.new_values, rules, own !== undefined),
+        after: keyValue(after, rules, own !== undefined),
       }),
     );
     const v = own !== undefined ? null : versionIn(r.old_values);
@@ -2511,7 +2864,7 @@ function stalenessKeyOf(parts: {
 
   return sha256(
     stableJson({
-      key: 'bridge-staleness-v4',
+      key: 'bridge-staleness-v5',
       operation: parts.operation.id,
       status: parts.status,
       named: parts.named,
@@ -2537,11 +2890,28 @@ interface Before {
   inputIds: readonly string[];
   named: readonly string[];
   drafts: ReadonlySet<string> | null;
+  /** The app's clock as the run starts (its today, with the clock at its end: todayOf). */
+  startedAt: number;
+  /** The company's time zone (Preferences > Company), for its today. */
+  timeZone: string | null;
+  /** The days the input gives (givenDaysOf). */
+  givenDays: ReadonlySet<string>;
+  /** The numbers the input gives, by key (givenNumbersOf). */
+  givenNumbers: ReadonlySet<string>;
 }
 
-async function readBefore(ctx: ServiceContext, companyId: string, input: OperationInput): Promise<Before> {
+async function readBefore(ctx: ServiceContext, companyId: string, input: OperationInput, timeZone: string | null): Promise<Before> {
+  const startedAt = Date.now();
   const inputIds = namedIds(input);
-  return { inputIds, named: await versionsOf(ctx.db, companyId, inputIds), drafts: await draftsBefore(ctx.db, companyId) };
+  return {
+    inputIds,
+    named: await versionsOf(ctx.db, companyId, inputIds),
+    drafts: await draftsBefore(ctx.db, companyId),
+    startedAt,
+    timeZone,
+    givenDays: givenDaysOf(input),
+    givenNumbers: givenNumbersOf(input),
+  };
 }
 
 /**
@@ -2611,8 +2981,12 @@ async function collect(
   const touched = await touchedEntries(ctx, rows, new Set(lines.map((l) => l.entry_id.toLowerCase())), before.drafts);
   const made = await runIdsOf(ctx, { inputIds: before.inputIds, audit: rows, ledger: lines, effects, touched });
   const span = await runSpanOf(ctx);
-  const rowNumbers = new Set<string>();
-  await ownNumbersOfRows(ctx, made, rowNumbers);
+  const taken: Taken = { all: new Set(), inText: new Set() };
+  const held = heldBeforeRun(rows, made, before.givenNumbers);
+  await takenOfRows(ctx, made, held, taken);
+  const takenOnRecords = await takenOnExisting(ctx, rows, made, held, taken);
+  takenOfManualEntries(lines, held, taken);
+  const today = todayOf([before.startedAt, span.to], before.timeZone);
   // changesInTransaction gives the memos as stored: a reversal copies its entry's, account numbers and all.
   const madeShown = ledger.entries.slice(0, PREVIEW_ROW_LIMIT).map((e) => shownEntry(ctx, e));
   await nameMadeLines(ctx, madeShown);
@@ -2627,7 +3001,7 @@ async function collect(
     records.length > PREVIEW_ROW_LIMIT;
   return {
     ledger: ledgerTotals(lines, touched, editsExistingRecord(rows, made)),
-    stalenessKey: stalenessKeyOf({ operation, status, named, ledger: lines, audit: rows, effects, touched, made, rowNumbers, span }),
+    stalenessKey: stalenessKeyOf({ operation, status, named, ledger: lines, audit: rows, effects, touched, made, taken, takenOnRecords, span, today, givenDays: before.givenDays }),
     preview: {
       ledger: { entries: [...madeShown, ...touchedShown], changes: ledger.changes.slice(0, PREVIEW_ROW_LIMIT) } satisfies ChangePreview,
       records: records.slice(0, PREVIEW_ROW_LIMIT),
@@ -3146,7 +3520,7 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
       try {
         await db.transaction(async (txRaw) => {
           const ctx = handlerContext(txRaw as unknown as DB, parts, false);
-          const before = await readBefore(ctx, base.companyId, asked);
+          const before = await readBefore(ctx, base.companyId, asked, gates.timeZone);
           if (sentFlags.length) withheld = await withheldWarnings(txRaw as unknown as DB, d);
           if (d.expired) throw new TimedOut();
           const run = await collectRun('capture', ctx, false);
@@ -3244,7 +3618,7 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
       const kept = await db.transaction(async (txRaw) => {
         const ctx = handlerContext(txRaw as unknown as DB, parts, false);
         if (actor.approval?.grantId) await countGrantUse(ctx, actor.approval.grantId);
-        const before = await readBefore(ctx, base.companyId, asked);
+        const before = await readBefore(ctx, base.companyId, asked, gates.timeZone);
         const run = await collectRun('defer', ctx, false);
         try {
           if (d.expired) throw new TimedOut();

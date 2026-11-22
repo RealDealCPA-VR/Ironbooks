@@ -39,6 +39,13 @@
  */
 import type { ClassificationMap } from '../types';
 
+/**
+ * Said by every receipt answer that carries the receipt (`{ receipt }`) besides receipts.get, which
+ * words its own: the text read off the file is hidden by the door too, not only by the service.
+ */
+const RECEIPT_TEXT_HIDDEN =
+  'The answer carries the receipt, and with it rawText, the text read off the file (a W-9 or a bank statement dropped into the inbox shows its numbers there). The receipts service gives an agent no text (lib/services/receipts.ts receiptTextFor), and sensitiveFields names the field so the door hides it as well, in every answer that goes through it, should the service ever hand it over. An agent that needs one receipt\'s text asks receipts.get with reveal: true.';
+
 export const DOCUMENTS_CLASSES: ClassificationMap = {
   // attachments: the Doc Center (documents filed to records, and the inbox)
   'GET /api/attachments': { class: 'read', describe: 'List documents in the Doc Center' },
@@ -80,7 +87,8 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     body: 'multipart',
     effects: ['file', 'network'],
     dryRun: 'none',
-    why: 'The receipt itself only waits in the inbox (not in the books), but the route starts reading it in the background after the answer (app/api/receipts/_upload.ts readInBackground). With a vision model set, that sends the picture to the model, which may be on another computer on the network or tailnet, so the upload is classed by that send. The file is written to disk before the row, so a rolled-back preview cannot contain it. The background read also reuses the request\'s database handle after the answer.',
+    why: `The receipt itself only waits in the inbox (not in the books), but the route starts reading it in the background after the answer (app/api/receipts/_upload.ts readInBackground). With a vision model set, that sends the picture to the model, which may be on another computer on the network or tailnet, so the upload is classed by that send. The file is written to disk before the row, so a rolled-back preview cannot contain it. The background read also reuses the request's database handle after the answer. ${RECEIPT_TEXT_HIDDEN}`,
+    sensitiveFields: ['receipt.rawText'],
   },
   'GET /api/receipts/[id]': {
     class: 'prepare',
@@ -102,13 +110,16 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     describe: 'Read receipt {id} (offline OCR or the company\'s vision model)',
     effects: ['network'],
     dryRun: 'none',
-    why: 'Stores what was read in the inbox; nothing reaches the books. PDF text and offline OCR stay on this computer, but with a vision model set the receipt picture is sent to that model (lib/services/receipts.ts readWithVision), which may be on another computer on the network or tailnet; never a cloud AI. Classed by that send until the bridge can tell the two apart; a rolled-back preview would already send.',
+    why: `Stores what was read in the inbox; nothing reaches the books. PDF text and offline OCR stay on this computer, but with a vision model set the receipt picture is sent to that model (lib/services/receipts.ts readWithVision), which may be on another computer on the network or tailnet; never a cloud AI. Classed by that send until the bridge can tell the two apart; a rolled-back preview would already send. ${RECEIPT_TEXT_HIDDEN}`,
+    sensitiveFields: ['receipt.rawText'],
   },
   'POST /api/receipts/[id]/save': {
     class: 'enter',
     describe: 'Save receipt {id} as a transaction ({kind}) for {total}',
     confirmFlags: ['allowDuplicateNumber'],
     amountField: 'total',
+    why: RECEIPT_TEXT_HIDDEN,
+    sensitiveFields: ['receipt.rawText'],
   },
   'GET /api/receipts/settings': {
     class: 'outside',
@@ -320,7 +331,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     dryRun: 'none',
     why: 'With ai=1 it sends the payee name to the company\'s AI (and to its vendor lookup, when on). Without it, it still saves the learned model while suggesting, so it is never a pure read.',
   },
-  'GET /api/ai/proposals': { class: 'read', describe: 'List AI and agent proposals' },
+  'GET /api/ai/proposals': { class: 'read', describe: 'List the AI and agent proposals (an agent sees only its own)' },
   'POST /api/ai/proposals/[id]': {
     class: 'change',
     describe: 'Approve or reject proposal {id}',

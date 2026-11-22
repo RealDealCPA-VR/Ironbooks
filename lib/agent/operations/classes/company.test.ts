@@ -92,6 +92,15 @@ describe('classification: company', () => {
     expect(bad).toEqual([]);
   });
 
+  it("opening an Accountant's Copy is a restore: file Admin, approved at the host only, and the new file starts with no agent access", () => {
+    // The same restore as a portable company file (classes/admin.ts portable.restore), so the same needs.
+    const open = op('accountant-copy.open');
+    expect(open).toMatchObject({ method: 'POST', class: 'file', fileAdmin: true, hostOnly: true, dryRun: 'preview', effects: ['file'] });
+    expect(open).toMatchObject({ fileAdmin: op('portable.restore').fileAdmin, hostOnly: op('portable.restore').hostOnly });
+    expect(open.why).toMatch(/starts with no agent access/);
+    expect(open.why).toMatch(/restorePortableCompanyFile/);
+  });
+
   it('says void first when a batch names no action', () => {
     const line = (body: Record<string, unknown>) => describeRequest(op('accountant.batch-void.apply'), { body: { keys: ['invoice:x'], ...body } });
     expect(line({})).toBe('Batch void the selected transactions, or delete them with action delete');

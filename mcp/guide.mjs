@@ -128,6 +128,25 @@ export const NAMED_ENTRY_TOOLS = [
   'add_class',
 ];
 
+/**
+ * The named entry tools that go through the generic door (mcp/entry-tools.mjs ENTRY_TOOLS; a test
+ * holds the two lists together). Without a reason, the door puts none of their requests to a
+ * person (lib/agent/operate.ts NO_REASON_NOTE), while the curated tools still ask and the card says
+ * no reason was given (lib/agent/actions.ts NO_REASON_GIVEN). Named here, not imported:
+ * entry-tools.mjs loads operations-tools.mjs, which loads this file.
+ */
+export const DOOR_ENTRY_TOOLS = [
+  'enter_estimate',
+  'convert_estimate',
+  'enter_purchase_order',
+  'receive_items',
+  'enter_credit_memo',
+  'enter_vendor_credit',
+  'enter_time',
+  'adjust_inventory',
+  'pay_sales_tax',
+];
+
 /** The named tools that correct something already entered. */
 export const NAMED_FIX_TOOLS = ['edit_transaction', 'void_transaction', 'edit_list_entry', 'deactivate_list_entry'];
 
@@ -195,8 +214,8 @@ Ironbooks is a desktop accounting system: a double-entry ledger for one company.
   - Entering: ${NAMED_ENTRY_TOOLS.join(', ')}.
   - Correcting: ${NAMED_FIX_TOOLS.join(', ')}. A mistake is voided or corrected; the named tools never delete.
   - Banking: get_bank_feed, import_statement_lines, categorize_bank_line, the reconciliation tools.
-  - Reports: ${NAMED_REPORT_TOOLS.join(', ')} and the other report_ tools. list_reports lists every standard report (about 100) with its key; run_report runs one by its key, with a period or dates, cash or accrual, columns and filters; report_drilldown lists the transactions behind one amount; export_report makes a report a PDF or an Excel file (get_file reads it; save_file saves it, with a person's approval).
-- Every named tool that changes the books takes dry_run, request_id and a reason, like run_operation. Give the reason whenever a person may have to approve the change: the approval card shows it as your words, and without one it says that no reason was given.
+  - Reports: ${NAMED_REPORT_TOOLS.join(', ')} and the other report_ tools. list_reports lists every standard report (about 100) with its key; run_report runs one by its key, with a period or dates, cash or accrual, columns and filters; report_drilldown lists the transactions behind one amount; export_report makes a report a PDF or an Excel file (get_file reads it; save_file saves it, with a person's approval). When your settings say a person must approve reading reports, these three take a request_id and a reason too and ask the person themselves; a read that runs at once does not use them.
+- Every named tool that changes the books takes dry_run, request_id and a reason, like run_operation. Give the reason whenever a person may have to approve the change: the approval card shows it as your words. Without one, a request from ${DOOR_ENTRY_TOOLS.join(', ')} (these go through the generic door, like run_operation and the report tools) is not put to a person at all: Ironbooks refuses it and says to send it again with a reason. The other named tools still ask, and the card then says that you did not say why.
 - For everything else, use the generic door. Every operation a person can do in Ironbooks has an operation id, for example "estimates.create" or "invoices.email":
   1. find_operations: search by words, area or class. Each result says whether you may run it now, must ask, or cannot (and why).
   2. describe_operation: the exact fields (JSON Schema) of the path parameters, the query and the body, what it returns, whether it can be dry run, the warnings it may raise, how your policy treats it, and worked examples where Ironbooks has them. The body uses the app's own field names (camelCase), exactly as describe_operation shows them.

@@ -254,7 +254,7 @@ beforeAll(async () => {
   bookkeeper = (await createAgent(admin, { name: 'Bookkeeper agent', roleKeys: ['bookkeeper'], preset: 'read_only' })).token;
   reportsOnly = (await createAgent(admin, { name: 'Reports agent', roleKeys: ['reports_only'], preset: 'read_only' })).token;
   payroll = (await createAgent(admin, { name: 'Payroll agent', roleKeys: ['payroll_processor'], preset: 'read_only' })).token;
-  // "Full, with asks": everyday entry and changes, and bulk work (statement lines) within its cap,
+  // "Full, with asks": everyday entry and changes, and laying out statement lines (prepare work),
   // run on its own; removals (undoing or cancelling a reconciliation) still ask a person.
   poster = (await createAgent(admin, { name: 'Posting agent', roleKeys: ['full_access'], preset: 'full_with_asks' })).token;
   proposer = (await createAgent(admin, { name: 'Proposing agent', roleKeys: ['bookkeeper'], preset: 'ask_every_change' })).token;
@@ -582,8 +582,8 @@ describe('the tools that change the books, against the real services', () => {
       request_id: 'mcp-je-1-edit',
       changes: { date: '2026-04-02', description: 'Supplies run (corrected)', lines: read.lines.map((l: Out) => ({ account_id: l.account_id, debit: l.debit ?? undefined, credit: l.credit ?? undefined, memo: l.memo })) },
     });
-    // Only the description changed: whether that counts as posting is the door's to say. The
-    // measure is run_operation's answer to the very same edit of a twin entry.
+    // Only the description changed: the entry keeps its lines, so nothing is posted. The tool
+    // answers as run_operation answers the very same edit of a twin entry.
     const twin = await ok(poster, 'enter_journal_entry', { ...je('64.20', 'Supplies run (twin)'), request_id: 'mcp-je-twin' });
     const twinRead = await ok(poster, 'get_transaction', { type: 'journal_entry', id: twin.result.id });
     const generic = await clientFor(poster).act({
@@ -594,13 +594,15 @@ describe('the tools that change the books, against the real services', () => {
       expectedUpdatedAt: twinRead.updated_at,
       requestId: 'mcp-je-twin-edit',
     });
-    expect(['posted', 'done'], JSON.stringify(generic).slice(0, 300)).toContain(generic.outcome);
-    expect(edited.outcome).toBe(generic.outcome);
-    expect((await ok(poster, 'get_transaction', { type: 'journal_entry', id: edited.result.id })).description).toBe('Supplies run (corrected)');
+    expect(generic.outcome, JSON.stringify(generic).slice(0, 300)).toBe('done');
+    expect(edited.outcome, JSON.stringify(edited).slice(0, 300)).toBe('done');
+    const reread = await ok(poster, 'get_transaction', { type: 'journal_entry', id: edited.result.id });
+    expect(reread.description).toBe('Supplies run (corrected)');
     const stale = await run(poster, 'edit_transaction', { type: 'journal_entry', id: edited.result.id, expected_updated_at: '2020-01-01T00:00:00.000Z', request_id: 'mcp-je-1-stale', changes: je('64.20', 'Stale') });
     expect(stale.ok).toBe(false);
     expect(stale.text).toMatch(/was changed by/);
-    const voided = await ok(poster, 'void_transaction', { type: 'journal_entry', id: edited.result.id, request_id: 'mcp-je-1-void' });
+    // Voided with the version read after the edit (the stale edit above changed nothing).
+    const voided = await ok(poster, 'void_transaction', { type: 'journal_entry', id: edited.result.id, expected_updated_at: reread.updated_at, request_id: 'mcp-je-1-void' });
     expect(voided.result.status).toBe('void');
   });
 
@@ -648,15 +650,20 @@ describe('the tools that change the books, against the real services', () => {
     const transfer = await ok(poster, 'transfer_funds', { date: '2026-04-09', from_account_id: rich.acct['1000'], to_account_id: rich.acct['1010'], amount: '250.00', memo: 'To savings', request_id: 'mcp-xfer-1' });
     expect(transfer.result).toMatchObject({ type: 'transfer', amount: '250.00' });
 
-    // Edit a list entry by the tool's own field names, then make it inactive.
-    const renamed = await ok(poster, 'edit_list_entry', { type: 'customer', id: customer.id, changes: { name: 'Tool Made Customer LLC', phone: '555-0100' }, request_id: 'mcp-cust-1-edit' });
+    // Edit a list entry by the tool's own field names, with the version read, then make it inactive.
+    const readCustomer = await ok(poster, 'get_transaction', { type: 'customer', id: customer.id });
+    expect(readCustomer.updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    const renamed = await ok(poster, 'edit_list_entry', { type: 'customer', id: customer.id, expected_updated_at: readCustomer.updated_at, changes: { name: 'Tool Made Customer LLC', phone: '555-0100' }, request_id: 'mcp-cust-1-edit' });
     expect(renamed.result.name).toBe('Tool Made Customer LLC');
     // What the registry says of each (lib/agent/operations/classes/lists.ts): nothing in the app
     // makes a class active again, so PATCH /api/classes/[id] is class 'remove', which always asks a
     // person; an item can be made active again, so DELETE /api/items/[id] is a 'change', which
-    // "Full, with asks" makes itself. The approved run answers the same request id.
-    for (const [type, id, expected] of [['class', cls.id, 'asked'], ['item', item.id, 'done']]) {
-      const args = { type, id, request_id: `mcp-${type}-1-off` };
+    // "Full, with asks" makes itself. The approved run answers the same request id. An item's
+    // version is its edited_at; a class has none to send.
+    const itemVersion = (await ok(poster, 'get_transaction', { type: 'item', id: item.id })).edited_at;
+    expect(itemVersion).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    for (const [type, id, expected, version] of [['class', cls.id, 'asked', null], ['item', item.id, 'done', itemVersion]] as Array<[string, string, string, string | null]>) {
+      const args = { type, id, ...(version ? { expected_updated_at: version } : {}), request_id: `mcp-${type}-1-off` };
       let off = await ok(poster, 'deactivate_list_entry', args);
       expect(off.outcome, `${type}: ${JSON.stringify(off)}`).toBe(expected);
       if (expected === 'asked') {
@@ -880,8 +887,8 @@ describe('a bank statement, start to finish', () => {
     const ledgerBefore = (await fingerprint()).journal;
     const statement = { bank_account_id: bank, statement_kind: 'bank', opening_balance: '0.00', closing_balance: '-18.00', lines: [{ date: '2026-06-03', description: 'MONTHLY FEE', amount: '-18.00' }] };
 
-    // Statement lines: the tool does what the registry says of a rows import for this preset (a
-    // person is asked while it counts as bulk work; done at once if it is prepare work). What
+    // Statement lines: the tool does what the registry says of a rows import for this preset (done
+    // at once while it is prepare work; a person is asked if it is ever classed as more). What
     // run_operation says of the very same request is the measure, not a class written down here.
     const importWould = await doorWould(proposer, 'POST', '/api/import', {
       body: { bankAccountId: bank, fileType: 'rows', rows: statement.lines, statement: { kind: 'bank', openingBalance: '0.00', closingBalance: '-18.00' }, filename: 'statement lines from an agent' },
@@ -895,7 +902,7 @@ describe('a bank statement, start to finish', () => {
     } else {
       expect(imported.result).toMatchObject({ added_to_feed: 1 });
     }
-    // An agent allowed bulk work lays them out itself (or finds them laid out already); nothing is posted.
+    // An agent allowed to lay them out does so itself (or finds them laid out already); nothing is posted.
     expect(await ok(poster, 'import_statement_lines', { ...statement, request_id: 'prop-import-by-poster' })).toMatchObject({
       outcome: 'done',
       result: importWould === 'asked' ? { added_to_feed: 1 } : { added_to_feed: 0, already_there: 1 },

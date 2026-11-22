@@ -90,6 +90,28 @@ describe('classification: admin', () => {
     expect(op('company-file.info')).toMatchObject({ method: 'GET', class: 'file', availability: 'agent', dryRun: 'none' });
     // Every other GET of a person's own account ('self') is not offered either.
     for (const o of ops()) if (o.method === 'GET' && o.rule === 'self') expect(o.availability, o.id).not.toBe('agent');
+    // The screen a person looks it up in is named as the menu has it (lib/nav.ts: Setup > Security (2FA)).
+    expect(op('file-protection.status').why).toMatch(/Setup > Security \(2FA\)/);
+    expect(op('file-protection.status').why).not.toMatch(/Company > Security/);
+  });
+
+  it("the company file's name: the why does not claim the class keeps a public answer from the agent", () => {
+    const info = op('company-file.info');
+    // The route is 'public' (the sign-in screen reads it before anyone signs in) and never asks for a
+    // context, so the way-in check of an agent's own request never runs for it.
+    expect(info.rule).toBe('public');
+    expect(info.why).toMatch(/route is public/);
+    expect(info.why).toMatch(/with or without an agent's token/);
+    expect(info.why).toMatch(/without the folder/);
+  });
+
+  it('the practice-copy refusals say why in plain words and cite no plan section', () => {
+    const refused = ops().filter((o) => o.route.startsWith('/api/sandbox') && o.availability === 'hard_floor');
+    expect(refused.length).toBe(4);
+    for (const o of refused) {
+      expect(o.why, o.id).toMatch(/never work in a practice copy/);
+      expect(o.why, o.id).not.toMatch(/\(plan [0-9.]+\)/);
+    }
   });
 
   it('every restore is class file, needs the file Admin and is approved at the host only; a whole-file restore says it ends every agent', () => {
@@ -121,10 +143,11 @@ describe('classification: admin', () => {
 
   it("a role change names the role, and says no agent may change or delete a role any agent holds", () => {
     const line = describeRequest(op('roles.update'), { params: { id: 'r-1' }, body: { permissions: {} } }, { key: 'r-1', name: 'Month-end helper' });
-    expect(line).toBe('Change what role r-1 allows (called Month-end helper after the change)');
+    // No name in the body: nothing is renamed, so the line has no 'called … after the change' aside.
+    expect(line).toBe('Change what role r-1 allows');
     // As the door words it: {id} by the role's name now (summaryNames), the answer's name after.
     expect(describeRequest(op('roles.update'), { params: { id: 'r-1' }, body: { permissions: {} } }, { key: 'r-1', name: 'Clerk' }, { 'r-1': 'Clerk' })).toBe(
-      'Change what role Clerk allows (called Clerk after the change)',
+      'Change what role Clerk allows',
     );
     expect(describeRequest(op('roles.update'), { params: { id: 'r-1' }, body: { name: 'Clerk helper' } }, { key: 'r-1', name: 'Clerk helper' }, { 'r-1': 'Clerk' })).toBe(
       'Change what role Clerk allows (called Clerk helper after the change)',

@@ -828,6 +828,38 @@ describe('describeRequest: naming a record a person knows by name', () => {
     expect(describeRequest(update(), { params: { id: ROLE } }, undefined, { [ROLE]: '  ' })).toBe(`Change what role ${ROLE} allows`);
   });
 
+  // WAVE4 notes (classes-a, optional for this file): the new name shows only on a rename.
+  it("says what the role is called after the change only when the request renames it", () => {
+    const real = () => registryOp('PATCH /api/roles/[id]');
+    expect(real().describe).toMatch(/\(called \{name\} after the change\)/);
+    const saved = { id: ROLE, key: 'custom', name: 'Clerk' };
+    // Only its permissions change: the answer still holds its name, which is no rename.
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { permissions: {} } }, saved, { [ROLE]: 'Clerk' })).toBe('Change what role Clerk allows');
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { permissions: {} } }, saved)).toBe('Change what role Clerk allows');
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { permissions: {} } }, undefined, { [ROLE]: 'Clerk' })).toBe('Change what role Clerk allows');
+    // The name it has now, sent again (as the Users & Roles window does), or only blank.
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { name: 'Clerk', permissions: {} } }, saved, { [ROLE]: 'Clerk' })).toBe('Change what role Clerk allows');
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { name: ' Clerk ', permissions: {} } }, undefined, { [ROLE]: 'Clerk' })).toBe('Change what role Clerk allows');
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { name: '  ' } }, undefined, { [ROLE]: 'Clerk' })).toBe('Change what role Clerk allows');
+    // A rename shows the new name: from the body before the dry run, and as saved after it.
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { name: 'Senior clerk' } }, undefined, { [ROLE]: 'Clerk' })).toBe(
+      'Change what role Clerk allows (called Senior clerk after the change)',
+    );
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { name: 'Senior clerk ' } }, { ...saved, name: 'Senior clerk' }, { [ROLE]: 'Clerk' })).toBe(
+      'Change what role Clerk allows (called Senior clerk after the change)',
+    );
+    // Without the door's names the line cannot tell, so a name in the body shows.
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { name: 'Clerk' } })).toBe(`Change what role ${ROLE} allows (called Clerk after the change)`);
+    // A name that differs only by a mark nobody can see is still a rename: the aside says one happens.
+    const ZWSP = String.fromCharCode(0x200b);
+    expect(describeRequest(real(), { params: { id: ROLE }, body: { name: `Cl${ZWSP}erk` } }, undefined, { [ROLE]: 'Clerk' })).toBe(
+      'Change what role Clerk allows (called Clerk after the change)',
+    );
+    // A name only in the query is not read by the route, and the names are never read off the prototype.
+    expect(describeRequest(real(), { params: { id: ROLE }, query: { name: 'Admin' }, body: {} }, saved, { [ROLE]: 'Clerk' })).toBe('Change what role Clerk allows');
+    expect(describeRequest(real(), { params: { id: 'constructor' }, body: { name: 'Clerk' } }, undefined, {})).toBe('Change what role constructor allows (called Clerk after the change)');
+  });
+
   it('names ids anywhere on the line, and ids in a list', () => {
     const o = op({ route: '/api/invoices/batch-email', params: [], describe: 'Email invoices {ids} to their customers' });
     expect(describeRequest(o, { body: { ids: ['i1', 'i2'] } }, undefined, { i1: '1042', i2: '1043' })).toBe('Email invoices 1042, 1043 to their customers');
@@ -889,6 +921,25 @@ describe('describeRequest: the next dates of a memorized transaction (plan §8, 
     expect(describeRequest(change(), { params: { id: 't1' }, body: { isActive: false, frequency: 'monthly', nextRunDate: '2026-12-01' } })).toBe(
       'Change memorized transaction t1',
     );
+  });
+
+  // The reviewer's probe (wave 4, guards): before the dry run, only what the route reads.
+  it('before its dry run, a field the route does not read from the body changes nothing on the line', () => {
+    const next = /\(next dates: 2026-12-01, 2027-01-01, 2027-02-01\)$/;
+    // The AI's memorize takes only docType, sourceDocId, frequency, nextRunDate, name and autoEnter
+    // (memorizeSuggestionSchema): the template it saves repeats with no limit, active, and enters or
+    // reminds on each date.
+    const memo = { docType: 'bill', sourceDocId: 'b1', frequency: 'monthly', nextRunDate: '2026-12-01', name: 'Paper' };
+    expect(describeRequest(ai(), { body: memo })).toMatch(next);
+    for (const over of [{ remaining: 1 }, { remaining: 0 }, { mode: 'never' }, { isActive: false }, { autoEnter: false }, { autoEnter: true }]) {
+      expect(describeRequest(ai(), { body: { ...memo, ...over } }), JSON.stringify(over)).toMatch(next);
+    }
+    // POST /api/recurring reads mode and remaining (above), but not isActive: createTemplate saves it active.
+    expect(describeRequest(create(), { body: body({ isActive: false }) })).toMatch(next);
+    // After the dry run, the template the route saved says it all, whatever the body held.
+    const row = { id: 't1', name: 'Paper', frequency: 'monthly', nextRunDate: '2026-12-01T00:00:00.000Z', anchorDay: 1, remaining: 2, mode: 'automatic', isActive: true };
+    expect(describeRequest(ai(), { body: memo }, { template: row })).toMatch(/\(its last 2 dates: 2026-12-01, 2027-01-01\)$/);
+    expect(describeRequest(create(), { body: body({ remaining: 12 }) }, { ...row, isActive: false })).not.toMatch(/dates/);
   });
 
   it('works the dates out by the rules of lib/services/recurring.ts, for every frequency', () => {

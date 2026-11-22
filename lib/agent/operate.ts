@@ -27,8 +27,9 @@
  *  8. What the policy says to ask about becomes a permission request: the agent's reason (its own
  *     words, required), a summary built from the operation (never from the agent's text) and the
  *     preview. Nothing more happens until a person approves it in their own window; that run is
- *     `runApproved`, which tries it again with the approver's rights first and puts it back to the
- *     person (a "the books changed" answer) when it would do more than they were shown.
+ *     `runApproved`, which tries it again with the approver's rights first (closed-period work with
+ *     the closing-date password they typed, so it too is judged on its real figures) and puts it
+ *     back to the person (a "the books changed" answer) when it would do more than they were shown.
  *
  * Who a run is for:
  *  - What an agent runs on its own (Allow) runs with its role's access, masked: no full SSNs or
@@ -64,12 +65,12 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
-import { and, eq, inArray, isNull } from 'drizzle-orm';
+import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '@/lib/db';
 import { AGENT_PAUSED_MESSAGE } from '@/lib/agentContext';
 import { AGENTS_BLOCKED_MESSAGE, agentsBlockedFor } from '@/lib/services/agents';
-import { agentPermissionRequests, agentRequests, agents, companies, companyRoles, userCompanies } from '@/lib/db/schema';
+import { agentPermissionRequests, agentRequests, agents, companies, companyRoles, userCompanies, userSessions, users } from '@/lib/db/schema';
 import { ACTIVITIES, VIEW_BALANCE, activitiesOf, supportedActions, type ActivityDef } from '@/lib/permissions/activities';
 import {
   ACTIONS,
@@ -100,9 +101,9 @@ import { runOperation } from '@/lib/agent/bridge';
 import { guardInput } from '@/lib/agent/guards';
 import { factsOf } from '@/lib/agent/facts';
 import { describeRequest, type DescribeNames } from '@/lib/agent/describe';
-import { allowedFolder, readStagedFile, stagedFileInfo, uploadChunk } from '@/lib/agent/files';
+import { allowedFolder, overlapsAppData, readStagedFile, stagedFileInfo, uploadChunk } from '@/lib/agent/files';
 import { AGENT_OUTBOX_NAME, defaultAgentFolders, runShellOperation } from '@/lib/agent/shell';
-import { findOperations, operationById } from '@/lib/agent/operations/registry';
+import { findOperations, operationById, operationForRoute } from '@/lib/agent/operations/registry';
 import { describeSchemas, examplesOf, type OperationExample } from '@/lib/agent/operations/schemas';
 import { SHELL_OPERATIONS } from '@/lib/agent/operations/shell';
 import { SHORT_GRANT_MINUTES, approvalNeeds, baseClass, decide, flagsNeeded, isPaused, needsTwoPerson, roleProblem } from '@/lib/agent/policy';
@@ -173,9 +174,13 @@ const UNTRIED_ACCESS =
 /** For the approval card (a person reads it) when a request is put back because its figures could not be checked. */
 const UNCHECKED_FOR_PERSON =
   'Ironbooks could not try this ahead of time, so its real amount is not known until it runs. Because of the two-person limit set for this agent, two different people must approve it.';
-/** For the approval card, when the try at approval found the work dated on or before the closing date, which the request did not show. */
+/**
+ * For the approval card, when the try at approval found the work dated on or before the closing
+ * date, which the request did not show. The next approval's try takes the closing-date password the
+ * person types (runApproved, dryRunSecrets), so it is judged on its real figures before it runs.
+ */
 const CLOSED_FOR_PERSON =
-  'Ironbooks found that this is dated on or before the closing date, which the request did not show when it was asked. Work in a closed period cannot be tried ahead of time, so its real amount is not known until it runs. If it is still right, approve it again; you will need the closing-date password.';
+  'Ironbooks found that this is dated on or before the closing date, which the request did not show when it was asked. If it is still right, approve it again and type the closing-date password. Ironbooks then tries it first on its real figures: if they are more than this request showed, you see them before anything is done.';
 /** For the approval card, when the real figures could only be seen in a try with the protected values shown. */
 const REVEALED_MORE_FOR_PERSON =
   'Ironbooks tried this with the full protected values, and it would do more than the request showed: the amount and the number of records here are what it would really do. Its preview is not shown, because it holds those protected values. If it is still right, approve it again.';
@@ -352,8 +357,16 @@ interface Door {
   now: string;
   /** The people who gave grants, each looked up once per request (giverWithin). */
   givers: Map<string, Promise<Awaited<ReturnType<typeof resolveAccess>> | null>>;
-  /** The names the one-line summary shows for the records the request names by id (summaryNames). */
-  names?: DescribeNames;
+  /**
+   * The names the one-line summary shows for the records the request names by id (summaryNames):
+   * in what the agent alone reads, and on the request a person is shown (NamesShown).
+   */
+  names?: { agent?: DescribeNames; person?: DescribeNames };
+  /**
+   * The folders the Admin added that this agent may use now (usableFolders), worked out once per
+   * door, when a run or a check first needs them: never for a read.
+   */
+  folders?: Promise<string[]>;
 }
 
 function requireAgent(ctx: ServiceContext): AgentOfContext {
@@ -455,45 +468,190 @@ async function rolesAgentsHold(db: ServiceContext['db'], companyId: string): Pro
  * a role ANY agent holds (the asking agent's own included), otherwise null. Agents' access is read
  * live from their roles (lib/services/agents.ts agentAccess), so such a change would change that
  * agent, which no agent may do. Asked of the database each time: a role can become held between an
- * ask and its approval.
+ * ask and its approval. `shown` says whose names the note may give its reader (NamesShown): the
+ * agent's note at the door names only what the agent may read itself, a person's at approval all.
  */
-async function roleHeldRefusal(db: ServiceContext['db'], companyId: string, operation: Operation, input: OperationInput): Promise<string | null> {
+async function roleHeldRefusal(
+  db: ServiceContext['db'],
+  companyId: string,
+  operation: Operation,
+  input: OperationInput,
+  shown: NamesShown,
+): Promise<string | null> {
   if (!changesRole(operation)) return null;
   const named = input?.params?.id;
   const key = roleKeyOf(named);
   // Nothing named: the route has no role to change (the bridge refuses a missing path value).
   if (key === null) return null;
   if (!(await rolesAgentsHold(db, companyId)).has(key)) return null;
-  // The role's name, as the card's summary shows it. A role spelled other than its stored id (the
-  // database reads a uuid in other spellings) has no name here, so the id the agent sent is shown.
-  const names = await summaryNames(db, companyId, operation, input);
+  // The role's name, as a summary shows it to the same reader. A role spelled other than its stored
+  // id (the database reads a uuid in other spellings) has no name here, so the id sent is shown.
+  const names = await summaryNames(db, companyId, operation, input, shown);
   return roleHeldNote(named, typeof named === 'string' ? names?.[named.trim()] : null);
+}
+
+/** Whether `userId` is a person of this company: a member (active or not), or its owner. */
+async function personOfCompany(db: ServiceContext['db'], companyId: string, userId: string): Promise<boolean> {
+  const [member] = await db
+    .select({ userId: userCompanies.userId })
+    .from(userCompanies)
+    .where(and(eq(userCompanies.companyId, companyId), eq(userCompanies.userId, userId)));
+  if (member) return true;
+  const [company] = await db.select({ ownerId: companies.ownerId }).from(companies).where(eq(companies.id, companyId));
+  return company?.ownerId === userId;
+}
+
+/** The name of a person of this company, by their user id; null for anyone else. */
+async function personName(db: ServiceContext['db'], companyId: string, userId: string): Promise<string | null> {
+  if (!UUID_RE.test(userId) || !(await personOfCompany(db, companyId, userId))) return null;
+  const [row] = await db.select({ name: users.name }).from(users).where(eq(users.id, userId));
+  return typeof row?.name === 'string' && row.name.trim() ? row.name : null;
+}
+
+/**
+ * Whose names a one-line summary, or the hard-floor note, may give its reader (summaryNames).
+ *  - A line a person is shown (personLine) names every record it can: whoever approves must know
+ *    what they approve. The agent reads that same line once it has asked, as the request a person
+ *    is shown, with its reason, in the approval center.
+ *  - What only the agent reads, with nothing asked or kept (a dry run, a refusal, a warning, the
+ *    answer of a run: agentLine), names this company's own roles, people, agents and sign-ins only
+ *    where the agent could read them itself without asking. Otherwise a dry run would turn an id it
+ *    holds into a name with nobody asked: Users & Roles reads are class 'admin', asked each time.
+ * Built-in roles are always named (their names are the product's own, the same in every company
+ * file), and so are the roles the agent itself holds (get_my_permissions shows it their names).
+ */
+interface NamesShown {
+  roles: boolean;
+  people: boolean;
+  agents: boolean;
+  /** Whose sign-in a session is: only an Admin sees whose sessions are whose (GET /api/sessions). */
+  sessions: boolean;
+  /** The agent the line is about: the roles it holds are named whatever `roles` says. */
+  agentId: string | null;
+}
+
+/** Every name, for a line a person is shown; whose sign-in a session is only when `sessions` (the agent reads the line too). */
+function personLine(agentId: string | null, sessions: boolean): NamesShown {
+  return { roles: true, people: true, agents: true, sessions, agentId };
+}
+
+/**
+ * The names the agent may read itself without asking: those of a list (the roles, the users, the
+ * agents, the sign-ins) whose read its policy runs on its own, judged as describe_operation judges
+ * it (typicalFacts), standing permission aside. The users and the roles are class 'admin', which is
+ * never Allow, and the agents are never an agent's to read, so for those the agent reads back the
+ * id it sent. Who is signed in is a plain read, whose names only an Admin role sees.
+ */
+function agentLine(door: Door): NamesShown {
+  const readsAlone = (route: string): boolean => {
+    try {
+      const read = operationForRoute('GET', route);
+      if (!read || read.availability !== 'agent') return false;
+      return decideFor({ ...door, grants: [] }, read, typicalFacts(read)).outcome === 'run';
+    } catch {
+      return false;
+    }
+  };
+  return {
+    roles: readsAlone('/api/roles'),
+    people: readsAlone('/api/users'),
+    agents: readsAlone('/api/agents'),
+    sessions: door.ceiling.access.isAdmin === true && readsAlone('/api/sessions'),
+    agentId: door.agent.id,
+  };
+}
+
+/** Whether this agent of the company holds the role `roleId` (compared as roleKeyOf spells keys). */
+async function agentHoldsRole(db: ServiceContext['db'], companyId: string, agentId: string | null, roleId: string): Promise<boolean> {
+  if (!agentId || !UUID_RE.test(agentId)) return false;
+  const want = roleKeyOf(roleId);
+  const [row] = await db
+    .select({ roleKeys: agents.roleKeys })
+    .from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)));
+  const keys = Array.isArray(row?.roleKeys) ? (row.roleKeys as unknown[]) : [];
+  return want !== null && keys.some((k) => roleKeyOf(k) === want);
 }
 
 /**
  * The names a person knows the records of a request by, for its one-line summary
- * (lib/agent/describe.ts DescribeNames): a role's name for the role id of /api/roles/[id], so the
- * card reads "Delete role Clerk", not a uuid. Read from this company's own roles; nothing when the
- * id names no role here.
+ * (lib/agent/describe.ts DescribeNames), by the id the request names in its path, as far as
+ * `shown` lets its reader see them (NamesShown):
+ *  - a role's name for /api/roles/[id], so the card reads "Delete role Clerk", not a uuid;
+ *  - a person's name for /api/users/[id] and what lies under it ("Set a new password for user Pat
+ *    Lee"), only for a person of this company;
+ *  - an agent's name for /api/agents/[id] and what lies under it (no agent reaches those: the
+ *    hard floor; named all the same, should a line ever be built for one);
+ *  - whose sign-in it is for /api/sessions/[id] ("Sign out session of Pat Lee").
+ * Read from this company's own records; nothing when the id names none of them.
  */
-async function summaryNames(db: ServiceContext['db'], companyId: string, operation: Operation, input: OperationInput): Promise<DescribeNames | undefined> {
-  if (operation.kind !== 'route' || !operation.route.startsWith('/api/roles/[id]')) return undefined;
+async function summaryNames(
+  db: ServiceContext['db'],
+  companyId: string,
+  operation: Operation,
+  input: OperationInput,
+  shown: NamesShown,
+): Promise<DescribeNames | undefined> {
+  if (operation.kind !== 'route') return undefined;
   const raw = input?.params?.id;
   if (typeof raw !== 'string' || !raw.trim()) return undefined;
   const id = raw.trim();
-  const builtin = builtinRole(id);
-  if (builtin?.name) return { [id]: builtin.name };
+  const route = operation.route;
+  const named = (name: string | null | undefined): DescribeNames | undefined => (typeof name === 'string' && name.trim() ? { [id]: name } : undefined);
+
+  if (route.startsWith('/api/roles/[id]')) {
+    const builtin = builtinRole(id);
+    if (builtin?.name) return named(builtin.name);
+    if (!UUID_RE.test(id)) return undefined;
+    if (!shown.roles && !(await agentHoldsRole(db, companyId, shown.agentId, id))) return undefined;
+    const [row] = await db
+      .select({ name: companyRoles.name })
+      .from(companyRoles)
+      .where(and(eq(companyRoles.id, id), eq(companyRoles.companyId, companyId)));
+    return named(row?.name);
+  }
   if (!UUID_RE.test(id)) return undefined;
-  const [row] = await db
-    .select({ name: companyRoles.name })
-    .from(companyRoles)
-    .where(and(eq(companyRoles.id, id), eq(companyRoles.companyId, companyId)));
-  return row?.name ? { [id]: row.name } : undefined;
+  if (route.startsWith('/api/users/[id]')) return shown.people ? named(await personName(db, companyId, id)) : undefined;
+  if (route.startsWith('/api/agents/[id]')) {
+    if (!shown.agents) return undefined;
+    const [row] = await db.select({ name: agents.name }).from(agents).where(and(eq(agents.id, id), eq(agents.companyId, companyId)));
+    return named(row?.name);
+  }
+  if (route === '/api/sessions/[id]' && shown.sessions) {
+    const [row] = await db.select({ userId: userSessions.userId }).from(userSessions).where(eq(userSessions.id, id));
+    const whose = typeof row?.userId === 'string' ? await personName(db, companyId, row.userId) : null;
+    return whose ? named(`of ${whose}`) : undefined;
+  }
+  return undefined;
 }
 
-/** The request's one line, with the names the door read for it (summaryNames). */
-function summaryOf(door: Door, operation: Operation, input: OperationInput, answer?: unknown): string {
-  if (door.names) return describeRequest(operation, input, answer, door.names);
+/**
+ * The names the one-line summary of an agent's request shows a person (summaryNames, personLine),
+ * for whoever rebuilds that line later (lib/services/agentRequests.ts, when the books changed under
+ * an approval or the request is settled, and the words of a reveal), so it keeps naming the records
+ * the way the door named them on the request. `ctx` is the person's or the agent's own; the agent's
+ * role decides whether a session is named, as at the door (the agent reads the line too).
+ */
+export async function requestNames(ctx: ServiceContext, agentId: string, operation: Operation, input: OperationInput): Promise<DescribeNames | undefined> {
+  try {
+    let sessionsShown = false;
+    if (operation.kind === 'route' && operation.route === '/api/sessions/[id]' && UUID_RE.test(agentId)) {
+      sessionsShown = (await agentCeiling(ctx, agentId)).access.isAdmin === true;
+    }
+    return await summaryNames(ctx.db, ctx.companyId, operation, input ?? {}, personLine(agentId, sessionsShown));
+  } catch {
+    // Only words: the line shows the ids instead.
+    return undefined;
+  }
+}
+
+/**
+ * The request's one line, with the names the door read for it (summaryNames): for the agent alone
+ * (the default) only those it may read itself, for the request a person is shown every one.
+ */
+function summaryOf(door: Door, operation: Operation, input: OperationInput, answer?: unknown, reader: 'agent' | 'person' = 'agent'): string {
+  const names = reader === 'person' ? door.names?.person : door.names?.agent;
+  if (names) return describeRequest(operation, input, answer, names);
   return answer === undefined ? describeRequest(operation, input) : describeRequest(operation, input, answer);
 }
 
@@ -528,7 +686,7 @@ async function shellPathRefusal(door: Door, operation: Operation, input: Operati
   const fields = shellPathFields(operation);
   if (!fields.length) return null;
   const b = bodyFields(input.body);
-  const folders = saveFolders(door);
+  const folders = await saveFolders(door);
   for (const { field, required } of fields) {
     const v = b[field];
     if ((v === undefined || v === null) && !required) continue;
@@ -573,7 +731,8 @@ async function firstLook(ctx: ServiceContext, agent: AgentOfContext, operation: 
   const facts = factsOf(operation, input, { closingDate: door.closingDate });
   let decision = decideFor(door, operation, facts);
   if (!(decision.outcome === 'refuse' && (decision.code === 'paused' || decision.code === 'hard_floor'))) {
-    const held = await roleHeldRefusal(ctx.db, ctx.companyId, operation, input);
+    // The note goes to the agent alone: it names the role only as the agent may read it (agentLine).
+    const held = await roleHeldRefusal(ctx.db, ctx.companyId, operation, input, agentLine(door));
     if (held) decision = { outcome: 'refuse', code: 'hard_floor', message: held, effectiveClass: decision.effectiveClass };
   }
   if (decision.outcome !== 'refuse') {
@@ -582,11 +741,19 @@ async function firstLook(ctx: ServiceContext, agent: AgentOfContext, operation: 
     // Admin did not allow.
     if (outside) decision = { outcome: 'refuse', code: 'never', message: outside, effectiveClass: decision.effectiveClass };
   }
+  if (decision.outcome !== 'refuse') {
+    // A staged file a desktop or server action names, of a reveal whose time is up: never put to a person.
+    const ended = await revealFileRefusal(ctx, agent.id, operation, input);
+    if (ended) decision = { outcome: 'refuse', code: 'never', message: ended, effectiveClass: decision.effectiveClass };
+  }
   return { input, stripped: guarded.stripped, door, facts, decision };
 }
 
-/** Who an agent's own run is for (contract §4). Never a person, never a secret, never a reveal. */
-function ownActor(door: Door, grantId: string | null): BridgeActor {
+/**
+ * Who an agent's own run is for (contract §4). Never a person, never a secret, never a reveal.
+ * `folders` are the folders it may save in (doorFolders); a read saves nothing and gets none.
+ */
+function ownActor(door: Door, grantId: string | null, folders: readonly string[]): BridgeActor {
   return {
     agent: { id: door.agent.id, name: door.agent.name, preset: door.policy.preset, onBehalfOf: door.agent.onBehalfOf ?? null },
     access: ownRunAccess(door.ceiling.access),
@@ -595,7 +762,7 @@ function ownActor(door: Door, grantId: string | null): BridgeActor {
     approval: { approvedBy: null, requestId: null, grantId },
     reveal: false,
     secrets: {},
-    folders: [...(door.policy.folders ?? [])],
+    folders: [...folders],
     atHost: false,
   };
 }
@@ -622,26 +789,43 @@ async function giverWithin(ctx: ServiceContext, door: Door, operation: Operation
   return { access: both, role: lowerRole(legacyRoleFor(giver.access, giver.isOwner === true), door.ceiling.role) };
 }
 
+/** What a grant lends a run under it: the giver's access within the agent's role, masked (grantLent). */
+interface GrantLent {
+  grantId: string;
+  access: EffectiveAccess;
+  role: Role;
+}
+
 /**
- * Who a run under a grant is for: the agent, with the giver's access within its role, masked like
- * any run without a person at the screen (no reveal, no secrets, nobody signed in), recorded under
- * the grant. Null when the grant cannot stand (giverWithin).
+ * What a run under a grant gets: the giver's access within the agent's role, masked like any run
+ * without a person at the screen, recorded under the grant (runActor). Null when the grant cannot
+ * stand (giverWithin).
  */
-async function grantActor(ctx: ServiceContext, door: Door, operation: Operation, facts: RequestFacts, grantId: string): Promise<BridgeActor | null> {
+async function grantLent(ctx: ServiceContext, door: Door, operation: Operation, facts: RequestFacts, grantId: string): Promise<GrantLent | null> {
   const grant = door.grants.find((g) => g.id === grantId);
   if (!grant) return null;
   const within = await giverWithin(ctx, door, operation, facts, grant);
   if (!within) return null;
-  return { ...ownActor(door, grantId), access: ownRunAccess(within.access), role: within.role };
+  return { grantId, access: ownRunAccess(within.access), role: within.role };
+}
+
+/**
+ * Who a run the door settled on is for: the agent's own (ownActor), or, under a grant, the agent
+ * with what the grant lends it (no reveal, no secrets, nobody signed in either way).
+ */
+async function runActor(door: Door, lent: GrantLent | null): Promise<BridgeActor> {
+  const own = ownActor(door, lent?.grantId ?? null, await doorFolders(door));
+  return lent ? { ...own, access: lent.access, role: lent.role } : own;
 }
 
 /** At most this many grants are tried for one request before it is simply asked. */
 const GRANT_TRIES = 10;
 
 /**
- * The decision with the grant it names checked against its giver (grantActor). A grant that cannot
+ * The decision with the grant it names checked against its giver (grantLent). A grant that cannot
  * stand is set aside and the policy decides again without it, so another grant may answer, or the
- * request is asked. Returns the decision followed and the actor of the run when it is 'run'.
+ * request is asked. Returns the decision followed and, when it is 'run' under a grant, what that
+ * grant lends the run (runActor builds its actor).
  */
 async function settleGrant(
   ctx: ServiceContext,
@@ -649,17 +833,17 @@ async function settleGrant(
   operation: Operation,
   facts: RequestFacts,
   first: PolicyDecision,
-): Promise<{ decision: PolicyDecision; actor: BridgeActor }> {
+): Promise<{ decision: PolicyDecision; lent: GrantLent | null }> {
   let decision = first;
   let grants = door.grants;
   for (let i = 0; decision.outcome === 'run' && decision.grantId; i++) {
     const grantId: string = decision.grantId;
-    const actor = i < GRANT_TRIES ? await grantActor(ctx, { ...door, grants }, operation, facts, grantId) : null;
-    if (actor) return { decision, actor };
+    const lent = i < GRANT_TRIES ? await grantLent(ctx, { ...door, grants }, operation, facts, grantId) : null;
+    if (lent) return { decision, lent };
     grants = i < GRANT_TRIES ? grants.filter((g) => g.id !== grantId) : [];
     decision = decideFor({ ...door, grants }, operation, facts);
   }
-  return { decision, actor: ownActor(door, null) };
+  return { decision, lent: null };
 }
 
 function emptyFacts(input: OperationInput = {}): RequestFacts {
@@ -1107,8 +1291,15 @@ const MAYBE_PART_DONE =
 /** A first try older than this that never recorded its end is not "still running" any more. */
 const CLAIM_STALE_MS = 5 * 60 * 1000;
 
+/**
+ * The request id a change needs. Its absence is told apart from every other validation error by
+ * details.fields.requestId (as lib/agent/actions.ts says it), so a connector can tell "ask with a
+ * request id" from a body the route refused without matching the words.
+ */
 function requireRequestId(requestId: unknown): string {
-  if (typeof requestId !== 'string' || !REQUEST_ID_RE.test(requestId.trim())) throw validation(REQUEST_ID_MESSAGE);
+  if (typeof requestId !== 'string' || !REQUEST_ID_RE.test(requestId.trim())) {
+    throw validation(REQUEST_ID_MESSAGE, { fields: { requestId: 'give a request_id of your own, unique to this change' } });
+  }
   return requestId.trim();
 }
 
@@ -1540,14 +1731,145 @@ function text(v: unknown): string {
  * saveStagedFile): the company file's folder, Documents\Ironbooks and its Agent Outbox, and the
  * folders the Admin added for this agent.
  */
-function saveFolders(door: Door): { all: string[]; added: string[] } {
-  const added = [...(door.policy.folders ?? [])];
+async function saveFolders(door: Door): Promise<{ all: string[]; added: string[] }> {
+  const added = await doorFolders(door);
   return { all: [...defaultAgentFolders(), ...added], added };
+}
+
+/** usableFolders for this door, worked out once, when first needed (Door.folders). */
+function doorFolders(door: Door): Promise<string[]> {
+  door.folders ??= usableFolders(door.policy);
+  return door.folders;
+}
+
+/**
+ * The folders the Admin added for this agent (AgentPolicy.folders) that it may still use. Saving
+ * the list refused any folder holding Ironbooks' own data (lib/services/agentPolicies.ts), but a
+ * folder can come to hold it later (the books or their backups moved into it): judged again here,
+ * each time one is used, by the same rule (lib/agent/files.ts overlapsAppData), and left out when it
+ * does, or when it cannot be judged. Every run the door hands on (the bridge, the desktop shell)
+ * gets only these.
+ *
+ * overlapsAppData looks at the disk while the server waits (it must judge the folder as the disk
+ * has it), so each folder's disk is first asked without holding anyone up (folderAnswers). One that
+ * does not answer in time (a mapped network drive that is offline, say) is left out for now: judged
+ * then, it would hold up every person using Ironbooks until the network gave up.
+ */
+async function usableFolders(policy: Pick<AgentPolicy, 'folders'>): Promise<string[]> {
+  const out: string[] = [];
+  for (const f of policy.folders ?? []) {
+    if (typeof f !== 'string') continue;
+    // A share or device path is judged by its words alone (overlapsAppData never looks at one, so
+    // that Windows offers nobody's sign-in to another computer): it is not looked at here either.
+    if (!SHARE_OR_DEVICE_RE.test(f.trim()) && !(await folderAnswers(f))) continue;
+    try {
+      if (!overlapsAppData(f)) out.push(f);
+    } catch {
+      // Cannot be judged: left out.
+    }
+  }
+  return out;
+}
+
+/** A path that names a share (\\server\share) or a device (\\?\, \\.\) rather than a drive's folder. */
+const SHARE_OR_DEVICE_RE = /^[\\/]{2}/;
+/** How long the door waits for a folder's disk to answer before it leaves the folder out for now. */
+const FOLDER_ANSWER_MS = 2_000;
+/** A look at a folder's disk still under way: one at a time per folder, so a disk that does not answer ties up one of Node's file threads, never all of them. */
+const folderLooks = new Map<string, Promise<void>>();
+
+/**
+ * Whether the disk that holds `folder` answers within FOLDER_ANSWER_MS: whatever it says (there,
+ * not there, no access), it answered, and looking at it again while the server waits is then quick.
+ * The look runs on Node's file threads, so the wait holds up no one else.
+ */
+async function folderAnswers(folder: string): Promise<boolean> {
+  let look = folderLooks.get(folder);
+  if (!look) {
+    const started = fsp.lstat(folder).then(
+      () => undefined,
+      () => undefined,
+    );
+    look = started;
+    folderLooks.set(folder, started);
+    void started.then(() => {
+      if (folderLooks.get(folder) === started) folderLooks.delete(folder);
+    });
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), FOLDER_ANSWER_MS);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([look.then(() => true as const), late]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function folderNotAllowed(added: readonly string[]): string {
   const theirs = added.length ? `, or a folder the Admin added for this agent (${added.join('; ')})` : ', or a folder an Admin adds for this agent in Users & Roles > Agents';
   return `That folder is not one this agent may save to, or it does not exist. Use the company file's folder, Documents\\Ironbooks\\${AGENT_OUTBOX_NAME}${theirs}.`;
+}
+
+const REVEAL_FILE_ENDED =
+  'That file held protected values a person let this agent see for a while, and that time is over, so it can no longer be fetched or saved. If it is still needed, ask for it again with reveal: true and a reason.';
+
+/**
+ * The staged file is the answer of an approved reveal whose time is up (D6). The requests service
+ * removes such a file then (lib/services/agentRequests.ts letGoRevealFile); until it has (Ironbooks
+ * stopped in between, or the removal failed and waits for the next try), the door hands it over no
+ * more, nor saves it anywhere. A reveal whose end cannot be read counts as over (fail closed).
+ */
+async function revealFileEnded(ctx: ServiceContext, agentId: string, fileId: string): Promise<boolean> {
+  if (!fileId || !UUID_RE.test(agentId)) return false;
+  const rows = await ctx.db
+    .select({ result: agentPermissionRequests.result })
+    .from(agentPermissionRequests)
+    .where(
+      and(
+        eq(agentPermissionRequests.companyId, ctx.companyId),
+        eq(agentPermissionRequests.agentId, agentId),
+        eq(agentPermissionRequests.status, 'executed'),
+        or(
+          sql`(${agentPermissionRequests.result} ->> 'revealFileLeft') = ${fileId}`,
+          sql`(${agentPermissionRequests.result} -> 'file' ->> 'fileId') = ${fileId}`,
+        ),
+      ),
+    );
+  const now = Date.now();
+  return rows.some(({ result }) => {
+    if (!plainObject(result)) return false;
+    if (result.revealFileLeft === fileId) return true;
+    if (!Object.hasOwn(result, 'revealUntil')) return false;
+    const ends = typeof result.revealUntil === 'string' ? Date.parse(result.revealUntil) : NaN;
+    return !(Number.isFinite(ends) && now < ends);
+  });
+}
+
+/** The staged files a desktop or server action names: the values of its 'fileId' fields (lib/agent/operations/shell.ts). */
+function shellFileIds(operation: Pick<Operation, 'id' | 'kind'>, input: OperationInput): string[] {
+  if (operation.kind !== 'shell') return [];
+  const def = SHELL_OPERATIONS.find((d) => d.id === operation.id);
+  if (!def) return [];
+  const b = bodyFields(input.body);
+  return Object.entries(def.input)
+    .filter(([, f]) => f.type === 'fileId')
+    .map(([field]) => text(b[field]))
+    .filter((id) => id !== '');
+}
+
+/**
+ * REVEAL_FILE_ENDED when a desktop or server action (a save, a print) names a staged file whose
+ * reveal is over (revealFileEnded): looked at before a person is asked, and again when a person
+ * approves, since the time may run out in between. Null otherwise.
+ */
+async function revealFileRefusal(ctx: ServiceContext, agentId: string, operation: Pick<Operation, 'id' | 'kind'>, input: OperationInput): Promise<string | null> {
+  for (const fileId of shellFileIds(operation, input)) {
+    if (await revealFileEnded(ctx, agentId, fileId)) return REVEAL_FILE_ENDED;
+  }
+  return null;
 }
 
 function alreadyThere(name: string): string {
@@ -1561,9 +1883,10 @@ function alreadyThere(name: string): string {
  */
 async function savePreview(ctx: ServiceContext, door: Door, input: OperationInput): Promise<{ preview: OperationPreview } | { refused: string }> {
   const b = bodyFields(input.body);
+  if (await revealFileEnded(ctx, door.agent.id, text(b.fileId))) return { refused: REVEAL_FILE_ENDED };
   const staged = await readStagedFile({ companyId: ctx.companyId, agentId: door.agent.id }, text(b.fileId));
   if (!staged) throw new ServiceError('NOT_FOUND', FILE_GONE);
-  const folders = saveFolders(door);
+  const folders = await saveFolders(door);
   const dir = await allowedFolder(folders.all, text(b.folder));
   if (!dir) return { refused: folderNotAllowed(folders.added) };
   const name = text(b.name) || staged.file.name;
@@ -1645,10 +1968,16 @@ async function operateOnce(ctx: ServiceContext, agent: AgentOfContext, raw: RunO
   if (decision.outcome === 'refuse') return withStripped(refused(operation.id, decision.message), look.stripped);
   // Null only when the guards refused it, which is a refusal.
   const door = look.door as Door;
-  door.names = await summaryNames(ctx.db, ctx.companyId, operation, input);
+  const reads = decision.outcome === 'run' && decision.effectiveClass === 'read';
+  // What the agent alone reads names only what it may read itself; a request put to a person (only
+  // a real change is) names every record it can (NamesShown).
+  door.names = {
+    agent: await summaryNames(ctx.db, ctx.companyId, operation, input, agentLine(door)),
+    person: reads || req.dryRun === true ? undefined : await summaryNames(ctx.db, ctx.companyId, operation, input, personLine(agent.id, door.ceiling.access.isAdmin === true)),
+  };
 
   let answer: AgentOperationAnswer;
-  if (decision.outcome === 'run' && decision.effectiveClass === 'read') {
+  if (reads) {
     answer = await readNow(ctx, door, operation, input);
   } else if (req.dryRun === true) {
     answer = await tryOnly(ctx, door, operation, input, facts, decision);
@@ -1659,7 +1988,8 @@ async function operateOnce(ctx: ServiceContext, agent: AgentOfContext, raw: RunO
 }
 
 async function readNow(ctx: ServiceContext, door: Door, operation: Operation, input: OperationInput): Promise<AgentOperationAnswer> {
-  const r = await runOperation(ctx, operation, input, 'read', ownActor(door, null));
+  // A read saves nothing: no folders, and no look at their disks.
+  const r = await runOperation(ctx, operation, input, 'read', ownActor(door, null, []));
   if (r.outcome === 'needs_confirmation') return needsConfirmationAnswer(operation, r, summaryOf(door, operation, input, r.result));
   if (r.outcome === 'error') throw appError(r);
   return { operation: operation.id, outcome: 'read', result: r.result, ...(r.file ? { file: r.file } : {}) };
@@ -1700,7 +2030,7 @@ async function tryOnly(
       note: `${preview ? NOTHING_KEPT : NOT_TRIED} ${await wouldMeet(ctx, door, operation, unchecked(facts))}`,
     };
   }
-  const dry = await runOperation(ctx, operation, input, 'dry_run', ownActor(door, null));
+  const dry = await runOperation(ctx, operation, input, 'dry_run', ownActor(door, null, await doorFolders(door)));
   if (dry.outcome === 'needs_confirmation') return needsConfirmationAnswer(operation, dry, summary);
   if (dry.outcome === 'error') {
     if (closingDateFailure(dry)) {
@@ -1808,7 +2138,7 @@ async function change(
   let tried = false;
 
   if (dryRunFirst(operation, firstDecision)) {
-    const dry = await runOperation(ctx, operation, input, 'dry_run', ownActor(door, null));
+    const dry = await runOperation(ctx, operation, input, 'dry_run', ownActor(door, null, await doorFolders(door)));
     if (dry.outcome === 'needs_confirmation') return needsConfirmationAnswer(operation, dry, summaryOf(door, operation, input));
     if (dry.outcome === 'error') {
       if (closingDateFailure(dry)) {
@@ -1845,7 +2175,7 @@ async function change(
   // needsTwoPerson). When nothing showed the real figures, on the worst of them: the amount counts
   // as unknown, so the two-person rule and a grant's amount never rest on the body's own figures.
   const judged = known ? facts : unchecked(facts);
-  const { decision, actor } = await settleGrant(ctx, door, operation, judged, decideFor(door, operation, judged));
+  const { decision, lent } = await settleGrant(ctx, door, operation, judged, decideFor(door, operation, judged));
 
   const summary = summaryOf(door, operation, input, answerSoFar);
   if (decision.outcome === 'refuse') return refused(operation.id, decision.message, { summary });
@@ -1855,14 +2185,15 @@ async function change(
     if (!reason) return refused(operation.id, NO_REASON_NOTE, { summary, ...(preview ? { preview } : {}) });
     // The warnings the agent's confirmation flags silenced, for the card (plan §5.6): the same
     // question the person would have answered in the window, with the agent's yes beside it.
-    if (preview && tried) preview = withWarnings(preview, await silencedWarnings(ctx, operation, input, ownActor(door, null)));
+    if (preview && tried) preview = withWarnings(preview, await silencedWarnings(ctx, operation, input, ownActor(door, null, await doorFolders(door))));
     return askPerson(ctx, door, {
       kind: 'operation',
       requestKey,
       operation,
       input,
       reason,
-      summary,
+      // The line a person is shown: every record by the name they know it by (NamesShown).
+      summary: summaryOf(door, operation, input, answerSoFar, 'person'),
       effectiveClass: decision.effectiveClass,
       needs: decision.needs,
       // The figures the person is shown are the ones the policy judged on: what the dry run
@@ -1878,7 +2209,7 @@ async function change(
       note: untried,
     });
   }
-  return commit(ctx, door, operation, input, actor, requestKey, hash);
+  return commit(ctx, door, operation, input, await runActor(door, lent), requestKey, hash);
 }
 
 async function commit(
@@ -2114,7 +2445,9 @@ function exceedsShown(real: RequestFacts, shown: RequestFacts | null): boolean {
 
 /**
  * A route that can be tried with the approver's rights before it runs: rolled back or previewed
- * by the route itself, and needing nothing typed on the card (a dry run never gets those).
+ * by the route itself, and needing nothing typed on the card as part of the request itself. (A dry
+ * run gets none of those; the closing-date password it may get, dryRunSecrets, is the period's,
+ * not the request's.)
  */
 function canTryAhead(operation: Operation): boolean {
   return operation.kind === 'route' && operation.dryRun !== 'none' && (operation.needsSecret ?? []).length === 0;
@@ -2130,14 +2463,36 @@ function revealGetsThrough(access: EffectiveAccess, operation: Operation, input:
 }
 
 /**
+ * Of what the approver typed on the card, the one secret an approval-time dry run takes: the
+ * closing-date password (lib/agent/bridge.ts takes it on a rolled-back run too, and checks it
+ * through the closing-date password's own limiter). It is sent as a header, never in the body, so
+ * it is in no preview or answer. Every other secret is the commit's alone.
+ */
+function dryRunSecrets(secrets: BridgeActor['secrets'] | null | undefined): BridgeActor['secrets'] {
+  const typed = secrets?.closing_password;
+  return typeof typed === 'string' && typed !== '' ? { closing_password: typed } : {};
+}
+
+/**
+ * The approval-time dry run stopped at the closing-date password itself: it is not the right one
+ * (lib/agent/bridge.ts CLOSING_PASSWORD_WRONG_MESSAGE), or there were too many wrong ones. Only
+ * when one was typed: without one, the bridge never looks.
+ */
+function closingPasswordStopped(r: BridgeResult, sent: BridgeActor['secrets']): boolean {
+  if (!sent.closing_password || r.outcome !== 'error' || !plainObject(r.error?.details)) return false;
+  const d = r.error.details;
+  return d.closingPassword === 'wrong' || d.rateLimited === true;
+}
+
+/**
  * The real figures of a request the masked dry run could not try: tried again WITH the approved
- * reveal, as the approver, still without the typed secrets, and rolled back. Only its figures are
- * kept (amount, count, date): its answer and preview hold the protected values in full, so they go
- * nowhere. Null when that try did not go all the way either.
+ * reveal, as the approver, with no typed secret but the closing-date password (dryRunSecrets), and
+ * rolled back. Only its figures are kept (amount, count, date): its answer and preview hold the
+ * protected values in full, so they go nowhere. Null when that try did not go all the way either.
  */
 async function figuresWithReveal(approver: ServiceContext, operation: Operation, input: OperationInput, actor: BridgeActor, shown: RequestFacts): Promise<RequestFacts | null> {
   try {
-    const seen = await runOperation(approver, operation, input, 'dry_run', { ...actor, secrets: {} });
+    const seen = await runOperation(approver, operation, input, 'dry_run', { ...actor, secrets: dryRunSecrets(actor.secrets) });
     return figuresKnown(seen) ? dryRunFacts(operation, seen, shown) : null;
   } catch {
     // Seen nothing: the request is judged as before, with its amount unknown.
@@ -2164,7 +2519,8 @@ export const runApproved: RunApproved = async (approver, request, approve, opts)
     throw new ServiceError('FORBIDDEN', "Agents can never do this, even with a person's approval. A person can do it in Ironbooks.");
   }
   // The role may have become one an agent holds since the agent asked: looked at again now.
-  const held = await roleHeldRefusal(approver.db, approver.companyId, operation, request.input ?? {});
+  // A person reads this note: the role by its name.
+  const held = await roleHeldRefusal(approver.db, approver.companyId, operation, request.input ?? {}, personLine(request.agentId, true));
   if (held) throw new ServiceError('FORBIDDEN', `Nothing was done. ${held}`);
   if (operation.hostOnly && !opts.atHost) {
     throw new ServiceError('FORBIDDEN', 'This can only be approved at the computer that holds the company file.');
@@ -2194,7 +2550,7 @@ export const runApproved: RunApproved = async (approver, request, approve, opts)
     approval: { approvedBy: approver.userId, requestId: request.id, grantId: null },
     reveal: stored.reveal === true,
     secrets: { ...(approve?.secrets ?? {}) },
-    folders: [...(policy.folders ?? [])],
+    folders: await usableFolders(policy),
     atHost: opts.atHost === true,
   };
 
@@ -2222,20 +2578,29 @@ export const runApproved: RunApproved = async (approver, request, approve, opts)
   // preview, the approval service stores its key in place of the old one and decides who was
   // shown it, so their next yes matches it; if the books changed yet again, they see that too. A
   // yes only ever covers a preview the person saw. The dry run's preview may be stored on the
-  // request, where the agent reads it, so it runs without the reveal and without the typed
-  // secrets: only the real run needs them (figuresWithReveal is the one try that holds the reveal,
-  // and only its figures are kept).
+  // request, where the agent reads it, so it runs without the reveal (figuresWithReveal is the one
+  // try that holds the reveal, and only its figures are kept), and of the typed secrets with the
+  // closing-date password alone (dryRunSecrets): closing-date work is then judged on its real
+  // figures before it commits, and a wrong password stops here, before anything is done. A right
+  // one is checked again by the commit, which is harmless; every other secret only the real run gets.
   let real: RequestFacts | null = null;
   if (canTryAhead(operation)) {
-    const dryActor: BridgeActor = { ...actor, reveal: false, secrets: {} };
+    const dryActor: BridgeActor = { ...actor, reveal: false, secrets: dryRunSecrets(actor.secrets) };
     const dry = await runOperation(approver, operation, guarded.input, 'dry_run', dryActor);
+    // The password itself was refused (wrong, or too many wrong ones): the request ends with the
+    // bridge's own words, never as "the books changed".
+    if (closingPasswordStopped(dry, dryActor.secrets)) {
+      const err = appError(dry);
+      throw new ServiceError(err.code, err.message, err.details);
+    }
     // A new preview the person is shown carries the warnings the agent's flags silenced, as the
     // first one did (change).
     const shownAgain = async (r: BridgeResult): Promise<BridgeResult> =>
       r.outcome === 'ok' && r.preview ? { ...r, preview: withWarnings(r.preview, await silencedWarnings(approver, operation, guarded.input, dryActor)) } : r;
     if (closingDateFailure(dry)) {
-      // Dated on or before the closing date: this dry run gets no typed secrets (above), so it never
-      // gets through that, and the request is judged as closed-period work, whatever it was shown
+      // Dated on or before the closing date, and the dry run did not get past it: no closing-date
+      // password was typed, or the rights the approver and the agent both have lack the
+      // closed-period right. The request is judged as closed-period work, whatever it was shown
       // as, and its amount stays unknown.
       const closed: RequestFacts = { ...shownFacts, closedPeriod: true };
       refuseOverPolicy(ceiling.access, policy, operation, closed);
@@ -2347,6 +2712,10 @@ async function runShellApproved(
   const def: ShellOperationDef | undefined = SHELL_OPERATIONS.find((d) => d.id === operation.id);
   if (!def) return shellResult(input, { ok: false, error: 'Ironbooks does not know how to do this here.' });
   if (def.hostOnly && !actor.atHost) return shellResult(input, { ok: false, error: 'This can only be approved at the computer that holds the company file.' });
+  // A revealed file whose time ran out since the agent asked is saved or printed nowhere, even in
+  // the moment before the requests service removes it (revealFileRefusal).
+  const ended = await revealFileRefusal(approver, request.agentId, operation, input);
+  if (ended) return shellResult(input, { ok: false, error: ended });
 
   // One implementation of each: the desktop flows and the server's own "files.save" (which never
   // saves over a file that is already there, in the same folders the ask was checked against)
@@ -2474,8 +2843,22 @@ function grantFacts(c: GrantConstraints): RequestFacts {
   };
 }
 
-/** The approval card's one line for a grant request: built from the operation and the limits, never from the agent's words. */
-function grantSummary(operation: Operation, cls: RiskClass, c: GrantConstraints, minutes: number): string {
+/**
+ * The approval card's one line for a grant request: built from the operation and the limits, never
+ * from the agent's words. When standing permission may never cover some of this work (the
+ * two-person limit, on work whose amount may stay unknown: amountMayStayUnknown), the person reads
+ * that too, as the agent does, before saying yes to something that may never be used.
+ */
+function grantSummary(operation: Operation, cls: RiskClass, c: GrantConstraints, minutes: number, policy: AgentPolicy): string {
+  const line = grantLimitsLine(operation, cls, c, minutes);
+  return twoPersonLimitSet(policy) && amountMayStayUnknown(operation) ? `${line} ${UNKNOWN_AMOUNT_GRANT_CARD_NOTE}` : line;
+}
+
+/** grantSummary's warning, for the person reading the card. */
+const UNKNOWN_AMOUNT_GRANT_CARD_NOTE =
+  'While the two-person limit is set, it never covers a change to an existing record that posts nothing to the ledger: two people still approve each of those.';
+
+function grantLimitsLine(operation: Operation, cls: RiskClass, c: GrantConstraints, minutes: number): string {
   const limits: string[] = [];
   const many = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
   if (c.maxAmount) limits.push(`amounts up to ${c.maxAmount}`);
@@ -2608,7 +2991,7 @@ async function askForPermission(ctx: ServiceContext, agent: AgentOfContext, args
     operation,
     input: {},
     reason,
-    summary: grantSummary(operation, cls, constraints, minutes),
+    summary: grantSummary(operation, cls, constraints, minutes, door.policy),
     effectiveClass: d.effectiveClass,
     needs: d.needs,
     facts,
@@ -2771,7 +3154,13 @@ export const handleVerb: HandleVerb = async (ctx, verb, args) => {
       } catch {
         // Written wrong: the registry test names it. The rest of the description stands.
       }
-      if (examples.length) notes.push('Each of examples is a request as run_operation takes it: params, query, body and confirm.');
+      if (examples.length) {
+        // run_operation's arguments are checked strictly, so the words beside an example must not
+        // go with it (lib/agent/operations/schemas.ts OperationExample: title and note are not sent).
+        notes.push(
+          'Each of examples is a request as run_operation takes it: send its params, query, body, confirm and reveal as shown. Its title and note only explain it: leave them out when you send it.',
+        );
+      }
       const description: OperationDescription = {
         ...(await summaryFor(ctx, door, operation)),
         params: [...operation.params],
@@ -2815,7 +3204,8 @@ export const handleVerb: HandleVerb = async (ctx, verb, args) => {
         bulkCap: p.bulkCap,
         twoPersonOver: p.twoPersonOver,
         requestExpiryDays: p.requestExpiryDays,
-        folders: [...(p.folders ?? [])],
+        // Only the folders it may really use now (usableFolders), as with the grants below.
+        folders: await doorFolders(door),
         paused: isPaused(p.pausedAt),
         // Only the standing permission that would really let something run, with its real limits.
         grants: await grantsInEffect(ctx, door),
@@ -2831,6 +3221,7 @@ export const handleVerb: HandleVerb = async (ctx, verb, args) => {
     }
     case 'get_file': {
       const a = parseArgs(verbArgs.get_file, args);
+      if (await revealFileEnded(ctx, agent.id, a.fileId)) throw new ServiceError('NOT_FOUND', REVEAL_FILE_ENDED);
       const info = await stagedFileInfo(owner, a.fileId);
       if (!info) throw new ServiceError('NOT_FOUND', FILE_GONE);
       if (info.size > UPLOAD_MAX_BYTES) {

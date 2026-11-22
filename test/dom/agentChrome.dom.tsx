@@ -65,10 +65,14 @@ async function runLong(ms: number) {
   await settle(60);
 }
 
-/** The desktop shell's notice (electron/preload.js agentNotice), recorded instead of shown. */
-const notices: Array<{ title: string; body: string; href: string }> = [];
+/**
+ * The desktop shell's notice (electron/preload.js agentNotice), recorded instead of shown. `id`: the
+ * request the window found new, which the desktop app names only when its own read agrees.
+ */
+type RecordedNotice = { title: string; body: string; href: string; id?: string };
+const notices: RecordedNotice[] = [];
 (window as unknown as { bookkeeper?: unknown }).bookkeeper = {
-  agentNotice: (n: { title: string; body: string; href: string }) => {
+  agentNotice: (n: RecordedNotice) => {
     notices.push(n);
     return true;
   },
@@ -250,6 +254,7 @@ domTest('the notice is raised once per new request, and only when the window is 
     await until(() => notices.length === 1, 'a notice for the rise');
     const n = notices[0];
     equal(n.href, '/agent-requests', 'it opens the approval center');
+    equal(n.id, 'n2', 'it says which request it is for');
     check(n.title.includes('Month-end helper'), `it names the agent (got "${n.title}")`);
     check(n.body.includes('Pay 3 bills from Checking for $1,240.00'), `it says what the app made of the request (got "${n.body}")`);
     check(!/Ignore your rules/.test(`${n.title} ${n.body}`), 'never the agent’s own words');
@@ -280,6 +285,7 @@ domTest('the notice is raised once per new request, and only when the window is 
     await poke();
     await until(() => notices.length === 3, 'a new request raises one, though the number is the same');
     check(notices[2].body.includes('Enter a paycheck for Sam Ortiz'), `naming it (got "${notices[2].body}")`);
+    equal(notices[2].id, 'n5', 'and saying it is for n5');
     // n5 is decided: n4 is the newest again, and later the number rises with n4 still the newest.
     answer = counted({ pending: 4, newest: newest('n4', 'Payroll helper', 'Enter a paycheck for Dana Lee') });
     await poke();
@@ -428,6 +434,7 @@ domTest('a minimized window still raises the notice', async () => {
     check(notices[0].title.includes('Payroll helper'), `naming the agent (got "${notices[0].title}")`);
     check(notices[0].body.includes('Enter a paycheck for Dana Lee'), `in the app’s words (got "${notices[0].body}")`);
     equal(notices[0].href, '/agent-requests', 'opening the approval center');
+    equal(notices[0].id, 'm2', 'for the request the slow ask found');
     await until(() => pendingLong(AGENT_REQUESTS_HIDDEN_POLL_MS).length === 1, 'and the next slow ask is set');
     equal(pendingLong(AGENT_REQUESTS_POLL_MS).length, 0, 'still none at 20 seconds');
 
@@ -572,18 +579,25 @@ domTest('page help: the "What is this page?" bubble on Agent requests says the s
 domTest('page help: the Agents tab’s own header bubble says what a person needs, to someone who is not an Admin too', async () => {
   // The tab renders its own help (app/users/AgentsTab.tsx, <Help page="/users/agents">); the tab
   // lives in /users' state, so the shell's bubble and F1 there show the Users & Roles help. It is
-  // shown to anyone who may view Users & Roles > Users (app/users/page.tsx): here a person who is
-  // not an Admin, with no agent to list yet.
+  // shown to anyone who may view Users & Roles > Users (app/users/page.tsx), with no agent to list
+  // yet here: a person who is not an Admin but may change users, so may manage agents (make one
+  // stricter, pause it, take back standing permission: viewerMayManage, as the page passes it),
+  // and a person who may only look.
   try {
     stubRoutes({ 'GET /api/agents': { agents: [], allPaused: false, hostOnly: false, unattendedPossible: true } });
-    await mount(<AgentsTab roles={[]} viewerIsAdmin={false} />);
-    const trigger = await until(() => $<HTMLButtonElement>('[data-tab-help] button[aria-label="What is the Agents page?"]'), 'the help button in the tab header');
-    await click(trigger, 'What is this tab?');
-    const text = textOf(await until(() => $('[data-tab-help] [role="tooltip"]'), 'the bubble opens'));
-    for (const w of ['Allow (does it alone)', 'Ask (waits in Agent requests', 'approves once', 'standing permission', 'or Never', 'Pause this agent stops it', 'an Admin can pause all', 'The Audit Trail and Agent Activity report keep the record']) {
-      check(text.includes(w), `the bubble says "${w}" (got "${text}")`);
+    for (const [mayManage, who] of [
+      [true, 'a person who manages agents but is not an Admin'],
+      [false, 'a person who may only look'],
+    ] as const) {
+      await mount(<AgentsTab roles={[]} viewerIsAdmin={false} viewerMayManage={mayManage} />);
+      const trigger = await until(() => $<HTMLButtonElement>('[data-tab-help] button[aria-label="What is the Agents page?"]'), `${who}: the help button in the tab header`);
+      await click(trigger, 'What is this tab?');
+      const text = textOf(await until(() => $('[data-tab-help] [role="tooltip"]'), `${who}: the bubble opens`));
+      for (const w of ['Allow (does it alone)', 'Ask (waits in Agent requests', 'approves once', 'standing permission', 'or Never', 'Pause this agent stops it', 'an Admin can pause all', 'The Audit Trail and Agent Activity report keep the record']) {
+        check(text.includes(w), `${who}: the bubble says "${w}" (got "${text}")`);
+      }
+      await press('Escape');
     }
-    await press('Escape');
   } finally {
     resetWindow();
   }

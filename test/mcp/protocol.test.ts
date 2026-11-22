@@ -514,6 +514,16 @@ describe('the shipped server', () => {
   /** A named tool whose name starts with one of these changes something (convert_estimate, adjust_inventory …). */
   const CHANGING_NAME =
     /^(enter|add|edit|void|deactivate|pay|write|make|transfer|receive|import|categorize|match|unmatch|exclude|start|mark|update|finish|cancel|undo|convert|adjust)_/;
+  /**
+   * Named tools that only look, but read through the door, where an Admin can set the read to Ask:
+   * they take an optional request_id and reason to ask with (mcp/report-tools.mjs). Not the other
+   * reads: report_profit_and_loss and the other report_* tools, and get_bank_feed's lines, are GETs
+   * of their routes, which an agent reads with no policy and so never asks for (a plain read:
+   * lib/permissions/agentAccess.ts), and the bank feed's
+   * suggested accounts come from a curated read the door never asks for (an Admin's Ask refuses it
+   * outright: lib/agent/actions.ts OWN_READ_ASKS), so a request_id would have nothing to do there.
+   */
+  const ASKABLE_READS = new Set(['run_report', 'report_drilldown', 'export_report']);
 
   it('names itself and describes its tools for an agent', () => {
     expect(SERVER_INFO.name).toBe('ironbooks');
@@ -536,12 +546,27 @@ describe('the shipped server', () => {
       expect(t.name).not.toMatch(/^(delete|remove|drop|purge)_/);
       if (GENERIC.has(t.name)) continue;
       // A named tool whose name says it changes something is marked as one, takes a dry run and a
-      // request id; a tool that only looks takes neither. Nothing offers to delete.
+      // request id; a tool that only looks takes no dry run. Nothing offers to delete.
       const changing = CHANGING_NAME.test(t.name);
       expect(t.changes === true, t.name).toBe(changing);
       expect('dry_run' in t.inputSchema.properties, t.name).toBe(changing);
-      expect('request_id' in t.inputSchema.properties, t.name).toBe(changing);
+      // A request id says "this is kept, or asks a person, under your name for it". A tool that only
+      // looks takes none, so an agent (and the client's read-only hint) can tell a read from a
+      // change by its arguments, and no read seems to need one. The one exception: the reads a
+      // person may have to approve (an Admin set reading reports to Ask), which ask from the tool
+      // itself. Each is still marked as a read, takes a reason with its request id, and needs
+      // neither: a read that runs at once uses no request id.
+      const asksToRead = ASKABLE_READS.has(t.name);
+      expect('request_id' in t.inputSchema.properties, t.name).toBe(changing || asksToRead);
+      if (asksToRead) {
+        expect(t.changes, t.name).not.toBe(true);
+        expect('reason' in t.inputSchema.properties, t.name).toBe(true);
+        expect(t.inputSchema.required ?? [], t.name).not.toContain('request_id');
+        expect(t.inputSchema.required ?? [], t.name).not.toContain('reason');
+      }
     }
+    // Each one named is a tool of the server (a renamed tool fails here, not quietly).
+    for (const name of ASKABLE_READS) expect(names, name).toContain(name);
   });
 
   it('the generic tools: what each one may do, and what it takes', () => {

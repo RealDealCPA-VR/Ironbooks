@@ -478,10 +478,11 @@ function collectingClient(client) {
 }
 
 /**
- * A report read a person approved (asked for with run_operation, as run_report and report_drilldown
- * advise when reports are set to Ask) comes back in the shape those tools give, wherever the agent
- * collects it: wait_for_decision, run_operation sent again with the request id it was asked under
- * (its answer then says `repeated`), and the request's resource (collectedContents, below). It is
+ * A report read a person approved (asked for by run_report or report_drilldown with a request_id
+ * when reports are set to Ask, or with run_operation) comes back in the shape those tools give,
+ * wherever the agent collects it: wait_for_decision, run_operation sent again with the request id
+ * it was asked under (its answer then says `repeated`), and the request's resource
+ * (collectedContents, below). It is
  * made compact before the answer is held to its size limit (collectingClient); after that,
  * compactCollected runs again to say inside the result what the limit cut, if anything. A read
  * run_operation does at once keeps the app's own shape, as everything run_operation answers does.
@@ -532,10 +533,10 @@ export const INSTRUCTIONS = [
   'Ironbooks is a desktop accounting system (a double-entry ledger, like QuickBooks Desktop). These tools work in one company\'s books. The full guide is the resource ironbooks://guide (also the prompt ironbooks_guide): read it before your first change.',
   'Start with get_company_info (which company, the closing date, who you are) and get_my_permissions (what you may do on your own, what a person must approve, what is not allowed).',
   'Before entering anything, look: use find_transactions or search to make sure it is not already there, and list_accounts, list_customers or list_vendors for the ids you need.',
-  'Every standard report (about 100) is list_reports, then run_report; report_drilldown lists the transactions behind an amount, and export_report makes the report a PDF or Excel file.',
+  'Every standard report (about 100) is list_reports, then run_report; report_drilldown lists the transactions behind an amount, and export_report makes the report a PDF or Excel file. If a person must approve reading a report, those three take a request_id and a reason too, and ask the person themselves.',
   'The named tools cover everyday bookkeeping: invoices, bills, payments, checks, deposits, estimates, purchase orders, receiving items, credit memos, vendor credits, time, inventory adjustments, sales tax, bank statements and reconciling. For anything else (1099s, paystubs, the audit trail, emailing a form, budgets …), find_operations, then describe_operation, then run_operation: every operation a person can do in Ironbooks has an id.',
   'Every tool that changes the books takes dry_run, request_id and reason. dry_run true checks the change and shows what it would post, without keeping anything: use it whenever you are not sure. request_id is your own name for one change; asking again with the same request_id never does it twice, so repeat a request with the SAME request_id after a timeout, and use a NEW one for each new change. reason is one plain sentence saying why you want it: a person who must approve it reads it on the approval card.',
-  'When an answer says "asked", a person must approve it in Ironbooks: call wait_for_decision with its request_id, and do not send it again. "needs_confirmation" is a warning a person would have been asked about: go ahead only if it is right, as the answer says. "Refused" means stop.',
+  'When an answer says "asked", a person must approve it in Ironbooks: call wait_for_decision with its request_id, and do not send it again unless an answer\'s next tells you to (export_report makes its file that way, once a person approved reading the report). "needs_confirmation" is a warning a person would have been asked about: go ahead only if it is right, as the answer says. "Refused" means stop.',
   'When you edit, void or make something inactive, send the updated_at you read (get_transaction; for an account or an item, its edited_at) as expected_updated_at. A 409 (conflict) then means someone changed the record after you read it, and nothing was changed: read it again and make your change on what it says now.',
   'The named tools never delete: a mistake is voided (void_transaction) or corrected (edit_transaction). Deleting for good, closed-period work and settings always need a person; sending anything outside this computer does too, unless a person gave you a short standing permission for it. Dates are YYYY-MM-DD and amounts are text with two decimals ("1250.00").',
   'Never ask the person for a password, code or key, and never send one: when an operation needs one, the person types it on their own screen.',

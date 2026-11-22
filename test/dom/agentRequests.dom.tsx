@@ -15,7 +15,9 @@
 // questions sent with it; secrets of several parts go as the one text the guards read; a typed mail
 // password names its server; the address can name an agent or a request, also when a link is
 // followed while the page is open. Entries are labelled by the bridge's `touched` mark, never by
-// their description, and records that post nothing are named with the record changes.
+// their description, and records that post nothing are named with the record changes. A request
+// someone else answered meanwhile opens from a link and shows where it stands, with no error, and
+// an answer refused only because someone else got there first is a note, not an error.
 import * as React from 'react';
 import AgentRequestsPage from '@/app/agent-requests/page';
 import { Toaster } from '@/components/ui';
@@ -620,7 +622,7 @@ domTest("nothing is approvable on the list's copy: the card's own copy must load
   await click(button('Open', row), 'Open');
   const card = await until(() => (dialog() && $('[data-load-error]', dialog()!) ? dialog() : null), 'the load error');
   check(textOf(card).includes('Enter invoice 1042 for Acme Supply'), "the list's copy is shown");
-  check(textOf($('[data-load-error]', card)).includes('cannot be approved until it loads'), 'it says why it cannot be approved');
+  check(textOf($('[data-load-error]', card)).includes('cannot be approved or denied until it loads'), 'it says why it cannot be approved');
   check(button('Approve once', card)?.disabled, 'Approve waits');
   check(!button('Approve similar…', card), 'and so does Approve similar…');
   fail = false;
@@ -1512,13 +1514,187 @@ domTest('after a refused approval nothing is approvable until the card has loade
   await click(button('Approve once', card), 'Approve once');
   await until(() => $('[data-approve-failure]', dialog()!), 'the refusal');
   const banner = await until(() => $('[data-load-error]', dialog()!), 'the failed load, said on the card');
-  check(textOf(banner).includes('cannot be approved until it loads'), `it says why: ${textOf(banner)}`);
+  check(textOf(banner).includes('cannot be approved or denied until it loads'), `it says why: ${textOf(banner)}`);
   check(button('Approve once', dialog()!)?.disabled, 'Approve waits for the fresh copy');
   check(!button('Approve similar…', dialog()!), 'and so does Approve similar…');
   failLoad = false;
   await click(button('Try again', dialog()!), 'Try again');
   await until(() => !$('[data-load-error]', dialog()!) && !button('Approve once', dialog()!)?.disabled, 'the card to load');
   equal(posts(calls, path).length, 1, 'only the one approval was sent');
+  await unmount();
+});
+
+// ---------------------------------------------------------------------------
+// The fourth pass (wave 5): a request someone else answered meanwhile
+// ---------------------------------------------------------------------------
+
+domTest('a link to a request someone else answered meanwhile opens once the open card is closed, and shows where it stands, with no error', async () => {
+  const follow = async (query: string) => {
+    setQuery(query);
+    setTestPathname('/agent-requests');
+    await settle();
+  };
+  const done = req({ status: 'executed', canApprove: false, decidedByName: 'Pat Owner' });
+  // Denied by someone else in their own window while this person's approval of BASE is on its way;
+  // the list still has its older, waiting copy.
+  const deniedElsewhere = req({ ...EMAIL, status: 'denied', canApprove: false, decidedByName: 'Sam Lee', decidedAt: minutesAgo(1), note: 'Not this month' });
+  // Approved and done by someone else; the list still has its older, waiting copy.
+  const LATER = req({ id: ids(31), summary: 'Enter invoice 1044 for Acme Supply' });
+  const approvedElsewhere = req({ ...LATER, status: 'executed', canApprove: false, decidedByName: 'Sam Lee', decidedAt: minutesAgo(1) });
+  const gate: { release: (() => void) | null } = { release: null };
+  // The linked card's own copy is held back until the test lets it go: until then the card shows
+  // the list's older copy, on which Deny… and Deny request are still on screen.
+  const linkGate: { release: (() => void) | null } = { release: null };
+  let emailGets = 0;
+  const emailDeny = `/api/agent-requests/${EMAIL.id}/deny`;
+  try {
+    const calls = stubFetch({
+      'GET /api/agent-requests?status=pending': { requests: [BASE, EMAIL, LATER] },
+      [`GET /api/agent-requests/${BASE.id}`]: { request: BASE },
+      [`GET /api/agent-requests/${EMAIL.id}`]: () =>
+        ++emailGets === 1
+          ? new Promise((resolve) => (linkGate.release = () => resolve({ request: deniedElsewhere })))
+          : { request: deniedElsewhere },
+      [`GET /api/agent-requests/${LATER.id}`]: { request: approvedElsewhere },
+      // Sent only if the card answered the list's copy: the server would refuse it, as it does a request no longer waiting.
+      [`POST ${emailDeny}`]: reply(409, { error: 'This request was denied.', code: 'CONFLICT' }),
+      [`POST /api/agent-requests/${BASE.id}/approve`]: () =>
+        new Promise((resolve) => {
+          gate.release = () => resolve({ status: 'executed', request: done, produced: [], effects: [] } satisfies ApproveResult);
+        }),
+    });
+    setQuery('');
+    await mount(page());
+    const card = await openCard(BASE.id);
+    await click(button('Approve once', card), 'Approve once');
+    await until(() => gate.release !== null, 'the approval to be on its way');
+    await follow(`?id=${EMAIL.id}`);
+    await settle(60);
+    check(textOf().includes('The one from the link opens when you close it.'), 'the page says when the linked one opens');
+    gate.release?.();
+    await until(() => textOf(dialog()).includes('Done.'), 'the open card to get its answer');
+    await click(button('Close', dialog()!), 'Close');
+    const waiting = await until(
+      () => (dialog() && textOf($('[data-request-summary]', dialog()!)) === EMAIL.summary && $('[data-card-loading]', dialog()!) ? dialog() : null),
+      "the linked card, on the list's older copy while its own loads",
+    );
+    await until(() => linkGate.release, 'the linked card to ask for its own copy');
+    // The person tries to deny it from the list's copy: nothing is sent until the card's own copy is here.
+    await click(button('Deny…', waiting), 'Deny…');
+    const send = await until(() => button('Deny request', dialog()!), 'Deny request');
+    check(send.disabled, "Deny request waits for the card's own copy");
+    await click(send, 'Deny request, on the list copy');
+    await settle(60);
+    equal(posts(calls, emailDeny).length, 0, "no deny was sent on the list's copy");
+    linkGate.release?.();
+    const linked = await until(
+      () => (dialog() && textOf($('[data-request-summary]', dialog()!)) === EMAIL.summary && textOf(dialog()).includes('Denied by Sam Lee.') ? dialog() : null),
+      'the linked card, showing where it stands',
+    );
+    check(textOf(linked).includes('Note to the agent: “Not this month”'), `with the note it was denied with: ${textOf(linked)}`);
+    check(!$('[role="alert"]', linked) && !$('[data-approve-failure]', linked) && !$('[data-load-error]', linked), 'with no error');
+    check(!$('[data-answered-meanwhile]', linked), 'and no refusal to note: nothing was sent');
+    check(!textOf().includes('Denied. The agent'), 'no "Denied" toast: this person denied nothing');
+    equal(posts(calls, emailDeny).length, 0, 'no deny was sent once the copy came either');
+    check(!button('Approve once', linked) && !button('Deny…', linked) && !button('Approve similar…', linked), 'and nothing left to answer');
+    check(textOf(rowOf(EMAIL.id)).includes('Denied'), 'the list shows it as it now stands');
+
+    // With nothing holding the open card, a link to one answered meanwhile opens it at once, the same way.
+    await follow('');
+    await follow(`?id=${LATER.id}`);
+    const next = await until(() => (dialog() && textOf(dialog()).includes('Done, approved by Sam Lee.') ? dialog() : null), 'the next linked card');
+    check(!$('[role="alert"]', next) && !$('[data-approve-failure]', next) && !$('[data-load-error]', next), 'with no error either');
+    check(!button('Approve once', next) && !button('Deny…', next), 'and nothing to answer');
+    equal(calls.filter((c) => c.method === 'POST').length, 1, 'only the one approval was sent');
+    await unmount();
+  } finally {
+    setQuery('');
+  }
+});
+
+domTest("Deny waits for the card's own copy too; an answer refused because someone else got there first is a note beside where it stands, not an error", async () => {
+  // lib/services/agentRequests.ts STATUS_WHY.denied and CHANGED_JUST_NOW_MESSAGE, answered with 409.
+  const DENIED = 'This request was denied.';
+  const JUST_NOW = 'Someone decided this request just now. Open it again to see where it stands.';
+  // The card's first copy is held back until the test lets it go; once someone else has denied it, it says so.
+  const gate: { release: (() => void) | null } = { release: null };
+  let gets = 0;
+  let answered: AgentRequestForPerson | null = null;
+  const denyPath = `/api/agent-requests/${BASE.id}/deny`;
+  const calls = stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [BASE] },
+    [`GET /api/agent-requests/${BASE.id}`]: () => {
+      gets++;
+      if (gets === 1) return new Promise((resolve) => (gate.release = () => resolve({ request: BASE })));
+      return { request: answered ?? BASE };
+    },
+    [`POST ${denyPath}`]: () => {
+      answered = req({ status: 'denied', canApprove: false, decidedByName: 'Sam Lee', decidedAt: minutesAgo(0) });
+      return reply(409, { error: DENIED, code: 'CONFLICT' });
+    },
+  });
+  await mount(page());
+  const row = await until(() => rowOf(BASE.id), 'the row');
+  await click(button('Open', row), 'Open');
+  const card = await until(() => (dialog() && $('[data-card-loading]', dialog()!) ? dialog() : null), "the card, on the list's copy");
+  await click(button('Deny…', card), 'Deny…');
+  const send = await until(() => button('Deny request', dialog()!), 'Deny request');
+  check(send.disabled, "Deny waits for the card's own copy");
+  await click(send, 'Deny request, before the copy is here');
+  equal(posts(calls, denyPath).length, 0, 'nothing was sent on the list copy');
+  gate.release?.();
+  await until(() => !button('Deny request', dialog()!)?.disabled, 'Deny request, once the copy is here');
+  await click(button('Deny request', dialog()!), 'Deny request');
+  const note = await until(
+    () => (textOf(dialog()).includes('Denied by Sam Lee.') ? $('[data-answered-meanwhile]', dialog()!) : null),
+    "where it stands, with the server's words as a note",
+  );
+  equal(textOf(note), DENIED, "the server's words, as they came");
+  check(!$('[role="alert"]', dialog()!) && !$('[data-approve-failure]', dialog()!), 'not as an error');
+  check(!button('Deny request', dialog()!) && !button('Approve once', dialog()!), 'nothing left to answer');
+  check(textOf(rowOf(BASE.id)).includes('Denied'), 'the list shows it as it now stands');
+  equal(posts(calls, denyPath).length, 1, 'one deny was sent');
+  await unmount();
+
+  // Approve, the same: someone else approved and did it just before.
+  const OTHER = req({ id: ids(32), summary: 'Enter invoice 1045 for Acme Supply' });
+  let doneElsewhere = false;
+  stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [OTHER] },
+    [`GET /api/agent-requests/${OTHER.id}`]: () => ({
+      request: doneElsewhere ? req({ ...OTHER, status: 'executed', canApprove: false, decidedByName: 'Sam Lee', decidedAt: minutesAgo(0) }) : OTHER,
+    }),
+    [`POST /api/agent-requests/${OTHER.id}/approve`]: () => {
+      doneElsewhere = true;
+      return reply(409, { error: JUST_NOW, code: 'CONFLICT' });
+    },
+  });
+  await mount(page());
+  const other = await openCard(OTHER.id);
+  await click(button('Approve once', other), 'Approve once');
+  const said = await until(
+    () => (textOf(dialog()).includes('Done, approved by Sam Lee.') ? $('[data-answered-meanwhile]', dialog()!) : null),
+    "where it stands, with the server's words as a note",
+  );
+  equal(textOf(said), JUST_NOW, "the server's words, as they came");
+  check(!$('[role="alert"]', dialog()!) && !$('[data-approve-failure]', dialog()!), 'not as an error');
+  check(!button('Approve once', dialog()!), 'nothing more to approve');
+  await unmount();
+
+  // Refused while it still waits (someone gave the first of two approvals just now): still an error, and it can be answered again.
+  const TWO = req({ id: ids(33), summary: 'Enter invoice 1046 for Acme Supply', needs: { ...BASE.needs!, twoPerson: true } });
+  stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [TWO] },
+    [`GET /api/agent-requests/${TWO.id}`]: { request: TWO },
+    [`POST /api/agent-requests/${TWO.id}/approve`]: reply(409, { error: JUST_NOW, code: 'CONFLICT' }),
+  });
+  await mount(page());
+  const two = await openCard(TWO.id);
+  await click(button('Approve once', two), 'Approve once');
+  const failure = await until(() => $('[data-approve-failure]', dialog()!), 'the refusal');
+  equal(textOf(failure), JUST_NOW, 'said as an error while it still waits');
+  check(!$('[data-answered-meanwhile]', dialog()!), 'not as a note');
+  await until(() => !button('Approve once', dialog()!)?.disabled, 'the card to load again');
   await unmount();
 });
 

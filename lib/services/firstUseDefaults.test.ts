@@ -33,6 +33,7 @@ import {
   transactionsBySerialLot,
   verifySiteInvariants,
 } from './inventorySiteReports';
+import { listSiteReorderPoints } from './inventorySiteOps';
 import { ensureDefaultPayrollItems } from './payrollItems';
 import { GET as payrollItemsGET } from '@/app/api/payroll-items/route';
 
@@ -101,6 +102,10 @@ describe('the default inventory site', () => {
       expect(detail.sites).toEqual([]);
       expect(detail.rows).toMatchObject([{ itemId, bySite: {}, totalQuantity: '10.0000', notAtASite: '10.0000' }]);
       expect(detail.note).toBe(NO_SITE_YET_NOTE);
+      // Reorder Points: only the stored rows, and there are none yet (the item's own reorder point
+      // belongs to the default site, which does not exist yet).
+      expect(await listSiteReorderPoints(ctx)).toEqual([]);
+      expect(await listSiteReorderPoints(ctx, { itemId })).toEqual([]);
       // The self-check judges the stock as it will be once the default site is made: all is well.
       const checks = await verifySiteInvariants(ctx);
       expect(checks.checks.find((c) => c.name === 'Site quantities add up to quantity on hand')).toMatchObject({ ok: true });
@@ -125,6 +130,7 @@ describe('the default inventory site', () => {
       const reorder = await reorderBySite(ctx);
       expect(reorder.rows).toMatchObject([{ siteId: main, itemId, needsReorder: true }]);
       expect(reorder).not.toHaveProperty('note');
+      expect(await listSiteReorderPoints(ctx, { itemId })).toMatchObject([{ itemId, siteId: main, reorderPoint: '20.0000' }]);
       expect((await verifySiteInvariants(ctx)).allOk).toBe(true);
     }
     expect((await counts()).sites).toBe(1);

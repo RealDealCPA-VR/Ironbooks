@@ -908,21 +908,68 @@ function ownFolderRefusal(typed: string): ServiceError {
 }
 
 /**
+ * A name as Windows compares names: each character in upper case when that is still one character,
+ * as NTFS does. Not lower case: lower case keeps apart pairs Windows takes as one ("ſ", the long s,
+ * and "s"). A copy of windowsFold in lib/agent/files.ts, which does not export it.
+ */
+function windowsFold(s: string): string {
+  let out = '';
+  for (const ch of s) {
+    const up = ch.toUpperCase();
+    out += Array.from(up).length === 1 ? up : ch;
+  }
+  return out;
+}
+
+/**
+ * The spellings of a path that may still name the same folder, for a refusal only, in the order
+ * mayTouchByWords pairs them: as written and with every name as Windows opens it (trailing dots and
+ * spaces dropped: "archives." is "archives"; on every platform, since the folder may be on a disk
+ * Windows wrote), and each of those as written, as Windows folds case (windowsFold) and with no case
+ * or Unicode form at all (macOS folds both). The near match mayBeWithin in lib/agent/files.ts makes
+ * for overlapsAppData, by the words alone. Never used to allow anything.
+ */
+function nearSpellings(p: string): string[] {
+  const r = path.resolve(p);
+  const { root } = path.parse(r);
+  const trimmed = root + r.slice(root.length).split(/[\\/]/).map((n) => n.replace(/[. ]+$/, '') || n).join(path.sep);
+  return [r, trimmed].flatMap((s) => [s, windowsFold(s), s.normalize('NFC').toLowerCase()]);
+}
+
+/**
+ * `folder` may be, lie inside or hold one of `places`, by the words and in any spelling that may
+ * name the same folder (nearSpellings, each compared with the same spelling of the place). Nothing
+ * is looked at on the disk. For a refusal only.
+ */
+function mayTouchByWords(folder: string, places: string[]): boolean {
+  const inside = (c: string, p: string) => c === p || c.startsWith(p.endsWith(path.sep) ? p : p + path.sep);
+  const f = nearSpellings(folder);
+  return touchesOwnPlaces(folder, places) || places.some((b) => {
+    const k = nearSpellings(b);
+    return f.some((s, i) => inside(s, k[i]) || inside(k[i], s));
+  });
+}
+
+/**
  * Why a folder the agent already has would be refused were it new today, judged by its words
  * alone against the places as written (booksPlacesAsWritten, ironbooksPlacesAsWritten), or null.
  * The disk is never asked about it (see checkFolders): it may be gone, on a drive that is
  * unplugged or behind a link to a share that is offline. So this catches a folder an older
  * version took before a rule existed (the condense archives, the practice copies), and one that has
  * since come to hold the open company file or a chosen backups folder; what it misses through a link
- * is left to where the folder is used. A folder that is not a full path is left alone: it reaches
- * nothing where folders are used.
+ * is left to where the folder is used. Its places include those overlapsAppData knows
+ * (appDataPlaces is one of them) and they are compared the way it compares them by the words, a
+ * near match counting (mayTouchByWords: another case, another Unicode form, a name with a trailing
+ * dot), since that check itself looks at the disk. A new folder is held to the same near match
+ * (checkFolders), so one taken when it is added is not refused at the next save. A folder that is
+ * not a full path is left alone: it reaches nothing where folders are used.
  */
 function keptFolderRefusal(folder: string, books: string[], own: string[]): ServiceError | null {
   if (!looksAbsolute(folder)) return null;
   if (isThisComputerShare(folder)) return thisComputerShareRefusal(folder);
   if (isRootByWords(folder)) return wholeDriveRefusal(folder);
-  if (touchesOwnPlaces(folder, books)) return booksFolderRefusal(folder);
-  if (touchesOwnPlaces(folder, own)) return ownFolderRefusal(folder);
+  if (mayTouchByWords(folder, books)) return booksFolderRefusal(folder);
+  if (mayTouchByWords(folder, own)) return ownFolderRefusal(folder);
   return null;
 }
 
@@ -960,7 +1007,8 @@ interface CheckedFolders {
  * Ironbooks' own folders: the company file and its working data (booksPlaces), and every place
  * Ironbooks keeps its own data or copies of the books (ironbooksPlaces, and overlapsAppData of
  * lib/agent/files.ts, the same check the other units make): reading there would hand the agent the
- * whole books unmasked, another agent's files or the app's own state.
+ * whole books unmasked, another agent's files or the app's own state. Those places are compared as a
+ * kept folder's are, a near match counting (mayTouchByWords).
  */
 async function checkFolders(list: string[], had: readonly string[], isAdmin: boolean): Promise<CheckedFolders> {
   const stored = new Map(had.map((h) => [samePathKey(h), h]));
@@ -1014,17 +1062,22 @@ async function checkFolders(list: string[], had: readonly string[], isAdmin: boo
         if (isMountedVolume(typed) === true) throw wholeDriveRefusal(typed);
         if (reachedAsThisComputerShare(typed)) throw thisComputerShareRefusal(typed);
       }
-      throw validation(`The folder "${shown(typed, 200)}" was not found on this computer. Check the path, or make the folder first.`);
+      // `"<folder>" was not found` is read by the Agents screen (app/users/agents/AgentDetailView.tsx)
+      // to add its own hint: keep those words.
+      throw validation(`The folder "${shown(typed, 200)}" was not found on this computer. Check the path, make the folder first, or take it off the list.`);
     }
     // The words before the disk: isDriveOrShareRoot looks at the folder, a share's included.
     if (isThisComputerShare(real)) throw thisComputerShareRefusal(typed);
     if (isDriveOrShareRoot(real)) throw wholeDriveRefusal(typed);
     books ??= booksPlaces();
     own ??= ironbooksPlaces();
-    if (touchesOwnPlaces(real, books)) throw booksFolderRefusal(typed);
+    // By the same near match a kept folder is judged by (keptFolderRefusal; the places here hold
+    // the places as written, and their real paths besides), so a folder taken now is never refused
+    // at the next save, an Admin's tightening included. The real path is the one stored.
+    if (mayTouchByWords(real, books) || mayTouchByWords(typed, books)) throw booksFolderRefusal(typed);
     // The real path and the path as typed: allowedFolder has just shown that the links along it
     // stay on this computer, so overlapsAppData looks at nothing the person did not name.
-    if (touchesOwnPlaces(real, own) || overlapsAppData(real) || overlapsAppData(typed)) throw ownFolderRefusal(typed);
+    if (mayTouchByWords(real, own) || mayTouchByWords(typed, own) || overlapsAppData(real) || overlapsAppData(typed)) throw ownFolderRefusal(typed);
     add(real);
   }
   return out;

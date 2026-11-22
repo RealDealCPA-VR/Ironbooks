@@ -283,7 +283,12 @@ describe('operation schemas: shell operations', () => {
       type: 'object',
       description: 'Save a copy of the company file. Send only the fields listed here: any other field is refused.',
       properties: {
-        folder: { type: 'string', minLength: 1, description: 'A folder or file path on this computer. Where the copy goes.' },
+        folder: {
+          type: 'string',
+          minLength: 1,
+          description:
+            'A full path as this computer sees it, starting with a drive such as C:\\, a share such as \\\\server\\share, or / on a Mac or Linux computer. Where the copy goes.',
+        },
         name: { type: 'string', description: 'File name of the copy.' },
         keepOpen: { type: 'boolean', description: 'Stay in this company afterwards.' },
         copies: { type: 'number', description: 'How many copies.' },
@@ -311,6 +316,10 @@ describe('operation schemas: shell operations', () => {
       const texts: Array<[string, unknown]> = [['$', body.description]];
       for (const [name, field] of Object.entries((body.properties ?? {}) as Record<string, { description?: unknown }>)) {
         texts.push([`$.${name}`, field.description]);
+        // A path says the rule the guards refuse it by (guards.ts notFullPath): a full one.
+        if (def.input[name]?.type === 'path' && !/^A full path .*C:\\.*\\\\server\\share.*\/ on a Mac or Linux computer\./.test(String(field.description))) {
+          problems.push(`${def.id} $.${name}: does not say it takes a full path`);
+        }
       }
       for (const [at, text] of texts) {
         if (typeof text !== 'string' || !text.trim()) problems.push(`${def.id} ${at}: no description`);

@@ -17,7 +17,9 @@
  * pausing and a folder inside one it has stay open. A refusal from the server is shown in its own
  * words, beside Save: the folder checks only the server can make (a folder that is not there, a
  * share of this computer, one of Ironbooks' own places, a stored folder that does not really reach
- * the new one) come back that way.
+ * the new one) come back that way. A folder the agent had that the server took off its list itself
+ * on a save (for a person who is not an Admin, one that would be refused were it given today) is
+ * found by comparing what was sent with what came back, and said beside Save.
  *
  * Tightening, pausing and taking back a standing permission need the right to change Users & Roles
  * > Users (viewerMayManage; an Admin always has it). Someone who may only see that list sees this
@@ -44,6 +46,7 @@ import {
   clearSetting,
   differingCount,
   draftFrom,
+  foldersTakenAway,
   isChanged,
   keptAsChosen,
   lockedReason,
@@ -73,9 +76,9 @@ import {
   adjustedPresetNote,
   adjustedTitle,
   adminOnlyNote,
+  foldersTakenAwayNote,
   looserNote,
   presetSummary,
-  storedFolderGone,
   when,
 } from './words';
 
@@ -177,6 +180,12 @@ export default function AgentDetailView({
    * refusal of a draft that no longer exists does not sit beside Save.
    */
   const [refusal, setRefusal] = useState<{ draft: PolicyDraft; folder: string; message: string } | null>(null);
+  /**
+   * Folders the agent had that the last save sent back and Ironbooks took off its list itself
+   * (policyDraft.ts foldersTakenAway): said beside Save until the next save that is sent, or Undo,
+   * since the person did not take them off and would otherwise not know.
+   */
+  const [takenAway, setTakenAway] = useState<string[]>([]);
 
   /** Show what the server answered; an unsaved draft is kept unless asked to start again. */
   const take = useCallback((d: AgentDetail, resetDraft: boolean) => {
@@ -253,10 +262,10 @@ export default function AgentDetailView({
   // What a save would let the agent do more of, a folder typed but not added included.
   const typed = withTypedFolder(draft, folderText);
   const loosenings = mayLoosen || readOnly ? [] : looseningsOf(initial, typed.draft ?? draft);
+  // A folder the agent already has is never looked at on the disk again (lib/services/agentPolicies.ts
+  // checkFolders), so a refusal of "not found" is always about one typed in this save, and the
+  // server's words say what to do ("or take it off the list"): no hint of the page's own is needed.
   const saveError = refusal && refusal.draft === draft && refusal.folder === folderText ? refusal.message : '';
-  // The server could not find a folder the agent already has (moved or deleted since): say how to
-  // get past it. Read from its own words; if they ever change, only this hint is left out.
-  const goneFolder = saveError ? (initial.folders.find((f) => saveError.includes(`"${f}" was not found`)) ?? null) : null;
 
   function choose(areaKey: Area | null, cls: RiskClass, setting: PolicySetting) {
     setDraft((d) => (d && detail ? chooseSetting(d, detail.policy.locked, areaKey, cls, setting) : d));
@@ -287,11 +296,22 @@ export default function AgentDetailView({
       setFolderText('');
       return;
     }
+    // Only now is something sent: a save stopped above saved nothing, so the note about folders the
+    // last save really took away stays.
+    setTakenAway([]);
     setSaving(true);
     try {
-      take(await api.patch<AgentDetail>(`/api/agents/${encodeURIComponent(detail.id)}`, c.input), true);
+      const answer = await api.patch<AgentDetail>(`/api/agents/${encodeURIComponent(detail.id)}`, c.input);
+      take(answer, true);
       setFolderText('');
-      toast(`Saved. ${detail.name} works under these settings from its next request.`, 'success');
+      // A folder it had that Ironbooks took off the list itself (for a person who is not an Admin):
+      // the save went through, so it is said beside Save as well as in the notice.
+      const gone = foldersTakenAway(initial, c.input.folders, answer.policy?.policy?.folders);
+      setTakenAway(gone);
+      toast(
+        gone.length ? foldersTakenAwayNote(gone) : `Saved. ${detail.name} works under these settings from its next request.`,
+        gone.length ? 'info' : 'success',
+      );
     } catch (e) {
       // The server's own words: it decides who may change what (lib/services/agentPolicies.ts).
       setRefusal({ ...refused, message: errMsg(e) });
@@ -567,9 +587,9 @@ export default function AgentDetailView({
               {saveError}
             </p>
           )}
-          {goneFolder && (
-            <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-900" role="note" data-folder-gone="">
-              {storedFolderGone(goneFolder)}
+          {takenAway.length > 0 && (
+            <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-900" role="status" data-folders-taken-away="">
+              {foldersTakenAwayNote(takenAway)}
             </p>
           )}
           <div className="flex flex-wrap items-center justify-end gap-2">
@@ -580,6 +600,7 @@ export default function AgentDetailView({
                 setDraft(initial);
                 setFolderText('');
                 setRefusal(null);
+                setTakenAway([]);
               }}
               disabled={!changed || saving}
             >

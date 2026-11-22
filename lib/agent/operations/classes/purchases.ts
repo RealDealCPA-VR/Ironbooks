@@ -28,24 +28,21 @@ import type { ClassificationMap } from '../types';
 
 // The default "Main Warehouse" site is created by ensureDefaultSite (lib/services/inventorySites.ts)
 // the first time a person reads a company's sites, or by the first site operation of any kind. The
-// reads go through defaultSiteForRead, which makes it for a person only: an agent's read, or any
-// context that only reads, gets what is there (no site yet, on such a company), so these GETs are
-// plain reads.
+// reads (the site list, the by-site reports and the per-site reorder points, inventorySiteOps.ts
+// listSiteReorderPoints) go through defaultSiteForRead, which makes it for a person only: an agent's
+// read, or any context that only reads, gets what is there (no site yet, on such a company), so
+// these GETs are plain reads.
 const READS_DEFAULT_SITE =
   'Reads only. A person\'s first call on a company with no inventory site makes the default "Main Warehouse", ' +
   'as it always has; an agent\'s read, or any read-only one, never makes it (defaultSiteForRead, ' +
   'lib/services/inventorySites.ts) and answers as if no site had been set up yet: no sites, and the ' +
   'stock at no site until the default exists.';
 
-// GET /api/inventory-sites/reorder-points goes through lib/services/inventorySiteOps.ts
-// listSiteReorderPoints, which still calls ensureDefaultSite. It stays a read: an agent's read runs
-// on the read-only database handle (lib/agent/bridge.ts, mode 'read'), so that one write can never
-// happen under an agent's name, and the read fails on such a company instead.
-const MAKES_DEFAULT_SITE =
-  'Read only for an agent: the first call on a company with no default inventory site would create ' +
-  '"Main Warehouse" (ensureDefaultSite has no read-only guard), and the read-only database handle refuses ' +
-  'that write, so on such a company the read fails with "This connection can only read the books" until a ' +
-  'person opens the inventory sites. After that it only reads.';
+// The reorder points read: before the default site exists, an item's own reorder point (Edit Item)
+// is at no site yet, so only the stored per-site rows come back (inventorySiteOps.ts).
+const READS_REORDER_POINTS =
+  READS_DEFAULT_SITE +
+  " Until then the list holds only the reorder points saved for a site; an item's own reorder point (Edit Item) is not at any site yet.";
 
 // ensureSeeded (lib/services/lists/simpleLists.ts) saves the default Terms list on a person's first
 // read; it returns early only when ctx.readOnly is set.
@@ -396,7 +393,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/inventory-sites/reorder-points': {
     class: 'read',
     describe: 'List reorder points by site',
-    why: MAKES_DEFAULT_SITE,
+    why: READS_REORDER_POINTS,
   },
   'PUT /api/inventory-sites/reorder-points': {
     class: 'change',

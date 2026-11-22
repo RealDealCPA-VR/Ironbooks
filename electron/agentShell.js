@@ -445,17 +445,24 @@ function ownNames(env, hostname) {
  * never a folder agents may use, whoever named it: the same rule as the company server's
  * (lib/agent/files.ts) and the connector's (mcp/files-tools.mjs). Judged by the words alone:
  * nothing is looked up and nothing is looked at. The share may be written as a device path
- * ("\\?\UNC\localhost\c$", which cleanPath refuses anyway), and the server with spaces or dots
- * around it. False for every path that is no UNC path, and on other systems. `opts` are for tests:
- * another system, environment, adapters or host name.
+ * ("\\?\UNC\localhost\c$", which cleanPath refuses anyway), the server with spaces or dots around
+ * it, or in Windows' offline-files spelling ("localhost$NOCSC$"). False for every path that is no
+ * UNC path, every other device path included ("\\?\GLOBALROOT\Device\Mup\localhost\c$" may reach
+ * this computer's share as well: cleanPath refuses every device path by the words first), and on
+ * other systems. `opts` are for tests: another system, environment, adapters or host name.
  */
 function isThisComputerShare(p, { platform = process.platform, env = process.env, interfaces = () => os.networkInterfaces(), hostname = () => os.hostname() } = {}) {
   if (typeof p !== 'string' || platform !== 'win32') return false;
   const raw = uncServer(p.trim());
   if (raw === null) return false;
-  // "server@SSL@443" (a WebDAV share) is on that same server; trailing dots, and spaces either
-  // side, leave the same name (a refusal errs on the side of refusing).
-  const host = looseHost(raw.split('@')[0]).trim().replace(/[.\s]+$/, '');
+  // "server@SSL@443" (a WebDAV share) is on that same server, and so is "server$NOCSC$" (Windows'
+  // offline files reaching it directly); trailing dots, and spaces either side, leave the same
+  // name, in any order (a refusal errs on the side of refusing).
+  let host = looseHost(raw.split('@')[0]).trim();
+  for (let before = ''; before !== host; ) {
+    before = host;
+    host = host.replace(/[.\s]+$/, '').replace(/\$nocsc\$$/, '').trim();
+  }
   // No server at all is no share anyone can name: refused as well.
   if (!host) return true;
   if (host === 'localhost' || host.endsWith('.localhost') || host === 'wsl$') return true;
@@ -872,7 +879,9 @@ function onVirtualNetwork(host, networks) {
  * adapters (a WSL, Hyper-V or Docker guest is a program on this computer one hop removed:
  * virtualNetworks), and a name that leads to any of them now (it is looked up; a name that cannot
  * be looked up is refused). A Hyper-V switch shared with the office network (an "external" switch)
- * counts as virtual too: an agent then cannot join a host on that network, a person still can.
+ * counts as virtual too, whatever it is named: no adapter is let off by its name, since a virtual
+ * machine's network can be named anything (fail closed). An agent then cannot join a host on that
+ * network; a person still can, from File > Open company on host.
  */
 async function joinProblem(raw, network = REAL_NETWORK) {
   const net0 = { ...REAL_NETWORK, ...(network || {}) };
@@ -1804,14 +1813,25 @@ async function printPdf({ BrowserWindow, bytes, printer = null, copies = 1, sett
 /** Pages a notice may open: the approval center, or one request in it. */
 const NOTICE_ROUTE = /^\/agent-requests(?:\/[A-Za-z0-9_-]{1,64})?$/;
 const NOTICE_HOME = '/agent-requests';
+/** A request's id as a notice may carry it (the same shape as a request's page in NOTICE_ROUTE). */
+const NOTICE_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
-/** Title and body as one plain line each, and the page to open (the approval center unless it is one of its own). */
+/** `v` when it is a request id a notice may carry, else null. */
+function noticeId(v) {
+  return typeof v === 'string' && NOTICE_ID.test(v) ? v : null;
+}
+
+/**
+ * Title and body as one plain line each, the page to open (the approval center unless it is one of
+ * its own), and `id`, the request the notice is for, when it says (showNotice announces each once).
+ */
 function cleanNotice(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const title = oneLine(raw.title, 80);
   if (!title) return null;
   const href = typeof raw.href === 'string' && NOTICE_ROUTE.test(raw.href) ? raw.href : NOTICE_HOME;
-  return { title, body: oneLine(raw.body, 240), href };
+  const id = noticeId(raw.id);
+  return { title, body: oneLine(raw.body, 240), href, ...(id ? { id } : {}) };
 }
 
 /**
@@ -1820,10 +1840,21 @@ function cleanNotice(raw) {
  * summary the server built from the operation, never the agent's own words and never any text the
  * page sends. `count` null (the server could not be asked): a notice that names nothing. `href`:
  * the page the page asked to open, only when it is one of the approval center's own.
+ *
+ * `askedId`: the request the window found new (its own read of the same route). This read comes a
+ * moment after the window's, so a request that arrives or is decided in between can make the
+ * server's newest another one: the agent and the summary are then never named (they would be the
+ * other request's), only the plain words. Without `askedId` (an older window), the newest one of
+ * this read is named. The notice carries the id of the request it is for, so showNotice announces
+ * each request once.
  */
-function noticeFromCount(count, href) {
+function noticeFromCount(count, href, askedId) {
   const c = count && typeof count === 'object' ? count : {};
-  const newest = c.newest && typeof c.newest === 'object' ? c.newest : null;
+  const read = c.newest && typeof c.newest === 'object' ? c.newest : null;
+  const asked = noticeId(askedId);
+  const readId = read ? noticeId(read.id) : null;
+  // Named only when this read's newest is the request the window found (or the window did not say).
+  const newest = read && (asked === null || asked === readId) ? read : null;
   const pending = Number.isInteger(c.pending) && c.pending > 0 ? c.pending : 0;
   const name = newest ? oneLine(newest.agentName, 60) : '';
   const summary = newest ? oneLine(newest.summary, 180).replace(/[.\s]+$/u, '') : '';
@@ -1833,6 +1864,7 @@ function noticeFromCount(count, href) {
     title: name ? `${name} asks for your approval` : 'An agent asks for your approval',
     body: summary ? `${summary}.${waiting} Click to review ${it}.` : `A request is waiting in Agent requests.${waiting} Click to review ${it}.`,
     href: typeof href === 'string' ? href : NOTICE_HOME,
+    id: asked ?? (newest ? readId : null),
   });
 }
 
@@ -1848,18 +1880,31 @@ function showWindowOn(win, route, navigate) {
 
 /** Notices on screen, kept until clicked or closed (one that is collected forgets its click). */
 const shownNotices = new Set();
+/**
+ * The requests a notice was shown for (their ids, the latest few hundred): each is announced once,
+ * also when the window asks again for it (a reload of the page, or a later poll that finds as new
+ * a request this app already named because it arrived while the window was asking for another).
+ */
+const announcedNotices = new Set();
+const ANNOUNCED_MAX = 500;
 
 /**
- * Show the notice unless the window is in front (a minimized, hidden or covered window is not).
- * Electron is passed in (`Notification`); `open` brings the window forward on the page
- * (showWindowOn). True when it was shown.
+ * Show the notice unless the window is in front (a minimized, hidden or covered window is not), or
+ * a notice was already shown for the request it is for (its `id`). Electron is passed in
+ * (`Notification`); `open` brings the window forward on the page (showWindowOn). True when it was
+ * shown.
  */
 function showNotice({ Notification, win, notice, open }) {
   const n = cleanNotice(notice);
   if (!n) return false;
+  if (n.id && announcedNotices.has(n.id)) return false;
   if (win && typeof win.isDestroyed === 'function' && !win.isDestroyed() && win.isFocused()) return false;
   if (typeof Notification !== 'function') return false;
   if (typeof Notification.isSupported === 'function' && !Notification.isSupported()) return false;
+  if (n.id) {
+    announcedNotices.add(n.id);
+    if (announcedNotices.size > ANNOUNCED_MAX) announcedNotices.delete(announcedNotices.values().next().value);
+  }
   const shown = new Notification({ title: n.title, body: n.body });
   const forget = () => shownNotices.delete(shown);
   shown.on('click', () => {

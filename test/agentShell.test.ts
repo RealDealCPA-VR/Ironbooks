@@ -75,6 +75,8 @@ vi.mock('@/lib/services/agentPolicies', () => ({
 vi.mock('@/lib/agent/files', async (orig) => ({
   // The rule itself is the real one: lib/agent/shell.ts and the shell's port are held to it below.
   isThisComputerShare: (await orig<typeof import('@/lib/agent/files')>()).isThisComputerShare,
+  // So is the one that leaves out an Admin's folder that has come to hold Ironbooks' own data.
+  overlapsAppData: (await orig<typeof import('@/lib/agent/files')>()).overlapsAppData,
   readStagedFile: vi.fn(async (owner: { companyId: string; agentId: string }, fileId: string) => mocks.staged.get(`${owner.companyId}/${owner.agentId}/${fileId}`) ?? null),
   allowedFolder: vi.fn(async (allowed: readonly string[], folder: string) => {
     const want = path.resolve(folder).toLowerCase();
@@ -571,30 +573,67 @@ interface ShareCase {
 }
 
 /**
- * A share of this very computer, by the words alone: the shell's port (electron/agentShell.js
- * isThisComputerShare) is held to the server's rule (lib/agent/files.ts) through that rule's own
- * table, lib/agent/thisComputerShares.json, so the two cannot drift apart. Its templates are filled
- * in for this computer as lib/agent/files.test.ts fills them; a case whose template cannot be
- * filled here is left out.
+ * What each template of lib/agent/thisComputerShares.json stands for on this computer, as the
+ * table's own "templates" list explains it (null: it cannot be filled here, and its cases are left
+ * out). A template the table lists and this has no way to fill makes the table tests fail
+ * (unknownTemplates): the port is never held to less than the table says.
  */
-function thisComputerCases(): ShareCase[] {
+function templateValues(): Record<string, string | null> {
   let ownIPv4: string | null = null;
+  let ownIPv6: string | null = null;
   for (const list of Object.values(os.networkInterfaces())) {
-    for (const a of list ?? []) if (!ownIPv4 && a.family === 'IPv4' && !a.internal) ownIPv4 = a.address;
+    for (const a of list ?? []) {
+      // Node names the family 'IPv4' or 'IPv6' (a number in some older versions).
+      const family = String(a.family);
+      if (!ownIPv4 && (family === 'IPv4' || family === '4') && !a.internal) ownIPv4 = a.address;
+      if (!ownIPv6 && (family === 'IPv6' || family === '6') && !a.internal) ownIPv6 = a.address.replace(/%.*$/, '');
+    }
   }
+  const v4Number = ownIPv4 === null ? null : ownIPv4.split('.').reduce((n, part) => n * 256 + Number(part), 0);
   const host = os.hostname();
-  const fill: Record<string, string | null> = {
+  return {
     '{hostname}': host,
     '{hostname:lower}': host.toLowerCase(),
     '{hostname:upper}': host.toUpperCase(),
     '{COMPUTERNAME}': process.env.COMPUTERNAME?.trim() || null,
     '{ownIPv4}': ownIPv4,
+    '{ownIPv4:number}': v4Number === null ? null : String(v4Number),
+    '{ownIPv4:hex}': v4Number === null ? null : `0x${v4Number.toString(16)}`,
+    '{ownIPv6}': ownIPv6,
+    '{ownIPv6:literal}': ownIPv6 === null ? null : `${ownIPv6.replace(/:/g, '-')}.ipv6-literal.net`,
   };
+}
+
+/** The templates the table lists (its "templates") that templateValues cannot fill: [] when it knows them all. */
+function unknownTemplates(): string[] {
+  const known = templateValues();
+  return Object.keys(thisComputerShares.templates).filter((t) => !Object.prototype.hasOwnProperty.call(known, t));
+}
+
+/**
+ * A share of this very computer, by the words alone: the shell's port (electron/agentShell.js
+ * isThisComputerShare) is held to the server's rule (lib/agent/files.ts) through that rule's own
+ * table, lib/agent/thisComputerShares.json, so the two cannot drift apart. Every template the table
+ * lists is filled in for this computer (templateValues, as lib/agent/files.test.ts fills them); a
+ * case whose template cannot be filled here is left out. A template this test does not know, or a
+ * case naming one the table does not list, throws: the test fails rather than judge a template's
+ * own words.
+ */
+function thisComputerCases(): ShareCase[] {
+  const unknown = unknownTemplates();
+  if (unknown.length) {
+    throw new Error(`lib/agent/thisComputerShares.json lists templates this test cannot fill: ${unknown.join(', ')}. Fill them in templateValues.`);
+  }
+  const fill = templateValues();
+  const listed = Object.keys(thisComputerShares.templates);
   const out: ShareCase[] = [];
   for (const c of thisComputerShares.cases as ShareCase[]) {
     let p: string | null = c.path;
-    for (const [t, v] of Object.entries(fill)) if (p?.includes(t)) p = v === null ? null : p.split(t).join(v);
-    if (p !== null) out.push({ ...c, path: p, templated: p !== c.path });
+    for (const t of listed) if (p?.includes(t)) p = fill[t] === null ? null : p.split(t).join(fill[t] as string);
+    if (p === null) continue;
+    const left = /\{[^}]+\}/.exec(p);
+    if (left) throw new Error(`The case ${JSON.stringify(c.path)} names ${left[0]}, which lib/agent/thisComputerShares.json does not list under templates.`);
+    out.push({ ...c, path: p, templated: p !== c.path });
   }
   return out;
 }
@@ -624,8 +663,34 @@ describe('a share of this very computer (\\\\localhost, a loopback address, its 
     interfaces: () => ({ Ethernet: [{ address: '192.168.1.202' }], Loopback: [{ address: '127.0.0.1' }] }),
   };
 
+  it('this test fills every template the table lists, and fails on one it does not know', () => {
+    expect(unknownTemplates()).toEqual([]);
+    // Every case's templates are ones the table lists, and none is left unfilled.
+    for (const c of thisComputerCases()) expect(c.path, c.path).not.toMatch(/\{[^}]+\}/);
+    // The cases that name this computer through a template are there (its name at least).
+    expect(thisComputerCases().some((c) => c.templated && c.path.includes(os.hostname()))).toBe(true);
+    // A template the table would list and this test cannot fill is caught.
+    const templates = thisComputerShares.templates as Record<string, string>;
+    templates['{ownMAC}'] = 'a template no test knows';
+    try {
+      expect(unknownTemplates()).toEqual(['{ownMAC}']);
+      expect(() => thisComputerCases()).toThrow(/lists templates this test cannot fill: \{ownMAC\}/);
+    } finally {
+      delete templates['{ownMAC}'];
+    }
+    // So is a case that names a template the table does not list.
+    const cases = thisComputerShares.cases as ShareCase[];
+    cases.push({ path: '\\\\{nowhere}\\c$', want: true });
+    try {
+      expect(() => thisComputerCases()).toThrow(/names \{nowhere\}, which lib\/agent\/thisComputerShares\.json does not list/);
+    } finally {
+      cases.pop();
+    }
+  });
+
   it('the shell’s rule says what the server’s says, case by case, by the words alone', async () => {
     const files = await vi.importActual<typeof import('@/lib/agent/files')>('@/lib/agent/files');
+    expect(unknownTemplates()).toEqual([]);
     const cases = thisComputerCases();
     expect(cases.length).toBeGreaterThan(50);
     for (const c of cases) {
@@ -825,6 +890,26 @@ describe('the host an agent asks to join (shell.hosting.connect)', () => {
     const broken = { ...NETWORK, interfaces: () => { throw new Error('no table'); } };
     expect(await agentShell.joinProblem('172.29.150.7', broken)).toBeNull();
     expect(await agentShell.joinProblem('localhost', broken)).toMatch(/is this computer itself/);
+  });
+
+  it('a Hyper-V switch shared with the office network is not let off by its name: agents cannot join a host on it (fail closed)', async () => {
+    // An "external" switch: Windows moves the office network card's address onto the switch's own
+    // adapter. A virtual machine's network can be named anything, so no name lets one off.
+    for (const name of ['vEthernet (External Switch)', 'vEthernet (Office LAN)', 'Office network']) {
+      const shared = {
+        ...NETWORK,
+        interfaces: () => ({
+          [name]: [{ address: '192.168.1.202', netmask: '255.255.255.0', family: 'IPv4', mac: '00:15:5d:01:0a:0b', internal: false, cidr: '192.168.1.202/24' }],
+          Loopback: [{ address: '127.0.0.1', family: 'IPv4', internal: true }],
+        }),
+      };
+      const why = await agentShell.joinProblem('192.168.1.20', shared);
+      expect(why, name).toMatch(/is a virtual machine or container running on this computer/);
+      // What a person does instead is said.
+      expect(why, name).toMatch(/a person can join it from File > Open company on host/);
+      // Another office network next to it is not this computer's.
+      expect(await agentShell.joinProblem('192.168.2.20', shared), name).toBeNull();
+    }
   });
 
   it('refuses what the window refuses anyway, and a name it cannot look up', async () => {
@@ -1152,7 +1237,7 @@ describe('the endpoint and the server’s side of it', () => {
   };
 
   let endpoint: { env: { endpoint: string; key: string }; ready: Promise<unknown>; close: () => Promise<void> };
-  const saved = { endpoint: process.env[SHELL_ENDPOINT_ENV], key: process.env[SHELL_KEY_ENV] };
+  const saved = { endpoint: process.env[SHELL_ENDPOINT_ENV], key: process.env[SHELL_KEY_ENV], docs: process.env[SHELL_DOCUMENTS_ENV] };
 
   /** What the endpoint writes to the app's log (main.js prints it with "[agent-shell]"). */
   const logged: string[] = [];
@@ -1162,11 +1247,14 @@ describe('the endpoint and the server’s side of it', () => {
     await endpoint.ready;
     process.env[SHELL_ENDPOINT_ENV] = endpoint.env.endpoint;
     process.env[SHELL_KEY_ENV] = endpoint.env.key;
+    // As main.js tells the company server: the shell's Documents, so the server's own check of a
+    // flow's paths (runShellOperation) and the shell's (its folders: Documents\Ironbooks) agree.
+    process.env[SHELL_DOCUMENTS_ENV] = path.dirname(ALLOWED);
   });
   afterAll(async () => {
     setPrintHandler(null);
     await endpoint.close();
-    for (const [k, v] of [[SHELL_ENDPOINT_ENV, saved.endpoint], [SHELL_KEY_ENV, saved.key]] as const) {
+    for (const [k, v] of [[SHELL_ENDPOINT_ENV, saved.endpoint], [SHELL_KEY_ENV, saved.key], [SHELL_DOCUMENTS_ENV, saved.docs]] as const) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
@@ -1256,6 +1344,66 @@ describe('the endpoint and the server’s side of it', () => {
     expect(ran).toEqual([]);
     mocks.folders = [OUTSIDE];
     expect((await run('shell.company.saveCopyAs', { file: path.join(OUTSIDE, 'Copy.ironbooks') })).ok).toBe(true);
+  });
+
+  it('a folder the Admin added that has since come to hold Ironbooks’ own data is not sent to the shell, and allows nothing', async () => {
+    // Since the Admin added it, Ironbooks keeps its backups in a folder inside it.
+    const kept = path.join(OUTSIDE, 'kept-backups');
+    fs.mkdirSync(kept, { recursive: true });
+    const before = process.env.BKA_BACKUP_DIR;
+    process.env.BKA_BACKUP_DIR = kept;
+    mocks.folders = [OUTSIDE];
+    try {
+      const r = await run('shell.company.saveCopyAs', { file: path.join(OUTSIDE, 'Later.ironbooks') });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/not in a folder agents may use/);
+      expect(fs.existsSync(path.join(OUTSIDE, 'Later.ironbooks'))).toBe(false);
+      expect(ran).toEqual([]);
+    } finally {
+      if (before === undefined) delete process.env.BKA_BACKUP_DIR;
+      else process.env.BKA_BACKUP_DIR = before;
+      fs.rmSync(kept, { recursive: true, force: true });
+    }
+    // Once it holds none, it is the agent's folder again.
+    expect((await run('shell.company.saveCopyAs', { file: path.join(OUTSIDE, 'Later.ironbooks') })).ok).toBe(true);
+  });
+
+  it('each path is judged again when the approved work runs: one that has come to lie inside Ironbooks’ own data is refused before the shell is asked', async () => {
+    // The company file now sits in Documents\Ironbooks (one of the default folders), with its
+    // archives beside it. The shell's own check knows nothing of Ironbooks' data and would take a
+    // path in the archives; the server judges each path field as files.save judges its folder.
+    const archives = path.join(ALLOWED, 'archives');
+    fs.mkdirSync(archives, { recursive: true });
+    const keep = process.env.BKA_COMPANY_FILE;
+    process.env.BKA_COMPANY_FILE = path.join(ALLOWED, 'Acme.ironbooks');
+    const files = await import('@/lib/agent/files');
+    const real = await vi.importActual<typeof import('@/lib/agent/files')>('@/lib/agent/files');
+    const allowed = vi.mocked(files.allowedFolder);
+    const stand = allowed.getMockImplementation();
+    // The real folder rule for this test (the stand-in above knows nothing of Ironbooks' data).
+    allowed.mockImplementation(real.allowedFolder);
+    try {
+      const r = await run('shell.company.saveCopyAs', { file: path.join(archives, 'Old.ironbooks') });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/Old\.ironbooks" is not in a folder agents may use on this computer now, or its folder is no longer there, so nothing was done/);
+      expect(fs.existsSync(path.join(archives, 'Old.ironbooks'))).toBe(false);
+      // Every path the operation takes: the target of an open as well as the file it opens.
+      const target = await run('shell.portable.open', { file: path.join(ALLOWED, 'Acme.bkp'), target: path.join(archives, 'New.ironbooks') }, {}, { backup_password: SECRET });
+      expect(target.error).toMatch(/New\.ironbooks" is not in a folder agents may use on this computer now/);
+      // A folder that is gone by then, and what is no full path, the same.
+      expect((await run('shell.company.saveCopyAs', { file: path.join(ALLOWED, 'Gone', 'Copy.ironbooks') })).error).toMatch(/or its folder is no longer there/);
+      expect((await run('shell.company.saveCopyAs', { file: 'Copy.ironbooks' })).error).toMatch(/^"file" must be the full path of a file in a folder agents may use/);
+      expect(JSON.stringify(target)).not.toContain(SECRET);
+      expect(ran).toEqual([]);
+      // In the folder itself, beside the company file: the run goes through, and the shell checks it again.
+      expect((await run('shell.company.saveCopyAs', { file: path.join(ALLOWED, 'Beside.ironbooks') })).ok).toBe(true);
+      expect(ran).toEqual(['saveCopyAs']);
+    } finally {
+      if (stand) allowed.mockImplementation(stand);
+      if (keep === undefined) delete process.env.BKA_COMPANY_FILE;
+      else process.env.BKA_COMPANY_FILE = keep;
+      fs.rmSync(archives, { recursive: true, force: true });
+    }
   });
 
   it('a flow that needs an answer it was not given fails cleanly, naming the question, and nothing waits', async () => {
@@ -1605,6 +1753,92 @@ describe('files.save', () => {
       fs.rmSync(path.join(top, name), { force: true });
     }
     expect(fs.existsSync(path.join(OUTSIDE, name))).toBe(false);
+  });
+
+  it('an Admin folder that has since come to hold Ironbooks’ own data is not one it saves in', async () => {
+    const kept = path.join(OUTSIDE, 'kept-backups');
+    fs.mkdirSync(kept, { recursive: true });
+    const before = process.env.BKA_BACKUP_DIR;
+    process.env.BKA_BACKUP_DIR = kept;
+    const name = `ib-agent-shell-held-${process.pid}.pdf`;
+    try {
+      expect((await save({ fileId, folder: OUTSIDE, name })).error).toMatch(/not a folder agents may save in/);
+      expect(fs.existsSync(path.join(OUTSIDE, name))).toBe(false);
+    } finally {
+      if (before === undefined) delete process.env.BKA_BACKUP_DIR;
+      else process.env.BKA_BACKUP_DIR = before;
+      fs.rmSync(kept, { recursive: true, force: true });
+    }
+  });
+
+  it('an Admin folder that is a device path, or no full path, is never looked at and never used', async () => {
+    // \\?\GLOBALROOT\Device\Mup\… reaches any computer's shares (this one's too): refused by the
+    // words, before anything asks the disk about it (looking at a share offers it this person's sign-in).
+    // This covers the pair policyFolders (which already leaves these out: overlapsAppData is true
+    // for them) and usableFolders; the next test reaches usableFolders alone, through the defaults.
+    const odd = [
+      '\\\\?\\GLOBALROOT\\Device\\Mup\\otherserver\\books',
+      '\\\\.\\UNC\\otherserver\\books',
+      '\\??\\C:\\Books',
+      '//?/C:/Books',
+      'relative\\Books',
+      '   ',
+    ];
+    const looked = vi.spyOn(fs.realpathSync, 'native');
+    const allowed = vi.mocked((await import('@/lib/agent/files')).allowedFolder);
+    mocks.folders = odd;
+    try {
+      allowed.mockClear();
+      await save({ fileId, folder: OUTSIDE });
+      const seen = looked.mock.calls.map((c) => String(c[0]));
+      for (const f of odd) expect(seen, f).not.toContain(f);
+      // What reaches the folder check is only the defaults: none of those.
+      const given = (allowed.mock.calls[0]?.[0] ?? []) as string[];
+      for (const f of odd) expect(given, f).not.toContain(f);
+    } finally {
+      looked.mockRestore();
+      mocks.folders = [];
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('a default folder that is a device path (the company file or Documents as the shell told them) is never looked at either', async () => {
+    // The defaults do not go through policyFolders: usableFolders is the only check on them here.
+    const DEVICE = /^[\\/]{2}[?.][\\/]|^\\\?\?\\/;
+    const keep = { company: process.env.BKA_COMPANY_FILE, docs: process.env[SHELL_DOCUMENTS_ENV] };
+    process.env.BKA_COMPANY_FILE = '\\\\?\\GLOBALROOT\\Device\\Mup\\otherserver\\books\\Acme.ironbooks';
+    process.env[SHELL_DOCUMENTS_ENV] = '\\\\.\\UNC\\otherserver\\docs';
+    const odd = [
+      '\\\\?\\GLOBALROOT\\Device\\Mup\\otherserver\\books',
+      '\\\\.\\UNC\\otherserver\\docs\\Ironbooks',
+      `\\\\.\\UNC\\otherserver\\docs\\Ironbooks\\${AGENT_OUTBOX_NAME}`,
+    ];
+    // Should the guard ever go, the look still never leaves this computer from a test.
+    const realNative = fs.realpathSync.native;
+    const looked = vi.spyOn(fs.realpathSync, 'native').mockImplementation(((p: fs.PathLike, o?: unknown) => {
+      if (DEVICE.test(String(p))) throw Object.assign(new Error('ENOENT: not looked at in a test'), { code: 'ENOENT' });
+      return realNative(p, o as BufferEncoding);
+    }) as unknown as typeof fs.realpathSync.native);
+    const allowed = vi.mocked((await import('@/lib/agent/files')).allowedFolder);
+    const name = `ib-agent-shell-device-${process.pid}.pdf`;
+    try {
+      // They are among the defaults as the shell told them, so only usableFolders can leave them out.
+      expect(defaultAgentFolders()).toEqual(expect.arrayContaining(odd));
+      allowed.mockClear();
+      const r = await save({ fileId, folder: OUTSIDE, name });
+      expect(r.ok, r.error ?? '').toBe(true);
+      const seen = looked.mock.calls.map((c) => String(c[0]));
+      expect(seen.filter((s) => DEVICE.test(s))).toEqual([]);
+      const given = (allowed.mock.calls[0]?.[0] ?? []) as string[];
+      expect(given.filter((s) => DEVICE.test(s))).toEqual([]);
+      expect(given).toContain(OUTSIDE);
+    } finally {
+      looked.mockRestore();
+      for (const [k, v] of [['BKA_COMPANY_FILE', keep.company], [SHELL_DOCUMENTS_ENV, keep.docs]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      fs.rmSync(path.join(OUTSIDE, name), { force: true });
+    }
   });
 
   it('a name is only a name: no folder in it, nothing Windows would change or keeps for a device', async () => {
@@ -2156,6 +2390,7 @@ describe('the desktop notice when an agent asks (plan 7.2)', () => {
       title: 'Month-end helper asks for your approval',
       body: 'Pay 3 bills from Checking for $1,240.00. Click to review it.',
       href: '/agent-requests',
+      id: 'r1',
     });
     const three = agentShell.noticeFromCount({ ...count, pending: 3 }, '/agent-requests/r1');
     expect(three.body).toBe('Pay 3 bills from Checking for $1,240.00. 3 requests are waiting. Click to review them.');
@@ -2168,6 +2403,49 @@ describe('the desktop notice when an agent asks (plan 7.2)', () => {
       expect(n.body).toMatch(/^A request is waiting in Agent requests\./);
       expect(n.href).toBe('/agent-requests');
     }
+  });
+
+  it('names the agent and what it asks only for the request the window found new, and announces each request once', () => {
+    // The window found "a" new; this app's own read, a moment later, finds "b" newest (it arrived in between).
+    const count = {
+      pending: 2,
+      newest: { id: 'b-2', agentName: 'Payroll helper', summary: 'Enter a paycheck for Dana Lee', createdAt: '2026-11-20T10:01:00.000Z' },
+      agents: 1,
+      allPaused: false,
+      canPauseAll: true,
+    };
+    const forA = agentShell.noticeFromCount(count, '/agent-requests', 'a-1');
+    expect(forA).toEqual({
+      title: 'An agent asks for your approval',
+      body: 'A request is waiting in Agent requests. 2 requests are waiting. Click to review them.',
+      href: '/agent-requests',
+      id: 'a-1',
+    });
+    expect(JSON.stringify(forA)).not.toMatch(/Payroll helper|Dana Lee/);
+    // The same request: named.
+    const forB = agentShell.noticeFromCount(count, '/agent-requests', 'b-2');
+    expect(forB.title).toBe('Payroll helper asks for your approval');
+    expect(forB.id).toBe('b-2');
+    // An id that is no request's id is no id at all (an older window): the newest one is named.
+    for (const odd of ['', '../settings', 'x'.repeat(65), 42, null, undefined]) {
+      expect(agentShell.noticeFromCount(count, '/agent-requests', odd).title, String(odd)).toBe('Payroll helper asks for your approval');
+    }
+    // Each request is announced once, also when the window asks again (a reload, a later poll).
+    const before = FakeNotice.made.length;
+    const show = (notice: unknown) => agentShell.showNotice({ Notification: FakeNotice, win: win(false), notice, open: vi.fn() });
+    expect(show(forA)).toBe(true);
+    expect(show(agentShell.noticeFromCount(count, '/agent-requests', 'a-1'))).toBe(false);
+    // Asked without an id, the newest one ("b") is named once; the window's later ask for "b" shows nothing more.
+    expect(show(agentShell.noticeFromCount(count, '/agent-requests'))).toBe(true);
+    expect(show(agentShell.noticeFromCount(count, '/agent-requests', 'b-2'))).toBe(false);
+    expect(FakeNotice.made.slice(before).map((n) => n.opts.title)).toEqual(['An agent asks for your approval', 'Payroll helper asks for your approval']);
+    // While the window is in front nothing is announced, so the request is still announced later.
+    const c = { ...count, newest: { ...count.newest, id: 'c-3' } };
+    expect(agentShell.showNotice({ Notification: FakeNotice, win: win(true), notice: agentShell.noticeFromCount(c, '/agent-requests', 'c-3'), open: vi.fn() })).toBe(false);
+    expect(show(agentShell.noticeFromCount(c, '/agent-requests', 'c-3'))).toBe(true);
+    // A notice with no id at all (the server could not be asked) is never held back.
+    expect(show(agentShell.noticeFromCount(null, '/agent-requests'))).toBe(true);
+    expect(show(agentShell.noticeFromCount(null, '/agent-requests'))).toBe(true);
   });
 
   it('a minimized window is not in front: the notice shows, and clicking it brings the window back on the approval center', () => {
@@ -2207,8 +2485,11 @@ describe('the desktop notice when an agent asks (plan 7.2)', () => {
     try {
       showAgentRequestNotice({ title: 'Bot asks', body: 'Email invoice 1042', href: '/agent-requests/r1' });
       expect(agentNotice).toHaveBeenCalledWith({ title: 'Bot asks', body: 'Email invoice 1042', href: '/agent-requests/r1' });
+      // The id of the request the window found new goes along when there is one.
+      showAgentRequestNotice({ title: 'Bot asks', body: 'Email invoice 1042', href: '/agent-requests', id: 'r1' });
+      expect(agentNotice).toHaveBeenLastCalledWith({ title: 'Bot asks', body: 'Email invoice 1042', href: '/agent-requests', id: 'r1' });
       showAgentRequestNotice({ title: ' ', body: 'b', href: '/agent-requests' });
-      expect(agentNotice).toHaveBeenCalledTimes(1);
+      expect(agentNotice).toHaveBeenCalledTimes(2);
       g.window = { bookkeeper: { agentNotice: () => Promise.reject(new Error('no')) } };
       expect(() => showAgentRequestNotice({ title: 't', body: 'b', href: '/agent-requests' })).not.toThrow();
       g.window = { bookkeeper: {} };
@@ -2282,17 +2563,23 @@ describe('main.js and preload.js', () => {
     expect(main.slice(at, at + 200)).toMatch(/if \(!fromLocalApp\(e\) \|\| agentServiceHidden\) return false;/);
     const handler = main.slice(at, main.indexOf('});', at));
     expect(handler).toContain('const count = await agentRequestCountForNotice();');
-    expect(handler).toContain("notice: agentShell.noticeFromCount(count, ask && typeof ask === 'object' ? ask.href : null),");
+    // The page to open, and the id of the request the window found new (named only when it is this read's newest).
+    expect(handler).toContain(
+      "notice: agentShell.noticeFromCount(count, ask && typeof ask === 'object' ? ask.href : null, ask && typeof ask === 'object' ? ask.id : null),",
+    );
+    expect(handler).not.toMatch(/ask\.(title|body)/);
     expect(handler).toContain('open: (route) => agentShell.showWindowOn(mainWindow, route, navigate),');
     // The count is asked with the window's own sign-in, from this app's own server only.
     const count = fnBody('async function agentRequestCountForNotice() {');
     expect(count).toMatch(/if \(!serverUrl \|\| remoteHostOrigin \|\| !mainWindow \|\| mainWindow\.isDestroyed\(\)\) return null;/);
     expect(count).toContain("new URL('/api/agent-requests/count', serverUrl)");
     expect(count).toContain("ses.fetch(countUrl, { credentials: 'include', cache: 'no-store', redirect: 'error' })");
-    // The preload passes the page to open and nothing else.
+    // The preload passes the page to open and the request's id, and nothing else.
     const bridge = preload.slice(preload.indexOf('agentNotice: (notice) =>'), preload.indexOf('isDesktop: true'));
-    expect(bridge).toMatch(/ipcRenderer\.invoke\('agent:notice', \{\s*href: String\(\(notice && notice\.href\) \?\? ''\),\s*\}\)/);
-    expect(bridge).not.toMatch(/title: String|body: String/);
+    expect(bridge).toMatch(
+      /ipcRenderer\.invoke\('agent:notice', \{\s*href: String\(\(notice && notice\.href\) \?\? ''\),\s*id: String\(\(notice && notice\.id\) \?\? ''\),\s*\}\)/,
+    );
+    expect(bridge).not.toMatch(/title: String|body: String|notice\.(title|body|summary|newest)/);
   });
 
   it('staged files go when the company file closes, and the servers never take a staged-files folder from this computer', () => {

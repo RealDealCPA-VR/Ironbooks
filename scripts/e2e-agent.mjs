@@ -38,9 +38,10 @@
  * is never opened for an agent. Output: one line per check, a summary table at the end, exit code
  * 1 on any failure, and the throwaway folder kept (its path printed) when anything failed.
  *
- * Not covered any more: a person starting Ironbooks while it runs hidden for an agent gets that
- * copy's window (the earlier script's step 10). That second start can leave a native "could not
- * start" box behind on any computer (agents or not), which this script would have to click.
+ * Not automated: a person starting Ironbooks while it runs hidden for an agent gets that copy's
+ * window (the earlier script's step 10). It needs a person's own second start, so it is checked by
+ * hand (_vr_tmp/AGENT-ACCESS-TESTING.md, "While Ironbooks is closed"). That the second start exits
+ * at once and opens no window of its own is pinned by test/singleInstance.test.ts.
  */
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -150,7 +151,7 @@ const SCENARIOS = [
     title: 'Phase 4: an email reminder held until approval',
     steps: [
       'mail goes to a catcher on 127.0.0.1 started by this script (Preferences > Send Forms set up in the window)',
-      'a recipient that is not a plain address is refused before anyone is asked',
+      'a recipient that is not a plain address (a display name, or two addresses where one is taken) is refused before anyone is asked',
       'a dry run shows the email it would send and sends nothing',
       'asked: nothing is sent while it waits; the card shows the recipient\'s domain in full',
       'approved: exactly one email reaches the catcher, to the customer, and the collection contact is recorded',
@@ -971,13 +972,20 @@ async function phase4() {
   need(inv.status === 201 || inv.status === 200, 'and an invoice of theirs that is overdue', inv.body ?? inv.text);
   const pendingBefore = (await pendingFor(A.id)).length;
 
-  const bad = await tool('keeper', 'run_operation', {
-    operation: 'collections.email',
-    body: { customerId, what: 'invoices', to: 'Acme Billing <billing@acme.example>' },
-    request_id: 'e2e-p4-bad-to',
-    reason: 'Reminder of the overdue invoice.',
-  });
-  check(!bad.ok && /address/i.test(bad.text), 'a recipient that is not a plain address is refused', bad.text);
+  // An agent names plain addresses only (lib/agent/guards.ts plainAddress): a display name is
+  // refused, and so are two addresses in a field that takes one (collections.email's "to").
+  for (const [to, what, id] of [
+    ['Acme Billing <billing@acme.example>', 'a recipient with a display name', 'e2e-p4-bad-to'],
+    ['billing@acme.example, ap@acme.example', 'two addresses in a field that takes one', 'e2e-p4-two-to'],
+  ]) {
+    const bad = await tool('keeper', 'run_operation', {
+      operation: 'collections.email',
+      body: { customerId, what: 'invoices', to },
+      request_id: id,
+      reason: 'Reminder of the overdue invoice.',
+    });
+    check(!bad.ok && /address/i.test(bad.text), `${what} is refused, with a note to send just the address`, bad.text);
+  }
   check((await pendingFor(A.id)).length === pendingBefore && W.mail.messages.length === 0, 'before anyone is asked, and nothing is sent');
 
   const body = { customerId, what: 'invoices' };
@@ -1136,8 +1144,9 @@ async function phase6() {
     ['roles.update', { params: { id: heldId }, body: change, request_id: 'e2e-p6-role-change', reason: 'Tidy the role.' }, 'changing it'],
     ['roles.delete', { params: { id: heldId }, request_id: 'e2e-p6-role-delete', reason: 'Remove the role.' }, 'deleting it'],
   ];
-  // The door names the role as the agent named it (its id, lib/agent/operate.ts roleHeldNote);
-  // the approval path names it by its name (lib/agent/bridge.ts). Either one is the role.
+  // The door and the bridge name the role by its name (lib/agent/operate.ts roleHeldNote, through
+  // summaryNames; lib/agent/bridge.ts heldRoleRefusal), and fall back to the id when no name is
+  // found. Either one is the role.
   const namesHeld = new RegExp(`"(?:${literal(heldId)}|E2E Held Role)"`);
   for (const [operation, args, what] of tries) {
     const res = await tool('admin', 'run_operation', { operation, ...args });

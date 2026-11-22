@@ -13,14 +13,15 @@
  *  1. its input is checked with the action's own schema (the fields the curated tools send);
  *  2. the input is turned into the route's own request: path parameters, query and body
  *     (`request`), and the version of the record the agent last read (expectedUpdatedAt), which
- *     the route compares inside the transaction that commits;
- *  3. a check of the action's own (that same version, as a quick first answer) runs only once
- *     the policy has had its say. A request the policy or the agent's role refuses is refused
- *     before anything about the record is read, exactly as run_operation refuses it, so a refusal
- *     never says who last changed a record, or whether it exists;
+ *     the route alone compares, inside the transaction that commits, so a stale request is
+ *     answered exactly as run_operation answers it;
+ *  3. a check of the action's own, where it has one (no opening stock on a new item), runs only
+ *     once the policy has had its say. A request the policy or the agent's role refuses is refused
+ *     first, exactly as run_operation refuses it, so a refusal never says who last changed a
+ *     record, or whether it exists;
  *  4. that request goes through the door as the run_operation verb itself (handleVerb), with the
  *     agent's request id, the dry run flag and its reason (the agent's own words; the placeholder
- *     of noReasonGiven only when the request has no reason field at all). The policy, standing
+ *     NO_REASON_GIVEN only when the request has no reason field at all). The policy, standing
  *     permission, the route bridge, dry runs, request ids, permission requests and the "slow
  *     down" are all the door's, so a curated action can never do what run_operation would not;
  *  5. the door's answer comes back in the action's words (`answer`: documentResult and friends).
@@ -106,10 +107,10 @@ export interface AgentActionDef<I = unknown> {
   /** The route's answer in this action's words (documentResult and friends). Left out: as the route answered. */
   answer?: (routeAnswer: unknown, input: I, how: ActionAnswerContext) => unknown;
   /**
-   * A check of the action's own before the request is sent (the version of a record the agent
-   * last read, as a quick first answer; the route compares it again where it counts, inside the
-   * committing transaction). It runs only when the policy does not refuse the request (see the
-   * top of this file).
+   * A check of the action's own before the request is sent: something the route accepts and the
+   * action does not (opening stock on a new item). It runs only when the policy does not refuse the
+   * request (see the top of this file). Never the version of a record: the route compares that
+   * itself, and a check here could answer differently from run_operation (lib/agent/catalog.ts).
    */
   check?: (ctx: ServiceContext, input: I) => Promise<void>;
   /** 'door' (the default): through the agent's door. 'own' and 'self': see the top of this file. */
@@ -412,22 +413,29 @@ interface Asked {
 }
 
 /**
- * The words that stand in for a reason when the request has no reason field at all: a client that
- * never sends one (an older connector, whose curated tools had no reason field; today's send the
- * agent's own, mcp/write-tools.mjs). A person is never asked without a reason, so the card says
- * plainly that this is not the agent's own explanation. A client that sends the field (even empty)
- * knows it: an empty reason then meets the door's own rule (operate.ts NO_REASON_NOTE).
+ * The words that stand in for a reason when the request has no reason field at all. Every curated
+ * tool of today's connector offers one (mcp/write-tools.mjs) and leaves the field out when the
+ * agent gives none; an older connector never sends it. A person is never asked without a reason,
+ * so the card says plainly that the agent gave none, rather than make one up. A client that sends
+ * the field (even empty) knows it: an empty reason then meets the door's own rule (operate.ts
+ * NO_REASON_NOTE).
  */
-function noReasonGiven(action: AnyAction): string {
-  return `No reason given: the agent used the "${action.name}" tool, which does not ask for one.`;
+const NO_REASON_GIVEN = 'No reason given: the agent did not say why.';
+
+/**
+ * A request id that cannot be one, said as the door says it, with the field named
+ * (details.fields.requestId) so a client can tell it from any other refusal of the input.
+ */
+function requestIdError() {
+  return validation(REQUEST_ID_MESSAGE, { fields: { requestId: 'give a request_id of your own, unique to this change' } });
 }
 
-function askedOf(action: AnyAction, body: AgentActionRequest): Asked {
+function askedOf(body: AgentActionRequest): Asked {
   const dryRun = body?.dryRun === true;
   const id = body?.requestId;
-  if (id !== undefined && id !== null && typeof id !== 'string') throw validation(REQUEST_ID_MESSAGE);
+  if (id !== undefined && id !== null && typeof id !== 'string') throw requestIdError();
   // The door refuses an id longer than it stores with a message of its own; say the same thing here.
-  if (!dryRun && typeof id === 'string' && id.length > REQUEST_ID_MAX) throw validation(REQUEST_ID_MESSAGE);
+  if (!dryRun && typeof id === 'string' && id.length > REQUEST_ID_MAX) throw requestIdError();
   const given = body?.reason;
   if (given !== undefined && given !== null && typeof given !== 'string') {
     throw validation('Give the reason as text: one line saying why this is needed.', { fields: { reason: 'must be text' } });
@@ -437,11 +445,11 @@ function askedOf(action: AnyAction, body: AgentActionRequest): Asked {
     throw validation(`The reason can be at most ${REASON_MAX} characters. Say why in one or two plain sentences.`, { fields: { reason: `at most ${REASON_MAX} characters` } });
   }
   const absent = given === undefined || given === null;
-  return { dryRun, requestId: typeof id === 'string' ? id : undefined, reason: absent ? noReasonGiven(action) : reason };
+  return { dryRun, requestId: typeof id === 'string' ? id : undefined, reason: absent ? NO_REASON_GIVEN : reason };
 }
 
 function requireRequestId(requestId: unknown): string {
-  if (typeof requestId !== 'string' || !REQUEST_ID_RE.test(requestId.trim())) throw validation(REQUEST_ID_MESSAGE);
+  if (typeof requestId !== 'string' || !REQUEST_ID_RE.test(requestId.trim())) throw requestIdError();
   return requestId.trim();
 }
 
@@ -522,7 +530,7 @@ export async function runAgentAction(ctx: ServiceContext, body: AgentActionReque
 
   if (action.runs === 'self') {
     const input = parseInput(action, body?.input);
-    askedOf(action, body);
+    askedOf(body);
     // Its run is a verb of the door's (list_my_requests), which counts the call itself.
     return { action: action.name, outcome: 'read', result: await action.run(ctx, input) };
   }
@@ -536,7 +544,7 @@ export async function runAgentAction(ctx: ServiceContext, body: AgentActionReque
   // answer) is this same call.
   return doorRun(ctx, async () => {
     const input = parseInput(action, body?.input);
-    const asked = askedOf(action, body);
+    const asked = askedOf(body);
     const operation = actionOperation(action);
     if (asked.requestId !== undefined && !asked.dryRun) {
       const before = await answerFromBefore(agent.id, asked.requestId, action, input);
@@ -554,9 +562,9 @@ export async function runAgentAction(ctx: ServiceContext, body: AgentActionReque
  *
  * The version of the record the agent last read goes with the request (OperationInput
  * expectedUpdatedAt): the bridge sends it to the route as x-expected-updated-at, and the route's
- * own withVersionCheck compares it inside the transaction that commits. That is the real guard
- * against overwriting a person's edit; the action's own check (lib/agent/catalog.ts versionCheck)
- * is only the quick first answer.
+ * own withVersionCheck compares it inside the transaction that commits. That is the one guard
+ * against overwriting a person's edit, for a dry run, the agent's own run and an approved run
+ * alike; nothing here compares it first (lib/agent/catalog.ts versioned says why).
  */
 async function door(ctx: ServiceContext, operation: Operation, request: OperationInput, asked: Asked): Promise<AgentOperationAnswer> {
   const { handleVerb } = await import('./operate');
@@ -595,11 +603,9 @@ async function doorRefusal(ctx: ServiceContext, operation: Operation, request: O
 
 /**
  * Send the action's request through the agent's door, as run_operation sends it. The action's own
- * check (the version of the record the agent last read, or opening stock on a new item) runs only
- * for a request the policy does not refuse: a refusal comes first, in the door's words, before the
- * record is looked at, so it never says who changed a record last or whether it exists. All of it
- * comes after the call was counted (runAgentAction, doorRun): a check that answers "changed since"
- * counts as a call like any other.
+ * check (opening stock on a new item) runs only for a request the policy does not refuse: a
+ * refusal comes first, in the door's words. All of it comes after the call was counted
+ * (runAgentAction, doorRun): a request the check refuses counts as a call like any other.
  * `decided`: the caller already knows the policy does not refuse it (runOwn).
  */
 async function throughDoor<I>(

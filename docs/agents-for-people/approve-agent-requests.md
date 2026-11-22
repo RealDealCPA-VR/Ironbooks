@@ -11,9 +11,10 @@
 - **area:** `ai` (AI & automation)
 - **go:** [Agent requests](/agent-requests)
 
-**Summary.** An agent asks before it does anything its settings do not let it do alone. Its
-requests wait in Agent requests: open one, check what Ironbooks worked out it would do, then
-choose "Approve once", "Approve similar…" or "Deny…".
+**Summary.** On its own an agent does only what its settings allow, or what a person gave it
+standing permission for. What its settings say to ask for waits in Agent requests: open a request, check what Ironbooks worked out it would do, then
+choose "Approve once", "Approve similar…" or "Deny…". Work its settings set to Never is refused
+without asking, so it never shows here.
 
 ## Steps
 
@@ -37,6 +38,9 @@ choose "Approve once", "Approve similar…" or "Deny…".
 
 ## Good to know
 
+- An agent never asks for work its settings set to Never: it is told no at once, and nothing
+  waits here. If you want it to ask for that work, an Admin sets it to Ask on the agent's page in
+  Users & Roles > Agents.
 - "The books changed since the agent asked" means someone changed a record the request uses after
   the agent asked. The card shows what would happen now. Click "Approve what would happen now"
   only if that is still right. Work elsewhere in the books, or the next invoice or check number,

@@ -137,8 +137,10 @@ interface ShareCase {
 }
 
 /**
- * The table's cases with its templates filled in for this computer (lib/agent/thisComputerShares.json
- * says what each stands for); a case whose template cannot be filled here is left out.
+ * The table's cases with every template it lists filled in for this computer
+ * (lib/agent/thisComputerShares.json says what each stands for); a case whose template cannot be
+ * filled here is left out. A template the table lists that this cannot fill, or a case naming one
+ * the table does not list, throws: the test fails rather than judge a template's own words.
  */
 function shareCases(): ShareCase[] {
   let ownIPv4: string | null = null;
@@ -164,11 +166,17 @@ function shareCases(): ShareCase[] {
     '{ownIPv6}': ownIPv6,
     '{ownIPv6:literal}': ownIPv6 === null ? null : `${ownIPv6.replace(/:/g, '-')}.ipv6-literal.net`,
   };
+  const listed = Object.keys(thisComputerShares.templates);
+  const unknown = listed.filter((t) => !Object.prototype.hasOwnProperty.call(fill, t));
+  if (unknown.length) throw new Error(`lib/agent/thisComputerShares.json lists templates this test cannot fill: ${unknown.join(', ')}.`);
   const out: ShareCase[] = [];
   for (const c of thisComputerShares.cases as ShareCase[]) {
     let p: string | null = c.path;
-    for (const [t, v] of Object.entries(fill)) if (p?.includes(t)) p = v === null ? null : p.split(t).join(v);
-    if (p !== null) out.push({ ...c, path: p });
+    for (const t of listed) if (p?.includes(t)) p = fill[t] === null ? null : p.split(t).join(fill[t] as string);
+    if (p === null) continue;
+    const left = /\{[^}]+\}/.exec(p);
+    if (left) throw new Error(`The case ${JSON.stringify(c.path)} names ${left[0]}, which lib/agent/thisComputerShares.json does not list under templates.`);
+    out.push({ ...c, path: p });
   }
   return out;
 }
@@ -2057,6 +2065,14 @@ describe('overlapsAppData (for the folder rules of other units)', () => {
       }
       // This test fills every template the table names: no case is judged by a template's own words.
       for (const c of shareCases()) expect(c.path, c.path).not.toMatch(/\{[^}]+\}/);
+      // A template the table would list and this test cannot fill fails it.
+      const templates = thisComputerShares.templates as Record<string, string>;
+      templates['{ownMAC}'] = 'a template no test knows';
+      try {
+        expect(() => shareCases()).toThrow(/lists templates this test cannot fill: \{ownMAC\}/);
+      } finally {
+        delete templates['{ownMAC}'];
+      }
       // Both answers, and the machine-specific ones, are there.
       expect(shareCases().some((c) => c.want)).toBe(true);
       expect(shareCases().some((c) => !c.want)).toBe(true);
@@ -2136,6 +2152,55 @@ describe('allowedFolder', () => {
     expect(await allowedFolder([allowed], allowed)).toBe(real(allowed));
     expect(await allowedFolder([allowed], sub)).toBe(real(sub));
     expect(await allowedFolder([outside, allowed], `${sub}${path.sep}`)).toBe(real(sub));
+  });
+
+  it('judges a folder as it is when it is used: one that has come to hold Ironbooks’ data allows nothing inside that data', async () => {
+    // The Admin allowed `allowed` long ago; since then Ironbooks keeps its backups in a folder in it
+    // (the shell's BKA_BACKUP_DIR), and the company file sits in it, with its archives beside it.
+    const backups = path.join(allowed, 'kept-backups');
+    const archives = path.join(allowed, 'archives');
+    const later = path.join(backups, 'later');
+    for (const d of [later, archives]) fs.mkdirSync(d, { recursive: true });
+    process.env.BKA_BACKUP_DIR = backups;
+    process.env.BKA_COMPANY_FILE = path.join(allowed, 'Acme.ironbooks');
+    try {
+      // Inside that data, as typed, in another case, or through ".." that ends there: refused.
+      expect(await allowedFolder([allowed], backups)).toBeNull();
+      expect(await allowedFolder([allowed], later)).toBeNull();
+      expect(await allowedFolder([allowed], archives)).toBeNull();
+      expect(await allowedFolder([allowed], `${sub}${path.sep}..${path.sep}..${path.sep}kept-backups`)).toBeNull();
+      if (WIN) expect(await allowedFolder([allowed.toUpperCase()], later.toLowerCase())).toBeNull();
+      // Even when the data's own folder is the allowed one.
+      expect(await allowedFolder([backups], later)).toBeNull();
+      // A folder that only holds it is still used: the company file's own folder holds the company
+      // file, and the rest of the allowed folder is as before.
+      expect(await allowedFolder([allowed], allowed)).toBe(real(allowed));
+      expect(await allowedFolder([allowed], sub)).toBe(real(sub));
+      // Through a link into that data: refused as the disk has it.
+      const into = path.join(allowed, 'to-backups');
+      if (link(later, into)) {
+        try {
+          expect(await allowedFolder([allowed], into)).toBeNull();
+        } finally {
+          try {
+            fs.unlinkSync(into);
+          } catch {
+            fs.rmSync(into, { force: true });
+          }
+        }
+      }
+    } finally {
+      restoreEnv('BKA_BACKUP_DIR', 'BKA_COMPANY_FILE');
+      fs.rmSync(backups, { recursive: true, force: true });
+      fs.rmSync(archives, { recursive: true, force: true });
+    }
+    // Once Ironbooks keeps nothing there, the folder is the agent's again.
+    fs.mkdirSync(later, { recursive: true });
+    try {
+      expect(await allowedFolder([allowed], later)).toBe(real(later));
+    } finally {
+      fs.rmSync(backups, { recursive: true, force: true });
+    }
   });
 
   it('refuses a folder beside or above, also through ".."', async () => {

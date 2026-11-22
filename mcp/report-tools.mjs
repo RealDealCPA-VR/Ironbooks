@@ -24,14 +24,15 @@
  * each row as its cells in column order.
  *
  * When an Admin set reading reports to Ask, a person must approve the read first. These tools only
- * look, so they take no request id or reason to ask with (test/mcp/protocol.test.ts holds every
- * tool that only looks to that): the answer says to ask with run_operation, with the same input,
- * then to wait_for_decision. What the agent then collects comes back as these tools give it
- * (compactCollected, used by mcp/tools.mjs).
+ * look, but run_report, report_drilldown and export_report take an optional request_id and reason
+ * so that such a read is asked for from the tool itself (test/mcp/protocol.test.ts names the reads
+ * that may): a read that runs at once uses neither. The answer is then "asked", and wait_for_decision
+ * gives what was read, in the shape these tools give it (compactCollected, used by mcp/tools.mjs);
+ * the same tool sent again with the same request_id gives it too.
  */
 import { ToolError } from './protocol.mjs';
 import { fit, runOperation } from './entry-tools.mjs';
-import { askedReadCheck, settle } from './write-tools.mjs';
+import { sentence, settle, wantsRequestId } from './write-tools.mjs';
 
 const DATE = { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', patternHint: 'must be a date as YYYY-MM-DD' };
 const ID = { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', patternHint: 'must be an id returned by another tool' };
@@ -398,55 +399,148 @@ const KEY = { type: 'string', enum: REPORT_KEYS, description: 'The report, by it
 const OTHER_READS =
   '1099s, paystubs, the audit trail, the transaction log and why a number changed are not standard reports: find_operations finds them ("1099", "paystub", "audit trail", "transaction log", "why changed").';
 
+const READ_REQUEST_ID_ABOUT =
+  'Only needed when a person must approve this read (an answer says so): your own name for it, for example "pl-2026-03". Ironbooks then asks a person, and wait_for_decision with the request_id its answer gives waits for them. Sent again with the same request_id, it never asks twice: once a person approved it, it gives what was read. A read that runs at once does not use it.';
+
+/** request_id of a report tool: optional, for a read a person must approve (lib/agent/operate.ts change). */
+const READ_REQUEST_ID = {
+  type: 'string',
+  pattern: '^[A-Za-z0-9][A-Za-z0-9._:\\-]{2,119}$',
+  patternHint: 'must be 3 to 120 letters, digits, dots, dashes, colons or underscores',
+  description: READ_REQUEST_ID_ABOUT,
+};
+
+/** What export_report adds to its request_id for the file step (the read and the file are two requests). */
+const FILE_STEP = ':file';
+
+/** The same for export_report: two steps, the file's under the request_id with FILE_STEP added, so at most 115 characters. */
+const EXPORT_REQUEST_ID = {
+  type: 'string',
+  pattern: '^[A-Za-z0-9][A-Za-z0-9._:\\-]{2,114}$',
+  patternHint: 'must be 3 to 115 letters, digits, dots, dashes, colons or underscores',
+  description: `${READ_REQUEST_ID_ABOUT} Reading the report and making the file may each need a person: the file is asked for under this request_id with "${FILE_STEP}" added.`,
+};
+
+/** reason of a report tool: read on the approval card, as on every tool that may ask (write-tools.mjs REASON). */
+const READ_REASON = {
+  type: 'string',
+  maxLength: 500,
+  description:
+    'Why you need this read, in one plain sentence (at most 500 characters). Used only when a person must approve it: they read it on the approval card, labelled as your words.',
+};
+
 /**
- * Read through the door. A read usually runs at once and needs no request id, so these tools take
- * none (a tool that only looks takes neither dry_run nor request_id). But an Admin can set reading
- * reports to Ask (a class or area override): the door then files the read for a person, and asks
- * for a request id and a reason as it does for a change (lib/agent/operate.ts change). That answer
- * would send the agent to an argument these tools do not have, so it is turned into the way that
- * works: run_operation, which takes both, with the same input. It is told from any other error by
- * the door's own answer to the same read as a dry run (write-tools.mjs askedReadCheck), not by the
- * words of the error. `instead` says how to send the input; `collect` what wait_for_decision gives.
+ * How a report tool asks, from its arguments: the request id and the reason when a request id was
+ * given (a reason of only spaces is no reason, and is left out); nothing otherwise.
+ * @param {Record<string, any>} a  the tool's arguments
+ * @returns {{ requestId?: string, reason?: string }}
+ */
+function askingOf(a) {
+  if (typeof a.request_id !== 'string' || !a.request_id) return {};
+  const reason = typeof a.reason === 'string' ? a.reason.trim() : '';
+  return { requestId: a.request_id, ...(reason ? { reason } : {}) };
+}
+
+/**
+ * Read through the door. A read usually runs at once and the door uses no request id for it. But
+ * an Admin can set reading reports to Ask (a class or area override): the door then files the read
+ * for a person, and wants a request id and a reason as it does for a change (lib/agent/operate.ts
+ * change). With the request id the tool was given (`asking`), it is filed there and then, and the
+ * answer is "asked". Without one, the door refuses it with its request-id check, which is told
+ * from any other error by the field the refusal names (write-tools.mjs wantsRequestId), never by
+ * the words of the error; the agent is told to send the same tool again with a request_id and a
+ * reason (the "asked" answer it then gets says what comes next). Any other error is the read's
+ * own and is answered as it is, after one read. With a request id, that check is passed already.
+ * `tool` names the tool for that message.
  * @param {any} client
  * @param {Parameters<typeof runOperation>[1]} req
- * @param {string} instead
- * @param {string} collect
+ * @param {{ requestId?: string, reason?: string }} asking
+ * @param {string} tool
  */
-async function readThroughDoor(client, req, instead, collect) {
+async function readThroughDoor(client, req, asking, tool) {
   try {
-    return await runOperation(client, req);
+    return await runOperation(client, { ...req, ...asking });
   } catch (err) {
-    const tried = await askedReadCheck(err, () => runOperation(client, { ...req, dryRun: true }));
-    if (!tried) throw err;
-    // Read after all (the first error passed), or refused: answered as either is.
-    if (tried.outcome !== 'dry_run') return tried;
+    if (asking.requestId || !wantsRequestId(err)) throw err;
     throw new ToolError(
-      `A person must approve this read before you see it, and this tool cannot ask for that. Ask with run_operation instead: operation "${req.operation}", ${instead}, a request_id of your own and a reason. Then call wait_for_decision with the request_id it gives: once a person approves it, ${collect}.`,
+      `A person must approve this read before you see it. Send ${tool} again with the same arguments, a request_id of your own and a reason: Ironbooks then asks a person, and its answer says what to do next.`,
     );
   }
 }
 
-/** The input of a run_operation request, in its own words, for the message above. */
-const inputWords = (/** @type {Record<string, unknown>} */ input) =>
-  Object.entries(input)
-    .filter(([, v]) => v !== undefined)
-    .map(([k, v]) => `${k} ${JSON.stringify(v)}`)
-    .join(', ');
+/**
+ * The door's answer to a read that did not run at once (refused, or asked), worded as every other
+ * answer is (write-tools.mjs settle: a refusal is a tool error). An asked read also says how the
+ * agent gets what was read once a person approves it: `then` is a sentence added to the usual
+ * next, or a function that words the whole next itself (export_report's read step, whose "do not
+ * send it again" holds only until a person approves).
+ * @param {any} answer
+ * @param {string | ((shaped: Record<string, any>) => string)} then
+ */
+function notRead(answer, then) {
+  const shaped = settle(answer, { fields: [] });
+  const waiting = shaped.outcome === 'asked' || shaped.outcome === 'proposed';
+  if (!waiting || typeof shaped.next !== 'string') return fit(shaped);
+  return fit({ ...shaped, next: typeof then === 'function' ? then(shaped) : `${shaped.next} ${then}` });
+}
+
+/** What an approved report read gives, wherever the agent collects it (mcp/tools.mjs collectingReads). */
+const REPORT_THEN = 'Once a person approves it, wait_for_decision gives you the report as run_report does.';
+const DRILL_THEN = 'Once a person approves it, wait_for_decision gives you the transactions as report_drilldown does.';
+
+/**
+ * export_report's read step, asked: what wait_for_decision gives is the report, so the file is made
+ * by sending the tool again once a person approved it. The agent's own request_id is named in
+ * full, apart from the one the answer gives (Ironbooks' id for the request): sent again under
+ * Ironbooks' id, the read would be a new request, and the person would be asked twice. The usual
+ * "do not send it again" is said as what holds until then. (wait_for_decision says the same when
+ * the read is done: operations-tools.mjs REPORT_READ_DONE.)
+ * @param {string} key  the request_id the agent gave export_report
+ */
+function exportReadNext(key) {
+  return (/** @type {Record<string, any>} */ shaped) => {
+    // Never asked without a request id of the agent's own (the door's check refuses it first); if
+    // it ever is, no request_id is made up for the agent to send.
+    if (!key) return `${shaped.next} Once a person approves it, send export_report again with the same arguments to make the file.`;
+    const wait =
+      typeof shaped.request_id === 'string'
+        ? `Call wait_for_decision with request_id "${shaped.request_id}" to wait for the person's answer`
+        : 'A person decides in Ironbooks: list_my_requests shows this request and, later, what the person decided';
+    return `${wait}. Until a person approves it, do not send export_report again: it is already waiting. Once they approve it (wait_for_decision then says it is done), send export_report again with the same arguments and your own request_id "${key}", not the request_id above: the report is not read a second time, and the file is made from it.`;
+  };
+}
+
+/**
+ * export_report's file step, asked. The file is collected with wait_for_decision: export_report sent
+ * again reads the report afresh when that read runs at once, and once the books change, the file
+ * asked for would be a different request under the same request_id (fileStepConflict).
+ */
+const EXPORT_FILE_THEN =
+  'Once a person approves it, wait_for_decision gives you the file_id of the file it made. Collect it there, and do not send export_report again for it: the report would be read afresh, and once the books change it is no longer the same request.';
+
+/**
+ * What a 409 on export_report's file step means in the tool's words, after Ironbooks' own message:
+ * it names a request_id the agent never typed ("<theirs>:file"), and the usual cause is the tool
+ * sent again after the file was asked for, with the report read afresh and changed since.
+ * @param {string} key  the request_id the agent gave export_report
+ */
+function fileStepConflict(key) {
+  return `("${key}${FILE_STEP}" is the request_id export_report gives the file step: yours with "${FILE_STEP}" added.) To collect a file a person was already asked to approve, call wait_for_decision with the request_id that answer gave (list_my_requests shows it): export_report sent again reads the report afresh, and once the books change it is no longer the same request. For a file of the report as it is now, send export_report with a NEW request_id.`;
+}
 
 /**
  * Run one standard report: the door's answer, and the report itself when it was read. Anything
  * but a read (refused, or asked) comes back as the door's answer, shaped like run_operation's.
+ * @param {any} client @param {string} key @param {any} options
+ * @param {{ requestId?: string, reason?: string }} asking  how to ask, when a person must approve the read
+ * @param {string} tool  the tool that reads it, for the message when it cannot ask
+ * @param {Parameters<typeof notRead>[1]} then  what to do once a person approved an asked read
  * @returns {Promise<{ report: any } | { answer: Record<string, unknown> }>}
  */
-async function readReport(/** @type {any} */ client, /** @type {string} */ key, /** @type {any} */ options) {
+async function readReport(client, key, options, asking, tool, then) {
   const req = { operation: 'reports.std.get', params: { report: key }, query: reportQuery(key, options) };
-  const answer = await readThroughDoor(
-    client,
-    req,
-    inputWords({ params: req.params, query: Object.keys(req.query).length ? req.query : undefined }),
-    'it gives you the report as run_report does',
-  );
-  if (answer?.outcome !== 'read') return { answer: fit(settle(answer, { fields: [] })) };
+  const answer = await readThroughDoor(client, req, asking, tool);
+  if (answer?.outcome !== 'read') return { answer: notRead(answer, then) };
   const report = answer.result;
   if (!report || typeof report !== 'object' || !Array.isArray(report.columns)) throw new ToolError('Ironbooks answered without a report. Try again; if it keeps happening, tell the person.');
   return { report };
@@ -665,15 +759,15 @@ export const REPORT_TOOLS = [
   {
     name: 'run_report',
     title: 'Run a report',
-    description: `Run any standard report by its key (list_reports finds it), with the options that report takes: a named period or dates (or an as-of date), cash or accrual basis, columns by month, quarter or year, a comparison, and filters (class, account, customer, vendor, item, transaction type, amount …). The answer is compact: the column headers once, then each row as its cells, with a row_id and the columns' keys for report_drilldown, and a journal_entry_id on transaction rows for get_journal_entry. Profit & Loss, Balance Sheet, Trial Balance, General Ledger and the agings also have named tools (report_*). Social Security numbers in employee-contact-list and voided-deleted-detail stay masked; to see them in full, a person must approve it: run_operation with operation "reports.std.get", reveal true and a reason. If a person must approve reading the report itself, the answer says how to ask for it with run_operation; once approved, wait_for_decision gives the report in this same compact shape. ${OTHER_READS}`,
+    description: `Run any standard report by its key (list_reports finds it), with the options that report takes: a named period or dates (or an as-of date), cash or accrual basis, columns by month, quarter or year, a comparison, and filters (class, account, customer, vendor, item, transaction type, amount …). The answer is compact: the column headers once, then each row as its cells, with a row_id and the columns' keys for report_drilldown, and a journal_entry_id on transaction rows for get_journal_entry. Profit & Loss, Balance Sheet, Trial Balance, General Ledger and the agings also have named tools (report_*). Social Security numbers in employee-contact-list and voided-deleted-detail stay masked; to see them in full, a person must approve it: run_operation with operation "reports.std.get", reveal true and a reason. If a person must approve reading the report itself, send it with a request_id and a reason: the answer is then "asked", and once a person approves it, wait_for_decision gives the report in this same compact shape. ${OTHER_READS}`,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       required: ['key'],
-      properties: { key: KEY, options: REPORT_OPTIONS, max_rows: MAX_ROWS },
+      properties: { key: KEY, options: REPORT_OPTIONS, max_rows: MAX_ROWS, request_id: READ_REQUEST_ID, reason: READ_REASON },
     },
     handler: async (a, c) => {
-      const got = await readReport(c, a.key, a.options);
+      const got = await readReport(c, a.key, a.options, askingOf(a), 'run_report', REPORT_THEN);
       if ('answer' in got) return got.answer;
       return fit(compactReport(a.key, got.report, a.max_rows));
     },
@@ -682,7 +776,7 @@ export const REPORT_TOOLS = [
     name: 'report_drilldown',
     title: 'Transactions behind a report amount',
     description:
-      'The transactions behind one amount of a report (QuickZoom): give the report key, the same options you ran it with, the row_id of the line and the key of the column, both from run_report. The answer says how many transactions there are, their total, the largest, and lists them (newest last) with their journal_entry_id. Works for the Profit & Loss and Balance Sheet reports, the Trial Balance, the General Ledger, the A/R and A/P agings, open invoices, collections, and the sales and expense summaries (list_reports marks them drilldown). If a person must approve reading it, the answer says how to ask for it with run_operation; once approved, wait_for_decision gives the transactions in this same shape.',
+      'The transactions behind one amount of a report (QuickZoom): give the report key, the same options you ran it with, the row_id of the line and the key of the column, both from run_report. The answer says how many transactions there are, their total, the largest, and lists them (newest last) with their journal_entry_id. Works for the Profit & Loss and Balance Sheet reports, the Trial Balance, the General Ledger, the A/R and A/P agings, open invoices, collections, and the sales and expense summaries (list_reports marks them drilldown). If a person must approve reading it, send it with a request_id and a reason: the answer is then "asked", and once a person approves it, wait_for_decision gives the transactions in this same shape.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -693,13 +787,15 @@ export const REPORT_TOOLS = [
         column: { type: 'string', pattern: '^[A-Za-z0-9_.:-]{1,60}$', patternHint: 'must be a column key from run_report', description: 'The key of the money column, from run_report\'s columns.' },
         options: { ...REPORT_OPTIONS, description: 'The same options you gave run_report, so the line means the same thing.' },
         max_transactions: { type: 'integer', minimum: 1, maximum: 5000, description: 'Most transactions to list (default 200). The count and the total always cover all of them.' },
+        request_id: READ_REQUEST_ID,
+        reason: READ_REASON,
       },
     },
     handler: async (a, c) => {
       const query = { ...reportQuery(a.key, a.options), row: a.row_id, col: a.column, limit: String(a.max_transactions ?? 200) };
       const req = { operation: 'reports.drilldown.get', params: { report: a.key }, query };
-      const answer = await readThroughDoor(c, req, inputWords({ params: req.params, query }), 'it gives you the transactions as report_drilldown does');
-      if (answer?.outcome !== 'read') return fit(settle(answer, { fields: [] }));
+      const answer = await readThroughDoor(c, req, askingOf(a), 'report_drilldown');
+      if (answer?.outcome !== 'read') return notRead(answer, DRILL_THEN);
       return fit(compactDrilldown(answer.result ?? {}, a.key));
     },
   },
@@ -707,7 +803,7 @@ export const REPORT_TOOLS = [
     name: 'export_report',
     title: 'Report as a PDF or Excel file',
     description:
-      'Make a standard report into a PDF or an Excel (.xlsx) file, the same file the report window\'s own buttons make, with the options run_report takes. Nothing in the books changes. The answer gives a file_id: get_file reads it, and save_file saves it in a folder you may use (a person approves each save). If a person must approve reading the report or making the file, the answer says how to ask for it with run_operation; once approved, wait_for_decision gives the file_id. To send it to someone, find_operations "email" shows what can be emailed.',
+      'Make a standard report into a PDF or an Excel (.xlsx) file, the same file the report window\'s own buttons make, with the options run_report takes. Nothing in the books changes. The answer gives a file_id: get_file reads it, and save_file saves it in a folder you may use (a person approves each save). If a person must approve reading the report or making the file, send it with a request_id and a reason: the answer is then "asked" and says what to do once a person approves it. Approved reading is followed by export_report sent again with your same request_id, which makes the file; a file a person must approve is collected with wait_for_decision, not by sending export_report again. To send it to someone, find_operations "email" shows what can be emailed.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -718,10 +814,16 @@ export const REPORT_TOOLS = [
         options: REPORT_OPTIONS,
         title: { type: 'string', minLength: 1, maxLength: 200, description: "The title printed on the file. Default: the report's own title." },
         landscape: { type: 'boolean', description: 'PDF only: print it sideways. Default: sideways when it has more than 6 columns.' },
+        request_id: EXPORT_REQUEST_ID,
+        reason: READ_REASON,
       },
     },
     handler: async (a, c) => {
-      const got = await readReport(c, a.key, a.options);
+      // Two requests, so two request ids: the report's read under the agent's own (the same one
+      // run_report would use for the same report), the file under it with FILE_STEP added. Sent
+      // again after an approval, each answers what became of its own request, and nothing is done twice.
+      const asking = askingOf(a);
+      const got = await readReport(c, a.key, a.options, asking, 'export_report', exportReadNext(asking.requestId ?? ''));
       if ('answer' in got) return got.answer;
       const report = got.report;
       const table = reportTable(report);
@@ -741,14 +843,18 @@ export const REPORT_TOOLS = [
         rows: table.rows,
         ...(a.format === 'pdf' && typeof a.landscape === 'boolean' ? { landscape: a.landscape } : {}),
       };
-      // The rows are too many to repeat in a message: describe_operation says how to send them.
-      const answer = await readThroughDoor(
-        c,
-        { operation: 'export.reports', body },
-        'with the body describe_operation shows for it (the format, a title, and the report\'s columns and rows in the shape it shows)',
-        'it gives you the file_id of the file it made',
-      );
-      if (answer?.outcome !== 'read') return fit(settle(answer, { fields: [] }));
+      const fileAsking = asking.requestId ? { ...asking, requestId: `${asking.requestId}${FILE_STEP}` } : {};
+      let answer;
+      try {
+        answer = await readThroughDoor(c, { operation: 'export.reports', body }, fileAsking, 'export_report');
+      } catch (err) {
+        // Any 409 here names the file step's request_id, which the agent never typed: say what it
+        // is, and how to collect the file instead (the door's own words come first, as they are).
+        const e = /** @type {any} */ (err);
+        if (asking.requestId && e?.isIronbooksError === true && e.status === 409) throw new ToolError(`${sentence(e.message)} ${fileStepConflict(asking.requestId)}`);
+        throw err;
+      }
+      if (answer?.outcome !== 'read') return notRead(answer, EXPORT_FILE_THEN);
       const f = answer.file;
       if (!f || !f.fileId) throw new ToolError('Ironbooks ran the report but did not make the file. Try again; if it keeps happening, tell the person.');
       return {

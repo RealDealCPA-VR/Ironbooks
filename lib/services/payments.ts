@@ -1771,6 +1771,8 @@ export async function voidPayment(ctx: ServiceContext, id: string) {
  * record (closing-date check on the new date). If anything is invalid — e.g. an applied amount
  * larger than an invoice's balance — the whole edit rolls back with a plain-language error.
  * The audit trail / transaction log records old and new values.
+ *
+ * The answer carries `creditsApplied`, as receivePayment's does.
  */
 export async function updatePayment(ctx: ServiceContext, id: string, input: ReceivePaymentInput) {
   let [payment] = await ctx.db
@@ -1856,14 +1858,18 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
     if ((input.paymentCredits ?? []).length > 0) {
       await applyEarlierPayments(tx, input, id);
     }
-    const posted = await postPayment(tx, { ...input, paymentCredits: null, journalOffsets: keptOffsets ?? input.journalOffsets }, id);
+    const saved = { ...input, journalOffsets: keptOffsets ?? input.journalOffsets };
+    const posted = await postPayment(tx, { ...saved, paymentCredits: null }, id);
     await confirmReconciledRepost(tx, {
       oldEntryId: payment.postedEntryId,
       newEntryId: posted.entry?.id ?? null,
       what: 'payment',
       allowReconciledEdit: input.allowReconciledEdit,
     });
-    return posted;
+    // As receivePayment answers it: every credit the edited payment now uses. The edit rolled the
+    // old applications back and applied these again, General Journal offsets it kept included, so
+    // a $1 edit that applies a $50,000 credit is not judged at $1.
+    return { ...posted, creditsApplied: creditsAppliedBy(saved) };
   });
 }
 

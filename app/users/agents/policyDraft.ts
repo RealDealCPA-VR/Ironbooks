@@ -527,3 +527,39 @@ export function withTypedFolder(draft: PolicyDraft, typed: string): { draft: Pol
 export function removeFolder(draft: PolicyDraft, folder: string): PolicyDraft {
   return { ...draft, folders: draft.folders.filter((f) => f !== folder) };
 }
+
+/** A folder as words to compare: either slash, no trailing one, letter case ignored on Windows. */
+function folderWords(p: string): string {
+  const t = p.trim();
+  if (!WINDOWS_PATH.test(t)) return t.replace(/\/+$/, '') || t;
+  return t.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+}
+
+/**
+ * The folders the agent had (`saved`) that a save sent back (`sent`, AgentPolicyInput.folders) and
+ * the server's answer (`answer`, the saved policy's folders) no longer holds: Ironbooks took them
+ * away itself. The server does that for a person who is not an Admin when a folder the agent had
+ * would be refused were it new today (lib/services/agentPolicies.ts checkFolders: a whole drive, a
+ * share of this computer, or one that holds the company file or Ironbooks' own data); the save
+ * goes through, since taking a folder away only tightens, and the audit row says why
+ * (foldersTakenAway). The answer has no field for it, so the page finds them here and says so.
+ *
+ * Only folders the agent already had are compared: one it had is kept as stored, spelled as it
+ * was, while a new one is stored as the disk names it, so a new folder spelled otherwise is never
+ * taken for one taken away. Nothing sent (folders unchanged): nothing was looked at. An answer
+ * without a folder list says nothing either way, so nothing is said to be taken away.
+ */
+export function foldersTakenAway(saved: PolicyDraft, sent: readonly string[] | undefined, answer: readonly string[] | null | undefined): string[] {
+  if (!sent || !Array.isArray(answer)) return [];
+  const asked = new Set(sent.map(folderWords));
+  const kept = new Set(answer.map(folderWords));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const f of saved.folders) {
+    const w = folderWords(f);
+    if (!asked.has(w) || kept.has(w) || seen.has(w)) continue;
+    seen.add(w);
+    out.push(f);
+  }
+  return out;
+}

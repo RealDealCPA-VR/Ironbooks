@@ -147,7 +147,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
     describe: 'Show who can open the protected company file',
     id: 'file-protection.status',
     availability: 'person_only',
-    why: "A person's own route ('self' in lib/permissions/routes.ts): it answers from the signed-in user's session (getSessionGate) and refuses a caller without one, so it answers every agent \"This is not available to agents.\" Not offered to agents at all. Who can open the file is a person's to look up, in Company > Security.",
+    why: "A person's own route ('self' in lib/permissions/routes.ts): it answers from the signed-in user's session (getSessionGate) and refuses a caller without one, so it answers every agent \"This is not available to agents.\" Not offered to agents at all. Who can open the file is a person's to look up, in Setup > Security (2FA).",
   },
   'POST /api/file-protection': {
     class: 'secret',
@@ -338,7 +338,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
     sensitiveFields: ['password', 'challengeAnswer', 'recoveryKey'],
   },
 
-  // ---- Device security (Company > Security) ----
+  // ---- Device security (Setup > Security (2FA)) ----
   // Runs a local Windows check of the drive (nothing written, no network); 'unknown' from another computer.
   'GET /api/device-security': { class: 'read', describe: 'Show whether the drive holding the company file is encrypted' },
 
@@ -679,7 +679,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'GET /api/company-file/info': {
     class: 'file',
     describe: "Show the company file's name and whether it has a password",
-    why: "What the sign-in screen shows before anyone signs in: the company file's name (the folder it is in only to the app's own window on this computer, never to an agent) and whether the file has a password or protection. A read that shows the company file on disk is class file, like the File Utilities reads (plan 4.2): an Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.",
+    why: "What the sign-in screen shows before anyone signs in: the company file's name (the folder it is in only to the app's own window on this computer, never to an agent) and whether the file has a password or protection. A read that shows the company file on disk is class file, like the File Utilities reads (plan 4.2): asked for through the door, an Admin approves it, and it is described only, never dry run (a dry run would hand the agent the answer before anyone approved it). The class does not make the answer secret: the route is public (lib/permissions/routes.ts), because the sign-in screen reads it before anyone signs in. It never asks for a signed-in context, so the check on an agent's own request (lib/agentContext.ts) never runs for it, and anything that can reach Ironbooks reads the same answer, without the folder, with or without an agent's token.",
     dryRun: 'none',
   },
   'POST /api/company-file/save': {
@@ -746,7 +746,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
     class: 'file',
     describe: 'Make a practice copy of the company file and switch to it',
     availability: 'hard_floor',
-    why: 'Agents never work in a practice copy (plan 4.6): a person opens such books.',
+    why: 'Agents never work in a practice copy: a person opens such books.',
     fileAdmin: true,
     body: 'none',
     dryRun: 'none',
@@ -756,7 +756,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
     class: 'file',
     describe: 'Leave the practice copy and delete it',
     availability: 'hard_floor',
-    why: 'Agents never work in a practice copy (plan 4.6); leaving one is part of that work, and agents are refused inside one anyway.',
+    why: 'Agents never work in a practice copy; leaving one is part of that work, and agents are refused inside one anyway.',
     fileAdmin: true,
     body: 'none',
     dryRun: 'none',
@@ -765,7 +765,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
     class: 'file',
     describe: 'Leave the practice copy and keep it as a training file ({name})',
     availability: 'hard_floor',
-    why: 'Agents never work in a practice copy (plan 4.6); leaving one is part of that work, and agents are refused inside one anyway.',
+    why: 'Agents never work in a practice copy; leaving one is part of that work, and agents are refused inside one anyway.',
     fileAdmin: true,
     dryRun: 'none',
   },
@@ -773,7 +773,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
     class: 'file',
     describe: 'Reopen leftover practice copy {id}',
     availability: 'hard_floor',
-    why: 'Reopening a practice copy switches the server into it: agents never work in a practice copy (plan 4.6).',
+    why: 'Reopening a practice copy switches the server into it: agents never work in a practice copy.',
     fileAdmin: true,
     body: 'none',
     dryRun: 'none',

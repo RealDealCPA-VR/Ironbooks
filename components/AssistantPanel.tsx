@@ -134,24 +134,75 @@ export function shownAfterRefusal(p: Proposal, err: unknown): Proposal | null {
 
 type PostProposal = (url: string, body: { action: 'reject' }) => Promise<{ proposal: Proposal }>;
 
+/** The toast when the row turns out to be declined already, by another person or window. */
+export const ALREADY_DECLINED_MESSAGE = 'Someone already declined this one.';
+/** The toast when it turns out settled some other way: done, failed, withdrawn or expired. */
+export const ALREADY_SETTLED_MESSAGE = 'This one was already settled in Agent requests.';
+/** The same for a row with no request there (settled before agents' requests had their own page). */
+export const ALREADY_SETTLED_HERE_MESSAGE = 'This one was already settled.';
+
+/** What came of a click on Decline: the row to show next (null: leave it as it is) and the toast. */
+export interface DeclineOutcome {
+  shown: Proposal | null;
+  message: string;
+  /** True only when this click declined it. */
+  ok: boolean;
+  tone: 'info' | 'danger';
+}
+
 /**
- * Decline a leftover agent proposal (canOnlyDecline): the row to show next (null: leave it as it
- * is) and the words to show. `post` is the app's api client; a test hands in its own.
+ * Decline a leftover agent proposal (canOnlyDecline). `post` is the app's api client; a test hands
+ * in its own.
+ *
+ * When the refusal shows the row already settled, there is nothing left to decline and nothing is
+ * wrong: the toast says so gently, not as an error, and the row shows how it ended. Declined (someone
+ * declined it in Ask AI first, or denied its request in Agent requests) reads as the row does
+ * (agentRequestState 'Denied': rejected, with no note). Any other end (done, failed, withdrawn,
+ * expired) is not said to be a decline: the toast only says it was settled, and the row's badge and
+ * note say how. The server's words ("Open it there") are kept for a row that still waits there.
  */
 export async function declineAgentProposal(
   p: Proposal,
   post: PostProposal = (url, body) => api.post<{ proposal: Proposal }>(url, body),
-): Promise<{ shown: Proposal | null; message: string; ok: boolean }> {
+): Promise<DeclineOutcome> {
   try {
     const r = await post(`/api/ai/proposals/${p.id}`, { action: 'reject' });
-    return { shown: r.proposal, message: 'Declined. Nothing was entered.', ok: true };
+    return { shown: r.proposal, message: 'Declined. Nothing was entered.', ok: true, tone: 'info' };
   } catch (err) {
+    const shown = shownAfterRefusal(p, err);
+    if (shown && shown.status !== 'pending') {
+      const message =
+        shown.status === 'rejected' && !shown.error
+          ? ALREADY_DECLINED_MESSAGE
+          : shown.agentRequest
+            ? ALREADY_SETTLED_MESSAGE
+            : ALREADY_SETTLED_HERE_MESSAGE;
+      return { shown, message, ok: false, tone: 'info' };
+    }
     return {
-      shown: shownAfterRefusal(p, err),
+      shown,
       message: err instanceof ApiError ? err.message : 'It could not be declined. Try again.',
       ok: false,
+      tone: 'danger',
     };
   }
+}
+
+/**
+ * What a click on Decline does once the answer is in: the row shows where it really stands (the
+ * link to Agent requests, or settled) and the toast says what came of it. `show` is the app's
+ * toast; a test hands in its own, as it does `post`.
+ */
+export async function declineAndShow(
+  p: Proposal,
+  onChange: ((p: Proposal) => void) | undefined,
+  show: (message: string, tone: DeclineOutcome['tone']) => void = toast,
+  post?: PostProposal,
+): Promise<DeclineOutcome> {
+  const r = await declineAgentProposal(p, post);
+  if (r.shown) onChange?.(r.shown);
+  show(r.message, r.tone);
+  return r;
 }
 
 /** The waiting list after a row changed: kept while it still waits, dropped once it is settled. */
@@ -171,10 +222,7 @@ export function AgentRequestRow({ p, onOpen, onChange }: { p: Proposal; onOpen?:
   async function decline() {
     setBusy(true);
     try {
-      const r = await declineAgentProposal(p);
-      // Refused: the row shows where it really stands (the link to Agent requests, or settled).
-      if (r.shown) onChange?.(r.shown);
-      toast(r.message, r.ok ? 'info' : 'danger');
+      await declineAndShow(p, onChange);
     } finally {
       setBusy(false);
     }

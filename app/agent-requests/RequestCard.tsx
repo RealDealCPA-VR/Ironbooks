@@ -39,7 +39,12 @@
  *
  * An approval the server refuses before anything runs (a password left out, a refusal Ironbooks
  * never lets an agent past, someone else answered first) shows the server's own words, and the card
- * loads the request again so it shows where it now stands; nothing is approvable until it has.
+ * loads the request again so it shows where it now stands; nothing is approvable until it has. A
+ * refused Deny does the same, and Deny, like Approve, waits for the card's own copy: the list's copy
+ * of a request someone else answered meanwhile (one a link opened once another card closed, say)
+ * is never answered. When the refusal was only that the request had moved on, and the copy loaded
+ * again shows it is no longer waiting, the server's words are a plain note beside how it stands,
+ * not an error: nothing went wrong, it was answered (or expired, or was taken back) first.
  *
  * While an answer is on its way, or the card shows a secret the run produced, the page does not
  * swap it for the request a link names (onHold): that one opens once this card is closed.
@@ -47,7 +52,7 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { Badge, Button, Input, Label, Modal, Select, Spinner, toast } from '@/components/ui';
-import { api } from '@/lib/client';
+import { ApiError, api } from '@/lib/client';
 import { formatDate } from '@/lib/utils';
 import { sourceFormHref } from '@/lib/reports/drilldown';
 import { RISK_CLASS_LABELS, type SecretKind } from '@/lib/agent/operations/types';
@@ -116,6 +121,15 @@ export const REVEAL_NOTE =
 
 function errMsg(e: unknown) {
   return e instanceof Error ? e.message : 'Something went wrong';
+}
+
+/**
+ * Whether a refused answer says the request was no longer as this card showed it: the server answers
+ * 409 (CONFLICT) when it is no longer waiting, or someone decided it just now
+ * (lib/services/agentRequests.ts judge, the claim, denyAgentRequest).
+ */
+function movedOnError(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 409;
 }
 
 const sectionTitle = 'mb-1 text-xs font-semibold uppercase tracking-wide text-navy/50';
@@ -349,6 +363,8 @@ export default function RequestCard({
   // Set only by a 'stale' answer to an approval on this card; the next Approve accepts that preview.
   const [stale, setStale] = React.useState(false);
   const [failure, setFailure] = React.useState('');
+  // The refusal behind `failure` said the request had moved on (movedOnError).
+  const [failureMovedOn, setFailureMovedOn] = React.useState(false);
   const [note, setNote] = React.useState('');
   const [answers, setAnswers] = React.useState<Record<string, string | boolean>>({});
   // Whether each secret box ("kind:part") has something in it. Never the value itself.
@@ -446,6 +462,7 @@ export default function RequestCard({
   async function approve(withGrant: boolean) {
     if (!request || !ready) return;
     setFailure('');
+    setFailureMovedOn(false);
     setGrantError('');
     const body: ApproveInput = {};
     let grantMinutes: number | null = null;
@@ -499,6 +516,7 @@ export default function RequestCard({
       // Until that copy is here the one on screen may be out of date, so nothing is approvable on
       // it, and a load that fails says so with Try again.
       setFailure(errMsg(e));
+      setFailureMovedOn(movedOnError(e));
       setFresh(false);
       setLoadRound((n) => n + 1);
     } finally {
@@ -507,8 +525,10 @@ export default function RequestCard({
   }
 
   async function deny() {
-    if (!request || busy) return;
+    // Like Approve, only on the card's own copy: the list's may be of a request answered meanwhile.
+    if (!request || busy || !fresh) return;
     setFailure('');
+    setFailureMovedOn(false);
     takeSecrets();
     setBusy('deny');
     const text = note.trim();
@@ -523,7 +543,12 @@ export default function RequestCard({
       toast(text ? 'Denied. The agent will read your note.' : 'Denied. The agent is told.', 'success');
       onClose();
     } catch (e) {
+      // Not denied: the server's words, then the request as it now stands (someone else may have
+      // answered it first), as after a refused approval. The note stays in its box.
       setFailure(errMsg(e));
+      setFailureMovedOn(movedOnError(e));
+      setFresh(false);
+      setLoadRound((n) => n + 1);
       setBusy(null);
     }
   }
@@ -543,7 +568,7 @@ export default function RequestCard({
           <Button variant="secondary" onClick={() => setMode('main')} disabled={!!busy}>
             Back
           </Button>
-          <Button variant="danger" loading={busy === 'deny'} onClick={deny}>
+          <Button variant="danger" loading={busy === 'deny'} disabled={!fresh} onClick={deny}>
             Deny request
           </Button>
         </>
@@ -604,6 +629,11 @@ export default function RequestCard({
   const grantRule = request && isWaiting(request.status) ? grantRuleLine(request) : null;
   // The server marks a request whose books changed; until this card was shown the new preview, say so.
   const staleMark = !!request && request.stale === true && !stale && isWaiting(request.status) && outcome === null;
+  // A refused answer only because the request had moved on, now that its own copy shows it no longer
+  // waits. Until that copy is here, nothing is said of it (only that it is loading): whether it is an
+  // error depends on where the request now stands. A load that fails says the refusal as an error.
+  const answeredMeanwhile = failureMovedOn && fresh && !!request && !isWaiting(request.status) && outcome === null;
+  const movedOnLoading = failureMovedOn && !fresh && !loadError;
 
   const retry = (
     <Button size="sm" variant="secondary" onClick={() => setLoadRound((n) => n + 1)}>
@@ -630,8 +660,8 @@ export default function RequestCard({
           {!fresh && loadError && (
             <div role="alert" data-load-error="" className="space-y-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
               <p>
-                Ironbooks could not load the latest of this request: {loadError} What is shown may be out of date, so it cannot be approved until it
-                loads.
+                Ironbooks could not load the latest of this request: {loadError} What is shown may be out of date, so it cannot be approved or
+                denied until it loads.
               </p>
               {retry}
             </div>
@@ -907,12 +937,21 @@ export default function RequestCard({
           )}
 
           {/* Not repeated when the request, loaded again, already says the same as how it ended. */}
-          {failure && !(!actionable && plain(request.error).trim() === failure.trim()) && (
-            <p role="alert" data-approve-failure="" className="whitespace-pre-wrap break-words rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-              {/* The boxes were emptied by the send: say to type again, unless the server already says what to type. */}
-              {approveFailureText(failure, secretFields.length > 0 && actionable)}
-            </p>
-          )}
+          {failure &&
+            !(!actionable && plain(request.error).trim() === failure.trim()) &&
+            !movedOnLoading &&
+            (answeredMeanwhile ? (
+              // Someone else answered it first (or it expired, or the agent took it back): how it now
+              // stands is said above; the server's words go with it as a note, not as an error.
+              <p data-answered-meanwhile="" className="whitespace-pre-wrap break-words rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-navy/80">
+                {plain(failure)}
+              </p>
+            ) : (
+              <p role="alert" data-approve-failure="" className="whitespace-pre-wrap break-words rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                {/* The boxes were emptied by the send: say to type again, unless the server already says what to type. */}
+                {approveFailureText(failure, secretFields.length > 0 && actionable)}
+              </p>
+            ))}
         </div>
       )}
     </Modal>

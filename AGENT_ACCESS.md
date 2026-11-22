@@ -269,7 +269,7 @@ The banking tools follow the same rules as everything else:
 | Limit | What it does |
 | --- | --- |
 | Most records one request may change | The records limit above. "Full, with asks" comes with 200. |
-| Two people approve above this amount | Off unless set. Above it, two different people must approve. An amount Ironbooks cannot work out ahead of time counts as above it. |
+| Two people approve above this amount | Off unless set. Above it, two different people must approve. Work that changes the books, or pays or posts money, whose amount Ironbooks cannot work out ahead of time counts as above it. With no amount set, one person approves such work, and the card says the amount is unknown. |
 | Days a request waits for an answer | 7 unless set. After that the request expires and the agent is told. |
 | Folders it may read from or save to | The only folders the agent may take files from on this computer (none unless an Admin adds them). Saving, which an Admin always approves, may also go to the company file's folder, `Documents\Ironbooks` and its `Agent Outbox`. A whole drive or share is never one of them. |
 | Email notice | Off unless an Admin turns it on: an email to the Admins when the agent asks while nobody is signed in. |
@@ -295,8 +295,9 @@ filter by agent, kind of work, area and status.
 
 - What the request would do is written by Ironbooks from the operation and a trial run, never from
   the agent's own text.
-- "Amount unknown" means Ironbooks could not work the amount out ahead of time. Any amount limit
-  treats it as more than the limit.
+- "Amount unknown" means Ironbooks could not work the amount out ahead of time. A standing
+  permission's amount limit never covers it, and the two-person amount treats it as above it for
+  work that changes the books or pays or posts money.
 - Rows you cannot approve stay in the list, greyed, with the reason.
 
 ### The card
@@ -333,9 +334,11 @@ resumed.
 request reads or changes was changed since the agent asked, nothing runs. The card shows "The books
 changed since the agent asked. This is what would happen now." with the new preview, and the button
 becomes **Approve what would happen now**. You approve again on what you now see. What the run
-assigns to itself does not count as a change: the next invoice or entry number, records it makes
-itself, and times. So two waiting requests that each take "the next number" do not make each other
-stale, and a posting elsewhere that touches none of the request's records leaves it as it was.
+assigns to itself does not count as a change: the next invoice, check or entry number, the next
+place in a list (a new bank rule goes to the top; a new account without a number gets the next
+free one), records it makes itself, and times. So two waiting requests that each take "the next
+number" do not make each other stale, and a posting elsewhere that touches none of the request's
+records leaves it as it was.
 
 **Sent back with a note.** An approval can also send a request back before it runs (it turned out
 to be dated in a closed period, it needs a second person, or it shows more once protected values
@@ -414,8 +417,10 @@ Whatever its role and preset, with or without a person's yes, an agent can never
   permissions, or read the Agents tab's lists;
 - approve, deny or answer any request, its own included, or decide the Ask AI assistant's
   proposals;
-- change or delete a role that any agent holds. It is refused on every path, and again at the moment
-  a person approves; the agent is told which role and that an agent holds it;
+- change or delete a role that any agent holds (a paused agent still holds its roles, a removed one
+  no longer does). It is refused on every path, and again at the moment a person approves; the agent
+  is told which role and that an agent holds it. Standing permission for changing or deleting roles
+  is never given, for any role;
 - pause or resume all agents, or change the Integrated Applications switch (nor the employee
   portal or phone receipts switches, which only a person sets);
 - see a password, key, token or one-time code, its own token included;
@@ -447,7 +452,8 @@ The named tools never delete: they void. Deleting for good is a request like any
   (waiting for the decision, listing its requests, or asking with the same request id). After that
   it is masked for good. The next read is masked again, and another reveal asks again.
 - **Logged.** The audit trail and the Agent Activity report word it as: Revealed *which kinds of
-  values* of "*record or report*" to agent "*name*", approved by *person*.
+  values* of "*record or report*" to agent "*name*", approved by *person*. The record is named by
+  its own name where Ironbooks knows it, otherwise by the request's summary.
 
 ## Pausing and removing an agent
 
@@ -571,14 +577,25 @@ prompt `ironbooks_guide`.
   new change.
 - **`reason`** is one plain sentence a person reads on the approval card (at most 500 characters).
   It is required whenever the answer would be "asked"; without it nothing is put to a person.
-- **Edits, voids and making inactive** send the `updated_at` you read as `expected_updated_at`. A
-  conflict then means someone changed the record after you read it, and nothing was changed: read
-  it again.
+- **Edits, voids and making inactive** send the `updated_at` you read as `expected_updated_at`
+  (`run_operation` takes it too: the record's `updatedAt`, or `editedAt` for an account or an item,
+  exactly as you read it). A conflict then means someone changed the record after you read it, and nothing was changed: read
+  it again. A request that asks keeps that version and sends it with the approved run, so an
+  approval never overwrites a change a person saved in between.
 - **Answers:** `read`, `dry_run`, `posted` or `done` (it ran), `asked` (a person must approve:
   call `wait_for_decision` with its request id, at most 50 seconds a call, and do not send it
   again), `needs_confirmation` (a warning a person would have been asked about: resend with the
   flag in `confirm` only when going ahead is right), `refused` (stop; the note says what to do
   instead).
+- **Email recipients are plain addresses only:** `billing@acme.com`, with one @ and a domain of
+  letters, digits, dots and hyphens. No name, quotes, angle or square brackets, parentheses, spaces
+  or backslashes, and one address in a field that takes one (no comma or semicolon). Anything else
+  is refused before a person is asked: send just the address. A person's own email in Ironbooks
+  keeps its usual rules.
+- **Slow down.** Too many calls in the last minute, or too many under way, is answered HTTP 429
+  with a Retry-After, and the connector says "Nothing was done. Wait *N* seconds, then send it
+  again as it was". It is not a refusal of the work: wait, then send it again with the same
+  `request_id`.
 - **Never ask the person for a password, code or key, and never send one.** When an operation
   needs one, the person types it on their own screen.
 - **Restarts.** Opening, switching or restoring a company file and installing an update restart
@@ -612,7 +629,9 @@ prompt `ironbooks_guide`.
 5. `wait_for_decision("est-acme-0301")` answers `pending` until a person approves on the card; then
    `approved`, with the estimate. The audit trail reads "*agent* (agent), approved by *person*".
 
-**2. Closing March, with "Trusted bookkeeper".**
+**2. Closing March, with "Trusted bookkeeper".** The agent's role must be one that may change the
+closing date (Admin or Accountant; Full Access may only view it, so with Full Access the close is
+refused, not asked).
 
 1. `get_my_permissions`: entering and changing run by itself; changing many at once, deleting,
    closed periods, sending, printing, settings and company-file work ask.
@@ -651,7 +670,10 @@ full path of a request.
 - What an agent's own request may reach directly is narrow: its own requests, and reads the
   operation registry classes as plain reads outside Users & Roles and File Utilities. Those run on a
   read-only connection to the books, masked, never as an Admin. Everything else goes through one
-  door, `POST /api/agent/actions`, where the policy decides.
+  door, `POST /api/agent/actions`, where the policy decides. One exception, a known gap: the
+  sign-in screen's public read of the company file (its name, its id, whether it has a password or
+  protection) also answers an agent's token directly, with nobody asked. It never shows the folder
+  the file is in. This lasts until that read refuses a request that carries a token.
 - Every operation is the app's own route, run inside Ironbooks for the agent with the agent's
   access, so it meets exactly the checks a person's request meets. A dry run and the trial run behind
   every approval card run inside a database transaction that is always rolled back. Emails, saved

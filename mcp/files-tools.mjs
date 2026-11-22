@@ -345,9 +345,10 @@ function ownNames(/** @type {Record<string, string | undefined>} */ env) {
  * after it). Through such a share Ironbooks' own folders, the books and other agents' files are
  * there under another name, so it is never a folder an agent may read from. Judged by the words
  * alone: nothing is looked up and nothing is looked at. The share may be written as a device path
- * ("\\?\UNC\localhost\c$", which readAllowedFile refuses anyway), and the server with spaces or
- * dots around it. False for every path that is no UNC path, and on other systems. `opts` are for
- * tests: another system, another environment.
+ * ("\\?\UNC\localhost\c$", which readAllowedFile refuses anyway), the server with spaces or
+ * dots around it, or in Windows' offline-files spelling ("localhost$NOCSC$"). False for every path
+ * that is no UNC path, and on other systems. `opts` are for tests: another system, another
+ * environment.
  * @param {unknown} p
  * @param {{ platform?: string, env?: Record<string, string | undefined> }} [opts]
  */
@@ -355,9 +356,14 @@ export function isThisComputerShare(p, opts = {}) {
   if (typeof p !== 'string' || (opts.platform ?? process.platform) !== 'win32') return false;
   const raw = uncServer(p.trim());
   if (raw === null) return false;
-  // "server@SSL@443" (a WebDAV share) is on that same server; trailing dots, and spaces either
-  // side, leave the same name (a refusal errs on the side of refusing).
-  const host = looseHost(raw.split('@')[0]).trim().replace(/[.\s]+$/, '');
+  // "server@SSL@443" (a WebDAV share) is on that same server, and so is "server$NOCSC$" (Windows'
+  // offline files reaching it directly); trailing dots, and spaces either side, leave the same
+  // name (a refusal errs on the side of refusing). In a loop, as the app does: "localhost.$NOCSC$".
+  let host = looseHost(raw.split('@')[0]).trim();
+  for (let before = ''; before !== host; ) {
+    before = host;
+    host = host.replace(/[.\s]+$/, '').replace(/\$nocsc\$$/, '').trim();
+  }
   // No server at all is no share anyone can name: refused as well.
   if (!host) return true;
   if (host === 'localhost' || host.endsWith('.localhost') || host === 'wsl$') return true;

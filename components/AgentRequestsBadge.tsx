@@ -30,11 +30,12 @@
  * between two asks still does. The first answer is where the window starts, never news.
  *
  * The desktop app words the notice itself from its own read of the count route (electron/main.js
- * 'agent:notice'); the window only says when. That read comes a moment after the window's, and
- * today it is not told which request the window found: if a request arrives or is decided in that
- * moment, the notice can name another request than the one this window counted as new. Rare (a
- * few milliseconds), and the fix is in the desktop app: pass newest.id over and word the notice
- * only for that request.
+ * 'agent:notice'); the window says when, and which request it found new: the notice carries
+ * newest.id (AgentNotice.id). That read comes a moment after the window's, so a request that
+ * arrives or is decided in that moment can make the app's newest another one; the app names the
+ * agent and the summary only when its own newest is the request this window handed over, and
+ * otherwise says the plain words (electron/agentShell.js noticeFromCount). So a notice never names
+ * a request this window did not count as new.
  */
 import * as React from 'react';
 import { useRouter } from 'next/navigation';
@@ -74,6 +75,8 @@ export interface AgentNotice {
   title: string;
   body: string;
   href: string;
+  /** The request the notice is for (AgentRequestCount.newest.id): the desktop app names only that one. */
+  id?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +131,8 @@ function oneLine(s: string, max: number): string {
 /**
  * The desktop notice for a rise: the agent's name and the app's own summary of what it asks
  * (never the agent's reason), and a click opens the approval center. `added`: how many more
- * requests wait than at the last answer.
+ * requests wait than at the last answer. `id` is the request this window found new, so the desktop
+ * app names the agent only when its own read finds that same request newest.
  */
 export function agentRequestNotice(newest: NonNullable<AgentRequestCount['newest']>, added = 1): AgentNotice {
   const name = oneLine(newest.agentName, 60) || 'An agent';
@@ -139,6 +143,7 @@ export function agentRequestNotice(newest: NonNullable<AgentRequestCount['newest
     title: `${name} asks for your approval`,
     body: `${summary}${more}. Click to review ${added > 1 ? 'them' : 'it'}.`,
     href: AGENT_REQUESTS_HREF,
+    id: newest.id,
   };
 }
 

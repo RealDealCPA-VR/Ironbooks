@@ -61,9 +61,12 @@
  * Admin allowed for the agent, once links and ".." are resolved, compared exactly as the disk spells
  * the names. A whole drive or share is never an agent's folder, and neither is a share on this very
  * computer (isThisComputerShare: \\localhost\c$, \\127.1\…, its own name), through which the app's
- * own folders are there under another name. overlapsAppData is the check other units use before
- * they let a folder be an agent's at all. thisComputerShares.json, beside this file, is the table
- * of cases every port of isThisComputerShare (the connector's, the shell's) is held to.
+ * own folders are there under another name, nor a folder that is or lies inside a place where
+ * Ironbooks keeps the books or its own data (appDataPlaces), judged each time it is used: a folder
+ * allowed before it came to hold such a place allows nothing inside it. overlapsAppData is the
+ * stricter check other units use before they let a folder be an agent's at all (it also refuses a
+ * folder that holds such a place). thisComputerShares.json, beside this file, is the table of cases
+ * every port of isThisComputerShare (the connector's, the shell's) is held to.
  */
 import { randomBytes } from 'node:crypto';
 import fs, { type BigIntStats, type Dirent, type Stats } from 'node:fs';
@@ -1779,6 +1782,27 @@ async function resolveFolder(p: string, shares: ReadonlySet<string>): Promise<st
   }
 }
 
+/**
+ * For a refusal only: one of `forms` (a folder as typed, and as the disk has it) is, or lies inside,
+ * one of appDataPlaces, as written or as the disk has them (placeForms: a share is never looked
+ * at); a near match counts. True as well when that cannot be told (fail closed).
+ */
+function insideAppData(forms: readonly string[]): boolean {
+  try {
+    return appDataPlaces().some((place) => placeForms(place).some((p) => forms.some((f) => mayBeWithin(f, p))));
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The folder is used as it is now, whatever was true when the Admin saved the agent's folders: one
+ * that is, or lies inside, a place where Ironbooks keeps the books, copies of them or its own data
+ * (insideAppData: the backups, the working copies, the settings folder, other agents' staged files)
+ * is refused, also inside a folder that was allowed before it came to hold that place. A folder
+ * that only holds one is still used (the company file's own folder holds the company file, and
+ * Documents\Ironbooks may): only what lies inside the place is refused.
+ */
 export const allowedFolder: AllowedFolder = async (allowed, folder) => {
   try {
     const want = folderPath(folder);
@@ -1796,6 +1820,8 @@ export const allowedFolder: AllowedFolder = async (allowed, folder) => {
     if (wantShare !== null && !shares.has(wantShare)) return null;
     const real = await resolveFolder(want, shares);
     if (!real) return null;
+    // Inside the books or Ironbooks' own data, as typed or as the disk has it: never.
+    if (insideAppData([want, real])) return null;
     const realShare = uncShare(real);
     for (const entry of entries) {
       // An allowed share is looked at only when the folder is on it.

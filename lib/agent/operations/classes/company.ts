@@ -354,12 +354,20 @@ export const COMPANY_CLASSES: ClassificationMap = {
     class: 'file',
     describe: "Open a client's Accountant's Copy transfer file as a new company file",
     why:
-      'Restores the transfer file into a new company-file folder with its own database. Owner or Admin only. ' +
-      'A protected transfer file needs its password (x-ironbooks-password). Its own preview: ?inspect=1 only ' +
-      'checks and describes the file.',
+      'Restores the transfer file into a new company-file folder with its own database, through the same ' +
+      'restore as a portable company file (lib/services/accountantCopy/accountant.ts openAccountantCopyFile, ' +
+      'lib/services/portableFile.ts restorePortableCompanyFile). It leaves the open file and its agents as ' +
+      'they are; the new file starts with no agent access, and nothing the agents were waiting on runs in it ' +
+      '(endAgentAccessInRestoredBooks). The route needs the owner or an Admin; the approval asks more, the ' +
+      'file Admin at the computer that holds the company file (host-only), as for every restore ' +
+      '(classes/admin.ts). A protected transfer file needs its password (x-ironbooks-password), typed by the ' +
+      'approver. Its own preview: ?inspect=1 only checks and describes the file.',
+    fileAdmin: true,
+    hostOnly: true,
     needsSecret: ['backup_password'],
     body: 'bytes',
     dryRun: 'preview',
+    effects: ['file'],
   },
   'GET /api/accountant-copy/changes': {
     class: 'read',

@@ -224,7 +224,23 @@ describe('what the agent is told when Ironbooks says no', () => {
     expect(err.status).toBe(403);
     expect(err.code).toBe('FORBIDDEN');
     app.reply = { status: 400, body: JSON.stringify({ error: 'from: Invalid date', code: 'VALIDATION' }) };
-    expect((await failure(client().get('/api/find'))).message).toBe('from: Invalid date');
+    const plain = await failure(client().get('/api/find'));
+    expect(plain.message).toBe('from: Invalid date');
+    expect(plain.fields).toEqual({});
+  });
+
+  it('carries the fields a refusal names (details.fields), text only, so a tool can tell which input it was', async () => {
+    writeEndpoint(app.port);
+    app.reply = {
+      status: 400,
+      body: JSON.stringify({ error: 'Give a request_id.', code: 'VALIDATION', details: { fields: { requestId: 'give a request_id of your own', odd: 5 }, other: 'x' } }),
+    };
+    const err = await failure(client().act({ verb: 'run_operation', operation: 'reports.std.get' }));
+    expect(err).toMatchObject({ status: 400, code: 'VALIDATION', message: 'Give a request_id.' });
+    expect(err.fields).toEqual({ requestId: 'give a request_id of your own' });
+    // Details that are no list of fields: none.
+    app.reply = { status: 400, body: JSON.stringify({ error: 'No.', code: 'VALIDATION', details: { fields: ['requestId'] } }) };
+    expect((await failure(client().act({ verb: 'run_operation', operation: 'reports.std.get' }))).fields).toEqual({});
   });
 
   it('explains a token Ironbooks does not accept', async () => {

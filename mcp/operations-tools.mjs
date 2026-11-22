@@ -33,7 +33,7 @@
 import { WAITS_BUSY_CODE } from './client.mjs';
 import { ToolError, slowDownAdvice } from './protocol.mjs';
 import { CLASS_MEANINGS, SETTING_MEANINGS, SHORT_GRANT_MINUTES, STANDING, STANDING_TEXT } from './guide.mjs';
-import { camelize, settle } from './write-tools.mjs';
+import { camelize, sentence, settle } from './write-tools.mjs';
 
 /** The 14 risk classes (lib/agent/operations/types.ts RISK_CLASSES; a test holds them together). */
 export const RISK_CLASSES = Object.keys(CLASS_MEANINGS);
@@ -87,6 +87,23 @@ const REASON = {
   description:
     'Why you are asking, in one or two plain sentences (at most 500 characters). Needed when a person must approve it. The person sees it labelled as your words, next to a preview Ironbooks builds itself.',
 };
+/**
+ * The version of the record the agent last read (lib/agent/contract.ts OperationInput
+ * .expectedUpdatedAt), as the named tools take it (write-tools.mjs EXPECTED). Optional on every
+ * tool: it is kept into a request a person must approve and sent with the approved run, and the
+ * route compares it as it saves (lib/agent/bridge.ts).
+ */
+const EXPECTED_VERSION = {
+  type: 'string',
+  maxLength: 40,
+  pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}',
+  patternHint: "must be the record's updatedAt exactly as Ironbooks gave it, for example 2026-03-08T14:05:09.123Z",
+  description:
+    "When you change or void a record you read: its updatedAt as you read it (editedAt for an account or an item), exactly as given. If someone changed the record since, Ironbooks answers 409 (conflict) and changes nothing, instead of overwriting their work: read it again and make your change on what it says now. Leave it out for something new.",
+};
+/** After a 409 on a request that named a version: what to do, in place of the route's "reload". */
+const VERSION_CHANGED =
+  'If it says the record was changed since you read it, nothing was changed: read the record again, make your change on what it says now, and send it with the updatedAt you read then (editedAt for an account or an item) as expected_updated_at and a NEW request_id.';
 
 /** @param {object} properties @param {string[]} [required] */
 function schema(properties, required = []) {
@@ -554,6 +571,19 @@ function givenOf(/** @type {any} */ g) {
   return { limits: limitsOf(g.constraints) ?? NO_LIMITS, minutes: typeof g.minutes === 'number' ? g.minutes : undefined, endsAt: g.expiresAt };
 }
 
+/** A standard report read through the door (mcp/report-tools.mjs). */
+const REPORT_READ = 'reports.std.get';
+
+/**
+ * What to do once an approved report read is done. export_report asks for the read as its first
+ * step and makes the file only when it is sent again (mcp/report-tools.mjs exportReadNext), and
+ * this is the last answer such an agent reads: "do not send it again" alone would leave it with the
+ * rows and no file. The request does not say which tool asked for it, so both cases are said; the
+ * agent's own request_id is not in the request either, so it is described, apart from this one.
+ */
+export const REPORT_READ_DONE =
+  'It is done: what was read is in result. If you asked for it with export_report, send export_report again now with the same arguments and your own request_id (the one you chose, not this request_id) to make the file: the report is not read a second time. Otherwise, do not send it again.';
+
 /**
  * One request as the agent reads it (lib/agent/contract.ts AgentRequestView): what it was, what a
  * person decided, in plain words, and what to do next. `full`: with the result of the run (held to
@@ -607,7 +637,7 @@ export function shapeRequest(r, opts = {}) {
     said = `Approved${by}, and ${r.posted === true ? 'posted to the books' : 'done'}.`;
     if (given) said += ` The person also gave you standing permission for more of the same until ${given.endsAt}, within limits_given.`;
     else if (r.grantError) said += ' The person also wanted to give you standing permission for more of the same, but it was not given (standing_permission_not_given says why): each one still asks.';
-    next = file ? `Call get_file with file_id "${file.file_id}" to read the file it made.` : 'It is done. Do not send it again.';
+    next = file ? `Call get_file with file_id "${file.file_id}" to read the file it made.` : r.operation === REPORT_READ ? REPORT_READ_DONE : 'It is done. Do not send it again.';
   } else if (r.status === 'denied') {
     said = `Denied${by}. Nothing was done.`;
     next = "Do not send it again. Read the person's note; if the work still needs doing, ask the person what they would like instead.";
@@ -815,7 +845,7 @@ export const OPERATION_TOOLS = [
     changes: true,
     destructive: true,
     description:
-      'Run any operation by its id (from find_operations), with the input describe_operation shows. dry_run true runs it inside Ironbooks and rolls it back: you see what it would post, change or send, and nothing is kept. Without dry_run it runs for real when your policy allows it; when a person must approve it the answer is "asked" (give a reason), and you call wait_for_decision. "needs_confirmation" means a warning a person would have been asked about: resend with the flag in confirm only if going ahead is right. Anything kept needs a request_id; the same request_id never runs twice.',
+      'Run any operation by its id (from find_operations), with the input describe_operation shows. dry_run true runs it inside Ironbooks and rolls it back: you see what it would post, change or send, and nothing is kept. Without dry_run it runs for real when your policy allows it; when a person must approve it the answer is "asked" (give a reason), and you call wait_for_decision. "needs_confirmation" means a warning a person would have been asked about: resend with the flag in confirm only if going ahead is right. Anything kept needs a request_id; the same request_id never runs twice. When you change or void a record you read, send its updatedAt as expected_updated_at: a 409 (conflict) then means someone changed it after you read it, and nothing was changed.',
     inputSchema: schema(
       {
         operation: OPERATION,
@@ -849,21 +879,33 @@ export const OPERATION_TOOLS = [
           description: 'Flags of warnings you accept, each named by an earlier needs_confirmation answer (for example ["allowDuplicateNumber"]). Only after reading the warning, and only when going ahead is right.',
         },
         reveal: { type: 'boolean', description: 'Ask for protected values in full (Social Security numbers, bank account numbers). Always asks a person, for this one call.' },
+        expected_updated_at: EXPECTED_VERSION,
       },
       ['operation'],
     ),
     handler: async (a, c) => {
       const dryRun = a.dry_run === true;
-      const answer = await verb(c, 'run_operation', {
-        operation: a.operation,
-        params: a.params,
-        query: a.query,
-        body: a.body,
-        confirm: Array.isArray(a.confirm) && a.confirm.length ? a.confirm : undefined,
-        reveal: a.reveal === true ? true : undefined,
-        // A dry run keeps nothing, so it is never filed under a request id the real run will need.
-        ...(dryRun ? { dryRun: true } : { requestId: a.request_id, reason: a.reason }),
-      });
+      const version = typeof a.expected_updated_at === 'string' && a.expected_updated_at ? a.expected_updated_at : undefined;
+      let answer;
+      try {
+        answer = await verb(c, 'run_operation', {
+          operation: a.operation,
+          params: a.params,
+          query: a.query,
+          body: a.body,
+          confirm: Array.isArray(a.confirm) && a.confirm.length ? a.confirm : undefined,
+          reveal: a.reveal === true ? true : undefined,
+          // Sent with a dry run too: the route's own check then says at once that it changed since.
+          expectedUpdatedAt: version,
+          // A dry run keeps nothing, so it is never filed under a request id the real run will need.
+          ...(dryRun ? { dryRun: true } : { requestId: a.request_id, reason: a.reason }),
+        });
+      } catch (err) {
+        // The route's words for a record changed since say to reload, which an agent cannot do.
+        const e = /** @type {any} */ (err);
+        if (version && e?.isIronbooksError === true && e.status === 409) throw new ToolError(`${sentence(e.message)} ${VERSION_CHANGED}`);
+        throw err;
+      }
       // Asking for a restart (a company file switched, an update installed): until it is decided,
       // a silence of Ironbooks may be that restart, so no second copy is started meanwhile.
       if (answer?.outcome === 'asked' && typeof answer.requestId === 'string') {

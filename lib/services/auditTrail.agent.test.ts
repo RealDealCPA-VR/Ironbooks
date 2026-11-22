@@ -47,7 +47,7 @@ import {
   REQUEST_STATUS_WORDS,
 } from './auditTrail';
 import { auditEntityRef, auditValuesFor, canSeeAuditEntry } from './auditVisibility';
-import { expireRequests, shownStatus } from './agentRequests';
+import { approveAgentRequest, cancelAgentRequest, expireRequests, shownStatus } from './agentRequests';
 import { readAllTransactionLog, transactionLogPath, verifyTransactionLog, queryTransactionLog } from './transactionLog';
 import { isStandardReport, runStandardReport } from './reportRegistry';
 
@@ -645,6 +645,35 @@ describe('Agent Activity report (Reports > Accountant & Taxes)', () => {
     for (const key of ['past-its-time', 'first-of-two', 'first-then-expired', 'just-asked', 'first-then-marked-expired', 'first-then-taken-back', 'copied-decided']) {
       expect(after(key), key).toEqual(cells(key));
     }
+  });
+
+  it('keeps the first approver marked when the agent takes back a request one of two people approved (the real paths)', async () => {
+    const op = allOperations().find((o) => o.area === 'customers' && o.method !== 'GET' && o.availability === 'agent' && !o.hostOnly && !o.fileAdmin)!;
+    const [asked] = await db
+      .insert(agentPermissionRequests)
+      .values({
+        companyId: owner.companyId,
+        agentId,
+        requestKey: 'first-then-withdrawn',
+        operation: op.id,
+        class: 'change',
+        summary: 'Waiting first-then-withdrawn',
+        status: 'pending',
+        // Two people must say yes (D8); nothing else is asked of them.
+        needs: { admin: false, fileAdmin: false, hostOnly: false, flag: null, flags: [], grantAdminOnly: false, secrets: [], twoPerson: true, grantable: 'no' },
+        expiresAt: new Date(Date.now() + 86_400_000),
+        createdAt: new Date('2026-05-01T09:00:00.000Z'),
+      })
+      .returning();
+    // The first yes, through the approval center; then the agent withdraws the request.
+    expect((await approveAgentRequest(owner, asked.id, {}, { atHost: true })).status).toBe('needs_second_approver');
+    expect((await cancelAgentRequest(asAgent(), asked.id)).status).toBe('cancelled');
+    const [stored] = await db.select().from(agentPermissionRequests).where(eq(agentPermissionRequests.id, asked.id));
+    expect(stored).toMatchObject({ status: 'cancelled', decidedBy: people.owner, secondApprover: null });
+    const r = await runStandardReport(owner, 'agent-activity', { from: '2026-05-01', to: '2026-05-01' });
+    expect(r.rows.map((x) => x.cells)).toEqual([
+      expect.objectContaining({ what: 'Waiting first-then-withdrawn', status: 'Cancelled', decidedBy: 'Olivia Owner (first of two)' }),
+    ]);
   });
 
   it('reads every request through the approval center\'s own shownStatus', async () => {

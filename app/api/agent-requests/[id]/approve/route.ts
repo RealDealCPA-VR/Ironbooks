@@ -9,9 +9,8 @@
  * Which ones the run cannot do without is the service's to judge (lib/services/agentRequests.ts
  * checkTypedSecrets): a secret the operation always needs (Operation.needsSecret), and every secret
  * of a desktop flow, is sent back to the card with what to type, and nothing runs. A secret the
- * policy adds for this one request (the closing-date password for work in a closed period,
- * lib/agent/policy.ts) is not sent back that way yet for a route: the card does not let Approve
- * through without it, and a run without it is refused at the commit, so nothing is posted.
+ * policy adds for this one request (closing_password for work in a closed period,
+ * lib/agent/policy.ts) is sent back to the card the same way, and nothing runs.
  *
  * An approval only ever comes from a signed-in person's window (the host's, or a teammate's through
  * the multi-user proxy), never from an agent or another program on this computer

@@ -101,6 +101,10 @@ describe('classification: banking, a request that does two kinds of work', () =>
     expect(src).toMatch(/searchParams\.get\('ai'\) === '1'/);
     expect(BANKING_CLASS_BY_INPUT['GET /api/bank-transactions/suggestions']).toEqual({ from: 'query', field: 'ai', classes: { '1': 'outside' }, otherwise: 'read' });
     expect(op('bank-transactions.suggestions')).toMatchObject({ class: 'outside', effects: ['network'], dryRun: 'none' });
+    // With ai=1 the payee name can also go to the vendor web lookup (aiCategorizer.ts lookupVendor),
+    // when the owner turned it on: the why names both things that leave the computer.
+    expect(op('bank-transactions.suggestions').why).toMatch(/AI model/);
+    expect(op('bank-transactions.suggestions').why).toMatch(/vendor lookup/);
   });
 
   it('keeps excluding a bank line a change: an excluded line leaves the review list, on text outsiders wrote', () => {

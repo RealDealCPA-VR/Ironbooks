@@ -9,6 +9,8 @@
  *
  * runShellOperation, for an 'electron' operation:
  *  1. only for a person's approval: a context with an agent on it, or with no person, is refused;
+ *     each path the operation takes must be in a folder agents may use as things are now, by the
+ *     rule files.save uses (pathOutsideFolders): the approval may come long after the ask;
  *  2. makes the approval ticket (lib/agent/shellTicket.ts) over the request id, the operation, the
  *     input and the approver, good for SHELL_TICKET_SECONDS, its MAC also covering the answers,
  *     the folders, the file and which secrets come with it;
@@ -25,7 +27,8 @@
  * Folders: the company file's folder counts only when it is not the top of a drive or share (a USB
  * stick's E:\, a mapped Q:\, \\server\share, a mounted volume's /Volumes/USB) nor reached through a
  * share of this very computer (\\localhost\c$\…): then only Documents\Ironbooks and its Agent Outbox
- * apply. A folder the Admin added that is such a place, or leads to one, is never used either.
+ * apply. A folder the Admin added that is such a place, or leads to one, is never used either, nor
+ * one that has come to hold the books or Ironbooks' own data since it was added (policyFolders).
  *
  * 'files.save' (runner 'server') is done here: one of the agent's staged files saved into a folder
  * agents may use, made new on the disk (an exclusive create: never over a file that is there, even
@@ -45,7 +48,7 @@ import { loadAgentPolicy } from '@/lib/services/agentPolicies';
 import { setPrintHandler, type PrintHandler } from '@/lib/effects';
 import { currentServiceScope } from '@/lib/serviceScope';
 import type { ShellOperationDef } from './contract';
-import { allowedFolder, isThisComputerShare, readStagedFile } from './files';
+import { allowedFolder, isThisComputerShare, overlapsAppData, readStagedFile } from './files';
 import { SHELL_OPERATIONS } from './operations/shell';
 import { makeShellTicket, sealShellPrivate, shellAnswerChecks, shellFileRef, type ShellPrivate } from './shellTicket';
 
@@ -174,13 +177,20 @@ export function isDriveOrShareRoot(p: string, platform: NodeJS.Platform = proces
   return platform !== 'win32' && posixVolumeTop(resolved);
 }
 
+/** \\?\…, \\.\… and \??\…: device and raw namespace paths (lib/agent/files.ts DEVICE_PATH). */
+const DEVICE_PATH = /^(?:[\\/]{2}[?.](?:[\\/]|$)|\\\?\?\\)/;
+
 /**
  * The folders of `list` agents may use: never the top of a drive or share, as written or on the
- * disk, and never a share of this very computer (isThisComputerShare: \\localhost\c$\…), which is
- * judged by the words before the disk is looked at.
+ * disk, and never a share of this very computer (isThisComputerShare: \\localhost\c$\…). Refused by
+ * the words before the disk is looked at: those, every device path (\\?\GLOBALROOT\Device\Mup\…
+ * reaches any computer's shares, this one's too, and the rule judges no such path), and anything
+ * that is not a full path. allowedFolder refuses each of them as well; here they are never looked at.
  */
 function usableFolders(list: readonly string[]): string[] {
   return list.filter((f) => {
+    const typed = typeof f === 'string' ? f.trim() : '';
+    if (!typed || DEVICE_PATH.test(typed) || !path.isAbsolute(typed)) return false;
     if (isDriveOrShareRoot(f) || isThisComputerShare(f)) return false;
     try {
       // A folder that is a link to the top of a drive or share, or to a share of this computer, is
@@ -193,11 +203,26 @@ function usableFolders(list: readonly string[]): string[] {
   });
 }
 
-/** The folders the Admin allowed for this agent (none when the policy cannot be read: the defaults still apply). */
+/**
+ * The folders the Admin allowed for this agent that it may still use (none when the policy cannot
+ * be read: the defaults still apply). Saving the list refused a folder that is, lies inside or
+ * holds a place where Ironbooks keeps the books or its own data, but a folder can come to be one
+ * later (the books or their backups moved into it): judged again here, each time the work runs, by
+ * the rule the door uses when it is asked (lib/agent/files.ts overlapsAppData), and left out when it
+ * is one or cannot be judged. files.save and the desktop shell's own check (the line's `folders`)
+ * get only these.
+ */
 async function policyFolders(approver: ServiceContext, agentId: string): Promise<string[]> {
   try {
     const policy = await loadAgentPolicy(approver, agentId);
-    return Array.isArray(policy?.folders) ? policy.folders.filter((f): f is string => typeof f === 'string' && f.trim() !== '') : [];
+    const listed = Array.isArray(policy?.folders) ? policy.folders.filter((f): f is string => typeof f === 'string' && f.trim() !== '') : [];
+    return listed.filter((f) => {
+      try {
+        return !overlapsAppData(f);
+      } catch {
+        return false;
+      }
+    });
   } catch {
     return [];
   }
@@ -463,6 +488,46 @@ async function saveStagedFile(approver: ServiceContext, request: { agentId: stri
   }
 }
 
+/** A path an agent sent, as one line a person can read in a message (no invisible characters, cut short). */
+function shownPath(v: string): string {
+  const one = v.replace(/[\p{Cc}\p{Cf}]/gu, '');
+  return one.length > 200 ? `${one.slice(0, 199)}…` : one;
+}
+
+/**
+ * Why a desktop operation's paths may not be used now, or null. Each 'path' field names a file
+ * its flow opens or writes; its folder must be one agents may use as things are when the work
+ * runs, judged as files.save judges its folder (usableFolders, allowedFolder: links resolved, never
+ * the top of a drive or share nor a share of this computer, never inside the books or Ironbooks'
+ * own data). The door judged the same at the ask (lib/agent/operate.ts shellPathRefusal), but the
+ * approval may come later: a folder that has since come to lie inside such a place (the company
+ * file's folder that now holds its archives), or is gone, is refused before the shell is asked.
+ * The desktop shell checks again on its side (electron/agentShell.js pathProblem), without the
+ * rule on Ironbooks' own data, which only this side knows.
+ */
+async function pathOutsideFolders(def: ShellOperationDef, input: Record<string, unknown>, added: readonly string[]): Promise<string | null> {
+  const fields = Object.entries(def.input ?? {}).filter(([, f]) => f.type === 'path');
+  if (!fields.length) return null;
+  const where =
+    `Use the company file's folder, Documents\\Ironbooks or Documents\\Ironbooks\\${AGENT_OUTBOX_NAME}, ` +
+    "or a folder the Admin added in the agent's settings, then have the agent ask again.";
+  let allowed: string[] | null = null;
+  for (const [field, f] of fields) {
+    const v = input[field];
+    if ((v === undefined || v === null) && f.required !== true) continue;
+    // As the door and the shell read it: a whole path, with nothing around it.
+    if (typeof v !== 'string' || !v || v !== v.trim() || !path.isAbsolute(v)) {
+      return `"${field}" must be the full path of a file in a folder agents may use on this computer, so nothing was done. ${where}`;
+    }
+    allowed ??= usableFolders([...defaultAgentFolders(), ...added]);
+    const dir = await allowedFolder(allowed, path.dirname(path.resolve(v)));
+    if (!dir || isDriveOrShareRoot(dir)) {
+      return `"${shownPath(v)}" is not in a folder agents may use on this computer now, or its folder is no longer there, so nothing was done. ${where}`;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // The contract
 // ---------------------------------------------------------------------------
@@ -500,13 +565,16 @@ export async function runShellOperation(
       if (typeof pdf === 'string') return fail(pdf);
       file = pdf;
     }
+    const added = await policyFolders(approver, request.agentId);
+    const outside = await pathOutsideFolders(known, input, added);
+    if (outside) return fail(outside);
     return await sendToShell(known, {
       requestId: request.id,
       approverId: approver.userId as string,
       input,
       answers: answers && typeof answers === 'object' && !Array.isArray(answers) ? answers : {},
       secrets: cleaned,
-      folders: await policyFolders(approver, request.agentId),
+      folders: added,
       file,
     });
   } catch (err) {

@@ -185,7 +185,11 @@ domTest('New agent: name, roles (Admin with a warning) and the chosen preset are
   const adminBox = $$<HTMLInputElement>('input[type="checkbox"]', d).find((c) => textOf(c.closest('label')).startsWith('Admin')) ?? null;
   await click(adminBox, 'the Admin role');
   const warning = textOf(await until(() => $('[data-admin-warning]', d), 'the Admin warning'));
-  check(warning.includes('can ask for anything an Admin can do'), `the warning says it can ask for anything an Admin can do: ${warning}`);
+  // Changed on purpose (wave 5): Admin work stays on Never under "Ask for every change", so the
+  // warning says it can be asked for only where the settings say Ask.
+  check(warning.includes('can ask for Admin work'), `the warning says it can ask for Admin work: ${warning}`);
+  check(warning.includes('wherever its settings say Ask for that work') && warning.includes('"Ask for every change" keeps it on Never'), `and only where its settings say Ask: ${warning}`);
+  check(!warning.includes('anything an Admin can do'), 'never that it can ask for anything an Admin can do');
   check(warning.includes('still needs a person to say yes'), 'and that every such request still needs a person');
   await click(adminBox, 'the Admin role again');
   await until(() => !$('[data-admin-warning]', d), 'the warning to go');
@@ -345,7 +349,14 @@ type Override = { class: string; area: string | null; setting: string };
 
 /** AgentDetail (lib/agent/contract.ts) for HELPER, "Ask for every change" unless told, with `overrides` on top. */
 function detailOf(
-  opts: { overrides?: Override[]; paused?: boolean; bulkCap?: number | null; preset?: keyof typeof PRESET_DEFAULTS; locked?: typeof LOCKED } = {},
+  opts: {
+    overrides?: Override[];
+    paused?: boolean;
+    bulkCap?: number | null;
+    preset?: keyof typeof PRESET_DEFAULTS;
+    locked?: typeof LOCKED;
+    folders?: string[];
+  } = {},
 ) {
   const overrides = opts.overrides ?? [];
   const preset = opts.preset ?? 'ask_every_change';
@@ -378,7 +389,7 @@ function detailOf(
         bulkCap: opts.bulkCap ?? null,
         twoPersonOver: null,
         requestExpiryDays: 7,
-        folders: ['C:\\Receipts'],
+        folders: opts.folders ?? ['C:\\Receipts'],
         notifyEmail: false,
         pausedAt: opts.paused ? '2026-11-19T10:00:00.000Z' : null,
       },
@@ -795,6 +806,8 @@ domTest('a folder typed but not added is added by Save, and the cap that applies
   await until(() => calls.some((c) => c.method === 'PATCH'), 'the save');
   equal(JSON.stringify(calls.find((c) => c.method === 'PATCH')?.body), JSON.stringify({ bulkCap: 75, folders: ['C:\\Receipts', 'D:/Scans'] }), 'the typed folder is saved too');
   await until(() => !$('[data-folder-pending]') && ($('#ag-folder') as HTMLInputElement | null)?.value === '', 'the field empty after the save');
+  // The answer does not spell the new folder as typed; only a folder the agent had can be "taken away".
+  check(!$('[data-folders-taken-away]'), 'a new folder is never said to be taken away');
   await unmount();
 });
 
@@ -1019,6 +1032,22 @@ domTest('the page can say whether the person is an Admin, and the tab then does 
   );
   await until(() => $('[data-not-admin]'), 'the note for someone who is not an Admin');
   check(!button(/New agent/), 'no New agent');
+  // Wave 5, kept on purpose: told only that the person is not an Admin, the tab takes it that they
+  // may not change users either (fail closed), and offers the screens to look at only.
+  check($('[data-not-admin][data-view-only]'), 'without viewerMayManage, the screens to look at only');
+  equal(asked(calls), 0, 'the tab did not ask who is signed in');
+  await unmount();
+
+  // Told both, as Users & Roles tells it: someone who may change users gets the screens to tighten.
+  calls = stub({ 'GET /api/agents': LIST });
+  await mount(
+    <div>
+      <Toaster />
+      <AgentsTab roles={ROLES} viewerIsAdmin={false} viewerMayManage />
+    </div>,
+  );
+  await until(() => $('[data-not-admin]'), 'the note for someone who is not an Admin');
+  check(!$('[data-view-only]') && textOf($('[data-not-admin]')).includes('Open one to make it stricter or pause it.'), 'told they may tighten or pause');
   equal(asked(calls), 0, 'the tab did not ask who is signed in');
   await unmount();
 
@@ -1223,8 +1252,10 @@ domTest("the server's folder refusals are shown beside Save as they come", async
   // Ironbooks' own places, or (for someone who is not an Admin) a stored folder that does not really
   // reach the new one. Each comes back in its own words: the server's messages (lib/services/
   // agentPolicies.ts checkFolders and thisComputerShareRefusal, Windows wording), for the folder sent.
+  // Only a folder new in the save is looked at on the disk (a stored one is kept unlooked-at), so
+  // each refusal names the folder typed, never one the agent already has.
   const REFUSALS: Array<(typed: string) => string> = [
-    (f) => `The folder "${f}" was not found on this computer. Check the path, or make the folder first.`,
+    (f) => `The folder "${f}" was not found on this computer. Check the path, make the folder first, or take it off the list.`,
     (f) => `"${f}": that folder is on this computer, reached as a network share. Type its own path on this computer instead, like C:\\Users\\you\\Documents\\Receipts.`,
     (f) =>
       `The folder "${f}" is one of the folders Ironbooks keeps its own data in (settings, working copies, backups or agents' files), or is inside or holds one. Choose another folder for the agent.`,
@@ -1234,11 +1265,9 @@ domTest("the server's folder refusals are shown beside Save as they come", async
     'GET /api/agents': listed([HELPER]),
     'GET /api/agents/a1': detailOf(),
     'PATCH /api/agents/a1': (c: FetchCall) => {
-      // The folder refused is the one added (the last on the list sent); after the three, the
-      // agent's own C:\Receipts, deleted since it was given.
+      // The folder refused is the one added (the last on the list sent).
       const folders = (c.body as { folders?: string[] }).folders ?? [];
-      const error = next < REFUSALS.length ? REFUSALS[next](folders[folders.length - 1] ?? '') : REFUSALS[0]('C:\\Receipts');
-      return reply(400, { error, code: 'VALIDATION' });
+      return reply(400, { error: REFUSALS[next](folders[folders.length - 1] ?? ''), code: 'VALIDATION' });
     },
   });
   await openDetail(calls);
@@ -1253,19 +1282,61 @@ domTest("the server's folder refusals are shown beside Save as they come", async
     await click(button('Undo changes'), 'Undo changes');
     await until(() => !$('[data-save-error]') && button('Save changes')?.disabled, 'back as it was saved');
   }
-  check(!$('[data-folder-gone]'), 'a folder typed and not found is not taken for one the agent has');
+  equal(calls.filter((c) => c.method === 'PATCH').length, REFUSALS.length, 'each was sent once');
+  await unmount();
+});
 
-  // Wave 4: a folder the agent already has was deleted since. A save sends the whole list, so the
-  // server names that one; the screen says how to get past it, and the hint goes once it is off.
-  await focus($('#ag-folder'), 'the folder field');
-  await typeText('D:/Scans');
+// Wave 5: for a person who is not an Admin, the server takes off the list a folder the agent had
+// that would be refused were it given today (lib/services/agentPolicies.ts checkFolders), and the
+// save goes through. The answer has no field for it: the page compares what it sent with what came
+// back, and says which folders Ironbooks took off and why.
+domTest('a folder Ironbooks takes off the list on a save is named beside Save, with why', async () => {
+  // Given before the rule existed: a share of this very computer.
+  const SHARE = '\\\\localhost\\c$\\Scans';
+  let folders = ['C:\\Receipts', SHARE];
+  const calls = stubFetch({
+    'GET /api/auth/me': MANAGER_ME,
+    [COUNT_ROUTE]: NO_SWITCH,
+    'GET /api/agents': listed([HELPER]),
+    'GET /api/agents/a1': () => detailOf({ folders }),
+    'PATCH /api/agents/a1': (c: FetchCall) => {
+      const body = c.body as { folders?: string[]; bulkCap?: number };
+      // The server keeps what may stay and takes the share away (the audit row says why).
+      if (body.folders) folders = body.folders.filter((f) => !f.startsWith('\\\\localhost'));
+      return detailOf({ folders, bulkCap: body.bulkCap ?? null });
+    },
+  });
+  await openDetail(calls);
+  await click(button('Limits'), 'Limits');
+  await click(await until(() => button('Remove C:\\Receipts'), 'the folders'), 'Remove C:\\Receipts');
   await click(button('Save changes'), 'Save changes');
-  const gone = await until(() => $('[data-folder-gone]'), 'the hint');
-  equal(textOf($('[data-save-error]')), REFUSALS[0]('C:\\Receipts'), 'the refusal names the folder the agent has');
-  equal(textOf(gone), '"C:\\Receipts" is already on this agent\'s list. If it was moved or deleted, take it off the list under Limits, then save again.', 'and the screen says what to do');
-  await click(button('Remove C:\\Receipts'), 'Remove C:\\Receipts');
-  await until(() => !$('[data-folder-gone]') && !$('[data-save-error]'), 'the hint and the refusal go with the change');
-  equal(calls.filter((c) => c.method === 'PATCH').length, REFUSALS.length + 1, 'each was sent once');
+  const note = await until(() => $('[data-folders-taken-away]'), 'the note');
+  equal(JSON.stringify(calls.find((c) => c.method === 'PATCH')?.body), JSON.stringify({ folders: [SHARE] }), 'what was sent: the share kept');
+  const said = textOf(note);
+  check(said.startsWith('Saved. Ironbooks took this folder off the agent\'s list') && said.includes(`"${SHARE}"`), `it names the folder: ${said}`);
+  check(said.includes('a whole drive or share, a share of this computer, or holds or is inside the company file'), `and why: ${said}`);
+  // The audit trail needs a permission of its own, which this person may not have.
+  check(said.includes('The audit trail entry for this save says which; if you cannot open the audit trail, an Admin can.'), `where it is written, and who can look: ${said}`);
+  check(said.endsWith('Only an Admin can give the agent a folder outside the ones it has.'), `what only an Admin may add, as the Limits section says it: ${said}`);
+  check(!said.includes('C:\\Receipts'), 'the folder the person took off is not named');
+  check(!button(`Remove ${SHARE}`), 'the list shows what was saved');
+  check(!$('[data-save-error]'), 'and the save is not shown as refused');
+
+  // A save the page itself stops sends nothing and saves nothing, so the note stays.
+  const cap = await until(() => $<HTMLInputElement>('#ag-bulk-cap'), 'the bulk cap');
+  cap.select();
+  await typeText('0');
+  await click(button('Save changes'), 'Save changes');
+  await until(() => textOf().includes('The most records one request may change must be a whole number'), 'the problem');
+  equal(calls.filter((c) => c.method === 'PATCH').length, 1, 'nothing more was sent');
+  check(textOf($('[data-folders-taken-away]')) === said, 'the note about the folders taken away stays');
+
+  // The next save says only what it did.
+  cap.select();
+  await typeText('50');
+  await click(button('Save changes'), 'Save changes');
+  await until(() => calls.filter((c) => c.method === 'PATCH').length === 2 && !$('[data-folders-taken-away]'), 'the note to go with the next save');
+  equal(JSON.stringify(calls.filter((c) => c.method === 'PATCH')[1].body), JSON.stringify({ bulkCap: 50 }), 'no folders sent, so nothing to compare');
   await unmount();
 });
 
@@ -1513,6 +1584,37 @@ domTest('an audit trail row whose details cannot be loaded stays closed and says
   await click($(`tr[data-audit-row="${AU1}"]`), 'the row again');
   await until(() => textOf().includes('"total": "250.00"'), 'the details, on the second click');
   equal(calls.filter((c) => c.path === `/api/audit-trail/${AU1}`).length, 2, 'asked twice');
+  await unmount();
+});
+
+// Wave 5: an entry with words of its own (AuditLogRow.summary, lib/services/auditTrail.ts: a person's
+// approval of an agent's reveal, or "Details hidden ..." for a reader who may not see it) shows them
+// in the list and at the top of its details, as text. Every other row is as it was.
+domTest("the audit trail shows an entry's own words in the list and in its details", async () => {
+  const REVEAL_ID = '0b5e2c1a-1111-4aaa-8bbb-000000000003';
+  const HIDDEN_ID = '0b5e2c1a-1111-4aaa-8bbb-000000000004';
+  // The agent's name is data: it is shown as typed, never read as markup.
+  const REVEALED = 'Revealed full SSNs and tax IDs of "Show employee Dana Reyes" to agent "Helper <b>bold</b>", approved by Pat Owner.';
+  const HIDDEN = 'Revealed full SSNs and tax IDs to an agent. Details hidden. An Admin, or someone who may view Employees & Payroll, can see them.';
+  const DECISION = { action: 'update', entityType: 'agent_permission_request', entityId: 'r9', actorName: 'Pat Owner', actorId: 'u1', createdAt: '2026-11-21T09:00:00.000Z' };
+  const REVEAL_ROW = { ...DECISION, id: REVEAL_ID, summary: REVEALED };
+  const HIDDEN_ROW = { ...DECISION, id: HIDDEN_ID, entityId: 'r8', summary: HIDDEN };
+  const calls = stubFetch({
+    'GET /api/audit-trail': { rows: [REVEAL_ROW, HIDDEN_ROW, AUDIT_ROW], total: 3 },
+    [`GET /api/audit-trail/${REVEAL_ID}`]: { ...REVEAL_ROW, oldValues: { status: 'pending' }, newValues: { status: 'approved', revealed: REVEALED } },
+  });
+  await mount(<AuditTrailPage />);
+  const row = await until(() => $(`tr[data-audit-row="${REVEAL_ID}"]`), 'the decision in the list');
+  equal(textOf($('[data-audit-summary]', row)), REVEALED, 'the reveal in words, in the list');
+  check(!$('[data-audit-summary] b'), 'as text, never markup');
+  equal(textOf($('[data-audit-summary]', $(`tr[data-audit-row="${HIDDEN_ID}"]`) ?? document)), HIDDEN, "and for a reader who may not see it, the server's hidden words");
+  check(!$('[data-audit-summary]', $(`tr[data-audit-row="${AU1}"]`) ?? document), 'an entry without words of its own is as it was');
+
+  await click(row, 'the decision');
+  const words = await until(() => $('[data-audit-summary-detail]'), 'the words at the top of the details');
+  equal(textOf(words), REVEALED, 'the same words head the details');
+  await until(() => textOf().includes('"status": "approved"'), 'with what it recorded');
+  equal(calls.filter((c) => c.path === `/api/audit-trail/${REVEAL_ID}`).length, 1, 'the entry was asked for once');
   await unmount();
 });
 
