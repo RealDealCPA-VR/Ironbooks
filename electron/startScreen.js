@@ -1,8 +1,9 @@
 // "No Company Open" (QuickBooks parity): what the window shows after File > Close Company.
 // No company file is loaded (the local server is not started), so the file is released and can
 // be moved, copied or backed up. The screen lists the recent company files with their full
-// folder paths, and opens, creates or browses for one. Self-contained page (a data: URL with
-// its own preload, electron/startPreload.js); it never talks to a server.
+// folder paths, and opens, creates or browses for one. Self-contained page (a data: URL; the
+// window's preload, electron/preload.js, gives it only the start-screen calls); it never talks to
+// a server. A company chosen here opens in this same window (openingScreenHtml, then its pages).
 'use strict';
 
 /** Accent colors for the screen, matching the app's (app/globals.css): [light, dark]. */
@@ -223,4 +224,53 @@ function startScreenHtml({ dark, accent, platform, firstRun = false }) {
 </html>`;
 }
 
-module.exports = { ACCENT_RGB, recentEntries, startScreenHtml };
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+/**
+ * "Opening ABC Company…": what the window shows from the moment a company file is chosen (or the
+ * app starts on the last one) until its sign-in page is ready, so opening happens in the one
+ * window instead of the window going away while the file is prepared. Also "Closing ABC
+ * Company…" (`label`) while a company's server stops, before the start screen or the next
+ * company. Same frame and colors as the No Company Open page; no script, nothing to click.
+ */
+function openingScreenHtml({ dark, accent, platform, name = '', label: text = '' }) {
+  const [light, darkAccent] = ACCENT_RGB[accent] || ACCENT_RGB.blue;
+  const pad = platform === 'darwin' ? '80px' : '14px';
+  // `label`: the whole line when it is not an opening ("Closing ABC Company…").
+  const label = text ? escapeHtml(text) : name ? `Opening ${escapeHtml(name)}…` : 'Opening your company file…';
+  return `<!doctype html>
+<html lang="en" data-scheme="${dark ? 'dark' : 'light'}">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<title>Ironbooks</title>
+<style>
+  :root { --ink: 29 29 31; --canvas: 245 245 247; --chrome: 236 236 240; --line: 222 222 227; --muted: 110 110 115; --accent: ${light}; color-scheme: light; }
+  [data-scheme='dark'] { --ink: 245 245 247; --canvas: 18 18 20; --chrome: 40 40 43; --line: 62 62 66; --muted: 160 160 165; --accent: ${darkAccent}; color-scheme: dark; }
+  html, body { margin: 0; height: 100%; }
+  body { font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", Inter, system-ui, sans-serif; color: rgb(var(--ink)); background: rgb(var(--canvas)); -webkit-font-smoothing: antialiased; display: flex; flex-direction: column; cursor: progress; user-select: none; }
+  .titlebar { height: env(titlebar-area-height, 36px); flex: none; display: flex; align-items: center; padding-left: ${pad}; gap: 8px; background: rgb(var(--chrome)); border-bottom: 1px solid rgb(var(--line) / .8); font-size: 13px; font-weight: 600; -webkit-app-region: drag; }
+  .mark { width: 20px; height: 20px; border-radius: 6px; background: linear-gradient(rgb(var(--accent) / .85), rgb(var(--accent))); display: grid; place-items: center; }
+  main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 24px; background: radial-gradient(1200px 600px at 50% -10%, rgb(var(--accent) / .12), transparent); }
+  .icon { width: 56px; height: 56px; border-radius: 15px; background: linear-gradient(rgb(var(--accent) / .85), rgb(var(--accent))); display: grid; place-items: center; }
+  h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -.01em; text-align: center; max-width: 80vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar { width: 220px; height: 4px; border-radius: 4px; background: rgb(var(--ink) / .1); overflow: hidden; }
+  .bar i { display: block; width: 40%; height: 100%; border-radius: 4px; background: rgb(var(--accent)); animation: slide 1.1s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+  @media (prefers-reduced-motion: reduce) { .bar i { animation: none; width: 100%; opacity: .5; } }
+</style>
+</head>
+<body>
+<div class="titlebar"><span class="mark"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg></span>Ironbooks</div>
+<main role="status" aria-live="polite">
+  <div class="icon"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg></div>
+  <h1>${label}</h1>
+  <div class="bar" aria-hidden="true"><i></i></div>
+</main>
+</body>
+</html>`;
+}
+
+module.exports = { ACCENT_RGB, recentEntries, startScreenHtml, openingScreenHtml };

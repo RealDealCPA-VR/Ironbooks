@@ -211,7 +211,8 @@ describe('desktop shell wiring (source pins)', () => {
 
   it('the main window is built frameless from the saved theme', () => {
     expect(main).toMatch(/windowTheme\.frameOptions\(process\.platform, nativeTheme\.shouldUseDarkColors\)/);
-    expect(main).toMatch(/nativeTheme\.themeSource = theme\.mode;\s*\n\s*mainWindow = new BrowserWindow/);
+    // The one app window (ensureMainWindow): the saved light/dark choice is set just before it is built.
+    expect(main).toMatch(/nativeTheme\.themeSource = windowTheme\.normalizeTheme\(loadConfig\(\)\.theme\)\.mode;\s*\n\s*const win = new BrowserWindow/);
     expect(main).not.toMatch(/backgroundColor: '#0b1f3a'/);
   });
 

@@ -61,7 +61,8 @@ describe('1.1b: the shell reaches its server by exact address', () => {
     const tokenUses = main.split('\n').filter((l) => /x-bka-internal|internalToken/.test(l));
     // Generated once, handed to the servers in their environment, used by shellFetch and the check.
     for (const l of tokenUses) {
-      expect(l, l).toMatch(/const internalToken = |BKA_INTERNAL_TOKEN: internalToken|shellHeaders\(internalToken, launchPass\)|isOwnServer\(port, internalToken, |this launch's internal token/);
+      // (`let`: made anew when a company is closed without the app restarting, renewLaunchSecrets.)
+      expect(l, l).toMatch(/^let internalToken = crypto\.randomBytes\(32\)|^  internalToken = crypto\.randomBytes\(32\)|BKA_INTERNAL_TOKEN: internalToken|shellHeaders\(internalToken, launchPass\)|isOwnServer\(port, internalToken, |this launch's internal token/);
     }
     expect(main).not.toMatch(/fetch\(`\$\{(serverUrl|baseUrl|url)\}/);
     const shellFetch = fnBody('function shellFetch(baseUrl, route, init = {}) {');
