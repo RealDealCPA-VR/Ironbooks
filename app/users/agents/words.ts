@@ -233,7 +233,7 @@ export const ROLE_HELP =
  * D1: shown when the Admin role is ticked, and on the page of an agent that holds it. Admin work
  * (users and roles, the company file, passwords) stays on Never under "Ask for every change", the
  * new agent's preset (PRESET_DEFAULTS, lib/agent/policy.ts), so the warning says the agent can ask
- * for it only where its settings say Ask, as docs/agents-for-people/set-up-an-agent.md does.
+ * for it only where its settings say Ask, as the set-up-an-agent article in lib/kb/articles.ts does.
  */
 export const ADMIN_ROLE_WARNING =
   'With the Admin role this agent can ask for Admin work: users and roles, backups, restoring, the company file and passwords, wherever its settings say Ask for that work ("Ask for every change" keeps it on Never). Every one of those requests still needs a person to say yes, and only an Admin can approve them. Choose it only if the agent needs that work.';

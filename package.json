@@ -1,6 +1,6 @@
 {
   "name": "ironbooks",
-  "version": "1.7.19",
+  "version": "1.7.20",
   "private": true,
   "license": "MIT",
   "description": "Ironbooks: open-source desktop accounting — a QuickBooks competitor with AI-powered error correction.",
@@ -28,6 +28,7 @@
     "test:e2e:agent": "node --experimental-websocket scripts/e2e-agent.mjs",
     "test:crawl": "node scripts/crawl.mjs",
     "typecheck": "tsc --noEmit",
+    "docs": "tsx scripts/gen-docs.ts",
     "electron:dev": "electron .",
     "desktop": "concurrently -k -s first -n NEXT,APP -c blue,green \"next dev\" \"wait-on tcp:127.0.0.1:3000 && electron .\"",
     "make-dev-shortcut": "powershell -ExecutionPolicy Bypass -File scripts/make-dev-shortcut.ps1",

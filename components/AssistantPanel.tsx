@@ -6,6 +6,11 @@
  * proposes appears as a card that the user must Approve (posted through the normal journal
  * service) or Reject.
  *
+ * "How do I…?" questions are answered from the built-in guide (lib/kb). Those answers link
+ * into the app: `[Reconcile](/reconcile)` in the text becomes a link, and the reply's `links`
+ * show as "take me there" buttons. The server only sends links to real screens the person may
+ * open; this panel links nothing but in-app paths.
+ *
  * What an outside agent asked for is not decided here: it is approved or denied in Agent requests
  * (app/agent-requests), the one place that shows what the work would change first. The panel lists
  * such a request with its state and a link there, and does not count it among the things waiting
@@ -14,7 +19,7 @@
  */
 import * as React from 'react';
 import Link from 'next/link';
-import { AlertTriangle, Bot, ChevronDown, ChevronRight, Cloud, Send, Sparkles, Wifi, X } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Bot, ChevronDown, ChevronRight, Cloud, Send, Sparkles, Wifi, X } from 'lucide-react';
 import { Badge, Button, Spinner, toast, type BadgeTone } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
@@ -263,6 +268,8 @@ interface Reply {
   toolCalls: ToolCall[];
   proposals: Proposal[];
   unverifiedNumbers: string[];
+  /** Screens the answer sends you to (absent on threads saved by an older version). */
+  links?: { label: string; href: string }[];
   mode: 'llm' | 'offline';
   providerId?: string;
   redacted?: boolean;
@@ -350,11 +357,17 @@ async function askStreaming(
 const STARTERS = [
   'How did we do this month?',
   'Who owes us money?',
-  'Which bills are overdue?',
   'What is our cash balance?',
+  'How do I reconcile my bank account?',
+  'Where do I enter a bill?',
 ];
 
 const TOOL_LABELS: Record<string, string> = {
+  help_search: 'Help guide',
+  open_invoices: 'Open invoices',
+  sales_by_customer: 'Sales by customer',
+  expenses_by_vendor: 'Spending by vendor',
+  cash_flow: 'Cash flow',
   profit_and_loss: 'Profit & Loss',
   balance_sheet: 'Balance Sheet',
   ar_aging: 'A/R Aging',
@@ -363,6 +376,60 @@ const TOOL_LABELS: Record<string, string> = {
   list_accounts: 'Chart of accounts',
   search_transactions: 'Transaction search',
 };
+
+/** An in-app path: starts with one slash. Anything else in an answer stays plain text. */
+function isAppPath(href: string): boolean {
+  return href.startsWith('/') && !href.startsWith('//');
+}
+
+/**
+ * The answer text with its `[label](/path)` links made clickable (they close the panel and open
+ * the screen). The "[help_search]" style source tags are dropped: Sources lists them below.
+ */
+export function AnswerText({ text, onNavigate }: { text: string; onNavigate: () => void }) {
+  const parts: React.ReactNode[] = [];
+  const clean = text.replace(/\s*\[help_search\]\s*$/, '');
+  const re = /\[([^\]\n]{1,80})\]\(([^)\s]+)\)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(clean))) {
+    if (!isAppPath(m[2])) continue;
+    if (m.index > last) parts.push(clean.slice(last, m.index));
+    parts.push(
+      <Link key={m.index} href={m[2]} onClick={onNavigate} className="font-semibold text-electric underline underline-offset-2 hover:no-underline">
+        {m[1]}
+      </Link>,
+    );
+    last = m.index + m[0].length;
+  }
+  if (last < clean.length) parts.push(clean.slice(last));
+  return <>{parts}</>;
+}
+
+/** "Take me there" buttons for the screens an answer points at. */
+function GoLinks({ links, onNavigate }: { links: { label: string; href: string }[]; onNavigate: () => void }) {
+  const shown = links.filter((l) => isAppPath(l.href));
+  if (shown.length === 0) return null;
+  return (
+    <div className="mt-2 flex flex-wrap gap-1.5" aria-label="Open in Ironbooks">
+      {shown.map((l, i) => (
+        <Link
+          key={l.href}
+          href={l.href}
+          onClick={onNavigate}
+          className={
+            i === 0
+              ? 'inline-flex items-center gap-1 rounded-full bg-electric px-3 py-1 text-xs font-semibold text-white hover:bg-electric/90 outline-none focus-visible:ring-4 focus-visible:ring-electric/25'
+              : 'inline-flex items-center gap-1 rounded-full border border-electric/30 px-3 py-1 text-xs font-semibold text-electric hover:bg-electric/5 outline-none focus-visible:ring-4 focus-visible:ring-electric/25'
+          }
+        >
+          {i === 0 ? `Open ${l.label}` : l.label}
+          <ArrowRight className="h-3 w-3" aria-hidden="true" />
+        </Link>
+      ))}
+    </div>
+  );
+}
 
 function Sources({ calls }: { calls: ToolCall[] }) {
   const [open, setOpen] = React.useState(false);
@@ -638,7 +705,7 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
             </div>
             <div>
               <div className="font-bold text-navy leading-tight">Ask about your books</div>
-              <div className="text-[11px] text-navy/40">Answers come from your own reports</div>
+              <div className="text-[11px] text-navy/40">Your numbers, and how to do things in Ironbooks</div>
             </div>
           </div>
           <div className="flex items-center gap-3">
@@ -662,8 +729,9 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
           {messages.length === 0 && (
             <div className="text-sm text-navy/60">
               <p className="mb-3">
-                Ask a question in plain English. I can read your reports but I can’t change anything — if you ask me to
-                record something, I’ll prepare it for you to approve.
+                Ask a question in plain English: about your numbers, or how to do something here (I’ll link you to the
+                right screen). I can read your reports but I can’t change anything — if you ask me to record something,
+                I’ll prepare it for you to approve.
               </p>
               <p className="mb-3 text-xs text-navy/50">
                 Works with your ChatGPT plan (just sign in) or a free model on this computer — set up once in{' '}
@@ -694,12 +762,13 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
             ) : (
               <div key={i} className="max-w-[95%]">
                 <div className="rounded-2xl rounded-bl-sm bg-slate-50 border border-slate-100 px-3 py-2 text-sm text-navy whitespace-pre-wrap">
-                  {m.content}
+                  <AnswerText text={m.content} onNavigate={onClose} />
                 </div>
+                <GoLinks links={m.reply.links ?? []} onNavigate={onClose} />
                 <div className="mt-1 flex flex-wrap items-center gap-1.5">
                   {m.reply.mode === 'offline' ? (
                     <>
-                      <Badge tone="neutral">Basic answer (no AI model)</Badge>
+                      <Badge tone="neutral">{m.reply.toolCalls.some((c) => c.tool === 'help_search') ? 'From the built-in guide (no AI model)' : 'Basic answer (no AI model)'}</Badge>
                       <Link href="/ai-settings" onClick={onClose} className="text-[11px] text-electric underline">
                         Connect your AI for full answers
                       </Link>
@@ -750,7 +819,7 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
             rows={2}
             value={input}
             maxLength={4000}
-            placeholder="e.g. What were our biggest expenses last month?"
+            placeholder="e.g. What were our biggest expenses last month? How do I pay a bill?"
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {

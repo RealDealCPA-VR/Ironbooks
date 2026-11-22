@@ -19,7 +19,7 @@
 &nbsp;
 <a href="https://realdealcpa-vr.github.io/Ironbooks/"><img src="https://img.shields.io/badge/Visit%20the%20website-1B2A44?style=for-the-badge" alt="Visit the website"></a>
 
-[Why](#-why-ironbooks) · [A morning in Ironbooks](#-a-monday-morning-in-ironbooks) · [Features](#-everything-a-real-set-of-books-needs) · [The company file](#-a-company-file-that-works-like-a-qbw) · [Switching](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Security](#-security-you-never-notice) · [Quick start](#-quick-start)
+[Why](#-why-ironbooks) · [A morning in Ironbooks](#-a-monday-morning-in-ironbooks) · [Features](#-everything-a-real-set-of-books-needs) · [The company file](#-a-company-file-that-works-like-a-qbw) · [Switching](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Security](#-security-you-never-notice) · [Quick start](#-quick-start) · [Docs](#-documentation)
 
 </div>
 
@@ -298,7 +298,9 @@ Found a weakness? Please report it privately: [`SECURITY.md`](./SECURITY.md).
 **Just want to use it?**
 [Download the Windows installer](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest)
 (`Ironbooks-Setup-x.y.z.exe`, or the portable `Ironbooks-x.y.z.exe` that needs no install). It
-keeps itself up to date, and asks before it does. More in [`INSTALL.md`](./INSTALL.md).
+keeps itself up to date, and asks before it does. Then follow
+[**Start here**](./docs/START-HERE.md): open a company, connect your AI, first week. More in
+[`INSTALL.md`](./INSTALL.md).
 
 **Build it yourself** (also the route for macOS and Linux today):
 
@@ -310,8 +312,21 @@ npm run electron:dev   # desktop shell (with `npm run dev` running in another te
 npm run desktop:dist   # build installers for Windows / macOS / Linux
 ```
 
-More: [`GETTING_STARTED.md`](./GETTING_STARTED.md) · [`DESKTOP.md`](./DESKTOP.md) ·
+More: [`docs/agents`](./docs/agents/README.md) (where things live) · [`DESKTOP.md`](./DESKTOP.md) ·
 [`RELEASING.md`](./RELEASING.md) (tag-triggered releases)
+
+## 📚 Documentation
+
+Everything is written once and shows up in three places: the guides below, **Help & Glossary**
+inside the app, and **Ask AI**, which answers "how do I…?" from the same guides and links you
+straight to the screen.
+
+| | |
+|---|---|
+| 🚀 **[Start here](./docs/START-HERE.md)** | Install, open or convert a company, connect your AI, your first week |
+| 📖 **[User guide](./docs/guide/README.md)** | How-to guides for sales, purchases, banking, payroll, reports, backups and more |
+| 🧭 **[Every screen](./docs/guide/screens.md)** · **[QuickBooks names](./docs/guide/quickbooks-names.md)** | What each screen is for, and where the QuickBooks screen you know went |
+| 🤖 **[For coding agents and contributors](./docs/agents/README.md)** | The layout of the code and a [screen → files map](./docs/agents/code-map.md), so nobody has to read the whole codebase |
 
 ## 🧪 Tested like the money matters
 
@@ -345,6 +360,7 @@ electron/            Desktop shell (main process + preload bridge)
 lib/services/        Accounting engine (posting.ts is the only way to touch the ledger)
 lib/db/              Drizzle schema + PGlite client
 lib/ai/              AI router: local / tailnet / cloud + redaction
+lib/kb/              Product knowledge base: how-to articles for Ask AI, Help and docs/guide
 lib/permissions/     Roles, areas, route → permission map
 lib/net/guard.ts     Network policy (the only way out)
 lib/money.ts         Decimal-safe money
@@ -360,6 +376,8 @@ PARITY.md            QuickBooks Desktop Enterprise parity matrix
 - Map every new API route in `lib/permissions/routes.ts`. A test fails if you forget.
 - Write migrations by hand as the next `drizzle/00NN_*.sql` plus a `_journal.json` entry. Don't
   run drizzle-kit generate.
+- Changed a screen? Update its guide in `lib/kb/articles.ts` and run `npm run docs`. A test fails
+  if the published guides are out of date or link to a screen that does not exist.
 
 </details>
 
