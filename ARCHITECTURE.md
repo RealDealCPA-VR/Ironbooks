@@ -590,8 +590,8 @@ The desktop shell (electron/main.js) is a launcher plus file manager around a Ne
 | `electron/companyFile.js` | Folder-format manifest (bookkeeper-company.json), display names/details for both formats, sandbox marker reader |
 | `electron/hosting.js / electron/hostingCore.js` | Reverse proxy for multi-user access (tailnet or office LAN), header sanitising and the per-launch proxy secret, peer filtering, share URLs, host-address normalisation; the tailnet certificate (tailscale cert, userData/tls) with its key kept wrapped by safeStorage |
 | `electron/selfSignedCert.js` | ECDSA self-signed LAN certificate (per PC, userData/tls) and its pinned fingerprint |
-| `electron/security.js, preload.js, startPreload.js, waitPreload.js, promptPreload.js` | Navigation/request lockdown, permission denial; minimal renderer bridges (incl. backup.takePending) |
-| `electron/startScreen.js, waitPrompt.js, connectPrompt.js, menuRoutes.js, windowTheme.js, spelling.js, legacyBackups.js` | No Company Open window, waiting/connect prompts, QB section menus, frameless title bar theme, local spell check, legacy auto-backup pruning |
+| `electron/security.js, preload.js, waitPreload.js, promptPreload.js` | Navigation/request lockdown, permission denial; minimal renderer bridges (incl. backup.takePending). preload.js is the one window's bridge: the shell's own data: pages (No Company Open, Opening…) get only `startScreen`, the company's pages only `bookkeeper` |
+| `electron/startScreen.js, waitPrompt.js, connectPrompt.js, menuRoutes.js, windowTheme.js, spelling.js, legacyBackups.js` | No Company Open and "Opening…" / "Closing…" screens (shown in the one app window: opening a company, File > Close Company and switching company files all happen in that window without the app restarting; main.js openInWindow / closeThenOpenInWindow. Only the sandbox still restarts), waiting/connect prompts, QB section menus, frameless title bar theme, local spell check, legacy auto-backup pruning |
 | `lib/services/companyFileSave.ts` | Server-side save of the working copy into the company file: autosave timer, lock/saveId checks, single reusable conflict copy, dbSchema stamp, close-time save, Save Copy As (refuses files in use; no backup history on copies) |
 | `lib/services/restoreState.ts` | Registry of data folders being restored (autosave/Save Now wait) |
 | `lib/services/backup.ts` | Full and per-company .bka create/validate/restore, pre-op safety copies, restore verification and rollback, dbSchemaAt stamp and newer-version refusal |
@@ -617,7 +617,8 @@ The desktop shell (electron/main.js) is a launcher plus file manager around a Ne
 - Lock protocol: mkdir is the lock; takeover only of the lock judged stale (same token); access requests never create the lock folder (NOT_IN_USE)
 - Hosting: app server bound to 127.0.0.1; proxy strips x-bka-internal and stamps x-bka-remote-addr plus the per-launch proxy secret (a request claiming x-bka-remote-addr without it is classed as a program on this PC, UNVERIFIED_LOCAL_ADDR, and its claimed address is ignored); LAN mode only private peers, pinned self-signed cert
 - Whole-file operations (restore, backup download, condense archive restore, sandbox, portable) require an Admin of every company (requireFileAdmin) and exclusive access; all area routes are in lib/permissions/routes.ts
-- Next launch's config (other file, No Company Open, /signup) is written only after the open file closed (configAfterClose)
+- The next company's config (other file, No Company Open, /signup) is written only after the open file closed (closeThenOpenInWindow in the window; configAfterClose on a restart)
+- Closing a company in the window leaves what a restart leaves (releaseClosedCompany): hosting and the company server stopped, the shell's state for the file dropped, session cookies gone, and new per-launch secrets (renewLaunchSecrets), so every open of a company file asks for its password again: sign-ins are bound to BKA_INTERNAL_TOKEN (lib/auth.ts launchNonce)
 
 ### Known limits
 

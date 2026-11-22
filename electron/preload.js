@@ -2,17 +2,39 @@
 // Exposes a minimal, audited API on window.bookkeeper — no direct Node access in the renderer.
 const { contextBridge, ipcRenderer } = require('electron');
 
+// The one window shows two kinds of pages, and each gets only its own calls. The shell's own
+// self-contained pages (electron/startScreen.js: "No Company Open" and "Opening…", data: URLs)
+// get the start-screen bridge; the main process accepts those calls only while no company is
+// open, and only for folders on the recent list. The company's pages (the local server, or a
+// multi-user host) get window.bookkeeper below, whose calls the main process accepts only from
+// the app's own origin. Opening a company navigates this same window from one to the other.
+const shellPage = location.protocol === 'data:';
+
+if (shellPage) {
+  contextBridge.exposeInMainWorld('startScreen', {
+    /** Recent company files: [{ dir, name, exists, lastOpenedAt, passwordProtected }]. */
+    list: () => ipcRenderer.invoke('start:list'),
+    open: (dir) => ipcRenderer.invoke('start:open', String(dir)),
+    remove: (dir) => ipcRenderer.invoke('start:remove', String(dir)),
+    reveal: (dir) => ipcRenderer.invoke('start:reveal', String(dir)),
+    newCompany: () => ipcRenderer.invoke('start:new'),
+    browse: () => ipcRenderer.invoke('start:browse'),
+    /** Create a company file, then the QuickBooks import wizard. */
+    convert: () => ipcRenderer.invoke('start:convert'),
+  });
+}
+
 // Whether this window draws its own title bar (the main window has no system frame). Asked
 // synchronously so the page's first paint already reserves the title bar (lib/theme.ts).
 let chromeInfo = { frameless: false, platform: 'unknown' };
 try {
-  const info = ipcRenderer.sendSync('chrome:info');
+  const info = shellPage ? null : ipcRenderer.sendSync('chrome:info');
   if (info && typeof info === 'object') chromeInfo = { frameless: Boolean(info.frameless), platform: String(info.platform) };
 } catch {
   /* keep the defaults: a normal framed window */
 }
 
-contextBridge.exposeInMainWorld('bookkeeper', {
+if (!shellPage) contextBridge.exposeInMainWorld('bookkeeper', {
   /** Open a native file picker; returns { filePath, content } or null. */
   openFile: (filters) => ipcRenderer.invoke('dialog:openFile', filters),
   /** Save binary data (ArrayBuffer) to a user-chosen path; returns the path or null. */

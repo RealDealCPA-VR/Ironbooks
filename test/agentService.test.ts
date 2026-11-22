@@ -137,10 +137,13 @@ describe('main.js: a start without the flag is unchanged', () => {
   });
 
   it('the window is created shown, as always, unless the app was started for an agent', () => {
+    // The app's one window is made in ensureMainWindow (No Company Open, Opening… and the company's
+    // pages all show in it).
+    const win = fnBody('function ensureMainWindow()');
+    expect(win).toContain('show: !agentServiceHidden,');
+    expect(win).toContain('if (state?.maximized && !agentServiceHidden) win.maximize();');
+    // Still one server start in createWindow, and the page still loads from it.
     const body = fnBody('async function createWindow()');
-    expect(body).toContain('show: !agentServiceHidden,');
-    expect(body).toContain('if (state?.maximized && !agentServiceHidden) mainWindow.maximize();');
-    // Still one server start, and the page still loads from it.
     expect(body.match(/await startNextServer\(/g) ?? []).toHaveLength(1);
   });
 });

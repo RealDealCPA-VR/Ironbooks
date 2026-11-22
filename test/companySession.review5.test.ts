@@ -131,7 +131,15 @@ describe('switching or closing company files (source pins)', () => {
   const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
   it('the next launch\'s company file is only written once the open one has closed', () => {
     // openCompany / Close Company / New Company hand their config to relaunchApp…
-    expect(main).toMatch(/function relaunchApp\(nextConfig = null\) \{[\s\S]{0,200}configAfterClose = \{ \.\.\.\(configAfterClose \|\| \{\}\), \.\.\.nextConfig \};/);
+    // (a restart: restartApp. Closing in the window writes it at the same point: see below.)
+    expect(main).toMatch(/function restartApp\(nextConfig = null\) \{[\s\S]{0,200}configAfterClose = \{ \.\.\.\(configAfterClose \|\| \{\}\), \.\.\.nextConfig \};/);
+    const inWindow = main.slice(main.indexOf('async function closeThenOpenInWindow(nextConfig) {'), main.indexOf('async function releaseClosedCompany() {'));
+    // Closing a company without restarting: nothing is written before the open file has closed,
+    // and nothing at all when the save failed and the person keeps working.
+    expect(inWindow.indexOf('await closeOpenCompanyFile()')).toBeGreaterThan(0);
+    expect(inWindow.indexOf('saveConfig(')).toBeGreaterThan(inWindow.indexOf('if (goOn === false) {'));
+    expect(inWindow.indexOf('await openInWindow(nextConfig);')).toBeGreaterThan(inWindow.indexOf('await releaseClosedCompany();'));
+    expect(inWindow).toMatch(/if \(goOn === false\) \{[\s\S]{0,400}resumeBackgroundJobs\(\);[\s\S]{0,120}return;/);
     const open = main.slice(main.indexOf('function openCompany(location, extra = {})'));
     // (review loop 8: it first refuses inside the sandbox, which takes a few lines more)
     expect(open.slice(0, 1200)).toMatch(/relaunchApp\(\{\s*\.\.\.\(single \? \{ companyFile: location \}/);

@@ -122,14 +122,235 @@ function relaunchArgs() {
 let configAfterClose = null;
 
 /**
+ * Go to another company file / mode (`nextConfig`: another file, No Company Open, a host), all in
+ * the one window, as QuickBooks does:
+ *  - from "No Company Open" nothing is open to save or stop: `nextConfig` is applied and opened
+ *    right there (openInWindow);
+ *  - with a company open, it is first backed up, saved and released exactly as a quit does, its
+ *    server stopped, and then `nextConfig` is opened in the same window (closeThenOpenInWindow).
+ *    If the save fails and the person chooses to keep working, nothing is changed;
+ *  - otherwise (the sandbox, or something already under way) the app restarts (restartApp).
+ */
+function relaunchApp(nextConfig = null) {
+  if (canOpenInWindow()) return void openInWindow(nextConfig);
+  if (canCloseInWindow()) return void closeThenOpenInWindow(nextConfig);
+  restartApp(nextConfig);
+}
+
+/**
  * Restart into another company file / mode: quit (the open company file is backed up, saved and
  * released on the way out — before-quit), then start again with `nextConfig` applied. If the save
  * fails and the person chooses to keep working, nothing restarts and nothing is changed.
  */
-function relaunchApp(nextConfig = null) {
+function restartApp(nextConfig = null) {
   relaunchAfterQuit = true;
   if (nextConfig) configAfterClose = { ...(configAfterClose || {}), ...nextConfig };
   app.quit();
+}
+
+/**
+ * A company (or a connection to a host) is open and can be closed without leaving the window.
+ * Not the sandbox: its server has switched folders under the shell, and entering or leaving it
+ * restarts as before.
+ */
+function canCloseInWindow() {
+  if (startScreenMode || openingCompany || closingInProgress || quittingAfterBackup || installAfterClose) return false;
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (!serverUrl && !openFile && !remoteHostOrigin) return false;
+  return !loadConfig().sandbox && !sandboxActive();
+}
+
+/**
+ * Close what is open, then open `nextConfig`, without the app going away. The same steps, in the
+ * same order, as quitting and starting again (before-quit): the versioned backup, the save into
+ * the company file and the release of its lock while the company's page is still on screen (so a
+ * question about that save has a page to come back to); only then does the window show
+ * "Closing…", the server stops, and what the shell knew about that file is forgotten
+ * (releaseClosedCompany) — including this launch's secrets, so a sign-in to the closed file is
+ * worth nothing afterwards. `nextConfig` is written only after all of that, as configAfterClose is.
+ */
+async function closeThenOpenInWindow(nextConfig) {
+  // A close or quit asked for from here on waits until the window shows what comes next.
+  openingCompany = true;
+  closingInProgress = true;
+  const closing = (() => {
+    try {
+      const location = remoteHostOrigin ? loadConfig().remoteFile : currentCompanyLocation();
+      return typeof location === 'string' && location ? companyFile.locationName(location) : '';
+    } catch {
+      return '';
+    }
+  })();
+  stopBackgroundJobs();
+  let goOn = true;
+  try {
+    await runAutoBackup().catch((err) => console.error('[auto-backup] skipped:', err?.message || err));
+    goOn = await closeOpenCompanyFile().catch((err) => {
+      console.error('[company-file] closing failed:', err?.message || err);
+      return true;
+    });
+  } finally {
+    closingInProgress = false;
+  }
+  if (goOn === false) {
+    // The person chose to keep working (the save failed): nothing changes, and a close of the
+    // window asked for meanwhile is dropped with it (they are still working).
+    resumeBackgroundJobs();
+    closeAfterOpening = false;
+    endOpening();
+    return;
+  }
+  try {
+    await showBusyScreen(closing ? `Closing ${closing}…` : 'Closing the company file…');
+    await releaseClosedCompany();
+  } catch (err) {
+    // The file is saved and released; only this window could not let go of it (its server would
+    // not stop). Start again instead, as closing a company always did.
+    console.error('[close] could not close in the window, restarting:', err?.message || err);
+    quittingAfterBackup = true;
+    if (nextConfig) saveConfig(nextConfig);
+    if (autoUpdater) autoUpdater.autoInstallOnAppQuit = false;
+    app.relaunch({ args: relaunchArgs() });
+    app.quit();
+    return;
+  }
+  await openInWindow(nextConfig);
+}
+
+/**
+ * The company file is saved and released (closeOpenCompanyFile): stop everything that served it
+ * and forget it, leaving the shell as a fresh start would find it — what the second pass of
+ * before-quit and the end of the process did when closing a company restarted the app.
+ */
+async function releaseClosedCompany() {
+  stopLockMaintenance();
+  stopBackgroundJobs();
+  backgroundJobsUrl = null;
+  await hostingQueue.catch(() => {});
+  if (hostingState) await hosting.stopHosting(hostingState).catch(() => {});
+  hostingState = null;
+  hostingError = null;
+  // Stopped on purpose: cleared first, so its exit is not reported as "stopped working".
+  const server = serverProcess;
+  serverProcess = null;
+  if (server && !(await stopChild(server))) throw new Error('The company server did not stop.');
+  for (const child of [...scratchChildren]) {
+    try {
+      child.kill();
+    } catch {
+      /* already gone */
+    }
+  }
+  openFile = null;
+  serverUrl = null;
+  remoteHostOrigin = null;
+  remotePin = null;
+  launchPassOnWindow = false;
+  lockLostNoticeShown = false;
+  pendingAccessRequest = null;
+  answeredRequests.clear();
+  favoriteItems = [];
+  backupToRestore = null;
+  changesToImport = null;
+  closeAnswered = false;
+  // A host's own certificate was accepted for that host only: back to the normal checks.
+  session.defaultSession.setCertificateVerifyProc(null);
+  renewLaunchSecrets();
+  await forgetSessionCookies();
+}
+
+/**
+ * Cookies that a restart would not have kept (those with no expiry, such as the window's pass):
+ * gone here too, so the next company file starts with what a new launch starts with.
+ */
+async function forgetSessionCookies() {
+  try {
+    const cookies = await session.defaultSession.cookies.get({});
+    await Promise.all(
+      cookies
+        .filter((c) => c.session)
+        .map((c) =>
+          session.defaultSession.cookies
+            .remove(`${c.secure ? 'https' : 'http'}://${String(c.domain || '').replace(/^\./, '')}${c.path || '/'}`, c.name)
+            .catch(() => {}),
+        ),
+    );
+  } catch (err) {
+    console.error('[close] could not clear the session cookies:', err?.message || err);
+  }
+}
+
+/**
+ * The window is between two things: a company file is being opened (createWindow: locked,
+ * unpacked, its server started — or the start screen is being put up), or the open one is being
+ * closed first (closeThenOpenInWindow). The window is on screen meanwhile, so a close or quit
+ * asked for now waits until that has finished (closeAfterOpening) — stopping halfway would leave
+ * a file locked with nothing to release it.
+ */
+let openingCompany = false;
+let closeAfterOpening = false;
+let closeAfterOpeningTimer = null;
+/** Opening that has not finished this long after a close was asked for is not going to. */
+const OPENING_CLOSE_WAIT_MS = 60_000;
+
+/** createWindow has finished (or failed). True when a quit was waiting for it and now runs. */
+function endOpening() {
+  openingCompany = false;
+  if (closeAfterOpeningTimer) clearTimeout(closeAfterOpeningTimer);
+  closeAfterOpeningTimer = null;
+  if (!closeAfterOpening) return false;
+  closeAfterOpening = false;
+  app.quit();
+  return true;
+}
+
+/** A close / quit asked for while a company file is opening: it runs as soon as that is done. */
+function deferCloseUntilOpened() {
+  closeAfterOpening = true;
+  if (closeAfterOpeningTimer) return;
+  // Never a window that cannot be closed: an opening that hangs is given up on.
+  closeAfterOpeningTimer = setTimeout(() => {
+    closeAfterOpeningTimer = null;
+    if (openingCompany) endOpening();
+  }, OPENING_CLOSE_WAIT_MS);
+}
+
+/**
+ * From "No Company Open" there is nothing to save, release or stop: no company file is loaded and
+ * no server is running. So the company opens right here, in the window the person is looking at
+ * (QuickBooks does the same), instead of the app quitting and starting again.
+ */
+function canOpenInWindow() {
+  return Boolean(
+    startScreenMode && !openingCompany && mainWindow && !mainWindow.isDestroyed() &&
+    !serverProcess && !openFile && !remoteHostOrigin && !closingInProgress && !quittingAfterBackup,
+  );
+}
+
+/**
+ * Apply `nextConfig` and open what it names in the window, which shows "No Company Open" or (a
+ * company was just closed in it) "Closing…".
+ */
+async function openInWindow(nextConfig) {
+  openingCompany = true;
+  try {
+    if (nextConfig) saveConfig(nextConfig);
+    await createWindow();
+  } catch (err) {
+    console.error('[open] could not open the company file:', err);
+    if (endOpening()) return;
+    // As at start-up: say what happened and quit (before-quit releases the company file).
+    dialog.showErrorBox(
+      'Ironbooks could not open the company file',
+      `${String((err && err.message) || err)}\n\nClose any other Ironbooks windows and start it again. If this keeps happening, restart the computer.`,
+    );
+    app.quit();
+    return;
+  }
+  if (endOpening()) return;
+  // As after a start that opens a company file: its Privacy & Network settings now say whether
+  // update checks are allowed (the check at start-up found no company open).
+  if (!startScreenMode) checkForUpdates();
 }
 
 /** The main window for a dialog's parent, if it is still there. */
@@ -171,16 +392,30 @@ let remotePin = null;
 
 // Per-launch secret shared with the local Next server so the main process can make
 // authenticated "system" calls (e.g. the launch-time recurring run). The server is bound to
-// 127.0.0.1 and the token never leaves this machine.
-const internalToken = crypto.randomBytes(32).toString('hex');
+// 127.0.0.1 and the token never leaves this machine. Sign-ins are tied to it (lib/auth.ts
+// launchNonce), which is why opening a company file always asks for the password again: a new
+// one is made whenever a company is closed without the app restarting (renewLaunchSecrets).
+let internalToken = crypto.randomBytes(32).toString('hex');
 
 // Per-launch pass for this launch's window (lib/net/launchPass.ts). Anything on this computer can
 // reach 127.0.0.1 — another program, another Windows account — so the server only treats a request
 // as the app itself when it carries this value: the window as an HttpOnly cookie (set before its
 // first page loads, see setLaunchPassCookie), the shell's own calls as a header (shellFetch). The
-// server learns it from its environment, never the command line. Every company switch relaunches
-// the app, so each server process gets a new pass and the window the matching cookie.
-const launchPass = crypto.randomBytes(32).toString('hex');
+// server learns it from its environment, never the command line. Every company server gets a new
+// pass and the window the matching cookie: a new launch has new ones, and so does a company opened
+// after another was closed in the same window (renewLaunchSecrets, then setLaunchPassCookie).
+let launchPass = crypto.randomBytes(32).toString('hex');
+
+/**
+ * A company was closed without the app restarting (closeThenOpenInWindow): from here on it is a
+ * new launch as far as secrets go. Nothing that was told the old ones is running any more (the
+ * company server and the scratch servers were stopped first), and a sign-in or unlock made with
+ * the closed file is refused by whatever opens next — also the same file again.
+ */
+function renewLaunchSecrets() {
+  internalToken = crypto.randomBytes(32).toString('hex');
+  launchPass = crypto.randomBytes(32).toString('hex');
+}
 /**
  * The pass cookie is on the window's session, so the company server may insist on the pass. If
  * setting it failed, the server is started without it (as before this check existed) rather than
@@ -394,7 +629,7 @@ function extractBkaPath(argv) {
 let backupToRestore = null;
 
 function deliverPendingBka() {
-  if (!pendingBkaPath || !mainWindow) return;
+  if (!pendingBkaPath || !mainWindow || openingCompany) return;
   const filePath = pendingBkaPath;
   pendingBkaPath = null;
   // Same choice as File > Open or Restore Company: as a new company file, or into the open one
@@ -437,7 +672,7 @@ function extractBkpPath(argv) {
 }
 
 function deliverPendingBkp() {
-  if (!pendingBkpPath || !mainWindow) return;
+  if (!pendingBkpPath || !mainWindow || openingCompany) return;
   const filePath = pendingBkpPath;
   pendingBkpPath = null;
   openPortableFlow(filePath);
@@ -483,7 +718,7 @@ pendingIbacPath = extractPathWithExt(process.argv, '.ibac');
 pendingIbcxPath = extractPathWithExt(process.argv, '.ibcx');
 
 function deliverPendingIbac() {
-  if (!pendingIbacPath || !mainWindow) return;
+  if (!pendingIbacPath || !mainWindow || openingCompany) return;
   const filePath = pendingIbacPath;
   pendingIbacPath = null;
   openAccountantCopyFlow(filePath).catch((err) => console.error('[accountant copy] open:', err));
@@ -493,7 +728,7 @@ function deliverPendingIbac() {
 let changesToImport = null;
 
 function deliverPendingIbcx() {
-  if (!pendingIbcxPath || !mainWindow) return;
+  if (!pendingIbcxPath || !mainWindow || openingCompany) return;
   const filePath = pendingIbcxPath;
   pendingIbcxPath = null;
   if (startScreenMode || !serverUrl || remoteHostOrigin) {
@@ -672,7 +907,9 @@ function rememberRecentCompany(dir) {
 
 /**
  * Make `location` (a single company file, or an older company folder) the active company file and
- * relaunch into it. The one open now is saved, backed up and released on the way out (before-quit).
+ * open it: from "No Company Open" in the same window, at once (relaunchApp -> openInWindow);
+ * with a company file open, by relaunching into it — the one open now is saved, backed up and
+ * released on the way out (before-quit).
  */
 function openCompany(location, extra = {}) {
   // In the sandbox the practice copy is open: switching files from here kept the sandbox flag and
@@ -953,7 +1190,7 @@ ipcMain.handle('sandbox:entered', (e, dir) => {
     sandbox: { dir, realDir: marker.realDataDir, realFile: openFile ? openFile.path : null },
   });
   setImmediate(() => {
-    relaunchApp();
+    restartApp();
   });
   return true;
 });
@@ -971,7 +1208,7 @@ ipcMain.handle('sandbox:left', (e, opts) => {
   if ((kept && kept.kind === 'training') || (keptFile && keptFile.training === true)) rememberRecentCompany(trainingDir);
   rememberRecentCompany(sb.realFile || sb.realDir);
   setImmediate(() => {
-    relaunchApp();
+    restartApp();
   });
   return true;
 });
@@ -1138,7 +1375,7 @@ async function confirmConflict(filePath, state, manifest, reason) {
  */
 async function openSingleFileForLaunch(filePath) {
   if (!fs.existsSync(filePath)) {
-    await dialog.showMessageBox({
+    await dialog.showMessageBox(parentWindow(), {
       noLink: true,
       type: 'warning',
       message: `Ironbooks can't find ${path.basename(filePath)}`,
@@ -3076,43 +3313,195 @@ function isFirstRun() {
   return !companyFile.looksLikeCompany(path.join(companiesRoot(), 'default'));
 }
 
-/** The "No Company Open" window (electron/startScreen.js): no server, no company file loaded. */
-async function createStartWindow({ firstRun = false } = {}) {
-  startScreenMode = true;
-  const theme = windowTheme.normalizeTheme(loadConfig().theme);
-  nativeTheme.themeSource = theme.mode;
+/** Smallest window for each thing it shows: the start screen fits a smaller one than the books. */
+const START_MIN_SIZE = [760, 560];
+const COMPANY_MIN_SIZE = [1024, 700];
+
+/**
+ * The app's one window, made once per launch. "No Company Open", the "Opening…" screen and the
+ * company's own pages (its sign-in first) all show in it, one after the other, so opening a
+ * company never closes one window to bring up another. Its preload (electron/preload.js) gives
+ * each kind of page only its own calls.
+ */
+function ensureMainWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
+  // Restore the last window size/position; ignore positions that are no longer
+  // on any connected display (e.g. an unplugged external monitor).
   const state = loadWindowState();
   const usePosition = state && boundsVisible(state);
-  mainWindow = new BrowserWindow({
+  // Appearance (light / dark / auto): the window has no system frame and paints its title bar
+  // and background in the theme's colors from the first frame (electron/windowTheme.js).
+  nativeTheme.themeSource = windowTheme.normalizeTheme(loadConfig().theme).mode;
+  const win = new BrowserWindow({
     width: state ? state.width : 1440,
     height: state ? state.height : 900,
     ...(usePosition ? { x: state.x, y: state.y } : {}),
-    minWidth: 760,
-    minHeight: 560,
-    title: 'Ironbooks — No Company Open',
+    minWidth: START_MIN_SIZE[0],
+    minHeight: START_MIN_SIZE[1],
+    title: 'Ironbooks',
     icon: APP_ICON,
+    // Started for an agent: the window exists but is not shown until a person starts Ironbooks.
+    show: !agentServiceHidden,
     ...windowTheme.frameOptions(process.platform, nativeTheme.shouldUseDarkColors),
     webPreferences: {
-      preload: path.join(__dirname, 'startPreload.js'),
+      preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
       webviewTag: false,
-      spellcheck: false,
+      // Local-only spell check for memos/descriptions (electron/spelling.js: OS checker on
+      // Windows/macOS, no dictionary downloads anywhere).
+      spellcheck: true,
       navigateOnDragDrop: false,
     },
   });
-  if (state?.maximized) mainWindow.maximize();
-  trackWindowState(mainWindow);
-  buildStartMenu();
-  const html = startScreen.startScreenHtml({
-    dark: nativeTheme.shouldUseDarkColors,
-    accent: theme.accent,
-    platform: process.platform,
-    firstRun,
+  mainWindow = win;
+  // (maximize() would also show a hidden window)
+  if (state?.maximized && !agentServiceHidden) win.maximize();
+  trackWindowState(win);
+  // Closing the window with a company file open: keep it on screen while the file is saved into
+  // the company file (before-quit), so any question about that save has a window to appear on.
+  win.on('close', (e) => {
+    // Already closing (the company file is being saved): this X / Alt+F4 waits for that save.
+    if (closingInProgress) {
+      e.preventDefault();
+      // (Saved to close it in the window, not to quit: the close runs once that is done.)
+      if (openingCompany) deferCloseUntilOpened();
+      return;
+    }
+    // Closed while a company file is still opening: finish opening it, then close it properly.
+    if (openingCompany && !quittingAfterBackup) {
+      e.preventDefault();
+      deferCloseUntilOpened();
+      return;
+    }
+    // Alt+F4 / File > Exit with a form being typed: ask first (the page knows: LeaveGuard).
+    if (!quittingAfterBackup && !closeAnswered) {
+      e.preventDefault();
+      confirmCloseOverUnsavedWork(win).then((close) => {
+        if (!close || win.isDestroyed()) return;
+        if (openFile) app.quit();
+        else {
+          closeAnswered = true;
+          win.close();
+        }
+      });
+      return;
+    }
+    closeAnswered = false;
+    if (openFile && !quittingAfterBackup) {
+      e.preventDefault();
+      app.quit();
+    }
   });
-  await mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+  // The shell changes what the window shows (closing a company, opening another): a page never
+  // holds that up. (The company's pages do not refuse in the desktop app: components/LeaveGuard.tsx.)
+  win.webContents.on('will-prevent-unload', (e) => {
+    if (openingCompany) e.preventDefault();
+  });
+  spelling.attachContextMenu(win, Menu);
+  return win;
+}
+
+/** Give the window the smallest size its content needs, growing it when it is now too small. */
+function setWindowMinimum(win, [minWidth, minHeight]) {
+  win.setMinimumSize(minWidth, minHeight);
+  if (win.isMaximized() || win.isFullScreen() || win.isMinimized()) return;
+  const [width, height] = win.getSize();
+  if (width < minWidth || height < minHeight) win.setSize(Math.max(width, minWidth), Math.max(height, minHeight));
+}
+
+/** Load one of the shell's own self-contained pages (electron/startScreen.js) into the window. */
+function loadShellPage(win, html) {
+  return win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+}
+
+/**
+ * The window keeps only the page it shows now in its history. It showed "Opening…" (and maybe
+ * "No Company Open") before the company's first page, and Back there (Alt+Left, lib/shortcuts.ts)
+ * must stay where it is — as it did when that page was the first thing its window ever loaded —
+ * never return to a screen that is still "opening" a file that is already open.
+ */
+function forgetEarlierPages(win) {
+  const clear = () => {
+    try {
+      if (!win.isDestroyed()) win.webContents.navigationHistory.clear();
+    } catch (err) {
+      console.error('[window] could not clear the page history:', err?.message || err);
+    }
+  };
+  clear();
+  // A page still loading (a redirect took over the first load) cannot be pruned yet: once more
+  // when it has arrived.
+  if (!win.isDestroyed() && win.webContents.isLoading()) win.webContents.once('did-stop-loading', clear);
+}
+
+/** "No Company Open" (electron/startScreen.js) in the window: no server, no company file loaded. */
+async function createStartWindow({ firstRun = false } = {}) {
+  startScreenMode = true;
+  const win = ensureMainWindow();
+  const theme = windowTheme.normalizeTheme(loadConfig().theme);
+  nativeTheme.themeSource = theme.mode;
+  setWindowMinimum(win, START_MIN_SIZE);
+  win.setTitle('Ironbooks — No Company Open');
+  buildStartMenu();
+  await loadShellPage(
+    win,
+    startScreen.startScreenHtml({
+      dark: nativeTheme.shouldUseDarkColors,
+      accent: theme.accent,
+      platform: process.platform,
+      firstRun,
+    }),
+  );
+  forgetEarlierPages(win);
+}
+
+/**
+ * "Opening ABC Company…" in the window while the company file is locked, its working copy is
+ * prepared and its server starts — the window is there from the first moment, and from "No
+ * Company Open" it is the same one. No company is open yet, so the menus are only Exit.
+ */
+async function showOpeningScreen(location) {
+  let name = '';
+  try {
+    name = location ? companyFile.locationName(location) : '';
+  } catch {
+    name = '';
+  }
+  await showBusyScreen(name ? `Opening ${name}…` : 'Opening your company file…');
+}
+
+/**
+ * The window says what it is doing (`label`: "Opening ABC Company…", "Closing ABC Company…") and
+ * shows nothing else: no company is open in it now, so the start-screen calls are not accepted
+ * and the menus are only Exit.
+ */
+async function showBusyScreen(label) {
+  startScreenMode = false;
+  const win = ensureMainWindow();
+  const theme = windowTheme.normalizeTheme(loadConfig().theme);
+  nativeTheme.themeSource = theme.mode;
+  win.setTitle('Ironbooks');
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([{ label: 'File', submenu: [process.platform === 'darwin' ? { role: 'quit' } : { label: 'Exit', click: () => win.close() }] }]),
+  );
+  try {
+    // Leaving a company's pages: what they kept for this window only goes with them.
+    if (serverUrl) await Promise.race([win.webContents.executeJavaScript('try { sessionStorage.clear(); } catch {} 0', true), new Promise((r) => setTimeout(r, 1000))]);
+  } catch {
+    /* a page that does not answer keeps nothing we need */
+  }
+  try {
+    await loadShellPage(
+      win,
+      startScreen.openingScreenHtml({ dark: nativeTheme.shouldUseDarkColors, accent: theme.accent, platform: process.platform, label }),
+    );
+  } catch (err) {
+    // Only what the window shows while it waits: never a reason not to open or close the file.
+    console.error('[window] could not show the waiting screen:', err?.message || err);
+  }
 }
 
 /** Menus while no company is open: open or create one, and the basics. */
@@ -3270,6 +3659,8 @@ async function createWindow() {
       return;
     }
   }
+  // Until this has finished, a close or quit waits (every caller ends it with endOpening).
+  openingCompany = true;
   // A company file the OS asked us to open (double-click, Open with) wins over the last one used.
   if (pendingCompanyPath) {
     // Opened from an email attachment, a read-only file or a cloud-sync folder: ask first.
@@ -3292,6 +3683,16 @@ async function createWindow() {
     deliverPendingFilesToStartScreen();
     return;
   }
+  // From here a company is being opened: the window is up at once and says so, while the file is
+  // locked and its server starts (a few seconds). From "No Company Open" it is the same window.
+  await showOpeningScreen(
+    (() => {
+      const c = loadConfig();
+      if (process.env.BKA_DATA_DIR || c.sandbox) return '';
+      const named = c.remoteHost ? c.remoteFile : c.companyFile || c.dataDir;
+      return typeof named === 'string' ? named : '';
+    })(),
+  );
   // Client mode: show the company hosted on another machine instead of starting a local server.
   const remote = (() => {
     const r = loadConfig().remoteHost;
@@ -3334,69 +3735,14 @@ async function createWindow() {
   const url = remote ? remote.url : await startNextServer();
   serverUrl = url;
 
-  // Restore the last window size/position; ignore positions that are no longer
-  // on any connected display (e.g. an unplugged external monitor).
-  const state = loadWindowState();
-  const usePosition = state && boundsVisible(state);
-  // Appearance (light / dark / auto): the window has no system frame and paints its title bar
-  // and background in the theme's colors from the first frame (electron/windowTheme.js).
+  // The window is gone (a close that waited too long for this to finish: deferCloseUntilOpened).
+  // The quit under way saves and releases the file and stops the server; nothing more to show.
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  // The company's pages go into the window that showed "Opening…" (ensureMainWindow): its books
+  // need more room than the start screen.
+  setWindowMinimum(mainWindow, COMPANY_MIN_SIZE);
   const theme = windowTheme.normalizeTheme(loadConfig().theme);
   nativeTheme.themeSource = theme.mode;
-  mainWindow = new BrowserWindow({
-    width: state ? state.width : 1440,
-    height: state ? state.height : 900,
-    ...(usePosition ? { x: state.x, y: state.y } : {}),
-    minWidth: 1024,
-    minHeight: 700,
-    title: 'Ironbooks',
-    icon: APP_ICON,
-    // Started for an agent: the window exists but is not shown until a person starts Ironbooks.
-    show: !agentServiceHidden,
-    ...windowTheme.frameOptions(process.platform, nativeTheme.shouldUseDarkColors),
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-      webviewTag: false,
-      // Local-only spell check for memos/descriptions (electron/spelling.js: OS checker on
-      // Windows/macOS, no dictionary downloads anywhere).
-      spellcheck: true,
-      navigateOnDragDrop: false,
-    },
-  });
-  // (maximize() would also show a hidden window)
-  if (state?.maximized && !agentServiceHidden) mainWindow.maximize();
-  trackWindowState(mainWindow);
-  // Closing the window with a company file open: keep it on screen while the file is saved into
-  // the company file (before-quit), so any question about that save has a window to appear on.
-  mainWindow.on('close', (e) => {
-    // Already closing (the company file is being saved): this X / Alt+F4 waits for that save.
-    if (closingInProgress) {
-      e.preventDefault();
-      return;
-    }
-    // Alt+F4 / File > Exit with a form being typed: ask first (the page knows: LeaveGuard).
-    if (!quittingAfterBackup && !closeAnswered) {
-      e.preventDefault();
-      const win = mainWindow;
-      confirmCloseOverUnsavedWork(win).then((close) => {
-        if (!close || win.isDestroyed()) return;
-        if (openFile) app.quit();
-        else {
-          closeAnswered = true;
-          win.close();
-        }
-      });
-      return;
-    }
-    closeAnswered = false;
-    if (openFile && !quittingAfterBackup) {
-      e.preventDefault();
-      app.quit();
-    }
-  });
   // The page reads its theme from a cookie; hand it the saved one so the first paint matches
   // the frame (the local server's port, and so its origin, changes every launch).
   try {
@@ -3404,7 +3750,6 @@ async function createWindow() {
   } catch (err) {
     console.error('[theme] could not set the theme cookie:', err?.message || err);
   }
-  spelling.attachContextMenu(mainWindow, Menu);
 
   if (remoteHostOrigin) {
     buildMenu();
@@ -3414,6 +3759,7 @@ async function createWindow() {
     }
     try {
       await mainWindow.loadURL(url);
+      forgetEarlierPages(mainWindow);
     } catch (err) {
       const remoteFile = loadConfig().remoteFile;
       const { response } = await dialog.showMessageBox(mainWindow, {
@@ -3455,6 +3801,7 @@ async function createWindow() {
       );
     }
   }
+  forgetEarlierPages(mainWindow);
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
   // Ensure the active file is self-describing (manifest) and stamp its last-opened time.
   const activeDir = activeCompanyDir();
@@ -4528,6 +4875,7 @@ app.whenReady().then(async () => {
     // it again only focused the missing window. Say what happened and quit (before-quit releases
     // the company file).
     console.error('[startup] could not start:', err);
+    if (endOpening()) return;
     dialog.showErrorBox(
       'Ironbooks could not start',
       `${String((err && err.message) || err)}\n\nClose any other Ironbooks windows and start it again. If this keeps happening, restart the computer.`,
@@ -4535,6 +4883,7 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+  if (endOpening()) return;
   checkForUpdates();
   setInterval(() => checkForUpdates(), UPDATE_CHECK_INTERVAL_MS).unref?.();
 });
@@ -4548,7 +4897,9 @@ app.on('window-all-closed', () => {
 app.on('activate', () => {
   revealAgentServiceWindow();
   if (BrowserWindow.getAllWindows().length === 0 && !serverProcess) {
-    createWindow().catch((err) => console.error('[startup] could not reopen the window:', err));
+    createWindow()
+      .catch((err) => console.error('[startup] could not reopen the window:', err))
+      .finally(() => endOpening());
   }
 });
 
@@ -4561,6 +4912,12 @@ app.on('before-quit', (event) => {
   if (!gotSingleInstanceLock) return;
   if (!quittingAfterBackup) {
     event.preventDefault();
+    // A quit request while a company file is still opening: it runs once the file is open, so the
+    // file is saved and released the usual way instead of being left locked halfway (endOpening).
+    if (openingCompany) {
+      deferCloseUntilOpened();
+      return;
+    }
     // A quit request while the save is running: that save finishes the quit (a relaunch or next
     // config asked for meanwhile is applied when it does).
     if (closingInProgress) return;
