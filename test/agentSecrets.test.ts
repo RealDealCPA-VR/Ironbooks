@@ -6,7 +6,9 @@
  * lib/services/agentRequests.ts, typing on the card (ApproveInput.secrets):
  *  - the closing-date password, to post a journal entry dated in a closed period (once right,
  *    once wrong) and to move the closing date;
- *  - a mail server password, for a test email through a mail server the agent wrote down;
+ *  - a mail server password, for a test email through a mail server the agent wrote down, and to
+ *    save a mail server (both host-only: also with this launch's pass enforced, as the packaged
+ *    app runs, where only an approval at the host's own window carries it to the route);
  *  - a new user's password, and the temporary password of a reset that makes them choose their own;
  *  - the password of a portable copy of the company file (a backup).
  * One run produces a secret itself: a phone upload link for receipts (the link IS the secret).
@@ -39,6 +41,7 @@ import { agentPermissionRequests, companies, journalEntries, users } from '@/lib
 import { verifyPassword } from '@/lib/auth';
 import type { AgentOperationAnswer, AgentRequestView, ApproveInput, ApproveResult } from '@/lib/agent/contract';
 import { PRODUCED_SECRET_TEXT } from '@/lib/agent/guards';
+import { CLOSING_PASSWORD_WRONG_MESSAGE } from '@/lib/agent/bridge';
 import { setClosingDate } from '@/lib/services/company';
 import { sendTestEmail } from '@/lib/services/emailSettings';
 import { saveAgentPolicy } from '@/lib/services/agentPolicies';
@@ -76,6 +79,7 @@ const CLOSING_PW = 'Clos3-Card-Pw-7f3a91';
 const WRONG_CLOSING_PW = 'Wr0ng-Clos3-Pw-44aa1';
 const MAIL_PW = 'Ma1l-Card-Pw-2b7c55';
 const MAIL_SAVE_PW = 'Ma1l-Saved-Card-Pw-8e1f07';
+const MAIL_SAVE_PASS_PW = 'Ma1l-Saved-Pass-Pw-5c2e90';
 const NEW_USER_PW = 'N3w-User-Card-Pw-9d4e17';
 const RESET_PW = 'R3set-Temp-Card-Pw-6a8b42';
 const BACKUP_PW = 'B4ckup-Card-Pw-1c5d83';
@@ -85,6 +89,9 @@ const EXTRA_PW_2 = 'Extr4-Backup-Pw-3e4f5a';
 const EXTRA_PW_3 = 'Extr4-Mail-Pw-6b7c8d';
 const FIRST_OF_TWO_PW = 'F1rst-Of-Two-Pw-9e0f1a';
 const EXTRA_ANSWER_PW = 'Extr4-Answer-Pw-2c3d4e';
+// This launch's pass (BKA_LAUNCH_PASS), set while the packaged app's rule is drilled: it goes only
+// to the handler's own request, never to a row, an answer or a file.
+const LAUNCH_PASS = 'pass-of-this-launch-0123456789abcdef';
 // What the agent puts in its own input, named like a secret: it must be stripped, never stored.
 const AGENT_PW = 'Ag3nt-Own-Pw-0e0e51';
 const AGENT_CURRENT_PW = 'Ag3nt-Current-Pw-77ab3';
@@ -107,6 +114,7 @@ const typed: Needle[] = [
   { label: 'a wrong closing-date password', value: WRONG_CLOSING_PW },
   { label: 'the mail server password', value: MAIL_PW },
   { label: 'the mail server password saved for the company', value: MAIL_SAVE_PW },
+  { label: 'the mail server password saved with the launch pass enforced', value: MAIL_SAVE_PASS_PW },
   { label: "the new user's password", value: NEW_USER_PW },
   { label: 'the temporary password of the reset', value: RESET_PW },
   { label: 'the password of the portable copy', value: BACKUP_PW },
@@ -115,6 +123,7 @@ const typed: Needle[] = [
   { label: 'a mail password typed on a card that needs none', value: EXTRA_PW_3 },
   { label: 'what the first of two approvers typed', value: FIRST_OF_TWO_PW },
   { label: 'an answer named like a password', value: EXTRA_ANSWER_PW },
+  { label: "this launch's pass", value: LAUNCH_PASS },
 ];
 const agentSent: Needle[] = [
   { label: "the agent's own password field", value: AGENT_PW },
@@ -294,7 +303,8 @@ describe('the mail server password, typed by the approver', () => {
     const r = await approve(a.requestId!, { mail_password: MAIL_SAVE_PW });
     expect(r.status, JSON.stringify(r.request.error)).toBe('executed');
     // A person's own test of the saved set-up signs in with what was typed on the card. (The
-    // scan at the end proves it is kept only sealed.)
+    // scan at the end proves it is kept only sealed.) The suite runs without a launch pass: the
+    // packaged app's rule is drilled for this operation, and for the test email, below.
     const before = mailbox.length;
     const tested = await sendTestEmail(await s.admin.ctx(), { to: 'ada@secrets-scenario.test' });
     expect(tested.ok, JSON.stringify(tested)).toBe(true);
@@ -304,15 +314,22 @@ describe('the mail server password, typed by the approver', () => {
     expect(auth.pass).toBe(MAIL_SAVE_PW);
   });
 
-  // FAILS today (wave 3, tests-secrets): with the launch pass enforced (BKA_LAUNCH_PASS, as the
-  // packaged app always runs), the run approved at the host is refused by the route itself with
-  // "This can only be done on the computer that holds the company file." lib/agent/bridge.ts
-  // buildRequest makes the handler's request without the launch pass, so app/api/email/test's own
-  // isRemoteRequest(req) (lib/net/requestInfo.ts originFromHeaders) reads it as another program
-  // on this computer. Fails closed (nothing is sent, no secret leaks), but no host-only route
-  // that checks the request itself can ever be carried out for an agent in the real app. The case
-  // above passes only because the test suite runs without a launch pass.
-  it.fails('the same, with the launch pass enforced as in the packaged app: approved at the host, it still runs', async () => {
+  /** Approve with this launch's pass enforced (BKA_LAUNCH_PASS), as the packaged app always runs. */
+  async function withLaunchPass<T>(run: () => Promise<T>): Promise<T> {
+    process.env.BKA_LAUNCH_PASS = LAUNCH_PASS;
+    try {
+      return await run();
+    } finally {
+      delete process.env.BKA_LAUNCH_PASS;
+    }
+  }
+
+  // With the launch pass enforced, a host-only route checks the request itself (app/api/email/test
+  // isRemoteRequest, lib/net/requestInfo.ts originFromHeaders). A run a person approved at the
+  // host's own window carries this launch's pass to the handler's request, and only then
+  // (lib/agent/bridge.ts approvedAtHost, buildRequest's RequestExtras.hostPass); without it the
+  // route would read the run as another program on this computer and refuse it.
+  it('the same, with the launch pass enforced as in the packaged app: approved at the host, it still runs', async () => {
     const before = mailbox.length;
     const a = await asked({
       operation: 'email.test',
@@ -323,16 +340,41 @@ describe('the mail server password, typed by the approver', () => {
         draft: { host: '192.168.1.25', port: 587, security: 'starttls', username: 'books@secrets-scenario.test', fromEmail: 'books@secrets-scenario.test' },
       },
     });
-    process.env.BKA_LAUNCH_PASS = 'pass-of-this-launch-0123456789abcdef';
-    let r: ApproveResult;
-    try {
-      r = await approve(a.requestId!, { mail_password: MAIL_PW });
-    } finally {
-      delete process.env.BKA_LAUNCH_PASS;
-    }
+    const r = await withLaunchPass(() => approve(a.requestId!, { mail_password: MAIL_PW }));
     expect(r.status, JSON.stringify(r.request.error)).toBe('executed');
     expect(mailbox.length).toBe(before + 1);
     expect(((mailbox[before].options.auth ?? {}) as Record<string, unknown>).pass).toBe(MAIL_PW);
+  });
+
+  it('saving the mail server, with the launch pass enforced: approved at the host it is saved, and from another window it is not', async () => {
+    const a = await asked({
+      operation: 'email.settings.update',
+      requestId: key('mail-save-pass'),
+      reason: 'Save the mail server once more.',
+      body: { host: '192.168.1.27', port: 587, security: 'starttls', username: 'books@secrets-scenario.test', fromEmail: 'books@secrets-scenario.test', fromName: 'Scenario Books' },
+    });
+    expect(a.needs?.secrets).toEqual(['mail_password']);
+    expect(a.needs?.hostOnly).toBe(true);
+    // A window that is not the host's: refused, nothing saved, the request still waits.
+    const away = await withLaunchPass(async () => {
+      try {
+        await approveAgentRequest(await s.admin.ctx(), a.requestId!, { secrets: { mail_password: MAIL_SAVE_PASS_PW } }, { atHost: false });
+        return null;
+      } catch (err) {
+        return err as Error & { code?: string };
+      }
+    });
+    expect(away?.code).toBe('FORBIDDEN');
+    expect(away?.message ?? '').not.toContain(MAIL_SAVE_PASS_PW);
+    expect((await requestForPerson(await s.admin.ctx(), a.requestId!)).status).toBe('pending');
+    // At the host's own window it runs, and the saved set-up signs in with what was typed.
+    const r = await withLaunchPass(() => approve(a.requestId!, { mail_password: MAIL_SAVE_PASS_PW }));
+    expect(r.status, JSON.stringify(r.request.error)).toBe('executed');
+    const before = mailbox.length;
+    const tested = await sendTestEmail(await s.admin.ctx(), { to: 'ada@secrets-scenario.test' });
+    expect(tested.ok, JSON.stringify(tested)).toBe(true);
+    expect(mailbox[before].options.host).toBe('192.168.1.27');
+    expect(((mailbox[before].options.auth ?? {}) as Record<string, unknown>).pass).toBe(MAIL_SAVE_PASS_PW);
   });
 });
 
@@ -554,12 +596,29 @@ describe('secrets typed where they are not needed, or before the work can run', 
     const a = await asked({ operation: 'company.update', requestId: key('extra'), reason: 'Fix the company name.', body: { name: 'Secrets Scenario Books' } });
     expect(a.needs?.secrets ?? []).toEqual([]);
     // Answers named like a password (as a desktop flow's would be) count as typed secrets too.
-    const r = await approve(
-      a.requestId!,
-      { closing_password: EXTRA_PW, backup_password: EXTRA_PW_2, mail_password: EXTRA_PW_3 },
-      { answers: { password: EXTRA_ANSWER_PW, filePassword: EXTRA_ANSWER_PW } },
-    );
+    const r = await approve(a.requestId!, { backup_password: EXTRA_PW_2, mail_password: EXTRA_PW_3 }, { answers: { password: EXTRA_ANSWER_PW, filePassword: EXTRA_ANSWER_PW } });
     expect(r.status, JSON.stringify(r.request.error)).toBe('executed');
+    // (The scans at the end look for each of them in every row, answer and file.)
+  });
+
+  // The rule of lib/agent/bridge.ts closingPasswordCheck (wave 5): a closing-date password typed on
+  // the card is always checked, even on a card that did not ask for one, because whether the work
+  // touches a closed period cannot always be told before it runs (a void sent with only the
+  // record's id). A wrong one fails the request closed, in plain words, before the route runs, and
+  // is counted against the approver like any other guess. It still goes nowhere: not stored, not
+  // in the words, not in the request anyone reads.
+  it('a wrong closing-date password typed on a card that needs none stops the run, in plain words, and goes nowhere either', async () => {
+    const a = await asked({ operation: 'company.update', requestId: key('extra-closing'), reason: 'Fix the company name again.', body: { name: 'Never Renamed Books' } });
+    expect(a.needs?.secrets ?? []).toEqual([]);
+    const r = await approve(a.requestId!, { closing_password: EXTRA_PW });
+    expect(r.status).toBe('failed');
+    expect(r.request.error).toBe(CLOSING_PASSWORD_WRONG_MESSAGE);
+    expect(JSON.stringify(r)).not.toContain(EXTRA_PW);
+    const [co] = await s.db.select({ name: companies.name }).from(companies).where(eq(companies.id, s.companyId));
+    expect(co.name).not.toBe('Never Renamed Books');
+    const seen = await agentView(a.requestId!);
+    expect(seen.status).toBe('failed');
+    expect(JSON.stringify(seen)).not.toContain(EXTRA_PW);
   });
 
   it('what the first of two approvers types is not kept while the request waits for the second', async () => {

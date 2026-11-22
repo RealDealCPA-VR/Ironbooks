@@ -15,10 +15,13 @@
  *
  * A read that writes, or that the read-only handle stops from writing, is a FINDING: it stays on
  * WRITES as an it.fails case naming it and what it writes. Such a case turns red the day the read
- * stops writing (take it off then), and also if it stops being run at all. Some reads write only
- * the first time (a default list made on first use), so every case is first run once on the
+ * stops writing (take it off then), and also if it stops being run at all. Some reads would write
+ * only the first time (a default list made on first use), so every case is first run once on the
  * company before anyone opened those lists, and any write found there that is not on WRITES fails;
- * then the first-use records are made and every case runs again.
+ * then the first-use records are made and every case runs again. The decision is that a read from
+ * an agent never makes a first-use default (the default inventory site, the default payroll items)
+ * and answers as if none existed yet: FIRST_USE names the reads that make one for a person, and
+ * each must answer an agent cleanly on that company and leave it without one.
  *
  * Each case also runs asked as a dry run: the bridge still only reads it (on the read-only handle),
  * but then reports what the work asked to send, save or print, which a read drops unseen (the
@@ -27,7 +30,9 @@
  * Two more lists: REFUSED_BY_DESIGN (reads refused to agents on purpose: they must stay refused)
  * and NOT_FOR_AGENTS (FINDINGS: reads the registry offers to agents whose route refuses every
  * agent, it.fails like WRITES). KNOWN and these two live in the fixture, as the masking test
- * leaves out exactly the same reads.
+ * leaves out exactly the same reads. The person-only reads (PERSON_ONLY: a person's own list of
+ * company files, and who can open the protected file) are not offered to agents at all, and the
+ * bridge refuses them.
  *
  * One company for the whole file; the operations run in a few groups that loop. The agent's role
  * is Admin, so the role refuses nothing a read needs; a read_sensitive operation runs as an
@@ -54,12 +59,13 @@ delete process.env.BKA_DEVICE_VAULT;
 delete process.env.BKA_LAUNCH_PASS;
 delete process.env.BKA_COMPANY_STATE;
 
+import { sql } from 'drizzle-orm';
 import { closeDb, getDb, type DB } from '@/lib/db';
 import { READ_ONLY_MESSAGE } from '@/lib/db/readOnly';
 import { REPORT_CATALOG } from '@/lib/reports/catalog';
 import { SIMPLE_LIST_KEYS } from '@/lib/services/lists/simpleLists';
 import { readAllTransactionLog } from '@/lib/services/transactionLog';
-import { allOperations } from '@/lib/agent/operations/registry';
+import { allOperations, operationById } from '@/lib/agent/operations/registry';
 import type { Operation } from '@/lib/agent/operations/types';
 import type { BridgeResult } from '@/lib/agent/contract';
 import { runOperation } from '@/lib/agent/bridge';
@@ -72,7 +78,6 @@ import {
   buildCases,
   fingerprint,
   fingerprintDiff,
-  listedIn,
   makeReadsAgent,
   opOfLabel as opAmong,
   seedAgentRequest,
@@ -90,22 +95,45 @@ import {
 
 /**
  * Reads that write, or that the read-only handle stopped from writing, by case label (the
- * operation id, or "<operation id> <report key or list>"): what they write. Each is an it.fails
- * case, run on the company before anyone opened the lists that are seeded on first use
+ * operation id when it has one case, else "<operation id> <report key, list or kind>": one entry
+ * excuses one case, never every kind of an operation at once): what they write. Each is an
+ * it.fails case, run on the company before anyone opened the lists that are seeded on first use
  * (seedFirstUseRecords comes after; the same reads must then run cleanly in the groups below).
  * Take one off when its route is fixed. The pass over every case on that company fails on a write
  * that is not here.
+ *
+ * Empty since wave 5: the five first-use reads that were here (the inventory site list, its
+ * reorder points and by-site reports, Serial/Lot in Stock, the payroll item list) make nothing for
+ * an agent any more, and FIRST_USE below holds them to that.
  */
-const WRITES: Record<string, string> = {
-  'inventory-sites.list':
-    'listSites inserts the default inventory site on first use (lib/services/inventorySites.ts ensureDefaultSite); the read-only handle refuses it, so the read fails',
-  'inventory-sites.reorder-points': 'inserts the default inventory site on first use (ensureDefaultSite); the read-only handle refuses it, so the read fails',
+const WRITES: Record<string, string> = {};
+
+/**
+ * The reads that make a default on a person's first call, by case label (an operation id stands
+ * for all its cases): what they would make, and what stops it for an agent. Decision: a read from
+ * an agent, or from any read-only context, never makes it; it answers as if nothing existed yet.
+ * Each runs on the company before anyone opened these lists, as a read and as a dry run, and must
+ * answer cleanly and make nothing.
+ */
+const FIRST_USE: Record<string, string> = {
+  'inventory-sites.list': 'the default inventory site (lib/services/inventorySites.ts listSites: defaultSiteForRead)',
+  'inventory-sites.reorder-points': 'the default inventory site (lib/services/inventorySiteOps.ts listSiteReorderPoints: defaultSiteForRead)',
   'inventory-sites.reports':
-    'every kind but report=transactions inserts the default inventory site on first use (lib/services/inventorySiteReports.ts loadSites and verifySiteInvariants, lib/services/inventorySites.ts siteQuantities: ensureDefaultSite); the read-only handle refuses it, so the report fails',
-  'reports.std.get serial-lot-in-stock': 'inserts the default inventory site on first use (ensureDefaultSite); the read-only handle refuses it, so the report fails',
+    'the default inventory site, by every kind (lib/services/inventorySiteReports.ts loadSites, lib/services/inventorySites.ts siteQuantities: defaultSiteForRead)',
+  'reports.std.get serial-lot-in-stock': 'the default inventory site (lib/services/inventorySites.ts serialsInStock: defaultSiteForRead)',
   'payroll-items.list':
-    "GET /api/payroll-items inserts the default payroll items on first use unless ctx.role is viewer; the bridge runs it with the actor's role, so the read-only handle refuses the insert and the read fails",
+    'the default payroll items (app/api/payroll-items/route.ts skips them for an agent; lib/services/payrollItems.ts ensureDefaultPayrollItems makes none in a read-only context)',
 };
+
+/** The tables a first-use default lands in: empty before the first use, and after every FIRST_USE read. */
+const FIRST_USE_TABLES = ['inventory_sites', 'payroll_items'] as const;
+
+/**
+ * A person's own reads (decision): GET /api/companies (the company files the signed-in person
+ * belongs to) and GET /api/file-protection (who can open the protected file). They are not offered
+ * to agents at all, and the bridge refuses them.
+ */
+const PERSON_ONLY = ['companies.list', 'file-protection.status'] as const;
 
 // ---------------------------------------------------------------------------
 
@@ -232,15 +260,52 @@ describe('the lists of this file', () => {
     expect(Object.keys(KNOWN).length).toBeLessThanOrEqual(KNOWN_MAX);
   });
 
-  it('every read whose registry entry says it makes a default on first use is on WRITES', () => {
-    // classes/purchases.ts MAKES_DEFAULT_SITE and classes/payroll.ts (payroll items) say so in words.
-    const said = READ_OPS.filter((o) => /ensureDefault\w+ has no read-only guard/.test(o.why ?? ''));
-    expect(said.length).toBeGreaterThan(0);
-    expect(said.map((o) => o.id).filter((id) => !(id in WRITES))).toEqual([]);
+  it('a WRITES entry names one case: an operation of several kinds is listed by the kind that writes', () => {
+    // An operation id would excuse every kind at once, so a write by another kind (or of another
+    // table) would turn nothing red.
+    expect(Object.keys(WRITES).filter((l) => (casesOfLabel(l).cases ?? []).length !== 1)).toEqual([]);
+  });
+
+  it('every read whose registry entry says it makes a default on first use is on WRITES or FIRST_USE', () => {
+    expect(Object.keys(FIRST_USE).filter((l) => !opOfLabel(l))).toEqual([]);
+    const onList = (list: Record<string, string>, id: string) => Object.keys(list).some((l) => opOfLabel(l)?.id === id);
+    // A why that says a default has no read-only guard is a read that writes: it belongs on WRITES.
+    const unguarded = READ_OPS.filter((o) => /ensureDefault\w+ has no read-only guard/.test(o.why ?? ''));
+    expect(unguarded.map((o) => o.id).filter((id) => !onList(WRITES, id))).toEqual([]);
+    // A why that says how an agent's read leaves the default unmade (classes/purchases.ts
+    // READS_DEFAULT_SITE, classes/payroll.ts payroll items) is on FIRST_USE, so it runs here on a
+    // company without one.
+    const guarded = READ_OPS.filter((o) => /defaultSiteForRead|ensureDefaultPayrollItems/.test(o.why ?? ''));
+    expect(guarded.length).toBeGreaterThan(0);
+    expect(guarded.map((o) => o.id).filter((id) => !onList(FIRST_USE, id))).toEqual([]);
+  });
+
+  it("the person-only reads are not offered to agents (decision: a person's own routes)", () => {
+    for (const id of PERSON_ONLY) {
+      const op = operationById(id);
+      expect(op, id).toBeDefined();
+      expect(op!.availability, id).not.toBe('agent');
+      expect(READ_OPS.some((o) => o.id === id), id).toBe(false);
+    }
   });
 });
 
-describe('FINDINGS: reads the registry offers to agents that refuse every agent', () => {
+describe("reads whose route refuses every agent: a person's own are not offered, and FINDINGS where the registry still offers one", () => {
+  // A person's own reads (PERSON_ONLY) are not offered to agents, and the bridge refuses them.
+  for (const id of PERSON_ONLY) {
+    it(`${id}: refused, with nothing answered and nothing written`, async () => {
+      const op = operationById(id)!;
+      const run = await runCase(op, { label: id, input: {} }, 'read');
+      expect(run.threw).toBeNull();
+      expect(run.wrote).toEqual([]);
+      expect(run.r?.outcome).toBe('error');
+      expect(run.r?.error?.code).toBe('NOT_AVAILABLE');
+      expect(run.r?.result ?? null).toBeNull();
+      expect(run.r?.file ?? null).toBeNull();
+    });
+  }
+
+  // FINDINGS (NOT_FOR_AGENTS): offered to agents as reads, but the route refuses every agent.
   for (const [label, why] of Object.entries(NOT_FOR_AGENTS)) {
     it.fails(`${label}: ${why}`, async () => {
       const { op, cases } = casesOfLabel(label);
@@ -290,18 +355,52 @@ describe('FINDINGS: reads that write (on a company where nobody opened these lis
     }, 120_000);
   }
 
+  it("a read that makes a default on a person's first call makes none for an agent and answers as if none existed yet", async () => {
+    const rowsIn = async (t: string) =>
+      Number(
+        ((await db.execute(sql.raw(`select count(*)::int as n from ${t} where company_id = '${fx.ctx.companyId}'`))) as unknown as { rows: Array<{ n: number }> })
+          .rows[0].n,
+      );
+    // The premise: nobody made these yet, else a clean answer proves nothing.
+    for (const t of FIRST_USE_TABLES) expect(await rowsIn(t), `${t} before the first use`).toBe(0);
+    const problems: string[] = [];
+    let ran = 0;
+    for (const label of Object.keys(FIRST_USE)) {
+      const { op, cases } = casesOfLabel(label);
+      if (!cases?.length) {
+        problems.push(`${label}: not run (the fixture has no case for it)`);
+        continue;
+      }
+      for (const c of cases) {
+        ran++;
+        const p = await problemOf(op, c);
+        if (p) problems.push(p);
+      }
+    }
+    expect(problems).toEqual([]);
+    // Every kind of the by-site reports ran, not only one.
+    expect(ran).toBeGreaterThan(Object.keys(FIRST_USE).length);
+    // The two lists answer with what is there: nothing yet.
+    for (const id of ['inventory-sites.list', 'payroll-items.list']) {
+      const r = await runOperation(agent.base, operationById(id)!, {}, 'read', agent.actor);
+      expect(r.outcome, id).toBe('ok');
+      expect(r.result, id).toEqual([]);
+    }
+    for (const t of FIRST_USE_TABLES) expect(await rowsIn(t), `${t} after the agent's reads`).toBe(0);
+  }, 300_000);
+
   // A read that writes only the first time is seen only here: the groups below run after the
   // first-use records exist. So every case runs once now, as a read (a dry run of a read is a
-  // read too), and a write that WRITES does not name is a finding to add there.
+  // read too), and a write that WRITES does not name by its own case label is a finding to add
+  // there.
   it('a pass over every case before the first-use lists exist finds no write WRITES does not name', async () => {
     const unlisted: string[] = [];
-    const listed = new Set(Object.keys(WRITES));
     for (const op of READ_OPS) {
       for (const c of casesFor(op) ?? []) {
         coverage.firstUse++;
         const run = await runCase(op, c, 'read');
         const w = writeOf(c, run);
-        if (w && !listedIn(listed, c.label, op)) unlisted.push(w);
+        if (w && !(c.label in WRITES)) unlisted.push(w);
       }
     }
     expect(coverage.firstUse).toBeGreaterThan(READ_OPS.length);

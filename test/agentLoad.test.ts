@@ -26,14 +26,16 @@
  *     are put through the requests service the door itself calls (createAgentRequest, with each
  *     agent's own context and a preview of the same shape), which saves two minutes of dry runs
  *     and changes nothing a person's list or badge reads. Those 100 are lines of payees the company
- *     has not paid before, so each run would also save a bank rule: most come back "the books
- *     changed". Pinned as a defect (it.fails): those stale only because of the next rule position
- *     the runs before them took. Pinned as right: those whose payee's rule an approval before them
- *     saved (their run no longer saves the rule the person was shown). Then a second batch of 100,
+ *     has not paid before, so each run would also save a bank rule. Pinned: none comes back "the
+ *     books changed" only because of the next rule position the runs before it took (a defect until
+ *     wave 5). Pinned as right: those whose payee's rule an approval before them saved come back
+ *     stale (their run no longer saves the rule the person was shown). Then a second batch of 100,
  *     of payees the company has rules for, that all run: how long "approve 100" holds a person.
  *  4. One large company (20,000 journal entries seeded straight into the tables): a bridged dry
  *     run of a bill and of a journal entry stays well under BRIDGE_TIME_LIMIT_MS.
  *  5. The long poll: at most WAITS_PER_AGENT (4) open waits per agent.
+ *  6. The classifier part 3 rests on (test/agentLoadScenario.ts previewDifferences): it leaves out
+ *     only what a run gives itself, and reports a change of the ledger or the effects.
  *
  * Time limits are pinned at about three times what was measured (MEASURED, below), so a machine
  * busy with other work does not fail them, and a change that makes the work several times slower
@@ -45,8 +47,7 @@
  * Order: vitest runs these tests one after the other, in the order written, and each describe
  * builds on the company the ones before it left (the lines, the agents, the waiting requests).
  * Run the file whole. Run with -t on one case, a case that needs what an earlier one left fails
- * on that, or (the it.fails pin, which would otherwise count any failure as the defect) is
- * skipped and says so.
+ * on that and says so.
  *
  * What was measured is printed at the end and written to a file: AGENT_LOAD_REPORT names it, or
  * else it is ironbooks-agent-load-report.json in the system's temp folder. Under an AI coding
@@ -85,7 +86,10 @@ import type { RequestFacts } from '@/lib/agent/operations/types';
 import { operationById } from '@/lib/agent/operations/registry';
 import { describeRequest } from '@/lib/agent/describe';
 import { liveGrants } from '@/lib/services/agentGrants';
-import { badgeForPerson, createAgentRequest, listRequestsForPerson } from '@/lib/services/agentRequests';
+// BADGE_SETTLE_EVERY_MS: how often the badge settles a company's requests. The clock is moved a
+// little past it before a read that is to settle; the test checks such a read sends more statements
+// than one that does not.
+import { BADGE_SETTLE_EVERY_MS, badgeForPerson, createAgentRequest, listRequestsForPerson } from '@/lib/services/agentRequests';
 import { importTransactions } from '@/lib/services/import';
 import { createBill } from '@/lib/services/bills';
 import { postJournalEntry } from '@/lib/services/posting';
@@ -154,11 +158,13 @@ const MEASURED = {
 // 500 waiting alike: a listing sends 11 statements; the badge 6 for an Admin and 7 for someone who
 // is not (10 and 11 on the read that settles). Their times do grow with the rows they judge: at
 // 100 waiting the first page took 32 ms, the badge 15 ms (19 ms settling). The batch of 100 new
-// payees, 14 s (1 ran, 99 stale: 90 for the rule position, 9 for a rule saved before them); the
-// batch of 100 that all ran, 24 s. 20,000 entries seeded in 14 s. A bill's dry run 108 ms at 2,100
-// entries, 127 ms at 22,100 before the statistics were refreshed and 132 ms after (a journal
-// entry's 68, 93 and 82 ms), against 13 to 69 ms for a person entering the same; posted through
-// the door, 246 ms (bill) and 138 ms (journal entry); the reclassify of 100 lines, 462 ms. A
+// payees, 14 s (1 ran, 99 stale: 90 for the rule position, 9 for a rule saved before them; since
+// wave 5 left the position out of the staleness key, 10 run and 90 are stale for a rule saved
+// before them, 12.7 s); the batch of 100 that all ran, 24 s. 20,000 entries seeded in 14 s. A
+// bill's dry run 108 ms at 2,100 entries, 127 ms at 22,100 before the statistics were refreshed
+// and 132 ms after (a journal entry's 68, 93 and 82 ms), against 13 to 69 ms for a person entering
+// the same; posted through the door, 246 ms (bill) and 138 ms (journal entry); the reclassify of
+// 100 lines, 462 ms. A
 // second run right after, the machine less busy, took 8 minutes and 0.5 to 0.9 of these times (the
 // batch that all ran 14 s, the reclassify 391 ms, the listing of 500 67 ms): the limits are kept
 // at three times the busier run.
@@ -166,12 +172,6 @@ const MEASURED = {
 const LIMIT = (ms: number) => Math.max(ms, 50) * 3;
 /** Statements one bank line under a grant sends (131 measured), with room for the work of this wave. */
 const MAX_STATEMENTS_FOR_ONE_LINE = 200;
-/**
- * How often the badge settles a company's requests: lib/services/agentRequests.ts
- * BADGE_SETTLE_EVERY_MS (not exported). The clock is moved a little past it before a read that is
- * to settle; the test checks such a read sends more statements than one that does not.
- */
-const BADGE_SETTLES_EVERY_MS = 60_000;
 /** How many times a short read is timed (judged on the median). */
 const SAMPLES = 5;
 
@@ -626,6 +626,8 @@ let batched: {
   results: ApproveResult[];
   reasons: BatchReason[];
   payees: string[];
+  /** Whether the preview the person was shown for result k saves a new bank rule. */
+  shownSavesRule: boolean[];
   staleBecause: { position: number; ruleMadeEarlier: number; other: string[][] };
 } | null = null;
 
@@ -681,7 +683,7 @@ describe('500 waiting requests: the list, the badge and a batch approval of 100'
     };
     // A read of the badge that settles the company's requests (the first after its minute is up),
     // as the title bar's poll does once a minute; the reads in between do not.
-    const pastTheBadgesMinute = () => clock.jump(BADGE_SETTLES_EVERY_MS + 1_000);
+    const pastTheBadgesMinute = () => clock.jump(BADGE_SETTLE_EVERY_MS + 1_000);
     const measure = async (label: string) => {
       const ctx = await s.admin.ctx();
       const ben = await s.second.ctx();
@@ -784,7 +786,8 @@ describe('500 waiting requests: the list, the badge and a batch approval of 100'
       staleBecause.other.push([r.status, ...d]);
       return 'other';
     });
-    batched = { results: t.value, reasons, payees: t.value.map((_, k) => NEW_PAYEES[(FROM + k) % NEW_PAYEES.length]), staleBecause };
+    const shownSavesRule = t.value.map((r) => (shown.get(r.request.id)?.records ?? []).some((x) => x.kind === 'transaction_rule' && x.action === 'create'));
+    batched = { results: t.value, reasons, payees: t.value.map((_, k) => NEW_PAYEES[(FROM + k) % NEW_PAYEES.length]), shownSavesRule, staleBecause };
     const executed = byStatus.executed ?? 0;
     const stale = byStatus.stale ?? 0;
     report.batch100 = { ms: t.ms, byStatus, staleBecause: { ...staleBecause, other: staleBecause.other.slice(0, 3) } };
@@ -810,23 +813,25 @@ describe('500 waiting requests: the list, the badge and a batch approval of 100'
     expect(t.ms).toBeLessThan(LIMIT(executed * MEASURED.approveMs + stale * MEASURED.staleApproveMs));
   }, 600_000);
 
-  // DEFECT, pinned (owner: lib/agent/bridge.ts, the staleness key). Approving 100 waiting requests
-  // to add bank lines in one batch, 90 came back "the books changed" (status 'stale') though
-  // nothing they read or change had changed. Adding a payee's first line also teaches Ironbooks a
-  // bank rule (POST /api/bank-transactions/categorize, learnRuleFromChoice), and the new rule's
-  // `priority` is the next free position. Every approval before it that made a rule moved that
-  // position, so the new preview differs from the one shown only in transaction_rule.priority
-  // ("[21] then [22]") and in the entry number, which the key already leaves out (compared by
-  // test/agentLoadScenario.ts previewDifferences, which keeps every reference to a record that
-  // existed: the line, the account, the rule). The decision for
-  // this wave: the key leaves out everything the run assigns to itself, the next number it takes
-  // included; the next position is one of those. Passes once a made record's next position is left
-  // out of the key like its number.
-  // Skipped, not failed, when the batch above did not run (this file run with -t): without it this
-  // case would count any failure as the defect.
-  it.fails('a batch approval of 100: none comes back stale for the next rule position the approvals before it took', (ctx) => {
-    if (!batched) ctx.skip('The batch approval of the case above did not run (run the file whole): without it this pin proves nothing.');
-    expect(batched!.staleBecause.position).toBe(0);
+  // Was a defect until wave 5 (90 of the 100 came back "the books changed" though only the run's
+  // own next rule position had moved). Adding a payee's first line also teaches Ironbooks a bank
+  // rule (POST /api/bank-transactions/categorize, learnRuleFromChoice), and the new rule's
+  // `priority` is the next free position: every approval before it that made a rule moved that
+  // position. The decision: the staleness key leaves out everything the run assigns to itself, the
+  // next number or position it takes included. Fixed in lib/agent/bridge.ts: TAKEN_COLUMNS names
+  // transaction_rules.priority, so takenOfRows reads the position the run took and stalenessKeyOf
+  // leaves it out, as it does the entry number. The evidence (test/agentLoadScenario.ts
+  // previewDifferences, which compares the records, the ledger and the effects and keeps every
+  // reference to a record that existed): no stale result differs from what was shown only in
+  // transaction_rule.priority. And the case was really reached: the first line of each payee saved
+  // a rule, each taking the next position after the ones before it, and every one of them ran.
+  it('a batch approval of 100: none comes back stale for the next rule position the approvals before it took', () => {
+    expect(batched, 'The batch approval of the case above did not run (run the file whole).').not.toBeNull();
+    const { results, payees, shownSavesRule, staleBecause } = batched!;
+    expect(staleBecause.position).toBe(0);
+    const ranSavingRule = results.filter((r, k) => r.status === 'executed' && shownSavesRule[k]).length;
+    expect(ranSavingRule, 'approvals in the batch that ran and saved a new rule (one per payee)').toBe(new Set(payees).size);
+    expect(ranSavingRule).toBeGreaterThan(1);
   });
 
   // Pinned as RIGHT, not a defect. A line whose payee an approval earlier in the batch already
@@ -1066,4 +1071,47 @@ describe(`the long poll: at most ${WAITS_PER_AGENT} open waits per agent`, () =>
     expect(openWaitsOf(agent.id)).toBe(0);
     expect(openWaitsOf(other.id)).toBe(0);
   }, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// 6. The classifier the batch cases above rest on
+// ---------------------------------------------------------------------------
+
+// previewDifferences says why a batch result came back stale. It must leave out only what a run
+// gives itself, and report a change of the ledger or the effects too: a stale result whose records
+// differ only in a rule's position, but whose ledger or effects changed, is not the position case.
+describe('previewDifferences: what a stale answer shows that the person was not shown', () => {
+  const RULE = 'aaaaaaaa-0000-4000-8000-000000000001';
+  const LINE = 'bbbbbbbb-0000-4000-8000-000000000002';
+  const ACCOUNT = 'cccccccc-0000-4000-8000-000000000003';
+  const preview = (o: { entry: string; rule: string; priority: number; debit?: string; email?: string }): NonNullable<AgentOperationAnswer['preview']> => ({
+    ledger: {
+      entries: [{ journalEntryId: o.entry, entryNumber: o.priority + 100, date: '2026-08-01', description: 'Bank line', status: 'posted', source: `bank_transaction:${LINE}`, lines: [{ accountId: ACCOUNT, accountCode: '6300', accountName: 'Bank charges', debit: o.debit ?? '10.00', credit: null, memo: null, entityName: null }] }],
+      changes: [{ action: 'create', kind: 'journal_entry', id: o.entry }, { action: 'create', kind: 'transaction_rule', id: o.rule }],
+    },
+    records: [
+      { action: 'create', kind: 'transaction_rule', id: o.rule, fields: [{ field: 'priority', before: null, after: o.priority }, { field: 'id', before: null, after: o.rule }] },
+      { action: 'update', kind: 'bank_transaction', id: LINE, fields: [{ field: 'journalEntryId', before: null, after: o.entry }] },
+    ],
+    effects: o.email ? [{ kind: 'email', summary: `Email to ${o.email}`, detail: { to: o.email } }] : [],
+    warnings: [],
+    loss: null,
+    routePreview: null,
+    truncated: false,
+  });
+  const ids = (n: number) => ({ entry: `dddddddd-0000-4000-8000-00000000000${n}`, rule: `eeeeeeee-0000-4000-8000-00000000000${n}` });
+
+  it('leaves out the ids, the entry number and the times the run gave itself, and keeps the position', () => {
+    expect(previewDifferences(preview({ ...ids(1), priority: 21 }), preview({ ...ids(2), priority: 21 }))).toEqual([]);
+    expect(previewDifferences(preview({ ...ids(1), priority: 21 }), preview({ ...ids(2), priority: 22 }))).toEqual(['transaction_rule.priority: [21] then [22]']);
+  });
+
+  it('reports a change of the ledger or of the effects beside the position', () => {
+    const ledger = previewDifferences(preview({ ...ids(1), priority: 21 }), preview({ ...ids(2), priority: 22, debit: '11.00' }));
+    expect(ledger.some((d) => d.startsWith('ledger entry:') && d.includes('11.00'))).toBe(true);
+    const effects = previewDifferences(preview({ ...ids(1), priority: 21, email: 'a@example.com' }), preview({ ...ids(2), priority: 22, email: 'b@example.com' }));
+    expect(effects.some((d) => d.startsWith('effect email:') && d.includes('b@example.com'))).toBe(true);
+    // Either way the batch case above would count it as 'other', not as the position.
+    for (const d of [ledger, effects]) expect(d.every((x) => x.startsWith('transaction_rule.priority:'))).toBe(false);
+  });
 });

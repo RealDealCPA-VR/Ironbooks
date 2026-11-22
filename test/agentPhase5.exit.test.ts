@@ -362,6 +362,13 @@ describe('Phase 5 exit: the guess limit holds for approvals too', { timeout: 240
     expect(done.status).toBe('failed');
     expect(done.request.error ?? '').toMatch(/Too many wrong closing-date passwords/);
     expect(await closingDate()).toBe(target);
-    expect(holds(await storedText(s.db), CLOSING_PASSWORD)).toBe(false);
+    // The answers given on the way to the lockout, and while locked, go through the refusal for too
+    // many wrong passwords, not the path the scan above saw: neither password is kept there either.
+    const stored = await storedText(s.db);
+    for (const secret of [CLOSING_PASSWORD, WRONG_PASSWORD]) {
+      expect(holds(stored, secret), `stored: ${secret}`).toBe(false);
+      expect(holds(answeredText(agent), secret), `answered: ${secret}`).toBe(false);
+      expect(holds(done.request.error ?? '', secret)).toBe(false);
+    }
   });
 });

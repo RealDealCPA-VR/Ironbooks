@@ -19,7 +19,8 @@
  * coverage case prints the operations in scope that have no case yet (and the report,
  * PARITY_REPORT, lists them). Some need what this company cannot make without a model or a file:
  * ai.posts.undo (a post the AI made), errors.apply (a correction the AI suggested), receipts.save
- * (an uploaded receipt); currencies.home-currency-adjustment.delete needs foreign currencies.
+ * (an uploaded receipt). currencies.home-currency-adjustment.delete needs foreign currencies, and
+ * turning them on would change every later case on this one shared company, so it has none either.
  */
 import type { OperationInput } from '@/lib/agent/contract';
 import { Money, toAmountString } from '@/lib/money';
@@ -73,12 +74,14 @@ export interface ParityCase {
   approverFails?: RegExp;
 }
 
+// For the marks: no case carries one since wave 5 (every difference found before was fixed), but a
+// difference found later is marked with these, beside a comment giving the evidence and the owner.
 /** The words of a staleness key that moved between the agent's two dry runs, the hint matching `hint`. */
-const keyMoved = (hint: RegExp): RegExp => new RegExp(`^two dry runs in a row gave different staleness keys \\(.*${hint.source}`);
+export const keyMoved = (hint: RegExp): RegExp => new RegExp(`^two dry runs in a row gave different staleness keys \\(.*${hint.source}`);
 /** The words of an approver's dry run whose key is not the agent's, the hint matching `hint`. */
-const approverKeyMoved = (hint: RegExp): RegExp => new RegExp(`^the approver's dry run gave another staleness key than the agent's \\(.*${hint.source}`);
+export const approverKeyMoved = (hint: RegExp): RegExp => new RegExp(`^the approver's dry run gave another staleness key than the agent's \\(.*${hint.source}`);
 /** The hint when the two previews show the same and only what the key reads differs. */
-const PREVIEWS_AGREE = /the previews agree: the difference is in what the key reads, not what it shows\)$/;
+export const PREVIEWS_AGREE = /the previews agree: the difference is in what the key reads, not what it shows\)$/;
 
 function isObj(v: unknown): v is Obj {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -338,12 +341,10 @@ export const PARITY_CASES: ParityCase[] = [
       const memo = await w.make('credit-memos.create', body(creditMemoBody(w)));
       return on(memo, { action: 'apply', invoiceId: inv.id, amount: '20.00', date: D });
     },
-    // lib/services/creditMemos.ts writes the new credit application's id into the memo's audit row
-    // (newValues.creditApplicationId). That row has no audit 'create' of its own, so the bridge's
-    // staleness key (stalenessKeyOf) does not know the id is the run's own: every dry run gives
-    // another key. Ledger, records and amount agree.
-    fails: [keyMoved(/credit_memo\.creditApplicationId: /)],
-    approverFails: approverKeyMoved(/credit_memo\.creditApplicationId: /),
+    // Pins (a known difference until wave 5): lib/services/creditMemos.ts writes the new credit
+    // application's id into the memo's audit row (newValues.creditApplicationId) with no audit
+    // 'create' for it. The bridge now takes every id of a row the run inserted for its own
+    // (lib/agent/bridge.ts runIdsOf), so two dry runs, and the approver's, give one key.
   },
   { area: 'sales', operation: 'credit-memos.delete', input: async (w) => on(await w.make('credit-memos.create', body(creditMemoBody(w)))) },
 
@@ -435,15 +436,14 @@ export const PARITY_CASES: ParityCase[] = [
   {
     // The company's FIRST item receipt (no case before this one makes one: keep it first). The
     // service makes the Item Receipts Accrual account then (lib/services/itemReceipts.ts
-    // getOrCreateAccrualAccount) with a plain insert and no audit row. Each run makes its own, with
-    // an id of its own, and the bridge's staleness key reads that id in the ledger lines: two dry
-    // runs never agree. Ledger (the account by code and name), records and amount agree.
+    // getOrCreateAccrualAccount) with a plain insert and no audit row, each run its own. Pins (a
+    // known difference until wave 5): the bridge takes that account's id for the run's own
+    // (lib/agent/bridge.ts runIdsOf, a row the run inserted), so the key holds still; the ledger
+    // matches the account by its code and name.
     area: 'purchases',
     operation: 'item-receipts.create',
     label: 'first, makes the accrual account',
     input: async (w) => body(receiptBody(w, '6')),
-    fails: [keyMoved(/Item Receipts Accrual/)],
-    approverFails: approverKeyMoved(/Item Receipts Accrual/),
   },
   { area: 'purchases', operation: 'item-receipts.create', input: async (w) => body(receiptBody(w, '3')) },
   { area: 'purchases', operation: 'item-receipts.update', input: async (w) => on(await w.make('item-receipts.create', body(receiptBody(w, '2'))), receiptBody(w, '4')) },
@@ -664,12 +664,9 @@ export const PARITY_CASES: ParityCase[] = [
         action: 'depreciate',
         date: '2026-02-28',
       }),
-    // lib/services/fixedAssets.ts writes the new depreciation row's id into the asset's audit row
-    // (newValues.depreciationEntryId); that row has no audit 'create' of its own, so the bridge's
-    // staleness key takes it for a value the run read: every dry run gives another key. Ledger,
-    // records and amount agree.
-    fails: [keyMoved(/fixed_asset\.depreciationEntryId: /)],
-    approverFails: approverKeyMoved(/fixed_asset\.depreciationEntryId: /),
+    // Pins (a known difference until wave 5): lib/services/fixedAssets.ts writes the new
+    // depreciation row's id into the asset's audit row (newValues.depreciationEntryId) with no audit
+    // 'create' for it; the bridge takes it for the run's own (lib/agent/bridge.ts runIdsOf).
   },
   { area: 'banking', operation: 'loans.create', input: async (w) => body(loanBody(w)) },
   {
@@ -725,11 +722,9 @@ export const PARITY_CASES: ParityCase[] = [
       await w.commit('deposits.create', body({ depositAccountId: w.acct['1000'], date: D, paymentIds: [payment] }));
       return on(payment, { action: 'bounce', date: D, bankFee: '12.00', bankFeeAccountId: w.acct['6100'], customerFee: '25.00', customerFeeAccountId: w.acct['4900'], memo: 'NSF' });
     },
-    // lib/services/payments.ts writes the new bounced-check row's id into the payment's audit row
-    // (newValues.bouncedCheckId); that row has no audit 'create' of its own, so the key takes it
-    // for a value the run read. Ledger (three entries), records and amount agree.
-    fails: [keyMoved(/payment_received\.bouncedCheckId: /)],
-    approverFails: approverKeyMoved(/payment_received\.bouncedCheckId: /),
+    // Pins (a known difference until wave 5): lib/services/payments.ts writes the new bounced-check
+    // row's id into the payment's audit row (newValues.bouncedCheckId) with no audit 'create' for
+    // it; the bridge takes it for the run's own (lib/agent/bridge.ts runIdsOf). Three entries.
   },
   { area: 'sales', operation: 'customer-prices.create', input: async (w) => body({ customerId: w.customerId, itemId: w.serviceItemId, price: '110.00' }) },
   { area: 'sales', operation: 'billing-groups.create', input: async (w) => body({ name: w.unique('Monthly clients'), customerIds: [w.customerId] }) },
@@ -882,10 +877,9 @@ export const PARITY_CASES: ParityCase[] = [
     area: 'banking',
     operation: 'demo-feed',
     input: async (w) => body({ bankAccountId: await newBankAccount(w) }),
-    // lib/services/demoFeed.ts inserts the sample transactions with no audit row, and posts nothing:
-    // the dry run's preview is empty (no entry, no record), yet the real run adds 8 rows to
-    // bank_transactions. A person approving it is shown nothing of what it does.
-    fails: [/^records: the dry run shows nothing, the real run changed bank_transactions \(\d+ rows -> \d+ rows\) and wrote no audit row$/],
+    // Pins (a known difference until wave 5): the real run adds 8 rows to bank_transactions and
+    // posts nothing. lib/services/demoFeed.ts now writes an audit row for each line it inserts, so
+    // the dry run's preview shows them; before, it was empty and a person approving it saw nothing.
   },
   {
     area: 'banking',
@@ -956,24 +950,21 @@ export const PARITY_CASES: ParityCase[] = [
     label: 'liability',
     input: async (w) =>
       body({ type: 'liability', employeeId: w.employeeId, date: D, memo: 'Fix withholding', lines: [{ kind: 'tax', name: 'Federal Withholding', amount: '10.00' }], affectsAccounts: true, offsetAccountId: w.acct['6500'] }),
-    // lib/services/payrollAdjustments.ts posts the entry with reference pc.id.slice(0, 8): the first
-    // eight characters of the new adjustment row's id. The bridge's staleness key reads the
-    // reference (stalenessKeyOf) and puts aside only WHOLE new ids (keyValue), so every dry run
-    // gives another key. The preview does not show the reference. Ledger, records and amount agree.
-    fails: [keyMoved(PREVIEWS_AGREE)],
-    approverFails: approverKeyMoved(PREVIEWS_AGREE),
+    // Pins (a known difference until wave 5): lib/services/payrollAdjustments.ts posts the entry
+    // with reference pc.id.slice(0, 8), the first 8 hex digits of the new adjustment row's id. The
+    // bridge puts aside an id of the run's own cut to its first 8 digits too (lib/agent/bridge.ts
+    // keyRulesOf), so the key holds still; this test compares that reference the same way.
+    // The amount is unknown on purpose (lib/agent/operations/classes/payroll.ts amountField
+    // 'lines', an array: fail closed), a note in the report, not a difference.
   },
   {
     area: 'payroll',
     operation: 'payroll.adjustments.create',
     label: 'year to date',
     input: async (w) => body(ytdAdjustmentBody(w)),
-    // The same reference as the liability adjustment above. And the amount: amountField
-    // 'lines.*.amount' adds every line, the 2000.00 earning and the 200.00 withholding taken out
-    // of it, so the facts say 2200.00 where the entry posts 2000.00 (Dr wages 2000.00, Cr bank
-    // 1800.00, Cr liabilities 200.00). Larger, so no limit is missed, but not what was posted.
-    fails: [keyMoved(PREVIEWS_AGREE), /^amount: the dry run says 2200\.00, the real run posted 2000\.00$/],
-    approverFails: approverKeyMoved(PREVIEWS_AGREE),
+    // As the liability adjustment above. Until wave 5 the facts also said 2200.00 (every line
+    // added) where the entry posts 2000.00; the amount is now unknown on purpose (amountField
+    // 'lines'), which is a note, never that difference.
   },
   { area: 'payroll', operation: 'payroll.adjustments.delete', input: async (w) => on(await w.make('payroll.adjustments.create', body(ytdAdjustmentBody(w)))) },
   {
@@ -1055,14 +1046,10 @@ export const PARITY_CASES: ParityCase[] = [
     area: 'accounting',
     operation: 'accountant.sales-tax.adjustments',
     input: async (w) => body({ date: D, agencyId: await taxAgency(w), amount: '3.00', direction: 'reduce', adjustmentAccountId: w.acct['4900'], reason: 'rounding', memo: 'Vendor discount for paying on time' }),
-    // lib/services/accountant/salesTaxTools.ts writes an audit 'create' of kind
-    // sales_tax_adjustment whose id IS the new journal entry's id. The bridge's staleness key
-    // (stalenessKeyOf) maps each new id to one kind only: the ledger's 'new:journal_entry'
-    // overwrites 'new:sales_tax_adjustment', so that record's id is not taken for the run's own
-    // (isNew compares the kind) and stays in the key as it is: every dry run gives another key.
-    // Ledger, records and amount agree.
-    fails: [keyMoved(PREVIEWS_AGREE)],
-    approverFails: approverKeyMoved(PREVIEWS_AGREE),
+    // Pins (a known difference until wave 5): lib/services/accountant/salesTaxTools.ts writes an
+    // audit 'create' of kind sales_tax_adjustment whose id IS the new journal entry's id. The
+    // bridge now keeps a set of kinds per id the run made (lib/agent/bridge.ts runIdsOf), so
+    // neither kind keeps the raw id in the key.
   },
 
   // --- Applying general journal credits ---
@@ -1074,13 +1061,12 @@ export const PARITY_CASES: ParityCase[] = [
       const inv = await openInvoice(w);
       return body({ action: 'apply_credit', journalLineId: await customerCreditLine(w), invoiceId: inv.id, amount: '50.00', date: D });
     },
-    // lib/services/journalApplications.ts records the application in a row of its own and writes
-    // an audit 'update' on the journal entry naming it (newValues.applicationId), with no audit
-    // 'create' for the application. Two differences follow: the key reads the new id (two dry runs
-    // never agree), and the bridge (touchedEntries) lists the general journal entry as "Changed by
-    // this request" when its row and lines stay exactly as they were. Records and amount agree.
-    fails: [keyMoved(/journal_entry\.applicationId: /), /^ledger: the dry run shows entry [0-9a-f-]{36} as "Changed by this request: Goodwill credit", the real run left it as it was$/],
-    approverFails: approverKeyMoved(/journal_entry\.applicationId: /),
+    // Pins two known differences until wave 5. lib/services/journalApplications.ts records the
+    // application in a row of its own and writes an audit 'update' on the journal entry naming it
+    // (newValues.applicationId), with no audit 'create' for the application: the bridge now takes
+    // that id for the run's own (lib/agent/bridge.ts runIdsOf). And the general journal entry,
+    // whose row and lines stay as they were, is no longer shown as "Changed by this request"
+    // (lib/agent/bridge.ts touchedEntries leaves out an entry only an audit row names).
   },
   {
     area: 'purchases',
@@ -1088,8 +1074,6 @@ export const PARITY_CASES: ParityCase[] = [
     label: 'credit to a bill',
     input: async (w) => body({ action: 'apply_credit', journalLineId: await vendorCreditLine(w), billId: await openBill(w), amount: '40.00', date: D }),
     // As payments.journal-items.apply above, on the vendor side.
-    fails: [keyMoved(/journal_entry\.applicationId: /), /^ledger: the dry run shows entry [0-9a-f-]{36} as "Changed by this request: Vendor credit by letter", the real run left it as it was$/],
-    approverFails: approverKeyMoved(/journal_entry\.applicationId: /),
   },
   {
     area: 'payroll',
@@ -1110,13 +1094,10 @@ export const PARITY_CASES: ParityCase[] = [
       await w.make('invoices.create', body({ ...invoiceBody(w, '150.00', customerId), retainagePercent: '10' }));
       return body({ customerId, date: D, amount: '20.00', memo: 'Retainage released' });
     },
-    // lib/services/retainage.ts billRetainage writes an audit 'create' of kind retainage_billing
-    // whose id IS the new invoice's id, beside the invoice's own 'create'. As with the sales tax
-    // adjustment above, the bridge's staleness key (stalenessKeyOf) maps each new id to one kind
-    // only, so one of the two records keeps its raw id in the key: every dry run gives another
-    // key. Ledger, records and amount agree.
-    fails: [keyMoved(PREVIEWS_AGREE)],
-    approverFails: approverKeyMoved(PREVIEWS_AGREE),
+    // Pins (a known difference until wave 5): lib/services/retainage.ts billRetainage writes an
+    // audit 'create' of kind retainage_billing whose id IS the new invoice's id, beside the
+    // invoice's own 'create'. As with the sales tax adjustment above, the bridge keeps a set of
+    // kinds per id (lib/agent/bridge.ts runIdsOf).
   },
   {
     area: 'payroll',
@@ -1136,12 +1117,9 @@ export const PARITY_CASES: ParityCase[] = [
     operation: 'currencies.fx-adjustment',
     input: async (w) => body({ accountId: w.acct['1010'], amount: '12.34', gain: true, date: D, memo: 'Revalued at month end' }),
     // The company's first FX adjustment (the only case that makes one): lib/services/currencies.ts
-    // makes the Exchange Gain/Loss account (6900) on first use, with no audit row. Each run makes
-    // its own, with an id of its own, and the key reads that id in the ledger lines: two dry runs
-    // never agree, as with the first item receipt's accrual account. Ledger (the account by code
-    // and name), records and amount agree.
-    fails: [keyMoved(/Exchange Gain\/Loss/)],
-    approverFails: approverKeyMoved(/Exchange Gain\/Loss/),
+    // makes the Exchange Gain/Loss account (6900) on first use, with no audit row, each run its own.
+    // Pins (a known difference until wave 5), as the first item receipt's accrual account: the
+    // bridge takes that account's id for the run's own (lib/agent/bridge.ts runIdsOf).
   },
 
   // --- Assemblies: the bill of materials, a build, a pending build ---
@@ -1166,13 +1144,11 @@ export const PARITY_CASES: ParityCase[] = [
     area: 'inventory',
     operation: 'assemblies.build',
     input: async (w) => body({ assemblyItemId: await assemblyWithBom(w), quantity: '2', action: 'build', date: D }),
-    // lib/services/assemblies.ts tags the value-move entry with sourceRef
-    // "assembly_build:<buildId>:…", where buildId is a randomUUID() of each run that names no row
-    // (so no audit 'create' either). The bridge's staleness key reads the source and keeps that id
-    // as it is: every dry run gives another key. The preview shows the source, so the two previews
-    // differ there too. Ledger, records and amount agree with the real run.
-    fails: [keyMoved(/"source":"assembly_build:/)],
-    approverFails: approverKeyMoved(/"source":"assembly_build:/),
+    // Pins (a known difference until wave 5): lib/services/assemblies.ts tags the value-move entry
+    // with sourceRef "assembly_build:<buildId>:…", where buildId is a randomUUID() of each run that
+    // names no row and has no audit 'create'. The bridge takes an id that names no row for one the
+    // run made up (lib/agent/bridge.ts runIdsOf), so the key holds still; this test compares the
+    // source the same way ("assembly_build:(new)…").
   },
   {
     area: 'inventory',
@@ -1187,9 +1163,67 @@ export const PARITY_CASES: ParityCase[] = [
       const pending = await w.make('assemblies.pending.create', body({ assemblyItemId: await assemblyWithBom(w), quantity: '1', date: D }));
       return on(pending, { action: 'finalize' });
     },
-    // Finalizing builds it (buildAssembly): the same new build id in the entry's source as above.
-    fails: [keyMoved(/"source":"assembly_build:/)],
-    approverFails: approverKeyMoved(/"source":"assembly_build:/),
+    // Finalizing builds it (buildAssembly): the same made-up build id in the entry's source as
+    // above, pinned the same way.
+  },
+
+  // --- Money moved by the accountant's tools and the print queue (no case before wave 5) ---
+  {
+    area: 'accounting',
+    operation: 'accountant.client-data-review.run',
+    label: 'apply a customer credit',
+    input: async (w) => {
+      // A customer of its own, so the oldest open invoice the credit lands on is this case's.
+      const customerId = await w.make('customers.create', body({ displayName: w.unique('Credit client') }));
+      await openInvoice(w, customerId);
+      const memo = await w.make('credit-memos.create', body({ ...creditMemoBody(w), customerId }));
+      return body({ action: 'apply_customer_credit', refType: 'credit_memo', refId: memo });
+    },
+  },
+  {
+    area: 'accounting',
+    operation: 'accountant.client-data-review.run',
+    label: 'apply a vendor credit',
+    input: async (w) => {
+      const vendorId = await w.make('vendors.create', body({ displayName: w.unique('Credit vendor') }));
+      await w.make('bills.create', body({ ...billBody(w), vendorId }));
+      const credit = await w.make('vendor-credits.create', body({ ...vendorCreditBody(w), vendorId }));
+      return body({ action: 'apply_vendor_credit', refId: credit });
+    },
+  },
+  {
+    area: 'accounting',
+    operation: 'accountant.sales-tax.fix.run',
+    label: 'reclassify a payment',
+    input: async (w) => {
+      // A payment to the agency booked as office supplies: the fix moves it onto the agency's
+      // liability with a correcting entry whose reference names the existing line (fix-line:<id>).
+      const je = await w.make(
+        'journal-entries.create',
+        body({
+          date: D,
+          description: 'State sales tax paid, booked as supplies',
+          lines: [
+            { accountId: w.acct['6300'], debit: '27.00' },
+            { accountId: w.acct['1000'], credit: '27.00' },
+          ],
+        }),
+      );
+      return body({ action: 'reclassify', lineId: await lineOn(w, je, w.acct['6300']), agencyId: await taxAgency(w) });
+    },
+  },
+  {
+    area: 'banking',
+    operation: 'print-queue.refunds.add',
+    input: async (w) => {
+      // 400.00 received against a 340.00 invoice, 60.00 refunded from the bank: that refund's entry.
+      const inv = await openInvoice(w);
+      const payment = await w.make('payments.create', body({ ...paymentBody(w, inv.id, inv.total), amount: '400.00' }));
+      await w.commit('payments.action', on(payment, { action: 'refund', bankAccountId: w.acct['1000'], amount: '60.00', date: D, memo: 'Overpayment returned' }));
+      const [entryId] = await w.idsWhere('journal_entries', 'source_ref', `refund:${payment}`);
+      if (!entryId) throw new Error('The refund posted no entry');
+      return body({ entryId, memo: 'Refund of the overpayment' });
+    },
   },
 ];
 

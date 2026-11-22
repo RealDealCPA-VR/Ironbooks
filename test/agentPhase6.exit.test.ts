@@ -13,9 +13,10 @@
  *  - Backup to a named folder: the agent asks for a copy of the company file (File > Save Copy As)
  *    in a folder the Admin allowed; the Admin approves at the host; the shell is asked once, with
  *    a ticket for that request and that Admin, which cannot be used again. A folder outside the
- *    allowed ones is refused before any ask. The same for a downloaded backup saved with save_file.
+ *    allowed ones is refused before any ask, again before the shell is asked, and by the shell
+ *    itself. The same for a downloaded backup saved with save_file.
  *  - Add a user: the Admin approves and types the temporary password on the card; it is never in
- *    the agent's view of the request nor in any stored row.
+ *    the agent's view of the request nor in any stored row, and nothing is "produced" for it.
  *  - The hard floor: no verb reaches the routes of agents, policies, grants or approvals, nor does
  *    the agent's own token, and an agent's context can never approve.
  *
@@ -88,6 +89,7 @@ import { agentPermissionRequests, users } from '@/lib/db/schema';
 import { allOperations, operationForRoute } from '@/lib/agent/operations/registry';
 import { SHELL_TICKET_SECONDS, type AgentRequestView } from '@/lib/agent/contract';
 import { sendShellLine } from '@/lib/agent/shell';
+import { makeShellTicket, shellFileRef } from '@/lib/agent/shellTicket';
 import { verifyPassword } from '@/lib/auth';
 import { saveAgentPolicy } from '@/lib/services/agentPolicies';
 import { approveAgentRequest, denyAgentRequest, requestForPerson } from '@/lib/services/agentRequests';
@@ -180,32 +182,67 @@ describe('Phase 6 exit: a backup to a named folder (a copy of the company file, 
     expect(perms.folders).toEqual([allowed]);
   });
 
-  // DEFECT (lib/agent/operate.ts change/askPerson): a desktop operation's path fields are not
-  // checked against the folders agents may use before a person is asked. save_file checks its
-  // folder first (savePreview: "That folder is not one this agent may save to"), but
-  // shell.company.saveCopyAs (and every shell operation with a 'path' field) is put to the Admin as
-  // it is, with a path anywhere on the computer; only the desktop shell refuses it, after the
-  // Admin said yes (electron/agentShell.js pathProblem). The next test shows that last line holds.
-  it.fails('a folder outside the allowed ones is refused before any ask', async () => {
+  // Three lines hold a path outside the folders agents may use. The door refuses it before anyone
+  // is asked (lib/agent/operate.ts shellPathRefusal, in firstLook); the server refuses it again just
+  // before the shell is asked, for a folder taken off the list since the ask (lib/agent/shell.ts
+  // runShellOperation, pathOutsideFolders); and the desktop shell refuses it on its own side
+  // (electron/agentShell.js pathProblem). The next three tests show each.
+  it('a folder outside the allowed ones is refused before any ask', async () => {
     const before = (await requestRows()).length;
     const calls = rec.calls.length;
     const answer = await agent.run({ operation: SAVE_COPY, body: { file: copyIn(outside) }, requestId: requestKey('copy-outside'), reason: 'Keep a copy where the office keeps backups.' });
     expect(answer.outcome).toBe('refused');
-    expect(answer.note ?? '').toMatch(/folder/i);
+    expect(answer.note ?? '').toMatch(/must be the full path of a file in a folder this agent may use/);
+    expect(answer.note ?? '').toMatch(/Nobody was asked/);
     expect((await requestRows()).length).toBe(before);
     expect(rec.calls.length).toBe(calls);
   });
 
-  it('if such a request reaches the Admin anyway, the shell refuses it before its flow runs', async () => {
-    const answer = await agent.run({ operation: SAVE_COPY, body: { file: copyIn(outside, 'Elsewhere.ironbooks') }, requestId: requestKey('copy-outside-2'), reason: 'Keep a copy where the office keeps backups.' });
-    if (answer.outcome !== 'asked') {
-      expect(answer.outcome).toBe('refused');
-      return;
+  it('a folder taken off the list after the ask: the approval fails before the shell is asked', async () => {
+    const later = scratchFolder('allowed-then-removed');
+    try {
+      await saveAgentPolicy(s.admin.ctx, agent.id, { folders: [allowed, later] });
+      const answer = await agent.run({ operation: SAVE_COPY, body: { file: copyIn(later, 'Later.ironbooks') }, requestId: requestKey('copy-later'), reason: 'Keep a copy where the office keeps backups.' });
+      expect(answer.outcome, JSON.stringify(answer.note)).toBe('asked');
+      // The Admin takes the folder off the agent's list before anyone approves.
+      await saveAgentPolicy(s.admin.ctx, agent.id, { folders: [allowed] });
+      const lines = shell.lines.length;
+      const ran = shell.ran.length;
+      const done = await approveAgentRequest(s.admin.ctx, answer.requestId!, {}, { atHost: true });
+      expect(done.status).toBe('failed');
+      // Refused by the server's own check as things are when the work runs (pathOutsideFolders):
+      // the shell was never sent a line.
+      expect(done.request.error ?? '').toMatch(/is not in a folder agents may use on this computer now/);
+      expect(rec.calls.at(-1)).toMatchObject({ operation: SAVE_COPY, requestId: answer.requestId, ok: false });
+      expect(shell.lines.length).toBe(lines);
+      expect(shell.ran.length).toBe(ran);
+      expect(fs.readdirSync(later)).toEqual([]);
+    } finally {
+      await saveAgentPolicy(s.admin.ctx, agent.id, { folders: [allowed] });
+      fs.rmSync(later, { recursive: true, force: true });
     }
+  });
+
+  it('the shell itself refuses such a path before its flow runs, even on a good ticket for that request and that Admin', async () => {
+    // What the server would send if both checks above were gone: a ticket made with the shell's
+    // key for a request id and the Admin, over a path outside every agent folder.
+    const input = { file: copyIn(outside, 'Elsewhere.ironbooks') };
+    const answers = {};
+    const folders = [allowed];
+    const ticket = makeShellTicket(shell.key, {
+      requestId: randomUUID(),
+      operation: SAVE_COPY,
+      input,
+      approverId: s.admin.id,
+      bound: { answers, folders, file: shellFileRef(null), secrets: [] },
+    });
     const ran = shell.ran.length;
-    const done = await approveAgentRequest(s.admin.ctx, answer.requestId!, {}, { atHost: true });
-    expect(done.status).toBe('failed');
-    expect(done.request.error ?? '').toMatch(/folder/i);
+    const lines = shell.lines.length;
+    const answer = await sendShellLine(JSON.stringify({ ticket, operation: SAVE_COPY, input, answers, folders }), 10_000, { key: shell.key, ticketMac: ticket.mac });
+    expect(answer.ok).toBe(false);
+    // Refused for its folder, not for its ticket: the ticket was good, so the folder rule is what held.
+    expect(answer.error ?? '').toMatch(/is not in a folder agents may use on this computer/);
+    expect(shell.lines.length).toBe(lines + 1);
     expect(shell.ran.length).toBe(ran);
     expect(fs.readdirSync(outside)).toEqual([]);
   });
@@ -231,12 +268,10 @@ describe('Phase 6 exit: a backup to a named folder (a copy of the company file, 
     expect((card.input?.body as Out)?.file).toBe(copyIn(allowed));
   });
 
-  // DEFECT (lib/agent/describe.ts shown/cleanText, DESCRIBE_VALUE_MAX 60): the approval line cuts a
-  // path at its END, so the Admin's one line reads "Save a copy of the company file as
-  // C:\Users\…\Temp\ironbooks-exit-b-…-allow…" without the folder it really goes to or the file's
-  // name. For a path the end says where it goes (as keepEnd does for a server name); the whole path
-  // is only in the collapsed "What the agent sent" on the card (app/agent-requests/RequestCard.tsx).
-  it.fails('the approval line shows where the copy goes: its folder and its name', async () => {
+  // A path on the approval line is cut in its middle, never at its end (lib/agent/describe.ts: a
+  // path field is shown through cutPath), so the Admin's one line keeps the folder the copy goes to
+  // and the file's name.
+  it('the approval line shows where the copy goes: its folder and its name', async () => {
     const view = await agentView(askId);
     expect(view?.summary).toContain(path.basename(allowed));
     expect(view?.summary).toContain('Books backup.ironbooks');
@@ -372,20 +407,13 @@ describe('Phase 6 exit: an agent asks to add a user; the Admin approves', { time
     expect(holds(stored, AGENT_PASSWORD)).toBe(false);
   });
 
-  // PLAN WORDING, NOT A SECURITY GAP (lib/agent/operations/classes/admin.ts 'POST /api/users', with
-  // lib/services/users.ts addUser). The plan says two things: §5.8 lists "a user's new password"
-  // among the INPUTS the approver types on the card, while the Phase 6 exit says the temporary
-  // password "appears only on the Admin's screen", which reads like an OUTPUT (§5.8 "Outputs: a
-  // reset user's temporary password … shown once on the approver's card"; the contract's
-  // ProducedSecret and ApproveResult.produced). The build follows §5.8's inputs: the Admin TYPES it
-  // (needsSecret new_user_password, put in body.password by lib/agent/guards.ts applySecrets) and
-  // the route answers no password, so ApproveResult.produced is []. The test before this one proves
-  // the password reaches neither the agent nor any stored row. The owner chooses: either the exit
-  // criterion says "typed by the Admin on the card" (and this test goes), or adding a user
-  // generates the temporary password and lists producesSecret.
-  it.fails('the temporary password appears in ApproveResult.produced, shown once to the Admin', () => {
-    expect(produced.map((p) => p.kind)).toEqual(['new_user_password']);
-    expect(produced[0].value).toBe(TEMP_PASSWORD);
+  // Decided (plan §5.8, inputs): the password of a user an agent asks to add is TYPED by the
+  // approving Admin on the card (needsSecret new_user_password, put in body.password by
+  // lib/agent/guards.ts applySecrets). Nothing is produced for that request, and that is correct:
+  // the Admin already knows it, so there is nothing to show once. The tests above prove it
+  // reaches neither the agent nor any stored row.
+  it('nothing is produced for it: the Admin typed the password, so ApproveResult.produced is empty', () => {
+    expect(produced).toEqual([]);
   });
 });
 

@@ -6,13 +6,15 @@
  * request in a test).
  *
  *  - An agent finds, reads, tries and asks for a pay run with only the generic verbs; a person
- *    approves it in their own window and the paychecks are in the books, named "agent, approved by
- *    person".
+ *    approves it once in their own window and the paychecks are in the books, named "agent,
+ *    approved by person".
  *  - Every answer the agent got on the way is masked: no full SSN and no full bank account number,
  *    although the agent's role (Full Access) holds both View flags.
  *  - One approved reveal: an approver without "View sensitive payroll data" cannot approve it, one
  *    with it can; the agent then reads the full SSNs in that one answer, the next ordinary read is
- *    masked again and another reveal asks again. The decision is in the audit trail.
+ *    masked again and another reveal asks again. The audit trail words the reveal (which fields, to
+ *    which agent, approved by whom). The answer stays readable by the agent for
+ *    REVEAL_KEPT_MINUTES after the run (D6) and is masked for good afterwards.
  *
  * Where the build does not do what the plan says, the test stays as it.fails with what is wrong.
  */
@@ -44,7 +46,7 @@ import { operationForRoute } from '@/lib/agent/operations/registry';
 import type { AgentOperationAnswer, AgentRequestView } from '@/lib/agent/contract';
 import { createEmployee, updateEmployee } from '@/lib/services/payroll';
 import { createBankAccount } from '@/lib/services/bankAccounts';
-import { approveAgentRequest, requestForPerson } from '@/lib/services/agentRequests';
+import { approveAgentRequest, requestForPerson, REVEAL_KEPT_MINUTES } from '@/lib/services/agentRequests';
 import { ServiceError } from '@/lib/services/_base';
 import {
   addPerson,
@@ -223,33 +225,23 @@ describe('Phase 3 exit: an agent prepares a pay run that a person approves', { t
     expect(await s.db.select().from(paychecks)).toHaveLength(0);
   });
 
-  // DEFECT (lib/agent/bridge.ts stalenessKeyOf, with lib/services/payroll.ts): the staleness key of
-  // a pay run differs on EVERY run over the same books, so the approval always answers "the books
-  // changed" (status 'stale') and nothing runs. Each paycheck's journal entry carries
-  // reference = the first 8 hex digits of the new paycheck's id (seen: "2fcf3b08" in one rolled-back
-  // run, "e923e58c" in the next, all else equal). stalenessKeyOf puts `reference` in the key and
-  // keyValue only maps WHOLE uuids of created records to "new:<kind>", so a prefix of one stays as
-  // it is. Two dry runs by the same actor gave keys 1aa8f167… and 6b5cab49….
-  it.fails('a person approves it once in their own window and it runs (the books did not change)', async () => {
+  // One yes is enough (plan §7.4: a person approves the preview on their screen, and it runs while
+  // the books are as it showed). The staleness key leaves out what the run assigns to itself:
+  // lib/agent/bridge.ts keyRules/keyText map the ids the run made, and their 8-digit prefixes (each
+  // paycheck's journal reference is the first 8 hex digits of the new paycheck's id,
+  // lib/services/payroll.ts), to "new:<kind>", so the approval's own dry run gives the stored key.
+  it('a person approves it once in their own window and it runs (the books did not change)', async () => {
     const card = await requestForPerson(s.admin.ctx, requestId, { atHost: true });
     expect(card.canApprove).toBe(true);
+    expect(card.stale ?? false).toBe(false);
     const done = await approveAgentRequest(s.admin.ctx, requestId, {}, { atHost: true });
     expect(done.status, JSON.stringify(done.request.error)).toBe('executed');
-  });
-
-  // The same defect, seen through the second yes the plan gives (§7.4): the person is shown the new
-  // preview and approves again with acceptStale, but every new dry run has a new key again, so the
-  // request goes back to waiting each time and a pay run can never be approved at all.
-  it.fails('approving the new preview again runs it: the paychecks are in the books, named "agent, approved by person"', async () => {
-    let done = await approveAgentRequest(s.admin.ctx, requestId, { acceptStale: true }, { atHost: true });
-    for (let i = 0; i < 3 && done.status === 'stale'; i++) {
-      expect(done.request.stale).toBe(true);
-      done = await approveAgentRequest(s.admin.ctx, requestId, { acceptStale: true }, { atHost: true });
-    }
-    expect(done.status, JSON.stringify(done.request.error)).toBe('executed');
+    expect(done.request.stale ?? false).toBe(false);
     expect(done.request.posted).toBe(true);
     expect(done.request.entryIds?.length ?? 0).toBeGreaterThanOrEqual(2);
+  });
 
+  it('the paychecks are in the books, named "agent, approved by person"; a second yes adds nothing', async () => {
     const runs = await s.db.select().from(payRuns).where(eq(payRuns.companyId, s.companyId));
     expect(runs).toHaveLength(1);
     const checks = await s.db.select().from(paychecks).where(eq(paychecks.companyId, s.companyId));
@@ -263,6 +255,15 @@ describe('Phase 3 exit: an agent prepares a pay run that a person approves', { t
       expect(r.agentId).toBe(agent.id);
       expect(r.approvedBy).toBe(s.admin.id);
     }
+    // One decision, by the Admin: the request never went back to waiting with a new preview.
+    const row = await requestRow(requestId);
+    expect(row.status).toBe('executed');
+    expect(row.decidedBy).toBe(s.admin.id);
+
+    // The same yes again (an old window, a double click) runs nothing a second time.
+    await expect(approveAgentRequest(s.admin.ctx, requestId, {}, { atHost: true })).rejects.toBeInstanceOf(ServiceError);
+    expect(await s.db.select().from(payRuns).where(eq(payRuns.companyId, s.companyId))).toHaveLength(1);
+    expect(await s.db.select().from(paychecks).where(eq(paychecks.companyId, s.companyId))).toHaveLength(2);
 
     // The agent asks again with its request id and reads what happened.
     const again = await agent.run({ operation: PAY_RUN(), body: payRunBody(), requestId: key, reason: 'Payroll for the first half of November.' });
@@ -271,7 +272,7 @@ describe('Phase 3 exit: an agent prepares a pay run that a person approves', { t
     expect(again.status).toBe('executed');
   });
 
-  it('while it waits, the agent reads it back (and every new preview of it) masked', async () => {
+  it('the agent reads its request back (and every preview of it) masked', async () => {
     const view = await agent.verb('list_my_requests', {});
     const mine = view.requests.find((r) => r.id === requestId);
     expect(mine, 'the pay run request').toBeTruthy();
@@ -346,17 +347,23 @@ describe('Phase 3 exit: one approved reveal of the SSNs', { timeout: 240_000 }, 
     expect((executed!.newValues as Out).operation).toBe(EMPLOYEES());
   });
 
-  // PLAN DEVIATION (plan §5.9: "the audit trail records 'revealed fields of record to agent X,
-  // approved by Y'"). lib/services/agentRequests.ts auditDecision writes only
-  // { operation, agentId, status, approvedBy, grantId } for the decision, and the approved read runs
-  // on the read-only handle (lib/agent/bridge.ts 'read' mode), which writes no audit row. Nothing in
-  // the audit trail says that protected values were revealed, which kind (SSNs) or of which records.
-  it.fails('the audit trail words it as a reveal: what was revealed (SSNs), to which agent, approved by whom', async () => {
-    const rows = await s.db.select().from(auditLogs).where(eq(auditLogs.companyId, s.companyId));
-    const about = rows.filter((r) => r.entityId === revealId || r.agentRequestId === revealId);
-    const text = JSON.stringify(about);
-    expect(text).toMatch(/reveal/i);
-    expect(text).toMatch(/ssn/i);
+  // Plan §5.9 (D6): the audit trail words the reveal: "Revealed <which kinds of fields> of <record or
+  // report> to agent <name>, approved by <person>" (lib/services/agentRequests.ts revealAudit, put
+  // on the decision's row), and never the values themselves.
+  it('the audit trail words it as a reveal: what was revealed (SSNs), to which agent, approved by whom', async () => {
+    const rows = await s.db
+      .select()
+      .from(auditLogs)
+      .where(and(eq(auditLogs.entityType, 'agent_permission_request'), eq(auditLogs.entityId, revealId)));
+    const executed = rows.find((r) => (r.newValues as Out | null)?.status === 'executed');
+    const said = String((executed?.newValues as Out | undefined)?.revealed ?? '');
+    expect(said, JSON.stringify(rows)).toMatch(/^Revealed full SSNs/);
+    expect(said).toContain('to agent "Payroll Agent"');
+    expect(said).toContain('approved by Pat Payroll');
+    expect(String((executed!.newValues as Out).revealedFields)).toMatch(/SSNs/);
+    // What was revealed is named, never shown.
+    const text = JSON.stringify(rows);
+    for (const v of PROTECTED) expect(holds(text, v), `the audit trail holds ${v}`).toBe(false);
   });
 
   it('the reveal was for that one call: the next read is masked, and another reveal asks again', async () => {
@@ -377,44 +384,63 @@ describe('Phase 3 exit: one approved reveal of the SSNs', { timeout: 240_000 }, 
     expect(holds(seenText(agent), BANK_NUMBER)).toBe(false);
   });
 
-  // DEFECT (lib/services/agentRequests.ts record(), with the agent's views listRequestsForAgent and
-  // the door's replay, lib/agent/operate.ts presentState): the answer of an approved reveal is
-  // stored UNMASKED in agent_permission_requests.result (record() keeps scrubDeep(stripSecrets(
-  // r.result)), which takes out secrets, not protected values) and handed back on every read of
-  // the request: list_my_requests, every replay with the same request id, wait_for_decision. So
-  // "that single call runs unmasked" (plan §5.9) becomes "the agent can read the full SSNs again
-  // whenever it likes, for as long as the request is kept", and the full SSNs sit in a second table
-  // outside the employee records. Seen: list_my_requests and a second replay both answer
-  // "521-73-9846"; the stored row holds it too. The next three tests show each.
-  //
-  // A DECISION FOR THE OWNER, not only a bug: this reverses an earlier reading of D6. The second
-  // wave's review of the requests unit (_vr_tmp/WAVE2-NOTES.md, "requests" summary) says "The
-  // agent's own view keeps the revealed answer, as D6 intends", and the module header of
-  // lib/services/agentRequests.ts ("What an approved run answered is stored as the agent reads it,
-  // so an approved reveal (D6) keeps the full values for the agent") says the same. These tests
-  // follow the plan's wording instead (§5.9 "that single call runs unmasked"; the Phase 3 exit "one
-  // approved reveal shows them once"). Either (a) the agent keeps the revealed answer: these three
-  // become plain tests of the opposite and the exit wording changes; or (b) it is shown once, in the
-  // answer that carries it, and then masked in list_my_requests, every replay and the stored row.
-  it.fails("the agent's list of its requests shows the approved reveal masked", async () => {
+  // Decided (D6, plan §5.9): after an approved reveal the unmasked answer stays readable by that
+  // agent (wait_for_decision, list_my_requests, a replay of the same request id) for
+  // REVEAL_KEPT_MINUTES after the run; after that it is masked for good, in every view and in the
+  // stored row (lib/services/agentRequests.ts storedResult/revealOver for the views, settleRow and
+  // endedReveal for the row). The clock (Date only) proves both halves: a minute before the end and
+  // a minute after it.
+  async function revealSeen(): Promise<{ list: string; replay: AgentOperationAnswer }> {
     const mine = await agent.verb('list_my_requests', {});
     const view = mine.requests.find((r) => r.id === revealId);
     expect(view?.status).toBe('executed');
-    for (const v of PROTECTED) expect(holds(JSON.stringify(view), v), `list_my_requests showed ${v}`).toBe(false);
+    const replay = await agent.run({ operation: EMPLOYEES(), reveal: true, requestId: revealKey, reason: 'The W-4 review needs the full SSNs to match the forms.' });
+    expect(replay.replayed).toBe(true);
+    expect(replay.outcome).toBe('read');
+    return { list: JSON.stringify(view), replay };
+  }
+
+  it(`for ${REVEAL_KEPT_MINUTES} minutes after the run the agent may read the revealed answer again: its list and a replay`, async () => {
+    vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+    try {
+      vi.setSystemTime(Date.now() + (REVEAL_KEPT_MINUTES - 1) * 60_000);
+      const { list, replay } = await revealSeen();
+      for (const v of [SSN_DANA, SSN_LEE]) {
+        expect(holds(list, v), `list_my_requests hid ${v}`).toBe(true);
+        expect(holds(JSON.stringify(replay.result), v), `the replay hid ${v}`).toBe(true);
+      }
+      // Still only the SSNs: the bank number was never part of it.
+      expect(holds(list, BANK_NUMBER)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it.fails('asking again with the same request id does not show the SSNs a second time', async () => {
-    const again = await agent.run({ operation: EMPLOYEES(), reveal: true, requestId: revealKey, reason: 'The W-4 review needs the full SSNs to match the forms.' });
-    expect(again.replayed).toBe(true);
-    for (const v of [SSN_DANA, SSN_LEE]) expect(holds(JSON.stringify(again), v), `the replay showed ${v} again`).toBe(false);
-  });
+  it(`after the ${REVEAL_KEPT_MINUTES} minutes it is masked for good: in the list, in a replay and in the stored rows`, async () => {
+    vi.useFakeTimers({ toFake: ['Date'], shouldAdvanceTime: true });
+    try {
+      vi.setSystemTime(Date.now() + (REVEAL_KEPT_MINUTES + 1) * 60_000);
+      const { list, replay } = await revealSeen();
+      for (const v of PROTECTED) {
+        expect(holds(list, v), `list_my_requests showed ${v}`).toBe(false);
+        expect(holds(JSON.stringify(replay), v), `the replay showed ${v}`).toBe(false);
+      }
+      // The answer is still there, masked: the people are listed, with their last four digits.
+      const people = replay.result as Out[];
+      expect(people.map((x) => x.firstName).sort()).toEqual(['Dana', 'Lee']);
 
-  it.fails('the full SSNs are not kept in the request rows once they were shown', async () => {
-    const perm = JSON.stringify(await s.db.select().from(agentPermissionRequests));
-    const claims = JSON.stringify(await s.db.select().from(agentRequests));
-    expect({ agent_permission_requests: holds(perm, SSN_DANA) || holds(perm, SSN_LEE), agent_requests: holds(claims, SSN_DANA) || holds(claims, SSN_LEE) }).toEqual({
-      agent_permission_requests: false,
-      agent_requests: false,
-    });
+      // The reads settled the row: masked for good, not only in the views.
+      const perm = JSON.stringify(await s.db.select().from(agentPermissionRequests));
+      const claims = JSON.stringify(await s.db.select().from(agentRequests));
+      expect({
+        agent_permission_requests: holds(perm, SSN_DANA) || holds(perm, SSN_LEE),
+        agent_requests: holds(claims, SSN_DANA) || holds(claims, SSN_LEE),
+      }).toEqual({ agent_permission_requests: false, agent_requests: false });
+      const row = await requestRow(revealId);
+      expect((row.result as Out).revealUntil).toBeUndefined();
+      expect((row.result as Out).revealEnded).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -16,13 +16,17 @@
  *     flip Integrated Applications: not through the services with its own context, not by any verb,
  *     not by any operation id (every one the registry keeps from agents is drilled; of the ones it
  *     lets agents use, those under the paths that hold agents, their requests and grants only read
- *     the agent's own; and, in 2b, the role operations on a role an agent holds, which FAIL today),
+ *     the agent's own; and, in 2b, the role operations on a role an agent holds, on every path),
  *     not with a path value holding dot segments or encoded slashes, not with a body naming another
  *     agent's request or grant, and not through the person routes with forged headers
  *     (x-bka-origin, x-bka-internal, a launch pass it does not have) or a person's own sign-in
  *     cookie without the window's launch pass.
  *  3. Approval fatigue: an agent that asks more than ASKS_PER_HOUR_BEFORE_PAUSE times in an hour is
  *     paused, and a paused agent can do nothing, reads included, until a person resumes it.
+ *  4. An outside send always asks; a batch approval takes one kind of work only.
+ *  5. Every restore is the file Admin's, approved at the host one request at a time (never under
+ *     standing permission), and the restored books keep no agent: every token is refused, nothing
+ *     that waited runs, standing permission is over, until a person lets an agent in again.
  *
  * Only the mail transport is replaced, and no desktop shell is running
  * (test/helpers/agentSecretsScenario.ts). next/headers stands in for the request a route is called
@@ -32,7 +36,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { NextRequest } from 'next/server';
 
 const h = vi.hoisted(() => ({ headers: new Map<string, string>(), cookies: new Map<string, string>() }));
@@ -47,7 +51,9 @@ import { COMPANY_COOKIE } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/headers';
 import { LAUNCH_PASS_COOKIE, LAUNCH_PASS_HEADER } from '@/lib/net/launchPass';
 import { AGENT_PAUSED_MESSAGE, getAgentContext } from '@/lib/agentContext';
-import { AGENTS_BLOCKED_MESSAGE, agentAccess, createAgent, revokeAgent } from '@/lib/services/agents';
+import { AGENTS_BLOCKED_MESSAGE, agentAccess, createAgent, revokeAgent, revokeAllAgents } from '@/lib/services/agents';
+import { COMPANY_BACKUP_TABLE_NAMES, exportCompanyData } from '@/lib/services/backup';
+import { endAgentAccessInRestoredBooks } from '@/lib/services/portableFile';
 import { createRole } from '@/lib/services/users';
 import {
   AGENT_VERBS,
@@ -1024,21 +1030,16 @@ describe("a role an agent holds is as much a person's to change as the agent its
     expect(open.filter((o) => o.method !== 'GET' || o.class !== 'read').map((o) => `${o.id} (${o.method}, ${o.class})`)).toEqual([]);
   });
 
-  // FAILS today (wave 3, tests-secrets): roles.update and roles.delete are open to agents (class
-  // admin, availability 'agent'), and nothing refuses them on a role an agent holds. lib/agent
-  // (bridge, guards, operate) never looks at which roles agents hold, and lib/services/users.ts
-  // updateRole and deleteRole look at people's role assignments only. Mallory (Admin role) asks to
-  // widen Clerk Agent's role; the card says "Change what role <id> allows" and nothing on it says an
-  // agent holds the role; an Admin says yes and the run is 'executed'. Clerk Agent's access changes
-  // at once, since lib/services/agents.ts agentAccess reads an agent's ceiling live from its role
-  // definitions. That is the hard floor of plan 4.6 / D9 ("change any agent's role"), and the
-  // classification's own note on PATCH and DELETE /api/roles/[id]
-  // (lib/agent/operations/classes/admin.ts) says the bridge must refuse it when any agent holds the
-  // role. Every way through is collected, so the failure lists them all (today: the dry run and the
-  // asked run of all four, each approved and executed, and both agents' access changed). Standing
-  // permission is asked for too: it is refused today (class admin is never grantable), and should
-  // that change, a run under it must still be refused on a role an agent holds.
-  it.fails("no agent may change or delete a role an agent holds: another agent's, or its own", async () => {
+  // The hard floor of plan 4.6 / D9: a role an agent holds is part of that agent, and agentAccess
+  // (lib/services/agents.ts) reads an agent's ceiling live from its roles, so changing the role
+  // changes the agent. Refused on every path, before anyone is asked: the door
+  // (lib/agent/operate.ts roleHeldRefusal, and ROLE_GRANT_NOTE for standing permission), the bridge
+  // (lib/agent/bridge.ts heldRoleRefusal) and the service's own backstop (lib/services/users.ts
+  // refuseAgentOnAgentRole). Every way through is collected, so a failure lists them all. Each
+  // refusal must say why: that an agent holds the role (a refusal for some other reason, such as a
+  // missing right, would hide the hole if that reason went away). Standing permission is asked
+  // for too: it must be refused, and should it ever be given, a run under it must still be refused.
+  it("no agent may change or delete a role an agent holds: another agent's, or its own", async () => {
     const before = await heldRoles();
     const access = { clerk: await accessOf(clerk), keeper: await accessOf(keeper) };
     const letThrough: string[] = [];
@@ -1046,16 +1047,24 @@ describe("a role an agent holds is as much a person's to change as the agent its
       permissions: { banking: ['full'], customers: ['full'], vendors: ['full'], accounting: ['full'], users: ['full'], file_utilities: ['full'] },
       flags: { closedPeriod: true, fullAccountNumbers: true },
     };
-    const cases: Array<{ who: ScenarioAgent; what: string; operation: string; role: string; body?: unknown }> = [
-      { who: mallory, what: "Mallory widens Clerk Agent's role", operation: 'roles.update', role: clerkRole, body: wider },
-      { who: keeper, what: 'Keeper changes its own role', operation: 'roles.update', role: keeperRole, body: { description: 'Changed by the agent that holds it.' } },
+    // `named`: how the refusal may name the role (its id, or its name), so the reader knows which.
+    const cases: Array<{ who: ScenarioAgent; what: string; operation: string; role: string; named: string; body?: unknown }> = [
+      { who: mallory, what: "Mallory widens Clerk Agent's role", operation: 'roles.update', role: clerkRole, named: 'Clerk', body: wider },
+      { who: keeper, what: 'Keeper changes its own role', operation: 'roles.update', role: keeperRole, named: 'Role Keeper', body: { description: 'Changed by the agent that holds it.' } },
       // The deletes last: a role deleted is not there for the cases after it.
-      { who: mallory, what: "Mallory deletes Clerk Agent's role", operation: 'roles.delete', role: clerkRole },
-      { who: keeper, what: 'Keeper deletes its own role', operation: 'roles.delete', role: keeperRole },
+      { who: mallory, what: "Mallory deletes Clerk Agent's role", operation: 'roles.delete', role: clerkRole, named: 'Clerk' },
+      { who: keeper, what: 'Keeper deletes its own role', operation: 'roles.delete', role: keeperRole, named: 'Role Keeper' },
     ];
     const outcomeOf = (r: { answer?: AgentOperationAnswer; error?: ServiceError }) =>
       r.error ? `refused (${r.error.code}: ${r.error.message})` : `${r.answer?.outcome}${r.answer?.summary ? ` "${r.answer.summary}"` : ''}`;
     const isRefused = (r: { answer?: AgentOperationAnswer; error?: ServiceError }) => Boolean(r.error) || r.answer?.outcome === 'refused';
+    /** The refusal's words say an agent holds the role ("an agent holds it", "2 agents hold it"). */
+    const HELD = /an agent holds|agents hold it/;
+    const refusalWords = (r: { answer?: AgentOperationAnswer; error?: ServiceError }) => r.error?.message ?? r.answer?.note ?? '';
+    const saysWhy = (r: { answer?: AgentOperationAnswer; error?: ServiceError }, c: { role: string; named: string }) => {
+      const words = refusalWords(r);
+      return HELD.test(words) && (words.includes(c.role) || words.includes(`"${c.named}"`));
+    };
     const approved = async (requestId: string) => {
       const yes = await settle(approveAgentRequest(await adminCtx(), requestId, {}, { atHost: true }));
       return yes.answer?.status ?? `refused (${yes.error?.message})`;
@@ -1066,12 +1075,16 @@ describe("a role an agent holds is as much a person's to change as the agent its
       const base = { operation: c.operation, params: { id: c.role }, ...(c.body ? { body: c.body } : {}) };
       const tried = await settle(c.who.run({ ...base, dryRun: true }));
       if (!isRefused(tried)) letThrough.push(`${c.what}, as a dry run: ${outcomeOf(tried)}`);
+      else if (!saysWhy(tried, c)) letThrough.push(`${c.what}, as a dry run: refused without saying which role an agent holds: ${outcomeOf(tried)}`);
       const ran = await settle(c.who.run({ ...base, requestId: key('role'), reason: 'Tidy the roles.' }));
       if (!isRefused(ran)) {
         const asked = ran.answer?.outcome === 'asked' ? `; an Admin approves it: ${await approved(ran.answer.requestId!)}` : '';
         letThrough.push(`${c.what}: ${outcomeOf(ran)}${asked}`);
+      } else if (!saysWhy(ran, c)) {
+        letThrough.push(`${c.what}: refused without saying which role an agent holds: ${outcomeOf(ran)}`);
       }
       const ask = await settle(c.who.verb('ask_for_permission', { operation: c.operation, reason: 'Standing permission to tidy the roles.', requestId: key('role-grant'), minutes: 30 }) as Promise<AgentOperationAnswer>);
+      if (!isRefused(ask)) letThrough.push(`${c.what}, standing permission: ${outcomeOf(ask)}`);
       if (ask.answer?.outcome === 'asked' && (await approved(ask.answer.requestId!)) === 'executed') {
         const under = await settle(c.who.run({ ...base, requestId: key('role-under-grant'), reason: 'Tidy the roles.' }));
         if (!isRefused(under)) letThrough.push(`${c.what}, under standing permission an Admin gave: ${outcomeOf(under)}`);
@@ -1082,6 +1095,28 @@ describe("a role an agent holds is as much a person's to change as the agent its
     if ((await accessOf(keeper)) !== access.keeper) letThrough.push("Keeper's access changed");
     expect(letThrough, letThrough.join('\n')).toEqual([]);
   }, 120_000);
+
+  it('a role that an agent comes to hold after the ask is refused again when a person approves', async () => {
+    const admin = await adminCtx();
+    const late = (await createRole(admin, { cloneFrom: 'bookkeeper', name: 'Held Later' })).key;
+    const roleRow = async () => JSON.stringify(await s.db.select().from(companyRoles).where(eq(companyRoles.id, late)));
+    resetAgentRateLimits();
+    // Nobody holds it yet: Mallory's change is asked, as any change of a role is.
+    const a = await mallory.run({ operation: 'roles.update', params: { id: late }, body: { description: 'Widened while nobody looked.' }, requestId: key('role-late'), reason: 'Tidy the roles.' });
+    expect(a.outcome, JSON.stringify(a)).toBe('asked');
+    const before = await roleRow();
+    // Then a person gives the role to an agent, and an Admin approves the waiting change.
+    const holder = await s.makeAgent('Late Holder', 'read_only', { roleKeys: [late] });
+    const holderAccess = await accessOf(holder);
+    const yes = await settle(approveAgentRequest(admin, a.requestId!, {}, { atHost: true }));
+    expect(yes.answer?.status, JSON.stringify(yes.answer?.request.error)).not.toBe('executed');
+    const words = yes.error?.message ?? yes.answer?.request.error ?? '';
+    expect(words).toMatch(/an agent holds it/);
+    // A person reads this note: the role by its name.
+    expect(words).toContain('"Held Later"');
+    expect(await roleRow()).toBe(before);
+    expect(await accessOf(holder)).toBe(holderAccess);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1158,15 +1193,13 @@ describe('an agent that asks too often is paused, and a paused agent can do noth
     expect(made).toEqual([]);
   });
 
-  // FAILS today (wave 3, tests-secrets): the door re-checks the pause only where the policy
-  // decides (run_operation, ask_for_permission, find_operations). With a context taken before the
-  // pause (a call already under way when a person paused it, or the very ask that paused it),
-  // list_my_requests, get_my_permissions, describe_operation, cancel_request and upload_file still
-  // answer: it can still list its requests, withdraw one and stage a file. The way in
-  // (lib/agentContext.ts) refuses every NEW request of a paused agent (the test above), so this is
-  // defence in depth only. lib/agent/operate.ts handleVerb could read the pause once per call
-  // (loadAgentPolicy, isPaused) and refuse every verb, as it does for run_operation.
-  it.fails('…and no other verb answers it either: its requests, its permissions, staged files', async () => {
+  // With a context taken before the pause (a call already under way when a person paused it, or the
+  // very ask that paused it), the way in (lib/agentContext.ts) is behind it: the door itself reads
+  // the pause once per call for every verb (lib/agent/operate.ts handleVerb, stoppedNote), so it
+  // cannot list its requests, withdraw one or stage a file. Each must be refused BECAUSE it is
+  // paused: any other error (a bad argument) would hide a door that stopped checking. Needs the
+  // context taken by the first case of this describe (run the whole describe).
+  it('…and no other verb answers it either: its requests, its permissions, staged files', async () => {
     resetAgentRateLimits();
     const tries: Array<[AgentVerb, Record<string, unknown>]> = [
       ['list_my_requests', {}],
@@ -1179,10 +1212,12 @@ describe('an agent that asks too often is paused, and a paused agent can do noth
     for (const [v, args] of tries) {
       const r = await settle(flood.verbWith(stale, v, args));
       if (!r.error) answered.push(`${v}: ${JSON.stringify(r.answer)?.slice(0, 120)}`);
+      else if (r.error.message !== AGENT_PAUSED_MESSAGE) answered.push(`${v}: refused, but not as paused: ${r.error.code} ${r.error.message}`);
     }
     // The curated read of its requests is that same verb underneath (lib/agent/catalog.ts).
     const curated = await settle(runAgentAction(stale, { action: 'list_my_proposals', input: {} }));
     if (curated.answer && curated.answer.outcome !== 'refused') answered.push(`list_my_proposals: ${JSON.stringify(curated.answer).slice(0, 120)}`);
+    else if (curated.error && curated.error.message !== AGENT_PAUSED_MESSAGE) answered.push(`list_my_proposals: refused, but not as paused: ${curated.error.message}`);
     expect(answered, answered.join('\n')).toEqual([]);
   });
 
@@ -1244,4 +1279,146 @@ describe('the other defences against a steered agent', () => {
     }
     for (const id of [inv.requestId!, bill.requestId!, grant.requestId!]) expect((await card(id)).status).toBe('pending');
   });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Restores: the file Admin's, at the host, and no agent is left able to act afterwards
+// ---------------------------------------------------------------------------
+// Last in the file: its second case takes every agent's access away, as a restore does.
+
+describe('a restore is approved by the file Admin at the host, one at a time, and leaves no agent able to act', () => {
+  /** Every restore an agent may ask for: two replace the whole file, two add new books. */
+  const WHOLE = ['backup.restore', 'backups.restore'];
+  const AS_NEW = ['backup.company.restore', 'portable.restore'];
+  let restorer: ScenarioAgent;
+  let stagedId = '';
+  /** The request each restore made, left waiting for the second case. */
+  const waiting: Record<string, string> = {};
+
+  const inputOf = (id: string): Record<string, unknown> =>
+    id === 'backups.restore'
+      ? { body: { id: 'backup-of-monday' } }
+      : id === 'backup.company.restore'
+        ? { body: { fileId: stagedId }, query: { name: 'Restored Books' } }
+        : { body: { fileId: stagedId } };
+
+  beforeAll(async () => {
+    // The widest an agent gets: the Admin role (D1) and the widest preset.
+    restorer = await s.makeAgent('Restorer', 'full_with_asks', { roleKeys: ['admin'] });
+    resetAgentRateLimits();
+    const bytes = Buffer.from('not really a backup').toString('base64');
+    const up = await restorer.verb('upload_file', { name: 'books.bkp', type: 'application/octet-stream', chunkBase64: bytes, last: true });
+    stagedId = up.file?.fileId ?? '';
+    if (!stagedId) throw new Error('The agent could not stage a file to restore from.');
+  });
+
+  it('each restore is file-Admin and host-only: asked, never run, refused away from the host, and never given standing permission', async () => {
+    for (const id of [...WHOLE, ...AS_NEW]) {
+      const o = operationById(id)!;
+      expect(o, id).toBeTruthy();
+      // The classification's own words: the file Admin, at the computer that holds the company file.
+      expect(o, id).toMatchObject({ class: 'file', fileAdmin: true, hostOnly: true, availability: 'agent' });
+      expect(o.why, id).toMatch(/file Admin/);
+      expect(o.why, id).toMatch(/computer that holds the company file \(host-only\)/);
+      expect(o.why, id).toMatch(WHOLE.includes(id) ? /takes away every agent's access, this one's too/ : /starts with no agent access/);
+
+      resetAgentRateLimits();
+      const a = await restorer.run({ operation: id, requestId: key(`restore-${id}`), reason: 'Go back to Monday.', ...inputOf(id) });
+      // Never run for an agent, whatever its role and preset: a person is asked.
+      expect(a.outcome, `${id}: ${JSON.stringify(a).slice(0, 400)}`).toBe('asked');
+      expect(a.needs, id).toMatchObject({ fileAdmin: true, hostOnly: true });
+      if (WHOLE.includes(id)) expect(a.summary, id).toMatch(/\(ends every agent's access, this one's included\)$/);
+      waiting[id] = a.requestId!;
+
+      // The file Admin in a window away from the host: refused, and the request still waits.
+      const away = await settle(approveAgentRequest(await adminCtx(), a.requestId!, {}, { atHost: false }));
+      expect(away.answer?.status, `${id} approved away from the host`).toBeUndefined();
+      expect(away.error?.code, id).toBe('FORBIDDEN');
+      expect(away.error?.message, id).toMatch(/computer that holds the company file/);
+      expect((await card(a.requestId!)).status, id).toBe('pending');
+
+      // Standing permission: refused when the agent asks, and refused to an Admin who would give it.
+      const ask = await settle(
+        restorer.verb('ask_for_permission', { operation: id, reason: 'Restore whenever needed.', requestId: key(`restore-grant-${id}`), minutes: 30 }) as Promise<AgentOperationAnswer>,
+      );
+      if (ask.error) expect(ask.error.code, `${id}: ${ask.error.message}`).toBe('FORBIDDEN');
+      else expect(ask.answer?.outcome, `${id}: ${JSON.stringify(ask.answer).slice(0, 300)}`).toBe('refused');
+      const give = await settle(
+        createGrant(
+          await adminCtx(),
+          { confirm: [], reveal: false, amount: null, count: null, entityIds: [], accountIds: [], date: null, closedPeriod: false },
+          { agentId: restorer.id, operation: id, constraints: {}, minutes: 30, requestId: null },
+        ),
+      );
+      expect(give.error, `${id}: an Admin gave standing permission`).toBeInstanceOf(ServiceError);
+    }
+    const grants = await s.db.select().from(agentGrants).where(eq(agentGrants.agentId, restorer.id));
+    expect(grants).toEqual([]);
+  }, 120_000);
+
+  it('the restored books keep no agent: every token is refused, nothing waiting runs, standing permission is over, until a person lets an agent in again', async () => {
+    // The code each classification names. A whole-file restore runs revokeAllAgents and
+    // endAgentAccessInRestoredBooks on the restored books (lib/services/backup.ts restoreBackup), a
+    // portable restore the second (lib/services/portableFile.ts restorePortableCompanyFile), and a
+    // company backup never carries the agent tables at all (exportCompanyData).
+    const bodyOf = (file: string, fn: string) => {
+      const src = fs.readFileSync(path.join(process.cwd(), file), 'utf8');
+      const at = src.indexOf(`export async function ${fn}(`);
+      expect(at, `${fn} in ${file}`).toBeGreaterThan(-1);
+      const next = src.indexOf('\nexport ', at + 10);
+      return src.slice(at, next < 0 ? undefined : next);
+    };
+    const restoreBody = bodyOf('lib/services/backup.ts', 'restoreBackup');
+    expect(restoreBody).toMatch(/await revokeAllAgents\(restoredDb\)/);
+    expect(restoreBody).toMatch(/await endAgentAccessInRestoredBooks\(restoredDb\)/);
+    expect(bodyOf('lib/services/portableFile.ts', 'restorePortableCompanyFile')).toMatch(/await endAgentAccessInRestoredBooks\(db\)/);
+    for (const t of ['agents', 'agent_policies', 'agent_permission_requests', 'agent_grants', 'agent_requests']) expect(COMPANY_BACKUP_TABLE_NAMES, t).not.toContain(t);
+    const exported = await exportCompanyData(s.db, s.companyId);
+    const carried = JSON.stringify(exported);
+    // (An agent's id may be in the audit trail it carries, which says who did what; its access may not.)
+    expect(Object.keys(exported.tables).length).toBeGreaterThan(20);
+    for (const a of [writer, mallory, flood, restorer]) expect(carried.includes(a.token), `${a.name}'s token in a company backup`).toBe(false);
+
+    // Standing permission an Admin gave, and a request that waits: both must end.
+    resetAgentRateLimits();
+    const g = await createGrant(
+      await adminCtx(),
+      { confirm: [], reveal: false, amount: null, count: null, entityIds: [], accountIds: [], date: null, closedPeriod: false },
+      { agentId: restorer.id, operation: 'estimates.create', constraints: {}, minutes: 60, requestId: null },
+    );
+    const asked = await restorer.run({ operation: 'company.update', requestId: key('before-restore'), reason: 'Tidy the company name.', body: { name: 'Before The Restore Co' } });
+    expect(asked.outcome, JSON.stringify(asked)).toBe('asked');
+    const stale = await restorer.ctx();
+
+    // The scenario's books stand for the restored ones: what restoreBackup runs on them.
+    expect(await revokeAllAgents(s.db)).toBeGreaterThanOrEqual(4);
+    await endAgentAccessInRestoredBooks(s.db);
+
+    // No agent gets in: not at the way in, not with a context taken before the restore.
+    for (const a of [writer, mallory, flood, restorer]) {
+      const r = await settle(getAgentContext(new Headers({ authorization: `Bearer ${a.token}`, [ROUTE_PATH_HEADER]: '/api/agent/whoami', [ROUTE_METHOD_HEADER]: 'GET' })));
+      expect(r.error, `${a.name} still gets in`).toBeInstanceOf(ServiceError);
+    }
+    resetAgentRateLimits();
+    const after = await settle(restorer.verbWith(stale, 'run_operation', { operation: 'accounts.list' }));
+    expect(after.error?.message).toMatch(/has been removed/);
+    // Nothing waiting runs, even when a person says yes now: the restores, and the change above.
+    for (const id of [...Object.values(waiting), asked.requestId!]) {
+      expect((await card(id)).status, id).toBe('cancelled');
+      const yes = await settle(approveAgentRequest(await adminCtx(), id, {}, { atHost: true }));
+      expect(yes.answer?.status, id).not.toBe('executed');
+    }
+    expect(Object.keys(waiting)).toHaveLength(WHOLE.length + AS_NEW.length);
+    const [co] = await s.db.select({ name: companies.name }).from(companies).where(eq(companies.id, s.companyId));
+    expect(co.name).not.toBe('Before The Restore Co');
+    const [grant] = await s.db.select({ revokedAt: agentGrants.revokedAt }).from(agentGrants).where(eq(agentGrants.id, g.id));
+    expect(grant.revokedAt, 'the standing permission ended').toBeTruthy();
+    const active = await s.db.select({ id: agents.id }).from(agents).where(isNull(agents.revokedAt));
+    expect(active).toEqual([]);
+
+    // A person lets an agent in again (a new one, made in Users & Roles > Agents): only that works.
+    const again = await s.makeAgent('After The Restore', 'read_only');
+    const who = await settle(getAgentContext(new Headers({ authorization: `Bearer ${again.token}`, [ROUTE_PATH_HEADER]: '/api/agent/whoami', [ROUTE_METHOD_HEADER]: 'GET' })));
+    expect(who.error?.message).toBeUndefined();
+  }, 120_000);
 });

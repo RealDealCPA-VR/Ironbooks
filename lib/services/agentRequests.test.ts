@@ -1583,7 +1583,7 @@ describe('secrets never reach the row', () => {
     for (const s of [TYPED, PRODUCED, AGENT_PASSWORD, AGENT_KEY]) expect(audit).not.toContain(s);
   });
 
-  it('the books changed: the new preview and summary are stored without what was typed or produced', async () => {
+  it('the books changed and the new preview repeats what was typed or produced: the request ends, nothing of it is stored', async () => {
     const view = await ask('b', 'test.vendor', { input: { body: { name: 'Vendor', amount: '10.00', taxId: '123-45-6789' } } });
     m.runApproved.mockResolvedValueOnce(
       bridge({
@@ -1595,11 +1595,14 @@ describe('secrets never reach the row', () => {
       }),
     );
     const res = await approveAgentRequest(people.ada, view.id, { secrets: { closing_password: TYPED } }, { atHost: true });
-    expect(res.status).toBe('stale');
+    // Security review, wave 5c F8: a preview that repeats a typed secret is never stored with the
+    // spot masked (that would show the agent which of its words was the password).
+    expect(res.status).toBe('failed');
+    expect(res.request.error).toMatch(/not shown because it repeated a password typed on the card/);
     expect(res.produced).toEqual([]);
     for (const s of [TYPED, PRODUCED]) expect(JSON.stringify(res.request)).not.toContain(s);
     const row = await rowOf(view.id);
-    expect(row.status).toBe('pending');
+    expect(row.status).toBe('failed');
     const everyColumn = JSON.stringify(row);
     for (const s of [TYPED, PRODUCED]) expect(everyColumn).not.toContain(s);
     const agentSees = JSON.stringify(await requestForAgent(agentCtx.b, view.id));
@@ -1608,13 +1611,52 @@ describe('secrets never reach the row', () => {
     for (const s of [TYPED, PRODUCED]) expect(audit).not.toContain(s);
   });
 
-  it('a failed run whose message repeats the typed secret stores the message without it', async () => {
+  it('a failed run whose message repeats the typed secret stores a plain note, never the message with the spot masked', async () => {
     m.runApproved.mockResolvedValue(bridge({ outcome: 'error', result: null, error: { message: `The password ${TYPED} is wrong.`, code: 'FORBIDDEN', details: null } }));
     const view = await ask('a', 'test.enter');
     const res = await approveAgentRequest(people.ada, view.id, { secrets: { closing_password: TYPED } }, { atHost: true });
     expect(res.status).toBe('failed');
-    expect(res.request.error).toBe('The password ••• is wrong.');
+    expect(res.request.error).toMatch(/not shown because it repeated a password typed on the card/);
+    expect(res.request.error).not.toMatch(/•••/);
     expect(JSON.stringify(await rowOf(view.id))).not.toContain(TYPED);
+  });
+
+  // Security review, wave 5c F8: a masked spot in an answer the agent wrote tells it which of its
+  // own guesses was the password the approver typed.
+  it('an approval whose typed password is already in what the agent sent is refused, runs nothing and stays waiting', async () => {
+    m.runApproved.mockClear();
+    const view = await ask('b', 'test.enter', { input: { body: { name: 'Guesses: Closed2025! Acme2025 ' + TYPED + ' Winter#1', amount: '10.00' } } });
+    await expectError(
+      approveAgentRequest(people.ada, view.id, { secrets: { closing_password: TYPED } }, { atHost: true }),
+      'VALIDATION',
+      /already contains the password you typed/,
+    );
+    expect(m.runApproved).not.toHaveBeenCalled();
+    const row = await rowOf(view.id);
+    expect(row.status).toBe('pending');
+    expect(row.decidedBy).toBeNull();
+    expect(JSON.stringify(await requestForAgent(agentCtx.b, view.id))).not.toMatch(/already contains|•••/);
+  });
+
+  it('the same guess in the reason is refused too; a password too short to look for is not', async () => {
+    const view = await ask('b', 'test.enter', { reason: 'Maybe the password is ' + TYPED });
+    await expectError(approveAgentRequest(people.ada, view.id, { secrets: { closing_password: TYPED } }, { atHost: true }), 'VALIDATION', /already contains/);
+    m.runApproved.mockResolvedValue(bridge());
+    const other = await ask('b', 'test.enter', { input: { body: { name: 'Record ab', amount: '10.00' } } });
+    const res = await approveAgentRequest(people.ada, other.id, { secrets: { closing_password: 'ab' } }, { atHost: true });
+    expect(res.status).toBe('executed');
+  });
+
+  it('an answer that repeats the typed password is withheld whole: no masked spot shows where it was', async () => {
+    m.runApproved.mockResolvedValue(bridge({ result: { id: 'rec-1', memo: `one ${TYPED} two`, other: 'Acme2025' } }));
+    const view = await ask('b', 'test.enter');
+    const res = await approveAgentRequest(people.ada, view.id, { secrets: { closing_password: TYPED } }, { atHost: true });
+    expect(res.status).toBe('executed');
+    const agentSees = JSON.stringify(await requestForAgent(agentCtx.b, view.id));
+    expect(agentSees).not.toContain(TYPED);
+    expect(agentSees).not.toContain('Acme2025');
+    expect(agentSees).not.toMatch(/one ••• two/);
+    expect(agentSees).toMatch(/withheld this answer/);
   });
 
   it('a password typed as a desktop flow\'s answer is kept out of the stored error too', async () => {
@@ -1623,7 +1665,7 @@ describe('secrets never reach the row', () => {
     const view = await ask('a', 'test.enter');
     const res = await approveAgentRequest(people.ada, view.id, { answers: { filePassword: ANSWER, overwrite: 'yes' } }, { atHost: true });
     expect(m.runApproved.mock.calls[0][2].answers).toEqual({ filePassword: ANSWER, overwrite: 'yes' });
-    expect(res.request.error).toBe('Could not open with •••.');
+    expect(res.request.error).toMatch(/not shown because it repeated a password typed on the card/);
     expect(JSON.stringify(await rowOf(view.id))).not.toContain(ANSWER);
   });
 

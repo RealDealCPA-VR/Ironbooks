@@ -313,30 +313,42 @@ const OWN_FIELD = /(?:At|_at)$|^id$|^entryNumber$/;
 const ID_IN_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
 /**
- * Where the preview a person was shown and the one a later try made differ, record kind by record
- * kind ("transaction_rule.priority: [8] then [9]"), with what a run gives itself left out: a
- * record's own id, times, the entry number, and every id of a record that try made (it creates
- * it), wherever it shows, written "(made)". A reference to a record that was there before (the
- * line, the account, a rule) is compared as it is, as the staleness key compares it. A record that
- * existed is compared on its fields before and after. For explaining a 'stale' answer; empty when
- * the two agree on everything else.
+ * Where the preview a person was shown and the one a later try made differ, part by part, with
+ * what a run gives itself left out: a record's own id, times, the entry number, and every id of a
+ * record that try made (it creates it), wherever it shows, written "(made)". A reference to a
+ * record that was there before (the line, the account, a rule) is compared as it is, as the
+ * staleness key compares it. The parts, as lib/agent/bridge.ts stalenessKeyOf hashes them:
+ *  - the records, kind by kind ("transaction_rule.priority: [8] then [9]"); a record that existed
+ *    is compared on its fields before and after;
+ *  - the ledger ("ledger entry: [...] then [...]"): each entry by its date, description, status,
+ *    source and lines (account, debit, credit, memo, name, class), its number left out;
+ *  - the effects ("effect email: [...] then [...]"): each by its summary and detail.
+ * For explaining a 'stale' answer; empty when the two agree on everything else.
  */
 export function previewDifferences(shown: OperationPreview | null | undefined, now: OperationPreview | null | undefined): string[] {
   const valuesOf = (p: OperationPreview | null | undefined) => {
     const records = p?.records ?? [];
-    const made = new Set(records.filter((r) => r.action === 'create').map((r) => String(r.id).toLowerCase()));
+    const made = new Set(
+      [...records, ...(p?.ledger?.changes ?? [])].filter((r) => r.action === 'create').map((r) => String(r.id).toLowerCase()),
+    );
     const value = (v: unknown) => (JSON.stringify(v ?? null) ?? 'null').replace(ID_IN_TEXT, (id) => (made.has(id.toLowerCase()) ? '(made)' : id));
     const out = new Map<string, string[]>();
+    const add = (k: string, v: string) => out.set(k, [...(out.get(k) ?? []), v]);
     for (const r of records) {
       const own = made.has(String(r.id).toLowerCase());
-      const kind = `${r.kind} ${r.action}`;
-      out.set(kind, [...(out.get(kind) ?? []), own ? '(record)' : String(r.id).toLowerCase()]);
+      add(`${r.kind} ${r.action}`, own ? '(record)' : String(r.id).toLowerCase());
       for (const f of r.fields ?? []) {
         if (OWN_FIELD.test(f.field)) continue;
-        const k = `${r.kind}.${f.field}`;
-        out.set(k, [...(out.get(k) ?? []), own ? value(f.after) : `${value(f.before)} to ${value(f.after)}`]);
+        add(`${r.kind}.${f.field}`, own ? value(f.after) : `${value(f.before)} to ${value(f.after)}`);
       }
     }
+    for (const e of p?.ledger?.entries ?? []) {
+      const lines = e.lines
+        .map((l) => ({ account: l.accountId, debit: l.debit, credit: l.credit, memo: l.memo, name: l.entityName, class: l.className ?? null }))
+        .sort((x, y) => JSON.stringify(x).localeCompare(JSON.stringify(y)));
+      add('ledger entry', value({ id: e.journalEntryId, date: e.date, description: e.description, status: e.status, source: e.source, lines }));
+    }
+    for (const x of p?.effects ?? []) add(`effect ${x.kind}`, value({ summary: x.summary, detail: x.detail }));
     return out;
   };
   const a = valuesOf(shown);

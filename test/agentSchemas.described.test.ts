@@ -59,36 +59,14 @@ const root = path.resolve(__dirname, '..');
  * Enter / change operations whose route reads a JSON body by hand, with no zod schema (so
  * describe_operation shows no body). Take an operation off when its route gets a schema; never add
  * one. The count below is the length of this list and may only go down.
+ *
+ * Empty since wave 5: the 26 routes that read their body by hand (ai.posts.undo, assemblies.*,
+ * bank-accounts.create, billing-groups.*, sales-reps.* and the rest) all have a schema in
+ * lib/validation now. A new route that reads a body with no schema fails the first expectation of
+ * the test below; give it a schema rather than a place here.
  */
-const KNOWN_NO_SCHEMA = [
-  'ai.posts.undo',
-  'assemblies.pending.create',
-  'assemblies.replace',
-  'assemblies.update',
-  'bank-accounts.create',
-  'billing-groups.create',
-  'billing-groups.update',
-  'currencies.fx-adjustment',
-  'custom-fields.values',
-  'customer-prices.create',
-  'demo-feed',
-  'errors.apply',
-  'fifo.adjust',
-  'inventory-transfers.action',
-  'invoices.post-draft',
-  'landed-cost.action',
-  'lists.action',
-  'pay-liabilities.by-item.pay',
-  'pay-liabilities.checks.action',
-  'print-queue.refunds.add',
-  'reconciliations.pay',
-  'sales-forms.flags.update',
-  'sales-reps.assign',
-  'sales-reps.create',
-  'sales-reps.update',
-  'sales-tax.payments.action',
-];
-const KNOWN_NO_SCHEMA_MAX = 26;
+const KNOWN_NO_SCHEMA: string[] = [];
+const KNOWN_NO_SCHEMA_MAX = 0;
 
 /** The texts the shared helpers carry: right for a field nobody described, not a description of it. */
 const GENERIC_TEXTS = new Set(

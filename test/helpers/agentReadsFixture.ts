@@ -663,13 +663,11 @@ export const REFUSED_BY_DESIGN: Readonly<Record<string, string>> = {
 /**
  * FINDINGS: reads the registry offers to agents as class 'read' whose route refuses every agent,
  * with why. The purity test keeps each as an it.fails case that turns red the day it answers.
+ * Empty since wave 5: the two that were here (companies.list, file-protection.status) are a
+ * person's own routes and are no longer offered to agents at all (classes/admin.ts person_only);
+ * the purity test checks that the bridge refuses them.
  */
-export const NOT_FOR_AGENTS: Readonly<Record<string, string>> = {
-  'companies.list':
-    "GET /api/companies is a person's own route ('self' in lib/permissions/routes.ts: it reads getSessionGate), so inside the bridge it answers 403 \"This is not available to agents.\"; the registry (classes/admin.ts) files it as a read open to agents",
-  'file-protection.status':
-    "GET /api/file-protection is a person's own route ('self'), so inside the bridge it answers 403 \"This is not available to agents.\"; the registry (classes/admin.ts) files it as a read open to agents",
-};
+export const NOT_FOR_AGENTS: Readonly<Record<string, string>> = {};
 
 /** Every label on the three lists, with the list it is on. */
 export const LEFT_OUT: ReadonlyArray<readonly [label: string, list: 'KNOWN' | 'REFUSED_BY_DESIGN' | 'NOT_FOR_AGENTS']> = [

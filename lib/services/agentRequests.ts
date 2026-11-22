@@ -494,31 +494,71 @@ function maskedInput(input: OperationInput | null, sensitiveFields: readonly str
   return stripSecrets(copy);
 }
 
-/** Text with every secret the approver typed (or a run produced) taken out. */
-function scrubText(text: string, secrets: readonly string[], fallback: string): string {
-  let out = text;
-  for (const s of secrets) {
-    if (!s) continue;
-    if (s.length < 3) {
-      // Too short to cut out safely: say nothing of the original rather than risk showing it.
-      if (out.includes(s)) return fallback;
-      continue;
-    }
-    out = out.split(s).join(MASKED);
-  }
-  return out;
+/**
+ * Whether any secret the approver typed (or a run produced) appears anywhere in the value: its
+ * text, its keys, nested. A secret is never cut out of the place it appears: the agent wrote much
+ * of what a route answers (memos, names, descriptions), so a masked spot would tell it which of
+ * its own guesses was the password (security review, wave 5c F8). The whole value is withheld.
+ */
+function holdsSecret(v: unknown, secrets: readonly string[]): boolean {
+  const live = secrets.filter((s) => typeof s === 'string' && s.length > 0);
+  if (!live.length) return false;
+  const seen = (t: string) => live.some((s) => t.includes(s));
+  const walk = (x: unknown, depth: number): boolean => {
+    if (depth > 64) return true;
+    if (typeof x === 'string') return seen(x);
+    if (typeof x === 'number' || typeof x === 'bigint') return seen(String(x));
+    if (Array.isArray(x)) return x.some((y) => walk(y, depth + 1));
+    if (isPlainObject(x)) return Object.entries(x).some(([k, y]) => seen(k) || walk(y, depth + 1));
+    return false;
+  };
+  return walk(v, 0);
 }
 
+/** Text with no secret the approver typed (or a run produced) in it: the text, or the fallback. */
+function scrubText(text: string, secrets: readonly string[], fallback: string): string {
+  return holdsSecret(text, secrets) ? fallback : text;
+}
+
+/** What is kept of an answer that repeated a secret: a note, never the answer with the spot masked. */
+const SECRET_WITHHELD_NOTE =
+  'Ironbooks withheld this answer because it repeated a password typed on the card. The work itself ended as the status says.';
+
 function scrubDeep(v: unknown, secrets: readonly string[]): unknown {
-  if (!secrets.length) return v;
-  if (typeof v === 'string') return scrubText(v, secrets, MASKED);
-  if (Array.isArray(v)) return v.map((x) => scrubDeep(x, secrets));
-  if (isPlainObject(v)) {
-    const out: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(v)) out[k] = scrubDeep(val, secrets);
-    return out;
-  }
-  return v;
+  return holdsSecret(v, secrets) ? { withheld: SECRET_WITHHELD_NOTE } : v;
+}
+
+/** A failure message that repeated a typed secret: said plainly, without the message. */
+const SECRET_IN_MESSAGE =
+  'Ironbooks could not finish this work. Its message is not shown because it repeated a password typed on the card.';
+
+/** Every value typed on the card for this approval: the secrets, and a desktop flow's password answers. */
+function typedOnCard(input: { secrets: Partial<Record<string, string>>; answers?: Record<string, unknown> }, shellDef: { questions?: readonly { id: string; kind?: string }[] } | null): string[] {
+  const passwordQuestions = new Set((shellDef?.questions ?? []).filter((q) => q.kind === 'password').map((q) => q.id));
+  return [
+    ...Object.values(input.secrets),
+    ...Object.entries(input.answers ?? {})
+      .filter(([k, v]) => isSecretField(k, v) || (passwordQuestions.has(k) && (typeof v === 'string' || typeof v === 'number')))
+      .map(([, v]) => String(v)),
+  ].filter((s): s is string => typeof s === 'string' && s.length > 0);
+}
+
+/** Shortest typed value looked for in the agent's own words: shorter ones would match almost any text. */
+const AGENT_TEXT_SECRET_MIN = 4;
+
+/**
+ * Refuse an approval whose typed password already appears in what the agent wrote (its input, its
+ * reason, the line it asked for). An agent that writes candidate passwords into a memo or a name
+ * and waits for the approver to type the real one is guessing it. Nothing is claimed or run, the
+ * request stays waiting (the agent learns nothing new), and only the approver is told.
+ */
+function refuseSecretInAgentText(row: Row, typed: readonly string[]): void {
+  const long = typed.filter((s) => s.length >= AGENT_TEXT_SECRET_MIN);
+  if (!long.length) return;
+  if (!holdsSecret([row.input, row.reason, row.summary], long)) return;
+  throw validation(
+    'What the agent sent already contains the password you typed. An agent that writes passwords into its own request may be trying to find one out. Nothing was done: deny this request, and pause the agent while you check what it was reading.',
+  );
 }
 
 const UNEXPECTED_MESSAGE =
@@ -2550,6 +2590,7 @@ async function approveRequest(
   // What the run will be refused without is typed before anything is claimed (the first of two
   // approvals types nothing: the second approver's run is the one that needs it).
   if (!firstOfTwo && meta.kind === 'operation') checkTypedSecrets(target, needs, input.secrets);
+  if (!firstOfTwo) refuseSecretInAgentText(row, typedOnCard(input, shellDef));
 
   if (firstOfTwo) {
     // D8: the first of two different people. Nothing runs yet; nothing typed is kept.
@@ -2664,13 +2705,7 @@ async function carryOut(c: ClaimedRun): Promise<ApproveResult> {
 
   // Typed on the card: never in the row, the audit trail or an error. A desktop flow's answer named
   // like a password, or to a question that asks for one, counts too.
-  const passwordQuestions = new Set((shellDef?.questions ?? []).filter((q) => q.kind === 'password').map((q) => q.id));
-  const typed = [
-    ...Object.values(input.secrets),
-    ...Object.entries(input.answers ?? {})
-      .filter(([k, v]) => isSecretField(k, v) || (passwordQuestions.has(k) && (typeof v === 'string' || typeof v === 'number')))
-      .map(([, v]) => String(v)),
-  ].filter((s): s is string => typeof s === 'string' && s.length > 0);
+  const typed = typedOnCard(input, shellDef);
 
   if (meta.kind === 'grant') {
     let made: Awaited<ReturnType<typeof createGrant>> | null = null;
@@ -2722,7 +2757,9 @@ async function carryOut(c: ClaimedRun): Promise<ApproveResult> {
 
   // A desktop flow has no staleness key and is never previewed by running it: anything but a
   // committed run that worked ends it as failed, for good, so it is never claimed or run again.
-  if (r.mode === 'dry_run' && r.outcome === 'ok' && !shellDef) {
+  // A new preview that repeats a typed secret is never stored or shown: the request ends instead.
+  const previewHoldsSecret = r.mode === 'dry_run' && holdsSecret([r.preview, r.result], hide);
+  if (r.mode === 'dry_run' && r.outcome === 'ok' && !shellDef && !previewHoldsSecret) {
     // The books changed since the agent asked (plan §7.4): nothing ran. The person sees what would
     // happen now and approves again with acceptStale; every approval so far is set aside.
     const back = await backToWaiting(person, claimed, target, r, hide);
@@ -2754,7 +2791,13 @@ async function carryOut(c: ClaimedRun): Promise<ApproveResult> {
       grantError = scrubText(why, hide, GRANT_NOT_GIVEN_MESSAGE);
     }
   }
-  const failed = ok ? null : shellDef && r.mode === 'dry_run' && r.outcome === 'ok' ? UNEXPECTED_MESSAGE : failureMessage(r);
+  const failed = ok
+    ? null
+    : previewHoldsSecret && r.outcome === 'ok'
+      ? SECRET_IN_MESSAGE
+      : shellDef && r.mode === 'dry_run' && r.outcome === 'ok'
+        ? UNEXPECTED_MESSAGE
+        : failureMessage(r);
   // An approved reveal (D6): the full values stay readable by the agent for a while after the run,
   // then are masked for good; the audit trail words what was revealed, to whom, approved by whom.
   const revealed = ok && isReveal(row);
@@ -2764,7 +2807,7 @@ async function carryOut(c: ClaimedRun): Promise<ApproveResult> {
     target,
     {
       status: ok ? 'executed' : 'failed',
-      error: failed === null ? null : scrubText(changedUnder ? `${BOOKS_CHANGED_FAILED} ${failed}` : failed, hide, UNEXPECTED_MESSAGE),
+      error: failed === null ? null : scrubText(changedUnder ? `${BOOKS_CHANGED_FAILED} ${failed}` : failed, hide, SECRET_IN_MESSAGE),
       answer: ok ? scrubDeep(stripSecrets(jsonCopy(r.result ?? null)), hide) : null,
       file: ok && r.file ? jsonCopy(r.file) : null,
       ...committedLedger(r, target),

@@ -9,14 +9,18 @@
  *  - the dry run leaves the database as it was: the row count and a checksum of every table,
  *    the ledger tables among them, and the transaction log, before and after;
  *  - two dry runs in a row give the same staleness key;
- *  - the dry run's ledger preview (date, status, description, and the account, debit, credit and
- *    memo of every line; ids in the words put aside) is what the real run then posts: the entries
- *    it made, and the entries that already existed that it voided, deleted or changed (their lines
- *    and status as the real run left them). An account the run makes itself (Opening Balance
- *    Equity, say) is matched by its code and name: each run makes its own. The name (customer,
- *    vendor …) and class of each line the dry run made are compared too: the preview does not
- *    carry them (lib/agent/actions.ts PostingLine), so they are read in the dry run's own
- *    transaction, just before it is rolled back, by a pass-through on changesInTransaction;
+ *  - the dry run's ledger preview (date, status, description, source, and the account, debit,
+ *    credit and memo of every line; ids in the words put aside) is what the real run then posts:
+ *    the entries it made, and the entries that already existed that it voided, deleted or changed
+ *    (their lines and status as the real run left them). An account the run makes itself (Opening
+ *    Balance Equity, say) is matched by its code and name: each run makes its own. The name
+ *    (customer, vendor …) and class of each line the dry run made, and each new entry's reference,
+ *    are compared too: the preview does not carry them (lib/agent/actions.ts PostingEntry,
+ *    PostingLine), so they are read in the dry run's own transaction, just before it is rolled
+ *    back, by a pass-through on changesInTransaction. In a source or a reference, an id the run
+ *    made itself (also cut to its first 8 hex digits, a paycheck's reference) or one that names no
+ *    row (made up by the run, "assembly_build:<id>") is written "(new)"; the id of a record that
+ *    was there before is compared as it is;
  *  - the dry run's record diffs name the same records (action, kind, id) and the same changed
  *    fields as the audit rows the real run wrote, all of them, whichever handle wrote them. A
  *    record's id is compared as it is, except for a record the run made itself (an audit 'create'
@@ -25,10 +29,14 @@
  *    preview with nothing in it for a real run that keeps rows (with no audit row for them) is a
  *    difference: the person would be shown nothing of what they approve;
  *  - the amount in the dry run's facts is what the real run posted: the largest entry for an
- *    operation with an amount field, all of it for one without, "0.00" when it posted nothing,
- *    compared by size (the policy reads an amount by its size; a sign is a note). An amount field
- *    that could not be read stays unknown (fail closed, a decision of this feature): that is not a
- *    difference, but it is listed in the report (PARITY_REPORT below);
+ *    operation with an amount field, all of it for one without, compared by size (the policy reads
+ *    an amount by its size; a sign is a note). A run of an operation with no amount field that
+ *    posted and touched no entry: "0.00" when it only made new records, and unknown (null) when it
+ *    voided, deleted or changed a record that was there before it (an audit row other than
+ *    'create', of a record it did not make): money may move that no entry shows. An amount field
+ *    that could not be read stays unknown too. All three are decisions of this feature (fail
+ *    closed); an unknown amount field is not a difference, but it is listed in the report
+ *    (PARITY_REPORT below);
  *  - and, tested on its own in a second set of cases: the dry run an approval makes, as another
  *    person of the company (runApproved, lib/agent/operate.ts), gives the key the agent's dry run
  *    gave (the one the request stored), and keeps nothing either.
@@ -70,11 +78,13 @@ const h = vi.hoisted(() => ({
   handler: null as null | ((req: Request) => Promise<Response>),
   /** The lines of the entries the last run made, read just before its transaction ended (null: not read). */
   madeLines: null as null | MadeLine[],
+  /** The reference of each entry the last run made, by entry id, read beside its lines (null: not read). */
+  madeRefs: null as null | Map<string, string | null>,
 }));
 
 // A pass-through: the preview as the app builds it, and, beside it, the name and class of every
-// line it lists, read in the same transaction (so a dry run's, before it is rolled back) in the
-// same order as changesInTransaction lists them. Nothing is written.
+// line it lists and the reference of every entry, read in the same transaction (so a dry run's,
+// before it is rolled back) in the same order as changesInTransaction lists them. Nothing is written.
 vi.mock('./actions', async (orig) => {
   const real = await orig<typeof import('./actions')>();
   const { sql: q } = await import('drizzle-orm');
@@ -89,6 +99,10 @@ vi.mock('./actions', async (orig) => {
          WHERE je.company_id = ${ctx.companyId} AND je.created_at = now()
          ORDER BY je.entry_number, (l.debit IS NULL OR l.debit = 0), l.id`)) as unknown as { rows: MadeLine[] };
       h.madeLines = res.rows;
+      const refs = (await ctx.db.execute(q`
+        SELECT je.id::text AS id, je.reference FROM journal_entries je
+         WHERE je.company_id = ${ctx.companyId} AND je.created_at = now()`)) as unknown as { rows: Array<{ id: string; reference: string | null }> };
+      h.madeRefs = new Map(refs.rows.map((r) => [r.id.toLowerCase(), r.reference]));
       return out;
     },
   };
@@ -158,6 +172,8 @@ let policy: AgentPolicy;
 let agentBase: ServiceContext;
 let world: ParityWorld;
 let tableNames: string[] = [];
+/** The tables whose rows have a uuid `id`: where an id in a source or a reference may name a row. */
+let idTables: string[] = [];
 /** A second person of the company (Full Access) who approves the agent's requests: not the person who made the agent. */
 let approver: ServiceContext;
 /** The agent's ceiling as the approval loads it, as the approver (runApproved, lib/agent/operate.ts). */
@@ -211,8 +227,10 @@ const run = (operation: Operation, input: OperationInput, mode: 'dry_run' | 'com
 /**
  * The actor of the dry run an approval makes before the real run (runApproved in lib/agent/operate.ts):
  * the approving person's own context as the base, their access within the agent's ceiling, the
- * lower of their role and the ceiling's, the policy's folders, and neither the reveal nor typed
- * secrets. Approved at the desktop window (atHost). Its key is compared with the one the agent's
+ * lower of their role and the ceiling's, the policy's folders, no reveal, and of the secrets the
+ * approver typed only the closing-date password (dryRunSecrets there). No case dates anything in a
+ * closed period, so none is typed and `secrets` stays empty, as it is in the app for these
+ * requests. Approved at the desktop window (atHost). Its key is compared with the one the agent's
  * dry run gave (the one the request stored): when they differ, the person is told the books
  * changed and has to say yes again on a preview that shows the same thing.
  */
@@ -291,14 +309,26 @@ interface EntryState {
   date: string;
   description: string | null;
   entryNumber: number | null;
+  reference: string | null;
+  source: string | null;
   hash: string;
   total: string;
 }
 
-/** Every journal entry of the company: its status, date, total debits and a hash of it and its lines. */
+/** Every journal entry of the company: its status, date, reference, source, total debits and a hash of it and its lines. */
 async function entries(): Promise<Map<string, EntryState>> {
-  const rows = await rowsOf<{ id: string; status: string; date: string; description: string | null; entry_number: number | string | null; hash: string; total: string }>(sql`
-    SELECT je.id::text AS id, je.status::text AS status, je.date::text AS date, je.description, je.entry_number,
+  const rows = await rowsOf<{
+    id: string;
+    status: string;
+    date: string;
+    description: string | null;
+    entry_number: number | string | null;
+    reference: string | null;
+    source_ref: string | null;
+    hash: string;
+    total: string;
+  }>(sql`
+    SELECT je.id::text AS id, je.status::text AS status, je.date::text AS date, je.description, je.entry_number, je.reference, je.source_ref,
            md5(je::text || coalesce((SELECT string_agg(l::text, '|' ORDER BY l.id) FROM journal_entry_lines l WHERE l.journal_entry_id = je.id), '')) AS hash,
            coalesce((SELECT sum(l.debit) FROM journal_entry_lines l WHERE l.journal_entry_id = je.id), 0)::text AS total
       FROM journal_entries je
@@ -311,6 +341,8 @@ async function entries(): Promise<Map<string, EntryState>> {
         date: String(r.date).slice(0, 10),
         description: r.description,
         entryNumber: r.entry_number === null ? null : Number(r.entry_number),
+        reference: r.reference,
+        source: r.source_ref,
         hash: r.hash,
         total: r.total,
       },
@@ -351,6 +383,38 @@ async function accountIds(): Promise<Set<string>> {
 
 const accountOf = (existing: ReadonlySet<string>, id: string, code: string | null, name: string) =>
   existing.has(id.toLowerCase()) ? id.toLowerCase() : `(new account ${code ?? ''} ${name})`;
+
+/** Of these ids, the ones that name a row of any table now. */
+async function idsThatNameARow(ids: Iterable<string>): Promise<Set<string>> {
+  const list = [...new Set([...ids].map((id) => id.toLowerCase()))].filter((id) => /^[0-9a-f-]{36}$/.test(id));
+  if (!list.length || !idTables.length) return new Set();
+  // Ids passed the pattern above (hex digits and dashes only), and the table names come from the
+  // database's own catalogue, so both can be written in place.
+  const arr = `ARRAY[${list.map((id) => `'${id}'`).join(',')}]::uuid[]`;
+  const rows = await rowsOf<{ id: string }>(sql.raw(idTables.map((t) => `SELECT id::text AS id FROM "${t}" WHERE id = ANY(${arr})`).join(' UNION ')));
+  return new Set(rows.map((r) => r.id.toLowerCase()));
+}
+
+/** The uuids in these texts. */
+const uuidsIn = (...texts: Array<string | null | undefined>): string[] => texts.flatMap((t) => (t ?? '').toLowerCase().match(UUID_RE) ?? []);
+
+/**
+ * A new entry's source or reference as the comparison writes it. An id the run made itself
+ * (`made`), or one that names no row (`rows`: the ids of it that do), is "(new)": each run makes
+ * its own, or makes one up ("assembly_build:<id>"). So is a run of 8 hex digits that begins an id
+ * the run made (a paycheck's reference is the first 8 of the paycheck's id). The id of a record
+ * that was there before stays as it is: a source or reference naming another record is a
+ * difference. The entry's own number in its reference (a General Journal entry's) is "(its no.)",
+ * as entry numbers are notes, not differences.
+ */
+function refText(v: string | null, made: ReadonlySet<string>, rows: ReadonlySet<string>, entryNumber: number | null): string {
+  if (v === null || v === '') return '-';
+  if (entryNumber !== null && v === String(entryNumber)) return '(its no.)';
+  const prefixes = [...made].map((id) => id.slice(0, 8));
+  return v
+    .replace(UUID_RE, (m) => (made.has(m.toLowerCase()) || !rows.has(m.toLowerCase()) ? '(new)' : m.toLowerCase()))
+    .replace(/(?<![0-9a-f-])[0-9a-f]{8}(?![0-9a-f-])/gi, (m) => (prefixes.includes(m.toLowerCase()) ? '(new)' : m));
+}
 
 /**
  * The lines of these entries as the real run left them, their memos as the run's access may show
@@ -419,8 +483,8 @@ const words = (v: string | null) => (v ?? '').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[
 const lineText = (l: Line) =>
   `${l.account} Dr ${l.debit ?? '-'} Cr ${l.credit ?? '-'}${l.memo ? ` "${words(l.memo)}"` : ''}` +
   `${l.name === undefined ? '' : ` for ${l.name}`}${l.cls === undefined ? '' : ` class ${l.cls}`}`;
-const entryText = (date: string, status: string | null, description: string | null, lines: Line[]) =>
-  `${date}${status ? ` ${status}` : ''} "${words(description)}": ${lines.map(lineText).sort().join('; ')}`;
+const entryText = (date: string, status: string | null, description: string | null, lines: Line[], refs?: { source: string; reference: string }) =>
+  `${date}${status ? ` ${status}` : ''} "${words(description)}"${refs ? ` source ${refs.source} ref ${refs.reference}` : ''}: ${lines.map(lineText).sort().join('; ')}`;
 
 /** What is in `a` and not in `b`, and the other way round, as multisets. */
 function multisetDiff(a: string[], b: string[]): { onlyA: string[]; onlyB: string[] } {
@@ -572,10 +636,12 @@ async function parityOf(operation: Operation, input: OperationInput): Promise<Fo
 
   // 1. Two dry runs: nothing kept, the same key.
   h.madeLines = null;
+  h.madeRefs = null;
   const dry = await run(operation, input, 'dry_run');
-  // The name and class of every line the dry run made, read in its own transaction (the mock of
-  // ./actions above): the preview's lines do not carry them.
+  // The name and class of every line the dry run made, and each entry's reference, read in its own
+  // transaction (the mock of ./actions above): the preview does not carry them.
   const dryMadeLines = h.madeLines as MadeLine[] | null;
+  const dryRefs = h.madeRefs as Map<string, string | null> | null;
   if (dry.outcome !== 'ok' || dry.error) {
     return { differences: [`the dry run did not run (${dry.outcome}, status ${dry.httpStatus}): ${JSON.stringify(dry.error ?? dry.warnings)}`], notes, summary };
   }
@@ -601,6 +667,10 @@ async function parityOf(operation: Operation, input: OperationInput): Promise<Fo
     differences.push('the dry run has no ledger preview');
     return { differences, notes, summary, approverKey };
   }
+
+  // Which ids in the dry run's sources and references name a row, read now: its own rows are
+  // rolled back, so this is the books as they were before the runs.
+  const dryRows = await idsThatNameARow(uuidsIn(...dry.preview.ledger.entries.flatMap((e) => [e.source, dryRefs?.get(e.journalEntryId.toLowerCase())])));
 
   // 2. The real run.
   const done: BridgeResult = await run(operation, input, 'commit');
@@ -638,9 +708,24 @@ async function parityOf(operation: Operation, input: OperationInput): Promise<Fo
       const held = dryNames.get(e.journalEntryId.toLowerCase())?.[i];
       return { ...l, ...(held ? nameAndClass(dryMade, held) : { name: '(not read)', cls: '(not read)' }) };
     });
+  // Which ids in the real run's sources and references name a row: a row it wrote with no audit
+  // 'create' still does, so its id is compared as it is (where the dry run's, rolled back, is
+  // "(new)"): such a row then shows as a difference, never hidden.
+  const commitRows = await idsThatNameARow(uuidsIn(...madeIds.flatMap((id) => [after.get(id)!.source, after.get(id)!.reference])));
+  const shownRefs = (e: (typeof shownMade)[number]) => {
+    const id = e.journalEntryId.toLowerCase();
+    return {
+      source: refText(e.source, dryMade, dryRows, e.entryNumber),
+      reference: dryRefs?.has(id) ? refText(dryRefs.get(id) ?? null, dryMade, dryRows, e.entryNumber) : '(not read)',
+    };
+  };
+  const madeRefs = (id: string) => {
+    const a = after.get(id)!;
+    return { source: refText(a.source, commitMade, commitRows, a.entryNumber), reference: refText(a.reference, commitMade, commitRows, a.entryNumber) };
+  };
   const made = multisetDiff(
-    shownMade.map((e) => entryText(e.date, e.status, e.description, shownLines(e))),
-    madeIds.map((id) => entryText(after.get(id)!.date, after.get(id)!.status, lineMemoFor(shownTo, after.get(id)!.description), lines.get(id) ?? [])),
+    shownMade.map((e) => entryText(e.date, e.status, e.description, shownLines(e), shownRefs(e))),
+    madeIds.map((id) => entryText(after.get(id)!.date, after.get(id)!.status, lineMemoFor(shownTo, after.get(id)!.description), lines.get(id) ?? [], madeRefs(id))),
   );
   for (const e of made.onlyA) differences.push(`ledger: the dry run shows a new entry the real run did not post: ${e}`);
   for (const e of made.onlyB) differences.push(`ledger: the real run posted a new entry the dry run did not show: ${e}`);
@@ -700,14 +785,25 @@ async function parityOf(operation: Operation, input: OperationInput): Promise<Fo
   const largest = all.length ? all.reduce((m, t) => (Money.gt(t, m) ? t : m)) : null;
   const sumMade = Money.add(...madeTotals);
   const sumTouched = Money.add(...touchedCounted);
+  // It voided, deleted or changed a record that was there before it: an audit row other than
+  // 'create' of a record it did not make.
+  const editsExisting = written.some((r) => r.action !== 'create' && !commitMade.has(r.entity_id.toLowerCase()));
+  const noEntry = !madeIds.length && !touchedIds.length;
   const posted = operation.amountField
     ? largest === null
       ? null
       : toAmountString(largest)
-    : madeIds.length || touchedIds.length
+    : !noEntry
       ? toAmountString(sumMade.greaterThan(sumTouched) ? sumMade : sumTouched)
-      : '0.00';
+      : editsExisting
+        ? null
+        : '0.00';
   if (!sameAmount(dry.facts.amount, done.facts.amount)) differences.push(`amount: the dry run says ${dry.facts.amount}, the real run ${done.facts.amount}`);
+  // Decided (fail closed): with no amount field and no entry, a run that changed what was there
+  // before has an unknown amount, never "0.00".
+  if (!operation.amountField && noEntry && editsExisting && dry.facts.amount !== null) {
+    differences.push(`amount: the dry run says ${dry.facts.amount}; the real run changed a record that was there before and posted nothing, so the amount must be unknown`);
+  }
   if (dry.facts.amount !== null && Money.isNegative(dry.facts.amount)) {
     notes.push(`amount sign: the facts say ${dry.facts.amount} (the answer's own signed figure); the policy reads its size, the card shows the sign`);
   }
@@ -755,6 +851,12 @@ beforeAll(async () => {
   tableNames = (
     await rowsOf<{ table_name: string }>(
       sql`select table_name from information_schema.tables where table_schema = current_schema() and table_type = 'BASE TABLE' order by table_name`,
+    )
+  ).map((r) => r.table_name);
+  idTables = (
+    await rowsOf<{ table_name: string }>(
+      sql`select c.table_name from information_schema.columns c join information_schema.tables t on t.table_schema = c.table_schema and t.table_name = c.table_name
+           where c.table_schema = current_schema() and t.table_type = 'BASE TABLE' and c.column_name = 'id' and c.data_type = 'uuid' order by c.table_name`,
     )
   ).map((r) => r.table_name);
   const tools: ParityTools = {
@@ -896,6 +998,9 @@ describe('the comparison itself', () => {
         `records: the dry run shows update customer ${rich.customerId.toLowerCase()} [phone], the real run wrote no such audit row`,
         `records: the real run wrote update customer ${other.toLowerCase()} [phone], the dry run did not show it`,
       ]);
+      // Both change a record that was there before and post nothing: the amount is unknown (a
+      // decision of this feature), so it is no third difference.
+      expect(found.summary).toMatch(/, amount null$/);
     } finally {
       h.handler = null;
     }
@@ -932,6 +1037,59 @@ describe('the comparison itself', () => {
       expect(shown[0]).not.toContain(classId.toLowerCase());
       // Same accounts and amounts: only the name and the class differ.
       expect(found.differences.filter((d) => d.startsWith('amount'))).toEqual([]);
+    } finally {
+      h.handler = null;
+    }
+  });
+
+  it('catches a real run whose new entry names another record in its source or reference; its own and made-up ids are put aside', async () => {
+    const other = await world.make('customers.create', { body: { displayName: world.unique('Other customer') } });
+    let calls = 0;
+    h.handler = async () => {
+      calls++;
+      const ctx = await getServerContext();
+      const named = calls <= 3 ? rich.customerId : other;
+      // A record of the run's own (an audit 'create'), whose first 8 hex digits are the reference,
+      // and an id made up by the run in the source: each run has its own, which is not a difference.
+      const own = randomUUID();
+      await writeAudit(ctx, { action: 'create', entityType: 'parity_probe', entityId: own, newValues: { note: 'probe' } });
+      const entry = await postJournalEntry(ctx, {
+        date: new Date('2026-03-05'),
+        description: 'Parity probe',
+        sourceRef: `probe:${randomUUID()}:${named}`,
+        reference: `${own.slice(0, 8)} for ${named}`,
+        lines: [
+          { accountId: rich.acct['6300'], debit: '10.00' },
+          { accountId: rich.acct['1000'], credit: '10.00' },
+        ],
+      });
+      return NextResponse.json({ id: entry.id }, { status: 201 });
+    };
+    try {
+      const found = await parityOf(op('journal-entries.create'), { body: { date: '2026-03-05', description: 'Parity probe', lines: [] } });
+      expect(calls).toBe(4);
+      const a = rich.customerId.toLowerCase();
+      const b = other.toLowerCase();
+      expect(found.differences).toEqual([
+        expect.stringMatching(new RegExp(`^ledger: the dry run shows a new entry the real run did not post: .* source probe:\\(new\\):${a} ref \\(new\\) for ${a}: `)),
+        expect.stringMatching(new RegExp(`^ledger: the real run posted a new entry the dry run did not show: .* source probe:\\(new\\):${b} ref \\(new\\) for ${b}: `)),
+      ]);
+    } finally {
+      h.handler = null;
+    }
+  });
+
+  it('a run that only makes new records and posts nothing has the amount 0.00, and no difference', async () => {
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      await writeAudit(ctx, { action: 'create', entityType: 'parity_probe', entityId: randomUUID(), newValues: { note: 'new' } });
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    try {
+      const found = await parityOf(op('journal-entries.create'), { body: { date: '2026-03-05', description: 'Parity probe', lines: [] } });
+      expect(found.differences).toEqual([]);
+      expect(found.approverKey).toBeNull();
+      expect(found.summary).toMatch(/^0 entries made, 0 changed, 1 audit rows, amount 0\.00$/);
     } finally {
       h.handler = null;
     }
@@ -1040,7 +1198,8 @@ describe("the approver's dry run gives the key the agent's request stored", () =
       async () => {
         const found = await caseRun(c);
         expect(found.approverKey, `the parity run stopped before the approver's dry run ran:\n${found.differences.join('\n')}`).not.toBeUndefined();
-        if (c.approverFails) expect(found.approverKey).toMatch(c.approverFails);
+        // "(the keys agree)" for null, so a mark whose difference is gone fails with words, not a type error.
+        if (c.approverFails) expect(found.approverKey ?? '(the keys agree)').toMatch(c.approverFails);
         else expect(found.approverKey).toBeNull();
       },
       240_000,

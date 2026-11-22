@@ -27,21 +27,24 @@
  * More sides:
  *  - A 'read_sensitive' operation may show protected data without a reveal (a PDF cannot be
  *    masked): it always asks a person, and that person must hold the View flag of everything it
- *    shows (lib/agent/policy.ts approvalNeeds). What one shows that its approval does not ask the
- *    flag for is a finding. The fixture files a W-9 as a text document, so the document read has
- *    a tax ID and an account number to show.
+ *    shows (lib/agent/policy.ts approvalNeeds), with the reveal it names and without. What one
+ *    shows that its approval does not ask the flag for is a finding. The fixture files a W-9 as a
+ *    text document, so the document read has a tax ID and an account number to show.
  *  - A search that matches a protected value as stored answers guesses at it, even when the
  *    answer shows only the last digits: the right guess and two wrong ones must answer alike. A
  *    control first proves each search's filter is applied at all (text a seeded row holds answers
  *    differently from text none holds).
  *  - With an approved reveal on one operation the value appears, of that kind only, and only for
  *    a role that holds the flag; one reveal runs end to end through the door and a real approval.
- *  - GETs of the classes 'file' and 'admin' (exports, report files, a shareable copy, the raw
- *    transaction log), run as an approval without a reveal runs them, show only what their
- *    approver is asked to hold the flag for (APPROVED_UNGATED otherwise).
+ *  - GETs of the classes 'file' and 'admin' (exports, report files, a shareable copy), run as an
+ *    approval without a reveal runs them, show only what their approver is asked to hold the flag
+ *    for (APPROVED_UNGATED otherwise). The raw transaction log file is never for agents, approved
+ *    or not.
  *
  * Also noted on the way (decision: File Utilities reads that show file names or folders are class
- * 'file'): a 'read' whose answer holds the company file's folder is listed on SHOWS_FOLDER.
+ * 'file'): a 'read' whose answer holds the company file's folder is listed on SHOWS_FOLDER, and
+ * the company file's name (company-file.info) is class 'file': refused as a read, and approved it
+ * still never tells where the file is.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -234,6 +237,19 @@ const FLAG_OF: Record<Secret['kind'], 'sensitivePayroll' | 'fullAccountNumbers'>
 
 const BARE_FACTS: RequestFacts = { confirm: [], reveal: false, amount: null, count: null, entityIds: [], accountIds: [], date: null, closedPeriod: false };
 
+/**
+ * The actor of a run the owner approved without a reveal, as lib/agent/operate.ts runApproved
+ * runs it: the approver's access within the agent's ceiling (the owner's is the ceiling),
+ * approvedBy set, reveal off.
+ */
+const approvedActor = (): BridgeActor => ({
+  ...agent.actor,
+  access: agent.ceiling,
+  userId: fx.ctx.userId!,
+  approval: { approvedBy: fx.ctx.userId!, requestId: null, grantId: null },
+  reveal: false,
+});
+
 const coverage = {
   cases: 0,
   answered: 0,
@@ -363,8 +379,9 @@ describe("no 'read' shows a full SSN, tax ID or account number without an approv
     expect(coverage.cases).toBeGreaterThan(READ_OPS.length);
     const leftOut = LEFT_OUT.map(([l]) => l);
     const expected = READ_OPS.flatMap((op) => (casesFor(op) ?? []).filter((c) => listedIn(leftOut, c.label, op)).map((c) => c.label));
-    // Today: agent.hello, companies.list, file-protection.status, reports.std.get agent-activity,
-    // accountant-copy.changes, accountant-copy.changes.review.
+    // Today: agent.hello, reports.std.get agent-activity, accountant-copy.changes,
+    // accountant-copy.changes.review. (companies.list and file-protection.status were here until
+    // they stopped being offered to agents: they are a person's own routes.)
     expect([...coverage.notAnsweredLabels].sort(), coverage.notAnswered.join(' | ')).toEqual([...expected].sort());
     expect(coverage.unscanned).toEqual([]);
     // PDFs are read through their text layer; a report of files with none would prove nothing.
@@ -373,25 +390,51 @@ describe("no 'read' shows a full SSN, tax ID or account number without an approv
 });
 
 describe("a 'read_sensitive' read shows only what its approver is asked to hold the flag for", () => {
-  it(`every read_sensitive operation (${SENSITIVE_OPS.length})`, async () => {
+  // Each case runs twice: without a reveal (some show the data anyway: a PDF cannot be masked),
+  // and with the approved reveal the operation names (some refuse a masked caller outright, as
+  // the 1099 e-file does, so only this run shows what they hand over). Either way, what shows must
+  // be covered by the View flags the approval of that request asks for. A case that answers in
+  // neither run proves nothing, and an operation that shows nothing under its reveal is no test.
+  it(`every read_sensitive operation (${SENSITIVE_OPS.length}), without a reveal and with the one it names`, async () => {
     const ungated: string[] = [];
     const unrun: string[] = [];
+    const unanswered: string[] = [];
+    const showsNothing: string[] = [];
+    const flagsOf = (facts: RequestFacts, op: Operation) => {
+      const needs = approvalNeeds(op, op.class, facts, { twoPersonOver: null });
+      return new Set(needs.flags ?? (needs.flag ? [needs.flag] : []));
+    };
+    const judgeKinds = (label: string, how: string, s: Scan, asked: Set<string>) => {
+      for (const kind of s.kinds) {
+        if (!asked.has(FLAG_OF[kind])) {
+          ungated.push(`${label}: shows a full ${kind} ${how}, but its approval asks for ${[...asked].join(', ') || 'no View flag'}: ${s.leaks.join(' / ')}`);
+        }
+      }
+    };
     for (const op of SENSITIVE_OPS) {
-      const needs = approvalNeeds(op, op.class, BARE_FACTS, { twoPersonOver: null });
-      const asked = new Set(needs.flags ?? (needs.flag ? [needs.flag] : []));
+      const asked = flagsOf(BARE_FACTS, op);
+      const askedRevealed = flagsOf({ ...BARE_FACTS, reveal: true }, op);
       const cases = casesFor(op);
       if (!cases?.length && !(op.id in KNOWN)) unrun.push(`${op.id}: the fixture cannot supply ${op.params.join(', ') || 'what it needs'}`);
+      let shownUnderReveal = 0;
       for (const c of cases ?? []) {
         if (UNGATED[c.label]) continue;
         const s = await scan(op, c);
-        for (const kind of s.kinds) {
-          if (!asked.has(FLAG_OF[kind])) {
-            ungated.push(`${c.label}: shows a full ${kind} without a reveal, but its approval asks for ${[...asked].join(', ') || 'no View flag'}: ${s.leaks.join(' / ')}`);
-          }
+        judgeKinds(c.label, 'without a reveal', s, asked);
+        const r = op.reveal ? await scan(op, { label: c.label, input: { ...c.input, reveal: true } }, { ...agent.actor, reveal: true }) : null;
+        if (r) {
+          judgeKinds(c.label, `with a reveal of ${op.reveal}`, r, askedRevealed);
+          shownUnderReveal += r.kinds.size;
+          if (r.unscanned) unanswered.push(r.unscanned);
         }
+        if (s.unscanned) unanswered.push(s.unscanned);
+        if (!s.answered && !r?.answered) unanswered.push(`${c.label}: answered neither without a reveal (${s.refusal}) nor with it (${r?.refusal ?? 'no reveal to ask'})`);
       }
+      if (cases?.length && !shownUnderReveal) showsNothing.push(`${op.id}: showed no protected value even with ${op.reveal ? `a reveal of ${op.reveal}` : 'its approval'}`);
     }
     expect(unrun).toEqual([]);
+    expect(unanswered).toEqual([]);
+    expect(showsNothing).toEqual([]);
     expect(ungated).toEqual([]);
   }, 300_000);
 
@@ -585,23 +628,26 @@ describe('FINDINGS', () => {
     it.fails(`a read shows the company file's folder: ${label}: ${what}`, guarded(label, (s) => expect(s.folder).toEqual([])), 120_000);
   }
 
-  it('company-file.info never tells an agent where the company file is', async () => {
-    const r = await runOperation(agent.base, operationById('company-file.info')!, {}, 'read', agent.actor);
-    expect(r.outcome).toBe('ok');
-    expect((r.result as { location?: unknown }).location ?? null).toBeNull();
+  // Decision: File Utilities reads that show the file name are class 'file'. So an agent's read of
+  // it is refused (an Admin approves it first), and once approved it still answers without the
+  // folder the company file is in.
+  it("company-file.info is class 'file': refused as a read, and approved it never tells an agent where the company file is", async () => {
+    const op = operationById('company-file.info')!;
+    expect(op.class).toBe('file');
+    expect(op.availability).toBe('agent');
+    const read = await runOperation(agent.base, op, {}, 'read', agent.actor);
+    expect(read.outcome).toBe('error');
+    expect(read.error?.code).toBe('NOT_A_READ');
+    expect(read.result ?? null).toBeNull();
+    const r = await runOperation(agent.base, op, {}, 'commit', approvedActor());
+    expect(r.outcome, JSON.stringify(r.error ?? null)).toBe('ok');
+    const answer = r.result as { fileName?: unknown; location?: unknown };
+    // It did answer (the name is what the approval is for), so a missing folder is not a missing answer.
+    expect(typeof answer.fileName).toBe('string');
+    expect(answer.location ?? null).toBeNull();
+    const text = JSON.stringify(r);
+    expect(folderForms().filter((p) => text.includes(p))).toEqual([]);
   });
-
-  it.fails(
-    "company-file.info (class 'read') answers the company file's name; the decision files File Utilities reads that show file names as 'file' (lib/agent/operations/classes/admin.ts)",
-    async () => {
-      const op = operationById('company-file.info');
-      // Filed as 'file' (or no longer open to agents): this case turns red, take it off.
-      if (!op || op.class !== 'read' || op.availability !== 'agent') return;
-      const r = await runOperation(agent.base, op, {}, 'read', agent.actor);
-      if (r.outcome !== 'ok') return;
-      expect((r.result as { fileName?: unknown }).fileName ?? null).toBeNull();
-    },
-  );
 });
 
 // The bridge's side of a reveal: the actor carries reveal as an approved run sets it (operate.ts
@@ -736,7 +782,8 @@ describe('an approved reveal shows the value: on that one call, of that kind, fo
  * with no reveal asked. Run as an approved run runs them (lib/agent/operate.ts runApproved:
  * commit, the approver's access within the agent's ceiling, approvedBy set, reveal off). Not
  * here: the copies of the whole company file (backup.download, backup.company.download,
- * portable), which are compressed database files this scan cannot read.
+ * portable), which are compressed database files this scan cannot read, and the raw transaction
+ * log file (transaction-log.download), which is never for agents (checked on its own below).
  */
 const APPROVED_SCANS: Array<{ label: string; op: string; input: OperationInput }> = [
   { label: 'export.get vendors (CSV)', op: 'export.get', input: { params: { list: 'vendors' } } },
@@ -747,29 +794,18 @@ const APPROVED_SCANS: Array<{ label: string; op: string; input: OperationInput }
   { label: 'users.permissions-report user_list (CSV)', op: 'users.permissions-report', input: { query: { kind: 'user_list', format: 'csv' } } },
   { label: 'portable.shareable (workbook)', op: 'portable.shareable', input: { query: { format: 'xlsx' } } },
   { label: 'portable.shareable (PDF)', op: 'portable.shareable', input: { query: { format: 'pdf' } } },
-  { label: 'transaction-log.download', op: 'transaction-log.download', input: {} },
 ];
 
 /**
  * FINDINGS: approved GETs above that show, without a reveal, a kind of protected value whose View
  * flag the approving person is not asked to hold, by label: what and where. it.fails each.
+ * (The shareable workbook was one until lib/services/shareableLedger.ts wrote each Journal memo
+ * through lineMemoFor; the raw transaction log until it became never for agents.)
  */
-const APPROVED_UNGATED: Record<string, string> = {
-  'portable.shareable (workbook)':
-    "the Journal sheet's Memo column holds the journal line memo \"Acct # TAX-66019283745\" in full (lib/services/shareableLedger.ts writes l.memo as stored, where the reports mask it with lib/services/journal.ts lineMemoFor), and approving this 'file' operation asks for no View flag (lib/agent/operations/classes/admin.ts 'GET /api/portable/shareable': no reveal, no sensitiveFields)",
-  'transaction-log.download':
-    "the raw log (.bktlg) holds every vendor's full tax ID and account number, the Other Names account number and the employer's state account number as recorded (its registry entry says \"nothing masked\"), and approving it asks for no View flag (lib/agent/operations/classes/reports.ts 'GET /api/transaction-log/download': no reveal, no sensitiveFields)",
-};
+const APPROVED_UNGATED: Record<string, string> = {};
 
 describe('a GET of another class, approved without a reveal, shows only what its approver is asked to hold the flag for', () => {
-  const approved = (): BridgeActor => ({
-    ...agent.actor,
-    // The owner approved: their access within the agent's ceiling is the ceiling.
-    access: agent.ceiling,
-    userId: fx.ctx.userId!,
-    approval: { approvedBy: fx.ctx.userId!, requestId: null, grantId: null },
-    reveal: false,
-  });
+  const approved = approvedActor;
   const judgeApproved = async (a: (typeof APPROVED_SCANS)[number]): Promise<{ notRun: string | null; ungated: string[] }> => {
     const op = operationById(a.op);
     if (!op || op.kind !== 'route' || op.availability !== 'agent') return { notRun: `${a.label}: no agent operation ${a.op}`, ungated: [] };
@@ -797,6 +833,25 @@ describe('a GET of another class, approved without a reveal, shows only what its
     expect(notRun).toEqual([]);
     expect(ungated).toEqual([]);
   }, 300_000);
+
+  // The raw log file is a byte-for-byte copy with every full value in it and cannot be masked:
+  // never for agents, approved or not (classes/reports.ts: hard floor).
+  it('transaction-log.download: the raw log file is refused to an agent, as a read and as an approved run, and nothing of it reaches the agent', async () => {
+    const op = operationById('transaction-log.download')!;
+    expect(op.availability).toBe('hard_floor');
+    expect(AGENT_ROUTES.includes(op)).toBe(false);
+    for (const [mode, actor] of [
+      ['read', agent.actor],
+      ['commit', approved()],
+    ] as const) {
+      const r = await runOperation(agent.base, op, {}, mode, actor);
+      expect(r.outcome, mode).toBe('error');
+      expect(r.error?.code, mode).toBe('NOT_AVAILABLE');
+      expect(r.file ?? null, mode).toBeNull();
+      expect(r.result ?? null, mode).toBeNull();
+      expect(findSecrets(JSON.stringify(r)), mode).toEqual([]);
+    }
+  });
 
   it('APPROVED_UNGATED names scans above', () => {
     expect(Object.keys(APPROVED_UNGATED).filter((l) => !APPROVED_SCANS.some((a) => a.label === l))).toEqual([]);
