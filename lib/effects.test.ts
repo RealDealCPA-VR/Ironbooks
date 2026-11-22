@@ -19,6 +19,7 @@ import {
   currentEffects,
   currentEffectsMode,
   effects,
+  effectsAbout,
   effectsOfFailedRun,
   formatSize,
   outsideEffects,
@@ -366,6 +367,37 @@ describe('defer (a real run in a transaction): queued, done on release after the
       expect.objectContaining({ status: 'sent', error: null, ranDuringOperation: true }),
     ]);
     expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('an effect a service marked (effectsAbout) carries its record to the report, sent or failed; others carry none', async () => {
+    refuse = (m) => (m.subject === 'Bad' ? 'The mail server refused the recipient.' : null);
+    const about = { entityType: 'invoice', entityId: 'inv-1', onFailure: { toBeEmailed: true } };
+    const run = await runWithEffects('defer', async () => {
+      await effectsAbout(about, async () => {
+        await delay(1);
+        await effects.email(msg('Bad'), send);
+      });
+      // Two at once: each keeps its own mark.
+      await Promise.all([
+        effectsAbout({ entityType: 'invoice', entityId: 'inv-2' }, () => effects.email(msg('Good'), send)),
+        effects.email(msg('Plain'), send),
+      ]);
+    });
+    about.onFailure.toBeEmailed = false;
+    const report = await run.release();
+    expect(report.map((r) => [r.effect.summary.split(': ')[1], r.status, r.about ?? null])).toEqual([
+      ['Bad', 'failed', { entityType: 'invoice', entityId: 'inv-1', onFailure: { toBeEmailed: true } }],
+      ['Good', 'sent', { entityType: 'invoice', entityId: 'inv-2' }],
+      ['Plain', 'sent', null],
+    ]);
+    expect(report[2]).not.toHaveProperty('about');
+  });
+
+  it('with no scope the mark changes nothing: sent at once, errors thrown as they are', async () => {
+    const out = await effectsAbout({ entityType: 'invoice', entityId: 'x' }, () => effects.email(msg('Now'), send));
+    expect(out).toMatchObject({ sent: true, status: 'done' });
+    refuse = () => 'Refused.';
+    await expect(effectsAbout({ entityType: 'invoice', entityId: 'x' }, () => effects.email(msg('No'), send))).rejects.toThrow('Refused.');
   });
 
   it('printing with no handler at release reports that printing is not available here', async () => {

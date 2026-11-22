@@ -12,6 +12,11 @@
  * policy adds for this one request (closing_password for work in a closed period,
  * lib/agent/policy.ts) is sent back to the card the same way, and nothing runs.
  *
+ * The second of two approvals counts the first one only while the person who gave it could still
+ * give it (an active member, with the route's right, the Admin role and the flags the request
+ * needs). Otherwise nothing runs: the request waits for two people again, and the answer is a 409
+ * saying so, so the card loads it again.
+ *
  * An approval only ever comes from a signed-in person's window (the host's, or a teammate's through
  * the multi-user proxy), never from an agent or another program on this computer
  * (app/api/agent-requests/_guards.ts). Whether the window is the host computer's own is passed on,

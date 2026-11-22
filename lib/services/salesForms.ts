@@ -38,6 +38,7 @@ import { Money, formatCurrency } from '@/lib/money';
 import { docRef } from './docNumbers';
 import { emailNotSetUpError, isConfigured, sendMail } from './email';
 import { recipientProblem, senderMergeFields } from './emailSettings';
+import { currentEffectsMode, effectsAbout } from '@/lib/effects';
 import { getHomeCurrencyCode } from './currencies';
 import { companyTodayIso } from './preferences';
 import { fillMergeFields, type EmailTemplateType } from '@/lib/preferences';
@@ -489,9 +490,16 @@ export async function emailSalesForm(
     if (claimed.length === 0) throw new ServiceError('CONFLICT', 'This form was already sent (it is no longer waiting to be emailed).', { alreadySent: true });
   }
   let recipient: string;
+  // An agent's real run (the bridge's outbox): the email goes only after the commit, while the flag
+  // and the "emailed" row below are written now. What the form held before is named on the email,
+  // so the bridge can put it back when the send then fails (putBackAfterFailedEmail). A person's
+  // send, with no outbox, is sent at once exactly as before.
+  const before = currentEffectsMode() === 'defer' ? await sendStateOf(writeCtx, kind, id, opts?.queued === true) : null;
   try {
     const form = await renderSalesForm(ctx, kind, id, templateId);
-    recipient = await deliver(ctx, form, to);
+    recipient = before
+      ? await effectsAbout({ entityType: kind, entityId: id, onFailure: { putBack: SALES_FORM_EMAIL, ...before } }, () => deliver(ctx, form, to))
+      : await deliver(ctx, form, to);
   } catch (err) {
     // Not sent: back in the queue.
     if (opts?.queued) await writeCtx.db.update(t).set({ toBeEmailed: true } as never).where(and(eq(t.companyId, ctx.companyId), eq(t.id, id)));
@@ -512,6 +520,49 @@ export async function emailSalesForm(
   return { ok: true, to: recipient };
 }
 
+/** What a failed agent's email of a sales form puts back (EffectAbout.onFailure.putBack). */
+export const SALES_FORM_EMAIL = 'sales_form_email';
+
+/** A form's send flags as they are before an agent's email of it (a queued send has claimed it already). */
+async function sendStateOf(ctx: ServiceContext, kind: SalesFormKind, id: string, queued: boolean): Promise<{ toBeEmailed: boolean; lastEmailedAt: string | null }> {
+  const t = TABLE[kind] as unknown as typeof invoices;
+  const [row] = await ctx.db
+    .select({ toBeEmailed: t.toBeEmailed, lastEmailedAt: t.lastEmailedAt })
+    .from(t)
+    .where(and(eq(t.companyId, ctx.companyId), eq(t.id, id)));
+  const at = row?.lastEmailedAt instanceof Date && !Number.isNaN(row.lastEmailedAt.getTime()) ? row.lastEmailedAt.toISOString() : null;
+  return { toBeEmailed: queued || row?.toBeEmailed === true, lastEmailedAt: at };
+}
+
+/**
+ * After an agent's email of a sales form failed (its run committed, then the mail server refused
+ * it): the form goes back in the "to be emailed" queue when it was waiting there, and its "last
+ * emailed" time back to what it was. `before` is what emailSalesForm named on the email
+ * (EffectAbout.onFailure). Returns what was put back, for the audit row; null when nothing was
+ * (an unknown kind, or a form that is gone). Called by lib/agent/bridge.ts recordFailedEffects.
+ */
+export async function putBackAfterFailedEmail(
+  ctx: ServiceContext,
+  kind: string,
+  id: string,
+  before: Record<string, unknown>,
+): Promise<{ toBeEmailed: boolean; lastEmailedAt: string | null } | null> {
+  if (!Object.hasOwn(TABLE, kind) || typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id)) return null;
+  const t = TABLE[kind as SalesFormKind] as unknown as typeof invoices;
+  const toBeEmailed = before.toBeEmailed === true;
+  const at = typeof before.lastEmailedAt === 'string' ? new Date(before.lastEmailedAt) : null;
+  const lastEmailedAt = at && !Number.isNaN(at.getTime()) ? at : null;
+  // Never takes a form out of the queue: only puts it back when it was there before the send.
+  const set: Record<string, unknown> = { lastEmailedAt, ...(toBeEmailed ? { toBeEmailed: true } : {}) };
+  const rows = await ctx.db
+    .update(t)
+    .set(set as never)
+    .where(and(eq(t.companyId, ctx.companyId), eq(t.id, id)))
+    .returning({ id: t.id, toBeEmailed: t.toBeEmailed });
+  if (!rows.length) return null;
+  return { toBeEmailed: rows[0].toBeEmailed === true, lastEmailedAt: lastEmailedAt ? lastEmailedAt.toISOString() : null };
+}
+
 /** Email a customer statement (balance-forward, optional date range). */
 export async function emailCustomerStatement(
   ctx: ServiceContext,
@@ -522,7 +573,8 @@ export async function emailCustomerStatement(
   // One address, as on a form's email: before the statement is drawn up.
   if (opts?.email && opts.email.trim()) checkTypedRecipient(ctx, opts.email);
   const form = await renderCustomerStatement(ctx, customerId, { from: opts?.from, to: opts?.to });
-  const recipient = await deliver(ctx, form, opts?.email);
+  // Named for the bridge, which records a send that fails after an agent's run committed.
+  const recipient = await effectsAbout({ entityType: 'customer', entityId: customerId }, () => deliver(ctx, form, opts?.email));
   // Audited without the view-only role (see emailSalesForm): the statement already went out.
   await writeAudit({ ...ctx, role: ctx.role === 'viewer' ? undefined : ctx.role }, {
     action: 'update',

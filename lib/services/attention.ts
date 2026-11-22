@@ -54,6 +54,7 @@ import { listUndepositedPayments } from './deposits';
 import { canSeeTodoLink } from './todos';
 import { requireFileAdmin, requirePermission } from './access';
 import { isConfigured as emailIsConfigured, sendMail } from './email';
+import { effectsAbout } from '@/lib/effects';
 import { EMAIL_NOT_SET_UP_MESSAGE, recipientProblem, senderMergeFields } from './emailSettings';
 import { backupFolderIgnoredHere, lastFullBackup, readBackupHistory, readBackupSettings } from './backupHistory';
 import { runVersionedBackup } from './backupSchedule';
@@ -1191,20 +1192,24 @@ export async function sendPaymentReminder(
     sender: await senderMergeFields(ctx),
   });
   const { bytes } = await buildInvoicePdf(ctx, inv.id);
-  await sendMail(
-    {
-      to: recipient,
-      subject: text.subject,
-      text: text.body,
-      attachments: [
-        {
-          filename: `invoice-${number.replace(/[^A-Za-z0-9._-]+/g, '_')}.pdf`,
-          content: Buffer.from(bytes),
-          contentType: 'application/pdf',
-        },
-      ],
-    },
-    ctx,
+  // Named for the bridge, which records a send that fails after an agent's run committed (on the
+  // invoice: a 'payment_reminder' row is read as a reminder sent).
+  await effectsAbout({ entityType: 'invoice', entityId: inv.id }, () =>
+    sendMail(
+      {
+        to: recipient,
+        subject: text.subject,
+        text: text.body,
+        attachments: [
+          {
+            filename: `invoice-${number.replace(/[^A-Za-z0-9._-]+/g, '_')}.pdf`,
+            content: Buffer.from(bytes),
+            contentType: 'application/pdf',
+          },
+        ],
+      },
+      ctx,
+    ),
   );
   // Emailing a reminder changes nothing in the books, so a member who may only view and print
   // customer forms (the route's Customers: print right — the legacy 'viewer' role) may send one.

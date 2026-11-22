@@ -67,6 +67,7 @@ import {
   DEVICE_PATH_PREFIX,
   DOTS_ONLY_FOLDER,
   RECIPIENT_FIELDS,
+  STRICT_BOOLEANS,
   cleanText,
   hostShownInFull,
   maskAccountsInText,
@@ -729,6 +730,11 @@ function valueOf(operation: Operation, input: OperationInput, answer: unknown, n
   const rename = RENAMED_TO[routeKey(operation)];
   if (rename && rename.placeholder === name && !renames(operation, input, names, rename)) return { raw: undefined, fixed: false };
   const found = lookup(operation, input, answer, name);
+  // A flag the route compares strictly with true or false shows as the route reads it: "yes" only
+  // for a real true where the route acts on true (a text "yes" for condense's dryRun is the real
+  // condense, so it reads "no"), "no" only for a real false where it acts on false.
+  const strict = STRICT_BOOLEANS[routeKey(operation)]?.[name];
+  if (strict !== undefined) return { raw: absent(found) ? undefined : strict ? found === true : found !== false, fixed: false };
   const named = withNames(found, names);
   const raw = named === found ? nameFromAnswer(operation, input, answer, name, found) : named;
   const last = name.split('.').pop() ?? name;

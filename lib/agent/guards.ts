@@ -113,6 +113,46 @@ const PERSON_ONLY_FIELDS: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
+ * Body fields a route compares strictly with a boolean, per operation: the value the route acts on
+ * (`=== true`, or `=== false`). Anything that is not a boolean is read as the other one, so a text
+ * "yes" for condense's dryRun runs the real, irreversible condense while it reads like a preview.
+ * guardInput refuses a value of any other type for them (top level of the body); the request line
+ * shows them as the route reads them (lib/agent/describe.ts). Read off each handler: condense
+ * `body?.dryRun !== true` (the real run), currencies `isBase === true`, the AI test `allowCloud ===
+ * true` (and a person's only), a portable copy `body.protect === false` (a person's only).
+ */
+export const STRICT_BOOLEANS: Readonly<Record<string, Readonly<Record<string, boolean>>>> = Object.freeze({
+  'POST /api/condense': Object.freeze({ dryRun: true }),
+  'POST /api/currencies': Object.freeze({ isBase: true }),
+  'POST /api/ai/test': Object.freeze({ allowCloud: true }),
+  'POST /api/portable': Object.freeze({ protect: false }),
+});
+
+/**
+ * Extensions of files Windows runs or opens as a program when they are double-clicked or found in
+ * an auto-run place (the Startup folder, a PowerShell profile): never saved for an agent, in any
+ * folder (lib/agent/shell.ts saveStagedFile; the door's ask for files.save, by the name it gives).
+ */
+export const RUNNABLE_EXTENSIONS: readonly string[] = Object.freeze([
+  'exe', 'bat', 'cmd', 'com', 'ps1', 'psm1', 'vbs', 'vbe', 'js', 'jse', 'wsf', 'wsh', 'lnk', 'scr', 'msi', 'hta', 'reg', 'pif', 'cpl', 'dll',
+]);
+
+/**
+ * Why a file of that name is never saved for an agent (its extension is a program's, a script's
+ * or a shortcut's), or null. Judged as Windows would take the name: case aside, and trailing dots
+ * and spaces dropped.
+ */
+export function runnableNameProblem(name: unknown): string | null {
+  if (typeof name !== 'string') return null;
+  const taken = name.trim().replace(/[. ]+$/, '');
+  const dot = taken.lastIndexOf('.');
+  if (dot < 0) return null;
+  const ext = taken.slice(dot + 1).toLowerCase();
+  if (!RUNNABLE_EXTENSIONS.includes(ext)) return null;
+  return `Ironbooks never saves a program, script or shortcut for an agent (a .${ext} file), in any folder. Choose a name with another extension, or ask a person to save it.`;
+}
+
+/**
  * "Yes, I am sure" flags the routes accept after a 409 warning (plan §5.6). A flag in the body that
  * the operation does not list is taken out: the policy could not see it, and an unlisted
  * allowLedgerRewrite would otherwise ride along on an ordinary change. A listed one counts as sent
@@ -943,6 +983,18 @@ export function plainIsoTime(value: unknown): string | null {
   return Number.isFinite(Date.parse(v)) ? v : null;
 }
 
+/** Why a strictly compared flag of this operation's body (STRICT_BOOLEANS) cannot be used, or null. */
+function strictBooleanRefusal(operation: Pick<Operation, 'method' | 'route'>, cleaned: OperationInput): string | null {
+  const fields = STRICT_BOOLEANS[routeKey(operation)];
+  const body = cleaned.body;
+  if (!fields || !isPlainObject(body)) return null;
+  for (const field of Object.keys(fields)) {
+    if (!Object.prototype.hasOwnProperty.call(body, field)) continue;
+    if (typeof body[field] !== 'boolean') return `${field} must be true or false, not text, a number or empty. Send it again with true or false, or leave it out.`;
+  }
+  return null;
+}
+
 /** The first refusal that applies, or null. Order: the biggest reason first. */
 function refusalOf(operation: Operation, raw: OperationInput, cleaned: OperationInput): string | null {
   if (operation.availability === 'hard_floor') return REFUSE.hardFloor;
@@ -974,6 +1026,16 @@ function refusalOf(operation: Operation, raw: OperationInput, cleaned: Operation
   // file goes: refused before anyone is asked, and again when a person approves.
   const path = pathRefusal(operation, cleaned);
   if (path) return path;
+  // A flag the route compares strictly with true or false must be one: a text "yes" would read
+  // like the flag on the request line while the route takes it as the other (STRICT_BOOLEANS).
+  const typed = strictBooleanRefusal(operation, cleaned);
+  if (typed) return typed;
+  // A program, script or shortcut is never saved for an agent: refused by the name it gives (the
+  // save checks the staged file's own name again when it runs).
+  if (operation.kind === 'shell' && operation.id === 'files.save' && isPlainObject(cleaned.body)) {
+    const runnable = runnableNameProblem(cleaned.body.name);
+    if (runnable) return runnable;
+  }
 
   if (raw.params !== undefined && !isPlainObject(raw.params)) return REFUSE.notAnObject;
   if (raw.query !== undefined && !isPlainObject(raw.query)) return REFUSE.notAnObject;

@@ -262,16 +262,17 @@ A company file with no agents behaves exactly as before.
   removed after 24 hours and when the file closes.
 - Saving a file to a folder is approved by an Admin at the computer that holds the company file,
   only into the company file's folder, `Documents\Ironbooks`, its `Agent Outbox` or a folder the
-  Admin added, and never over a file that is already there.
+  Admin added, and never over a file that is already there. The company file's folder counts only
+  when it is not your profile folder, Desktop, Documents or Downloads itself and holds none of
+  Ironbooks' own data. No program, script or shortcut is ever saved. A backup, or a portable copy
+  without a password, is never readable by the agent: it can only be saved to such a folder.
 
 ### How an agent reaches the books
 
 - The agent reaches the books through the app's own server on this computer (`127.0.0.1`). Nothing
   new listens on the network, and an agent does not work through multi-user hosting.
-- One read answers an agent directly, with nobody asked, because the sign-in screen needs it before
-  anyone signs in: the company file's name, its id, and whether it has users, a password or
-  protection. It never shows the folder the file is in. This is a known gap, closed once that read
-  refuses a request that carries an agent's token.
+- The sign-in screen's read of the company file's name refuses any request that carries an agent's
+  token.
 - While a company file with an agent is open and someone has signed in, Ironbooks writes one small
   file in your own profile folder (`%LOCALAPPDATA%\Ironbooks\agent-endpoints`) so the agent's
   connector can find the app. It holds the app's local port and a check value for that run, nothing

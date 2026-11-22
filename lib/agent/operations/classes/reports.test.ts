@@ -58,6 +58,14 @@ const RECIPIENTS = 'ceo@acme.com, cfo@acme.com, x@outside.example';
 const HELD = 'held until a person saves its recipients';
 
 describe('classification: reports', () => {
+  it('no why a person reads cites a plan section or decision', () => {
+    for (const o of ops()) expect(o.why ?? '', o.id).not.toMatch(/\(plan [0-9]|\bplan [0-9]+\.[0-9]|\bD[0-9]+\b/);
+  });
+
+  it('the legacy automatic backup download says the agent cannot read the copy', () => {
+    expect(op('dashboard.auto-backup').why).toMatch(/agent cannot read that copy.*save_file/);
+  });
+
   it('covers every route of the bucket and is well formed', () => {
     expect(bucketProblems('reports', REPORTS_CLASSES)).toEqual([]);
   });

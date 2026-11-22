@@ -13,7 +13,9 @@
  * An agent's change names the agent and how it was allowed (agent full access, plan §7.3), in the
  * same words as the transaction log (transactionLog.ts agentActorName): "<Agent> (agent)",
  * "<Agent> (agent), approved by <person>", or "<Agent> (agent), under permission from <person>
- * until <time>". The ids behind those words come with each row too.
+ * until <time>". Work two people approved (the two-person rule) names both, the first approval
+ * first: "<Agent> (agent), approved by <A> and <B>" (read from the request the row ran under,
+ * firstApproversOf). The ids behind those words come with each row too.
  *
  * An agent reading the audit trail never sees the entries of Users & Roles or File Utilities, nor
  * the whole log as an Admin would (auditReaderFor). The record of an agent's request or standing
@@ -63,13 +65,59 @@ interface ActorFacts {
   approvedById: string | null;
   approvedByName: string | null;
   agentGrantId: string | null;
+  agentRequestId?: string | null;
+}
+
+/**
+ * The first of two approvers of work that needed two people, by the request it ran under: the
+ * request's decidedBy, when the row's approver is its secondApprover and someone else gave the first
+ * yes (lib/services/agentRequests.ts approveRequest stores both). Only for the rows that need it.
+ */
+type FirstApprovers = Map<string, { secondId: string; firstName: string }>;
+
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const firstApprover = alias(users, 'first_approver');
+
+async function firstApproversOf(ctx: ServiceContext, rows: ActorFacts[]): Promise<FirstApprovers> {
+  const ids = [
+    ...new Set(
+      rows
+        .filter((r) => (r.agentId || r.agentName) && r.approvedById && typeof r.agentRequestId === 'string' && UUID_TEXT.test(r.agentRequestId))
+        .map((r) => r.agentRequestId!.toLowerCase()),
+    ),
+  ];
+  const out: FirstApprovers = new Map();
+  if (!ids.length) return out;
+  const found = await ctx.db
+    .select({
+      id: agentPermissionRequests.id,
+      decidedBy: agentPermissionRequests.decidedBy,
+      secondApprover: agentPermissionRequests.secondApprover,
+      name: firstApprover.name,
+      email: firstApprover.email,
+    })
+    .from(agentPermissionRequests)
+    .leftJoin(firstApprover, eq(agentPermissionRequests.decidedBy, firstApprover.id))
+    .where(and(eq(agentPermissionRequests.companyId, ctx.companyId), inArray(agentPermissionRequests.id, ids)));
+  for (const f of found) {
+    if (!f.decidedBy || !f.secondApprover || f.decidedBy === f.secondApprover) continue;
+    out.set(String(f.id).toLowerCase(), { secondId: f.secondApprover, firstName: f.name || f.email || REMOVED_PERSON });
+  }
+  return out;
+}
+
+/** "A and B" for a row two people approved, else the row's own approver. */
+function approverWords(r: ActorFacts, firsts: FirstApprovers): string {
+  const second = r.approvedByName || REMOVED_PERSON;
+  const first = r.agentRequestId ? firsts.get(r.agentRequestId.toLowerCase()) : undefined;
+  return first && first.secondId === r.approvedById ? `${first.firstName} and ${second}` : second;
 }
 
 /** How the Audit Trail names who made a change (the transaction log uses the same words). */
-function actorLabel(r: ActorFacts, grants: Map<string, StandingPermissionWords>): string | null {
+function actorLabel(r: ActorFacts, grants: Map<string, StandingPermissionWords>, firsts: FirstApprovers = new Map()): string | null {
   if (!r.agentId && !r.agentName) return r.person ?? null;
   const actor = agentLabel(r.agentName ?? REMOVED_AGENT);
-  if (r.approvedById) return agentActorName(actor, { approvedBy: r.approvedByName || REMOVED_PERSON });
+  if (r.approvedById) return agentActorName(actor, { approvedBy: approverWords(r, firsts) });
   if (r.agentGrantId) return agentActorName(actor, { grant: grants.get(r.agentGrantId) ?? { givenBy: null, until: null } });
   // An agent's proposal approved before agent full access ran in the approver's own context: the
   // person in user_id is the one who approved it.
@@ -161,15 +209,16 @@ function factsOf(r: ActorRow): ActorFacts {
     approvedById: r.approvedById,
     approvedByName: r.approverName || r.approverEmail || null,
     agentGrantId: r.agentGrantId,
+    agentRequestId: r.agentRequestId,
   };
 }
 
 /** The actor fields of an AuditLogRow. */
-function actorFields(r: ActorRow, grants: Map<string, StandingPermissionWords>) {
+function actorFields(r: ActorRow, grants: Map<string, StandingPermissionWords>, firsts: FirstApprovers = new Map()) {
   const facts = factsOf(r);
   return {
     actorId: r.actorId ?? null,
-    actorName: actorLabel(facts, grants),
+    actorName: actorLabel(facts, grants, firsts),
     agentId: r.agentId ?? null,
     agentName: r.agentId || r.agentName ? (r.agentName ?? REMOVED_AGENT) : null,
     approvedById: r.approvedById ?? null,
@@ -361,7 +410,7 @@ export async function listAuditLogs(
     })
     .from(auditLogs)
     .leftJoin(users, eq(auditLogs.userId, users.id))
-    .leftJoin(agents, eq(auditLogs.agentId, agents.id))
+    .leftJoin(agents, and(eq(auditLogs.agentId, agents.id), eq(agents.companyId, ctx.companyId)))
     .leftJoin(approver, eq(auditLogs.approvedBy, approver.id))
     .where(where)
     .orderBy(desc(auditLogs.createdAt), asc(auditLogs.id))
@@ -369,6 +418,7 @@ export async function listAuditLogs(
     .offset(offset);
 
   const grants = await grantsOf(ctx, rows.map(factsOf));
+  const firsts = await firstApproversOf(ctx, rows.map(factsOf));
   const reader = auditReaderFor(ctx);
   return {
     rows: rows.map((r) => {
@@ -378,7 +428,7 @@ export async function listAuditLogs(
         action: r.action,
         entityType: r.entityType,
         entityId: r.entityId,
-        ...actorFields(r, grants),
+        ...actorFields(r, grants, firsts),
         createdAt: r.createdAt.toISOString(),
         // Only on the entries that have words of their own, so every other row keeps its shape.
         ...(summary ? { summary } : {}),
@@ -404,7 +454,7 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     })
     .from(auditLogs)
     .leftJoin(users, eq(auditLogs.userId, users.id))
-    .leftJoin(agents, eq(auditLogs.agentId, agents.id))
+    .leftJoin(agents, and(eq(auditLogs.agentId, agents.id), eq(agents.companyId, ctx.companyId)))
     .leftJoin(approver, eq(auditLogs.approvedBy, approver.id))
     .where(and(eq(auditLogs.id, id), eq(auditLogs.companyId, ctx.companyId)));
 
@@ -414,6 +464,7 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
   if (!canSeeAuditEntry(reader, row.entityType, row.oldValues, row.newValues)) throw notFound('Audit log entry');
 
   const grants = await grantsOf(ctx, [factsOf(row)]);
+  const firsts = await firstApproversOf(ctx, [factsOf(row)]);
   // Snapshots can hold SSNs, tax IDs and account numbers, also as memo text ("Acct # …" on a
   // check): masked per the caller's flags. Never the password hashes older builds wrote into
   // settings snapshots, whoever asks (auditValuesFor, lib/services/auditVisibility.ts). A request's
@@ -425,7 +476,7 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     action: row.action,
     entityType: row.entityType,
     entityId: row.entityId,
-    ...actorFields(row, grants),
+    ...actorFields(row, grants, firsts),
     createdAt: row.createdAt.toISOString(),
     oldValues: values.oldValues,
     newValues: values.newValues,

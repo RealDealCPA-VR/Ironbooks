@@ -139,7 +139,7 @@
 import { createHash } from 'node:crypto';
 import { promises as fsp, type Stats } from 'node:fs';
 import path from 'node:path';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, or, sql } from 'drizzle-orm';
 import type { AnyPgColumn, PgTable } from 'drizzle-orm/pg-core';
 import { NextRequest } from 'next/server';
 import { resolveDataDir, sealedMode, type DB } from '@/lib/db';
@@ -147,6 +147,7 @@ import { isReadOnlyDb, readOnlyDb } from '@/lib/db/readOnly';
 import { dataDirOf, rootDbOf } from '@/lib/db/txHooks';
 import {
   accounts,
+  agentPermissionRequests,
   agents,
   billPayments,
   bills,
@@ -200,7 +201,7 @@ import { assertPasswordChangeNotRequired } from '@/lib/services/passwordPolicy';
 import { isSandboxActive } from '@/lib/services/sandboxState';
 import { getSingleUserMode } from '@/lib/services/sessions';
 import { agentsHoldingRole, heldRoleKeyForm } from '@/lib/services/users';
-import { ServiceError, translateLedgerDbError, type ServiceContext } from '@/lib/services/_base';
+import { ServiceError, inTransaction, translateLedgerDbError, writeAudit, type ServiceContext } from '@/lib/services/_base';
 import { changesInTransaction, type ChangePreview, type PostingEntry, type PostingLine } from './actions';
 import {
   BRIDGE_REPORT_TIME_LIMIT_MS,
@@ -219,9 +220,9 @@ import {
   type StagedFile,
 } from './contract';
 import { personSignedIn } from './endpointFile';
-import { factsOf } from './facts';
-import { allowedFolder, overlapsAppData, readStagedFile, stageFile } from './files';
-import { applySecrets, guardInput, maskAccountsInText, redactAnswer } from './guards';
+import { factsOf, withLedgerAccounts } from './facts';
+import { allowedFolder, overlapsAppData, readStagedFile, stageAnswerFile } from './files';
+import { applySecrets, guardInput, maskAccountsInText, plainIsoTime, redactAnswer } from './guards';
 import { loadRouteHandler, operationById, operationForPath, type RouteHandler, type RouteParams } from './operations/registry';
 import type { EffectKind, EffectPreview, Operation, RecordDiff, RequestFacts, RiskClass, SecretKind, WarningPreview } from './operations/types';
 
@@ -647,18 +648,24 @@ function approvedAtHost(actor: BridgeActor): boolean {
 /** Longest version text sent on (an ISO time is 24 characters). */
 const MAX_VERSION_LENGTH = 40;
 
+/** Why an expectedUpdatedAt is refused (here, and by the door: lib/agent/operate.ts withVersion). */
+export const EXPECTED_VERSION_MESSAGE =
+  'Send expectedUpdatedAt as the record\'s updatedAt exactly as Ironbooks answered it, with its time zone (for example "2026-11-22T14:05:09.123Z"), or leave it out.';
+
 /**
  * OperationInput.expectedUpdatedAt, the version of the record the agent last read, as the route's
  * record locking reads it (lib/services/concurrency.ts expectedVersion): a time Date can read, sent
  * as given. Taken from the input the bridge was handed (guardInput keeps only what it knows), and
- * checked here: it is text that becomes a header, so only the characters a time is written with.
+ * checked here: it is text that becomes a header, so only the characters a time is written with,
+ * and a plain ISO time with its zone (guards.ts plainIsoTime): a time with no zone would be read in
+ * this computer's own time zone, hours away from the version the agent read.
  */
 function expectedVersionOf(input: OperationInput): { value: string | null } | { error: string } {
   const v = (input as { expectedUpdatedAt?: unknown }).expectedUpdatedAt;
   if (v === undefined || v === null || v === '') return { value: null };
   const s = typeof v === 'string' ? v.trim() : '';
-  if (!s || s.length > MAX_VERSION_LENGTH || !/^[0-9TZ:.+\- ]+$/.test(s) || !Number.isFinite(Date.parse(s))) {
-    return { error: 'Send expectedUpdatedAt as the record\'s updatedAt exactly as Ironbooks answered it (for example "2026-11-22T14:05:09.123Z"), or leave it out.' };
+  if (!s || s.length > MAX_VERSION_LENGTH || !/^[0-9TZ:.+\- ]+$/.test(s) || plainIsoTime(s) === null) {
+    return { error: EXPECTED_VERSION_MESSAGE };
   }
   return { value: s };
 }
@@ -795,6 +802,52 @@ function isFileRef(v: unknown): v is FileRef {
   return isObject(v) && Object.keys(v).length === 1 && typeof v.fileId === 'string';
 }
 
+/** Why a staged file of a reveal whose time is up is not used (revealFileEnded). */
+export const REVEAL_FILE_ENDED =
+  'That file held protected values a person let this agent see for a while, and that time is over, so it can no longer be fetched or saved. If it is still needed, ask for it again with reveal: true and a reason.';
+
+/**
+ * The staged file is the answer of an approved reveal whose time is up (D6). The requests service
+ * removes such a file then (lib/services/agentRequests.ts letGoRevealFile); until it has (Ironbooks
+ * stopped in between, or the removal failed and waits for the next try), it is handed over no
+ * more, saved, printed or sent nowhere: not by the door (lib/agent/operate.ts), and not as a FileRef
+ * in a request's body here. A reveal whose end cannot be read counts as over (fail closed).
+ */
+export async function revealFileEnded(db: DB, companyId: string, agentId: string, fileId: string): Promise<boolean> {
+  if (!fileId || !UUID.test(agentId)) return false;
+  const rows = await db
+    .select({ result: agentPermissionRequests.result })
+    .from(agentPermissionRequests)
+    .where(
+      and(
+        eq(agentPermissionRequests.companyId, companyId),
+        eq(agentPermissionRequests.agentId, agentId),
+        eq(agentPermissionRequests.status, 'executed'),
+        or(
+          sql`(${agentPermissionRequests.result} ->> 'revealFileLeft') = ${fileId}`,
+          sql`(${agentPermissionRequests.result} -> 'file' ->> 'fileId') = ${fileId}`,
+        ),
+      ),
+    );
+  const now = Date.now();
+  return rows.some(({ result }) => {
+    if (!isObject(result)) return false;
+    if (result.revealFileLeft === fileId) return true;
+    if (!Object.hasOwn(result, 'revealUntil')) return false;
+    const ends = typeof result.revealUntil === 'string' ? Date.parse(result.revealUntil) : NaN;
+    return !(Number.isFinite(ends) && now < ends);
+  });
+}
+
+/** The staged files a body names as FileRefs, anywhere in it (as withFiles finds them). */
+function fileRefIds(v: unknown, out: Set<string> = new Set(), depth = 0): Set<string> {
+  if (depth > 64 || out.size > MAX_FILE_REFS) return out;
+  if (isFileRef(v)) out.add(v.fileId);
+  else if (Array.isArray(v)) for (const item of v) fileRefIds(item, out, depth + 1);
+  else if (isObject(v)) for (const k of Object.keys(v)) fileRefIds(v[k], out, depth + 1);
+  return out;
+}
+
 const UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
 /** Put `true` at a dotted path of a JSON body (a copy), making the objects on the way. */
@@ -826,7 +879,14 @@ async function readFileRef(owner: FileOwner, ref: FileRef, seen: Map<string, Sta
   if (seen.size >= MAX_FILE_REFS) {
     throw new BridgeRefusal(`One request can use at most ${MAX_FILE_REFS} files.`, 'TOO_MANY_FILES');
   }
-  const got = await readStagedFile(owner, ref.fileId);
+  let got: StagedBytes | null;
+  try {
+    got = await readStagedFile(owner, ref.fileId);
+  } catch (err) {
+    // A file kept for a person only (a whole copy of the company file) is never sent in a request.
+    if (err instanceof ServiceError) throw new BridgeRefusal(err.message, err.code, { fileId: ref.fileId });
+    throw err;
+  }
   if (!got) {
     throw new BridgeRefusal(
       `The file "${ref.fileId}" is not there any more (staged files are cleared after a day). Upload it again and use the new file id.`,
@@ -1461,6 +1521,12 @@ interface TouchedEntry {
   counted: string | null;
   /** Its total cannot be known (it is gone and the audit trail does not hold it): fail closed. */
   unknown: boolean;
+  /**
+   * Which accounts its lines were on before the run cannot be known: the run opened the ledger
+   * for rewriting (a merge, a reclassify), under which a line can be moved to another account or
+   * deleted without a trace. Its accounts are then unknown (ledgerAccountsOf: fail closed).
+   */
+  accountsUnknown: boolean;
   entryNumber: number | null;
   date: string;
   description: string | null;
@@ -1610,6 +1676,7 @@ async function touchedEntries(
       status: r.status,
       counted: moves ? toAmountString(r.total) : null,
       unknown: false,
+      accountsUnknown: rewriteOpen,
       entryNumber: r.entry_number === null || r.entry_number === undefined ? null : Number(r.entry_number),
       date: day(r.date),
       description: r.description,
@@ -1631,6 +1698,7 @@ async function touchedEntries(
       status: 'deleted',
       counted: notInBooks ? null : total,
       unknown: !notInBooks && total === null,
+      accountsUnknown: false,
       entryNumber: typeof old.entryNumber === 'number' ? old.entryNumber : null,
       date: day(old.date),
       description: typeof old.description === 'string' ? old.description : null,
@@ -1835,9 +1903,15 @@ interface LedgerTotals {
    * (voiding a payroll adjustment that never posted still takes it off the W-2): unknown, never 0.00.
    */
   editsExisting: boolean;
+  /**
+   * Every account the run's ledger lines are on: of the entries it made, and of those it voided,
+   * deleted or changed (ledgerAccountsOf), all of them, not only the lines the preview shows. Null
+   * when that cannot be known; then no grant limited to accounts covers the run (factsFor).
+   */
+  accountIds: string[] | null;
 }
 
-function ledgerTotals(rows: readonly LedgerRow[], touched: readonly TouchedEntry[], editsExisting: boolean): LedgerTotals {
+function ledgerTotals(rows: readonly LedgerRow[], touched: readonly TouchedEntry[], editsExisting: boolean, accountIds: string[] | null): LedgerTotals {
   type Amount = ReturnType<typeof Money.zero>;
   const sourceOf = (s: string | null) => (s && s.trim() ? s.trim().toLowerCase() : null);
   const made = new Map<string, { total: Amount; source: string | null }>();
@@ -1873,7 +1947,52 @@ function ledgerTotals(rows: readonly LedgerRow[], touched: readonly TouchedEntry
     mixed,
     unknown: touched.some((t) => t.unknown),
     editsExisting,
+    accountIds,
   };
+}
+
+/**
+ * Every account the run's ledger lines are on (lower-case ids, sorted): the lines of the entries it
+ * made, the lines as they are now of the entries it voided or changed, and the lines an entry it
+ * deleted outright had, as the audit trail kept them. An item line's account comes from the item
+ * (a bill's expense or inventory asset account, an invoice's income account), not from the body,
+ * so only the ledger shows it. Null when the accounts cannot all be known: the run opened the
+ * ledger for rewriting (TouchedEntry.accountsUnknown), or an entry it deleted while it was in the
+ * books left no readable lines.
+ */
+async function ledgerAccountsOf(ctx: ServiceContext, made: readonly LedgerRow[], touched: readonly TouchedEntry[], audit: readonly AuditRow[]): Promise<string[] | null> {
+  if (touched.some((t) => t.accountsUnknown)) return null;
+  const out = new Set<string>();
+  for (const r of made) {
+    const id = String(r.account_id ?? '').toLowerCase();
+    if (!UUID.test(id)) return null;
+    out.add(id);
+  }
+  const live = touched.filter((t) => t.status !== 'deleted').map((t) => t.id.toLowerCase()).filter((id) => UUID.test(id));
+  if (live.length) {
+    // Every id passed the UUID pattern (hex digits and dashes only), so it can be written in place.
+    const list = sql.raw(`ARRAY[${live.map((id) => `'${id}'`).join(',')}]::uuid[]`);
+    const res = (await ctx.db.execute(sql`
+      SELECT DISTINCT l.account_id::text AS account_id FROM journal_entry_lines l
+       WHERE l.journal_entry_id = ANY(${list})`)) as unknown as { rows: Array<{ account_id: string }> };
+    for (const r of res.rows) out.add(r.account_id.toLowerCase());
+  }
+  for (const t of touched) {
+    if (t.status !== 'deleted') continue;
+    const row = audit.filter((r) => r.entity_type === 'journal_entry' && r.action === 'delete' && r.entity_id.toLowerCase() === t.id.toLowerCase()).pop();
+    const old = row && isObject(row.old_values) ? row.old_values : {};
+    const inBooks = t.counted !== null || t.unknown;
+    if (!Array.isArray(old.lines)) {
+      if (inBooks) return null;
+      continue;
+    }
+    for (const l of old.lines) {
+      const id = isObject(l) && typeof l.accountId === 'string' ? l.accountId.toLowerCase() : '';
+      if (!UUID.test(id)) return null;
+      out.add(id);
+    }
+  }
+  return [...out].sort();
 }
 
 // ---------------------------------------------------------------------------
@@ -3000,7 +3119,7 @@ async function collect(
     ledger.changes.length > PREVIEW_ROW_LIMIT ||
     records.length > PREVIEW_ROW_LIMIT;
   return {
-    ledger: ledgerTotals(lines, touched, editsExistingRecord(rows, made)),
+    ledger: ledgerTotals(lines, touched, editsExistingRecord(rows, made), await ledgerAccountsOf(ctx, lines, touched, rows)),
     stalenessKey: stalenessKeyOf({ operation, status, named, ledger: lines, audit: rows, effects, touched, made, taken, takenOnRecords, span, today, givenDays: before.givenDays }),
     preview: {
       ledger: { entries: [...madeShown, ...touchedShown], changes: ledger.changes.slice(0, PREVIEW_ROW_LIMIT) } satisfies ChangePreview,
@@ -3012,6 +3131,75 @@ async function collect(
       truncated,
     },
   };
+}
+
+/**
+ * After an agent's run committed and what it queued was released: one audit row for each email,
+ * file or print job that FAILED, so a record that says an email went out ("emailed", written in the
+ * run's transaction) is followed by one that says it did not (lib/effects.ts header). The row is on
+ * the record the service named (EffectAbout; else on the agent), with the run's agent, approval,
+ * request and grant, and says what it was, to whom and why it failed. A sales form's email also
+ * puts the form back in its "to be emailed" queue (salesForms.ts putBackAfterFailedEmail). Never
+ * throws: the work is committed either way, and the agent gets its answer. Returns the reports as
+ * the agent reads them (without `about`).
+ */
+async function recordFailedEffects(db: DB, parts: RunContextParts, reports: readonly EffectReport[]): Promise<EffectReport[]> {
+  const failed = reports.filter((r) => r.status === 'failed' && !r.ranDuringOperation);
+  if (failed.length) {
+    const own = handlerContext(db, parts, false);
+    // Recording what happened changes nothing in the books: a view-only role may record it.
+    const ctx: ServiceContext = { ...own, role: own.role === 'viewer' ? undefined : own.role };
+    for (const r of failed) {
+      try {
+        await inTransaction(ctx, async (tx) => {
+          const about = r.about && UUID.test(r.about.entityId) ? r.about : null;
+          let putBack: Record<string, unknown> | null = null;
+          if (about?.onFailure && r.effect.kind === 'email') {
+            const forms = await import('@/lib/services/salesForms');
+            if (about.onFailure.putBack === forms.SALES_FORM_EMAIL) putBack = await forms.putBackAfterFailedEmail(tx, about.entityType, about.entityId, about.onFailure);
+          }
+          await writeAudit(tx, {
+            action: 'update',
+            entityType: about ? about.entityType : 'agent',
+            entityId: about ? about.entityId : parts.actor.agent.id,
+            newValues: failedEffectValues(r, putBack),
+          });
+        });
+      } catch (err) {
+        console.error('[agent bridge] a failed email, file or print job could not be recorded', err);
+      }
+    }
+  }
+  return reports.map(({ about: _about, ...rest }) => rest);
+}
+
+/** What the audit row of a failed effect says (recordFailedEffects). */
+function failedEffectValues(r: EffectReport, putBack: Record<string, unknown> | null): Record<string, unknown> {
+  const d = isObject(r.effect.detail) ? r.effect.detail : {};
+  const list = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+  return {
+    action: r.effect.kind === 'email' ? 'email_failed' : `${r.effect.kind}_failed`,
+    what: r.effect.summary,
+    ...(r.effect.kind === 'email'
+      ? { to: list(d.to), cc: list(d.cc), bcc: list(d.bcc), subject: typeof d.subject === 'string' ? d.subject : '' }
+      : {}),
+    error: r.error ?? 'It did not go through.',
+    ...(putBack ? { putBack } : {}),
+  };
+}
+
+/**
+ * Called inside a commit's transaction, before it ends, with what the run did (its facts, preview
+ * and staleness key): the message to refuse it with when what it did is no longer what it was
+ * judged on (lib/agent/operate.ts: a run under a grant or under Allow, judged on its dry run's
+ * facts, whose record changed in between), or null to keep it. A refusal rolls everything back.
+ */
+export type CommitCheck = (committed: BridgeResult) => string | null;
+
+/** What a caller of runOperation may add to the contract's arguments. */
+export interface RunOptions {
+  /** A commit inside a transaction is checked with it before the transaction ends (CommitCheck). */
+  commitCheck?: CommitCheck;
 }
 
 /** One use of a standing permission; a grant that is gone or used up refuses the run. */
@@ -3222,8 +3410,10 @@ function stoppedAtNetwork(raw: RawAnswer, operation: Operation, actor: BridgeAct
  *    be known keeps null (fail closed).
  */
 function factsFor(operation: Operation, input: OperationInput, closingDate: string | null, answer: unknown, ledger: LedgerTotals | null): RequestFacts {
-  const facts = factsOf(operation, input, answer === undefined ? { closingDate } : { closingDate, answer });
-  if (ledger === null) return facts;
+  const named = factsOf(operation, input, answer === undefined ? { closingDate } : { closingDate, answer });
+  if (ledger === null) return named;
+  // The accounts the run posts to, besides those the body and the answer name (an item line's).
+  const facts = withLedgerAccounts(named, ledger.accountIds);
   if (ledger.unknown) return { ...facts, amount: null };
   if (operation.amountField) {
     const seen = ledger.mixed ? ledger.sum : ledger.largest;
@@ -3242,7 +3432,14 @@ function factsFor(operation: Operation, input: OperationInput, closingDate: stri
 // The bridge
 // ---------------------------------------------------------------------------
 
-export const runOperation: RunOperation = async (base, operation, input, mode, actor) => {
+export const runOperation = (async (
+  base: ServiceContext,
+  operation: Operation,
+  input: OperationInput,
+  mode: BridgeMode,
+  actor: BridgeActor,
+  opts: RunOptions = {},
+): Promise<BridgeResult> => {
   if (mode !== 'read' && mode !== 'dry_run' && mode !== 'commit') throw new Error(`Unknown bridge mode "${String(mode)}".`);
   assertRegistered(operation);
   const given: OperationInput = isObject(input) ? (input as OperationInput) : {};
@@ -3342,6 +3539,10 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
 
   // 5. The request.
   const owner: FileOwner = { companyId: base.companyId, agentId: actor.agent.id };
+  // A file of a reveal whose time is up goes nowhere, approved or not (revealFileEnded).
+  for (const fileId of fileRefIds(runInput.body)) {
+    if (await revealFileEnded(db, base.companyId, actor.agent.id, fileId)) return refuse(REVEAL_FILE_ENDED, 'FILE_NOT_FOUND', { fileId });
+  }
   const extras: RequestExtras = { expectedVersion: version.value, hostPass: approvedAtHost(actor) ? expectedLaunchPass() : null };
   let request: BuiltRequest;
   try {
@@ -3449,7 +3650,9 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
       return raw;
     }, { pinFiles: true });
 
-  const stage = (file: Interpreted['file']) => (file ? stageFile(owner, file) : Promise.resolve(null));
+  // Kept saying which operation answered it: a whole copy of the company file (a backup, a portable
+  // copy) is the person's only, which the agent may have saved but never read (files.ts).
+  const stage = (file: Interpreted['file']) => (file ? stageAnswerFile(owner, file, operation.id) : Promise.resolve(null));
 
   /**
    * The warnings the agent's confirmation flags accept, in the route's own words (plan §5.6), for
@@ -3593,7 +3796,7 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
         const seen = interpret(run.value, operation, actor, sentFlags);
         const file = await stage(seen.file);
         const shown = capped(run.effects);
-        const effects = await run.release();
+        const effects = await recordFailedEffects(db, parts, await run.release());
         return {
           ...blank(mode, facts(seen.answer, null)),
           httpStatus: run.value.status,
@@ -3641,6 +3844,9 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
             stalenessKey: done.stalenessKey,
             produced: seen.produced,
           };
+          // What it did is still what it was judged on (RunOptions.commitCheck): else nothing is kept.
+          const stale = opts.commitCheck?.(result) ?? null;
+          if (stale) throw new BridgeRefusal(stale, 'CONFLICT', null, run.value.status);
           if (d.expired) throw new TimedOut();
           d.finishing = true;
           return { run, result };
@@ -3649,11 +3855,11 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
           throw err;
         }
       });
-      // Committed: only now does anything leave the database.
-      return { ...kept.result, effects: await kept.run.release() };
+      // Committed: only now does anything leave the database. What failed is recorded.
+      return { ...kept.result, effects: await recordFailedEffects(db, parts, await kept.run.release()) };
     } catch (err) {
       // Calls to other computers a failed run had already made did happen: say so.
       return failed(err, effectsOfFailedRun(err)?.ran ?? []);
     }
   }, timeout);
-};
+}) satisfies RunOperation;

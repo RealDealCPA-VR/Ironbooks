@@ -50,6 +50,10 @@
  *    it wait for the clear, so it never removes a folder a write is using, and never a file staged
  *    after it began. Writes for one agent also happen one at a time (its own lock), so parts are
  *    appended in turn and the limits hold.
+ *  - A whole copy of the company file (a backup, a portable copy with no password on it:
+ *    PERSON_ONLY_FILE_OPERATIONS, looksLikeWholeCopy) is staged for a person only, marked so in its
+ *    .json: the agent may have it saved to a folder an Admin allowed (readStagedFileForSave), but
+ *    readStagedFile refuses it (get_file, a file reference in a request, printing).
  *  - Nothing here logs, and no error passes on a path or a file's content: a disk failure becomes
  *    one plain message (diskTrouble).
  *  - Files and unfinished uploads go after STAGED_FILE_HOURS (clearStagedFiles, also run lazily at
@@ -155,6 +159,44 @@ interface Meta {
   /** Whose file it is (ownerSegments): missing in a .json that no owner can read. */
   company?: string;
   agent?: string;
+  /** A whole copy of the company file (PERSON_ONLY_FILE_OPERATIONS): saved for a person only, never read by the agent. */
+  personOnly?: true;
+}
+
+/**
+ * Operations whose file answer is a whole copy of the company file with nothing masked and no
+ * password the approver typed on it: every user's password hash and two-step secret, the file's
+ * own secrets, and every SSN and account number in full (an unprotected backup is the database
+ * folder itself; a protected one carries the key slots, so the passwords can be guessed at offline
+ * all the same). The agent may ask for one and have it saved in a folder an Admin allowed
+ * (files.save, approved at the host), but never read it: its staged file is the person's only
+ * (readStagedFile refuses it, readStagedFileForSave hands it to the save). The portable copy
+ * an agent asks for with POST (portable.post) is not here: the agent cannot take its password off
+ * (lib/agent/guards.ts strips `protect`), so it is always sealed with the password the approver
+ * types, which the agent never sees. By operation id (operation-ids.txt).
+ */
+export const PERSON_ONLY_FILE_OPERATIONS: ReadonlySet<string> = new Set(['backup.download', 'portable', 'dashboard.auto-backup']);
+
+/** What an agent is told when it tries to read, or use in a request, such a staged copy. */
+export const PERSON_ONLY_FILE_MESSAGE =
+  'This file is a full copy of the company file, with every password and number in it, so an agent cannot read it or use it in a request. Save it to an allowed folder with save_file, or ask a person to open it.';
+
+/** The start of a zip file ("PK\x03\x04"): a portable copy with no password on it is one. */
+const ZIP_START = [0x50, 0x4b, 0x03, 0x04];
+
+/**
+ * By its name and bytes, a staged file is a whole copy of the company file with no password the
+ * approver typed: a whole-file backup as lib/services/backup.ts createBackup names every one
+ * ("ironbooks-backup-….bka", protected or not; a one-company backup is "ironbooks-company-…", masked
+ * for the agent, and stays readable), or a portable copy that is a plain zip (".bkp" without the
+ * password envelope a protected one starts with). The backstop for a file staged without its
+ * operation (stageFile): such a file is the person's only whichever operation answered it.
+ */
+function looksLikeWholeCopy(name: string, bytes: Uint8Array): boolean {
+  const n = name.trim().toLowerCase();
+  if (/^ironbooks-backup(?:[-_.].*)?\.bka$/.test(n)) return true;
+  const zip = bytes.byteLength >= ZIP_START.length && ZIP_START.every((b, i) => bytes[i] === b);
+  return zip && n.endsWith('.bkp');
 }
 
 /** A root's gate: writes share it, a clear has it alone; first come, first served. */
@@ -414,6 +456,15 @@ function envPlace(name: string): string | null {
  * reads them with the books' settings).
  */
 export function appDataPlaces(): string[] {
+  return ironbooksPlaces(true);
+}
+
+/**
+ * appDataPlaces, with or without the open company file itself and the archives folder beside it.
+ * Without them, for the one rule that must not count the company file in its own folder
+ * (holdsAppDataBesideTheBooks).
+ */
+function ironbooksPlaces(withOpenFile: boolean): string[] {
   const env = process.env;
   const home = os.homedir();
   const out: Array<string | null> = [appDataRoot(), path.dirname(appDataRoot())];
@@ -431,7 +482,7 @@ export function appDataPlaces(): string[] {
     // sandboxRoot's own test, word for word: any value at all means the shell named the folder.
     if (!env.BKA_SANDBOX_ROOT) out.push(path.join(beside, SANDBOXES_FOLDER));
   }
-  for (const file of [companyFile(), envPlace('BKA_REAL_COMPANY_FILE')]) {
+  for (const file of [withOpenFile ? companyFile() : null, envPlace('BKA_REAL_COMPANY_FILE')]) {
     if (file) out.push(file, path.join(path.dirname(file), 'archives'));
   }
   // The desktop app's settings folder (electron/main.js userData), as Electron names it
@@ -481,6 +532,21 @@ function sandboxedBooks(): { sandboxes: string; realBooks: string } | null {
  * drive): fail closed. A share is judged by the words alone and never looked at.
  */
 export function overlapsAppData(folder: string): boolean {
+  return overlapsPlaces(folder, appDataPlaces);
+}
+
+/**
+ * overlapsAppData without counting the open company file itself (and the archives beside it): for
+ * the company file's own folder as a folder agents may use by default (lib/agent/shell.ts
+ * defaultAgentFolders), which always holds the company file. True when that folder is, lies inside
+ * or holds any other place of Ironbooks' own data (the settings folder, the working copies, a
+ * backup folder the shell named, the staged files), or cannot be judged.
+ */
+export function holdsAppDataBesideTheBooks(folder: string): boolean {
+  return overlapsPlaces(folder, () => ironbooksPlaces(false));
+}
+
+function overlapsPlaces(folder: string, places: () => string[]): boolean {
   if (typeof folder !== 'string') return true;
   const typed = folder.trim();
   if (!typed || typed.length > PATH_MAX || /[\p{Cc}]/u.test(typed) || isDevicePath(typed) || !path.isAbsolute(typed)) return true;
@@ -488,7 +554,7 @@ export function overlapsAppData(folder: string): boolean {
   try {
     const mine = placeForms(typed);
     if (mine.some(isThisComputerShare)) return true;
-    return appDataPlaces().some((place) => placeForms(place).some((p) => mine.some((m) => mayOverlap(m, p))));
+    return places().some((place) => placeForms(place).some((p) => mine.some((m) => mayOverlap(m, p))));
   } catch {
     return true;
   }
@@ -883,6 +949,8 @@ function parseMeta(text: string): Meta | null {
     ) {
       const meta: Meta = { name: cleanName(m.name), type: cleanType(m.type), size: m.size, created: m.created };
       if (typeof m.company === 'string' && typeof m.agent === 'string') Object.assign(meta, { company: m.company, agent: m.agent });
+      // Anything but a plain "not marked" keeps it the person's (fail closed).
+      if (m.personOnly !== undefined && (m.personOnly as unknown) !== false) meta.personOnly = true;
       return meta;
     }
   } catch {
@@ -1030,13 +1098,13 @@ async function checkRoom(dir: string, add: { bytes: number; file: boolean; uploa
  * Keep `bytes` as a new staged file in `dir`. The .bin goes first: a .json always has its bytes.
  * A write (asWrite), after checkRoom.
  */
-async function writeStaged(dir: string, name: string, type: string, bytes: Uint8Array): Promise<StagedFile> {
+async function writeStaged(dir: string, name: string, type: string, bytes: Uint8Array, personOnly = false): Promise<StagedFile> {
   const fileId = newId();
   const bin = path.join(dir, `${fileId}.bin`);
   await ownerReady(dir);
   await writeAtomic(dir, bin, bytes);
   try {
-    await writeMeta(dir, fileId, { name, type, size: bytes.byteLength, created: new Date().toISOString() });
+    await writeMeta(dir, fileId, { name, type, size: bytes.byteLength, created: new Date().toISOString(), ...(personOnly ? { personOnly: true as const } : {}) });
   } catch (err) {
     await fsp.rm(bin, { force: true }).catch(() => undefined);
     throw err;
@@ -1054,6 +1122,8 @@ interface Found {
   bin: string;
   /** The .bin as it was checked, to compare with the file that is opened (sameFile). */
   checked: BigIntStats;
+  /** A whole copy of the company file: saved for a person, never read by the agent. */
+  personOnly: boolean;
 }
 
 /** One plain file with one name: never a link, nor a second name (a hard link) for a file kept elsewhere. */
@@ -1085,7 +1155,7 @@ async function findStaged(owner: FileOwner, fileId: string): Promise<Found | nul
     const meta = await readMeta(json, js);
     if (!meta || !metaIsOwners(meta, ids) || BigInt(meta.size) !== bs.size) return null;
     if (Date.now() - bornAt(meta, Number(bs.mtimeMs), Number(js.mtimeMs)) > STAGED_MS) return null;
-    return { file: { fileId, name: meta.name, type: meta.type, size: meta.size }, dir, bin, checked: bs };
+    return { file: { fileId, name: meta.name, type: meta.type, size: meta.size }, dir, bin, checked: bs, personOnly: meta.personOnly === true };
   } catch {
     return null;
   }
@@ -1112,19 +1182,36 @@ async function readExactly(handle: FileHandle, size: number): Promise<Buffer | n
 // Staged files
 // ---------------------------------------------------------------------------
 
-export const stageFile: StageFile = async (owner, file) => {
+async function stageAs(owner: FileOwner, file: Parameters<StageFile>[1], forPerson: boolean): Promise<StagedFile> {
   const dir = ownerDir(owner);
   if (!file || !(file.bytes instanceof Uint8Array)) throw new ServiceError('VALIDATION', 'There is no file content to keep. Send the file again.');
   if (file.bytes.byteLength > UPLOAD_MAX_BYTES) throw tooLarge();
   const name = cleanName(file.name);
   const type = cleanType(file.type);
   const bytes = file.bytes;
+  const personOnly = forPerson || looksLikeWholeCopy(String(file.name ?? ''), bytes) || looksLikeWholeCopy(name, bytes);
   await clearNowAndThen();
   return asWrite(dir, async () => {
     await checkRoom(dir, { bytes: bytes.byteLength, file: true, upload: false });
-    return writeStaged(dir, name, type, bytes);
+    return writeStaged(dir, name, type, bytes, personOnly);
   });
-};
+}
+
+/**
+ * Keep a file for the agent. A whole copy of the company file (looksLikeWholeCopy) is kept for a
+ * person only, whoever staged it: the backstop when the operation that answered it is not said.
+ */
+export const stageFile: StageFile = (owner, file) => stageAs(owner, file, false);
+
+/**
+ * Keep the file an operation answered (lib/agent/bridge.ts), saying which operation it was: the
+ * file of one in PERSON_ONLY_FILE_OPERATIONS is kept for a person only (save_file may save it in a
+ * folder an Admin allowed; get_file and a request's file reference are refused), and so is any
+ * file that looks like a whole copy of the company file (stageFile).
+ */
+export function stageAnswerFile(owner: FileOwner, file: Parameters<StageFile>[1], operationId: string): Promise<StagedFile> {
+  return stageAs(owner, file, PERSON_ONLY_FILE_OPERATIONS.has(operationId));
+}
 
 /** A plain file id and owner: only then is the disk looked at, the lazy clear included. */
 function worthLooking(owner: FileOwner, fileId: unknown): boolean {
@@ -1138,11 +1225,34 @@ function worthLooking(owner: FileOwner, fileId: unknown): boolean {
  * exactly its size (readExactly), and the owner's folders looked at once more after it was opened
  * (a folder swapped for a link and back).
  */
-export const readStagedFile: ReadStagedFile = async (owner, fileId) => {
+export const readStagedFile: ReadStagedFile = (owner, fileId) => readStaged(owner, fileId, false);
+
+/**
+ * The bytes of a staged file to SAVE in a folder (files.save: the door's save preview and the
+ * save itself, approved by an Admin at the host), a whole copy of the company file included. The
+ * bytes go to the disk only, never to the agent. Every other reader uses readStagedFile.
+ */
+export function readStagedFileForSave(owner: FileOwner, fileId: string): Promise<{ file: StagedFile; bytes: Uint8Array } | null> {
+  return readStaged(owner, fileId, true);
+}
+
+/** Whether a staged file of this owner is kept for a person only (a whole copy of the company file). False when there is none. */
+export async function stagedFileIsPersonOnly(owner: FileOwner, fileId: string): Promise<boolean> {
+  if (!worthLooking(owner, fileId)) return false;
+  return (await findStaged(owner, fileId))?.personOnly === true;
+}
+
+/**
+ * readStagedFile, and readStagedFileForSave when `forSave`. A file kept for a person only is
+ * refused to every reader but the save: get_file, a file reference in a request (whose route could
+ * hand the bytes back, as an attachment), printing (PERSON_ONLY_FILE_MESSAGE, FORBIDDEN).
+ */
+async function readStaged(owner: FileOwner, fileId: string, forSave: boolean): Promise<{ file: StagedFile; bytes: Uint8Array } | null> {
   if (!worthLooking(owner, fileId)) return null;
   await clearNowAndThen();
   const found = await findStaged(owner, fileId);
   if (!found) return null;
+  if (found.personOnly && !forSave) throw new ServiceError('FORBIDDEN', PERSON_ONLY_FILE_MESSAGE);
   let handle: FileHandle | null = null;
   try {
     handle = await fsp.open(found.bin, fs.constants.O_RDONLY | NO_FOLLOW | NON_BLOCK);

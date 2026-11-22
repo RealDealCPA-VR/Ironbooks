@@ -7,6 +7,11 @@
  * and request.status where it stands now, usually still waiting) is reported as such, never folded
  * into 'failed' or left out.
  *
+ * One click approving many pieces is one approval of all of them (D8): each agent's chosen requests
+ * are added up, and when they come to more than that agent's two-person amount together (or one
+ * shows no amount while it is set), nothing is approved and the answer is a 400 saying to approve
+ * them one at a time (lib/services/agentRequests.ts batchApprove).
+ *
  * A person's window only (app/api/agent-requests/_guards.ts); whether it is the host computer's own
  * is passed on, as for a single approval.
  */

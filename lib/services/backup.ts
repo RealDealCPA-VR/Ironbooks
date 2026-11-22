@@ -82,7 +82,7 @@ import {
 import { ServiceError, type ServiceContext } from './_base';
 import { cloneAttachmentFileForRestore, normalizeStoragePath, safeAttachmentPath } from './attachments';
 import { allowLedgerRewrite } from './posting';
-import { logTransaction, resetTransactionLogCache } from './transactionLog';
+import { agentLabel, logTransaction, resetTransactionLogCache } from './transactionLog';
 import { BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE, markPruned, readBackupHistory, recordBackup } from './backupHistory';
 import { beginRestore } from './restoreState';
 import {
@@ -1238,7 +1238,18 @@ export const COMPANY_BACKUP_EXCLUDED_TABLES: Record<string, string> = {
  * never treated as a hard foreign key.
  */
 const SOFT_REF_KEYS: Record<string, Set<string>> = {
-  auditLogs: new Set(['entityId']),
+  // Who made an audited change and how it was allowed (WAVE5C F11): the agent, the person who
+  // approved it, and the request or standing permission it ran under. Agents, their requests and
+  // grants are not in a company backup and users are machine-local, so these are kept verbatim:
+  // the restored Audit Trail still reads "<agent> (agent), approved by <person>" (or "Removed
+  // agent" / "a removed user" where that is no longer on file), never the restorer's own work.
+  // approvedBy is kept here, not mapped to the restorer like the other user columns: a restore
+  // must never put the restorer's name on an approval they did not give.
+  auditLogs: new Set(['entityId', 'agentId', 'approvedBy', 'agentRequestId', 'agentGrantId']),
+  // The agent behind an entry, a reconciliation or a proposal (no FK, see the schema).
+  journalEntries: new Set(['agentId']),
+  reconciliations: new Set(['agentId']),
+  aiProposals: new Set(['agentId']),
   // Polymorphic "attached to" pointers: remapped when the target is in the backup, else kept.
   entityNotes: new Set(['entityId']),
   todos: new Set(['entityId']),
@@ -1583,11 +1594,11 @@ function reviveRow(
         v = mapped.length > 0 ? mapped : null;
       } else if (col.columnType === 'PgUUID' && typeof v === 'string') {
         if (key === 'companyId') v = newCompanyId;
-        else if (USER_REF_KEYS.has(key)) v = ownerId;
+        else if (USER_REF_KEYS.has(key) && !SOFT_REF_KEYS[spec.name]?.has(key)) v = ownerId;
         else if (idMap.has(v)) v = idMap.get(v)!;
         else if (SOFT_REF_KEYS[spec.name]?.has(key)) {
           // Audit trail entity pointer: the company itself → the new company; anything else
-          // (a user, a deleted record) keeps its original id as historical information.
+          // (a user, an agent, a deleted record) keeps its original id as historical information.
           if (oldCompanyId && v === oldCompanyId) v = newCompanyId;
         }
         else if (col.notNull) {
@@ -1650,6 +1661,13 @@ export async function restoreCompanyBackup(
     dataDir?: string;
     /** Opens a backup protected with another company file's passwords (sealedArchives.ts). */
     credentials?: ArchiveCredentials | null;
+    /**
+     * The caller's agent and approval (ServiceContext.agent / .approval) when an agent asked for
+     * the restore: the new company's "company_restore" audit row and log record name them, as
+     * writeAudit does for any agent's change (WAVE5C F15). Absent for a person's own restore.
+     */
+    agent?: ServiceContext['agent'] | null;
+    approval?: ServiceContext['approval'] | null;
   },
 ): Promise<RestoreCompanyResult> {
   const { data, files } = await openCompanyBackup(buffer, { credentials: opts.credentials, dataDir: opts.dataDir });
@@ -1703,7 +1721,12 @@ async function restoreCompanyRows(
   data: CompanyExportData,
   idMap: Map<string, string>,
   name: string,
-  opts: { ownerId: string; name?: string },
+  opts: {
+    ownerId: string;
+    name?: string;
+    agent?: ServiceContext['agent'] | null;
+    approval?: ServiceContext['approval'] | null;
+  },
   attachmentsDataDir: string,
   copiedFiles: string[],
   files: Map<string, Buffer> = new Map(),
@@ -1767,7 +1790,9 @@ async function restoreCompanyRows(
       tableCounts[spec.name] = rows.length;
     }
 
-    // Record the restore in the NEW company's audit trail.
+    // Record the restore in the NEW company's audit trail, with the agent and the approval it ran
+    // under when an agent asked for it (the same fields writeAudit records).
+    const approval = opts.approval ?? null;
     await tx.insert(auditLogs).values({
       companyId: company.id,
       userId: opts.ownerId,
@@ -1775,6 +1800,10 @@ async function restoreCompanyRows(
       entityType: 'company_restore',
       entityId: company.id,
       newValues: { restoredFrom: data.company.name, tableCounts, ...(hold ? { internetServicesLeftOff: true } : {}) },
+      agentId: opts.agent?.id ?? null,
+      approvedBy: approval?.approvedBy ?? null,
+      agentRequestId: approval?.requestId ?? null,
+      agentGrantId: approval?.grantId ?? null,
     });
     // Running transaction log: one bulk record covering every restored posted entry, so
     // verifyTransactionLog can account for them.
@@ -1785,6 +1814,8 @@ async function restoreCompanyRows(
     await logTransaction(tx as unknown as DB, {
       companyId: company.id,
       userId: opts.ownerId,
+      ...(opts.agent ? { actorName: agentLabel(opts.agent.name), agentId: opts.agent.id } : {}),
+      ...(approval ? { approval } : {}),
       action: 'create',
       entityType: 'company_restore',
       entityId: company.id,

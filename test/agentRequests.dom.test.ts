@@ -24,6 +24,8 @@ import {
   asciiDomain,
   batchBlock,
   batchChoice,
+  batchTotalText,
+  batchTotals,
   canGiveGrant,
   companyFilePath,
   confirmFlagText,
@@ -788,6 +790,24 @@ describe('approving several at once', () => {
     expect(batchChoice([a], ['a', 'gone']).map((r) => r.id)).toEqual(['a']);
     const many = Array.from({ length: BATCH_MAX + 20 }, (_, i) => req({ id: `r${i}` }));
     expect(batchChoice(many, many.map((r) => r.id))).toHaveLength(BATCH_MAX);
+  });
+});
+
+describe('what the chosen requests come to together', () => {
+  it('adds up each agent on its own, by size, and counts the ones with no amount', () => {
+    const totals = batchTotals([
+      req({ id: 'a', agentId: 'x', agentName: 'Helper', amount: '4999.00' }),
+      req({ id: 'b', agentId: 'x', agentName: 'Helper', amount: '-4999.00' }),
+      req({ id: 'c', agentId: 'y', agentName: 'Closer', amount: null }),
+      req({ id: 'd', agentId: 'x', agentName: 'Helper', amount: 'lots' }),
+    ]);
+    expect(totals).toEqual([
+      { agentId: 'x', agentName: 'Helper', count: 3, total: '9998.00', unknown: 1 },
+      { agentId: 'y', agentName: 'Closer', count: 1, total: '0.00', unknown: 1 },
+    ]);
+    expect(batchTotalText(totals[0])).toBe('Helper: 3 requests, $9,998.00 together, 1 of which shows no amount');
+    expect(batchTotalText(totals[1])).toBe('Closer: 1 request, $0.00, which shows no amount');
+    expect(batchTotalText({ agentId: 'z', agentName: 'Z', count: 2, total: '300.00', unknown: 0 })).toBe('Z: 2 requests, $300.00 together');
   });
 });
 

@@ -15,7 +15,12 @@
  * request needs one, the file Admin when the route needs that, every role flag the request needs
  * (closed period, full SSNs, full account numbers), the host computer's own window for host-only
  * work, and a request that is still waiting. Two different people when the amount is above the
- * agent's two-person limit (D8). The run itself is lib/agent/operate.ts runApproved, as the
+ * agent's two-person limit (D8). At the second approval the first approver is judged again by the
+ * same rules, read from the company file now (firstApprovalLapsed): one who has been deactivated,
+ * removed, made view-only or has lost the right, the Admin role or a flag no longer counts, and the
+ * request waits for two people again. Batch approval adds up each agent's chosen requests and
+ * approves none together when the total passes the agent's two-person amount
+ * (refuseTogetherOverTwoPerson). The run itself is lib/agent/operate.ts runApproved, as the
  * approver, within the agent's role.
  *
  * Secrets (plan §5.8): what the approver types on the card goes to runApproved and nowhere else,
@@ -140,13 +145,14 @@ import {
   NO_RULE_FOR_APPROVER,
   SHORT_GRANT_MINUTES,
   approvalNeeds,
+  batchPassesTwoPerson,
   classRank,
   effectiveClass as effectiveClassOf,
   roleProblem,
   routeWithoutRule,
 } from '@/lib/agent/policy';
 import { removeStagedFile } from '@/lib/agent/files';
-import { guardInput, maskAccountsInText, maskSensitiveFields } from '@/lib/agent/guards';
+import { guardInput, maskAccountsInText, maskSensitiveFields, plainIsoTime } from '@/lib/agent/guards';
 import { describeRequest } from '@/lib/agent/describe';
 import { requestNames, runApproved } from '@/lib/agent/operate';
 import { OPTIONAL_ROUTE_SECRETS } from '@/lib/agent/bridge';
@@ -158,7 +164,7 @@ import { FLAGS, legacyRoleFor, type Area, type EffectiveAccess, type Flag } from
 import { maskAccountNumber, maskSensitive, maskSsn, stripSecrets } from '@/lib/permissions/mask';
 import { authorizeRequest } from '@/lib/permissions/enforce';
 import { BATCH_APPROVE_MAX } from '@/lib/validation/agentAccess';
-import { Money } from '@/lib/money';
+import { Money, formatCurrency } from '@/lib/money';
 import { loadAgentPolicy } from './agentPolicies';
 import { createGrant, grantWindowReader, type GrantWindow } from './agentGrants';
 import { requireFileAdmin, resolveAccess } from './access';
@@ -191,13 +197,6 @@ const SUMMARY_MAX = 64 * 1024;
 const NAMES_MAX = 50;
 const NAME_MAX = 200;
 const NAME_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:{}\-]{0,119}$/;
-/**
- * The version of the record the agent last read (OperationInput.expectedUpdatedAt), as the bridge
- * takes it (lib/agent/bridge.ts expectedVersionOf: keep the two the same): a time Date can read,
- * written with the characters of a time, at most 40 of them.
- */
-const VERSION_MAX = 40;
-const VERSION_RE = /^[0-9TZ:.+\- ]+$/;
 /** Largest input a request keeps, as JSON text. */
 const INPUT_MAX_CHARS = 512 * 1024;
 /** How often a waiting agent's request is read again, besides being woken. */
@@ -1467,6 +1466,79 @@ function visibleTo(person: Person, target: Target): boolean {
   return routeProblem(person, target) === null;
 }
 
+/**
+ * Why the first of two approvals no longer counts, or null when it still does (D8). At the second
+ * approval the first approver is judged again by the rules judge() holds every approver to: still
+ * an active member of the company, not view-only, allowed the request's route, an Admin or the
+ * file's Admin where the request needs one, and holding every flag it needs. Being at the host
+ * computer is not judged again: that was about where the first yes was given, and it was checked
+ * then. Read from the company file now, never from what was true when they said yes.
+ */
+async function firstApprovalLapsed(db: DB, companyId: string, firstId: string, target: Target, needs: ApprovalNeeds): Promise<string | null> {
+  const resolved = await resolveAccess(db, companyId, firstId);
+  if (!resolved.member || !resolved.active) return 'is no longer an active member of this company';
+  const access = resolved.access;
+  if (legacyRoleFor(access, resolved.isOwner) === 'viewer') return 'can now only view the books';
+  const first: Person = { ctx: { db, companyId, userId: firstId, access } as Person['ctx'], userId: firstId, access, isAdmin: access.isAdmin === true };
+  if (routeProblem(first, target)) return 'no longer has the right to do this work';
+  if (needs.admin && !first.isAdmin) return 'is no longer an Admin';
+  if (needs.fileAdmin) {
+    const fileAdmin = await requireFileAdmin({ db, userId: firstId }).then(
+      () => true,
+      () => false,
+    );
+    if (!fileAdmin) return 'is no longer an Admin of every company in this file';
+  }
+  for (const flag of needs.flags ?? []) {
+    if (!access.flags?.[flag]) return `no longer has "${flagLabel(flag)}" in their role`;
+  }
+  return null;
+}
+
+/**
+ * The first of two approvals no longer counts (firstApprovalLapsed): the request goes back to
+ * waiting for two approvals, with the first approver (and the note that came with their yes)
+ * cleared, and the audit trail says whose approval was withdrawn and why. Only while it is still
+ * that first approval, on the version this call judged. The second approver is told in a CONFLICT
+ * (the card reloads the request, which now waits for two people); nothing ran.
+ */
+async function withdrawFirstApproval(person: Person, row: Row, why: string): Promise<never> {
+  const firstId = row.decidedBy as string;
+  const names = await personNames(person.ctx.db, [firstId]);
+  const who = names.get(firstId) ?? 'The person who approved this first';
+  const reset = await inTransaction(person.ctx, async (tx) => {
+    const [updated] = await tx.db
+      .update(agentPermissionRequests)
+      .set({ decidedBy: null, decidedAt: null, note: null })
+      .where(
+        and(
+          eq(agentPermissionRequests.id, row.id),
+          eq(agentPermissionRequests.status, 'pending'),
+          eq(agentPermissionRequests.decidedBy, firstId),
+          sameVersion(row),
+        ),
+      )
+      .returning();
+    if (!updated) return null;
+    await auditDecision(tx, row, {
+      status: 'pending',
+      firstApprovalWithdrawn: firstId,
+      why: `The first approval no longer counts: that person ${why}.`,
+      waitingFor: 'two approvals',
+      noticedBy: person.userId,
+    });
+    return updated;
+  });
+  if (!reset) throw new ServiceError('CONFLICT', CHANGED_JUST_NOW_MESSAGE);
+  wake(reset);
+  throw new ServiceError(
+    'CONFLICT',
+    `Nothing was done. ${who} approved this first, but ${why}, so that approval no longer counts. ` +
+      'The request is waiting again for two people to approve it. Your approval can be the first of the two: approve it again.',
+    { firstApprovalWithdrawn: true },
+  );
+}
+
 /** A window that cannot be worked out is none (fail closed): the request can still be approved once. */
 const NO_WINDOW: GrantWindow = () => 0;
 
@@ -1903,9 +1975,11 @@ function withVersionKept(guarded: OperationInput, given: OperationInput): Operat
   const out: OperationInput = { ...guarded };
   delete out.expectedUpdatedAt;
   if (v === undefined || v === null || v === '') return out;
-  const s = typeof v === 'string' ? v.trim() : '';
-  if (!s || s.length > VERSION_MAX || !VERSION_RE.test(s) || !Number.isFinite(Date.parse(s))) throw validation(VERSION_MESSAGE);
-  return { ...out, expectedUpdatedAt: v as string };
+  // A plain ISO time with its zone, as guardInput keeps one (lib/agent/guards.ts plainIsoTime): a
+  // time with no zone would be read in this computer's own time zone, so it is refused.
+  const plain = plainIsoTime(v);
+  if (plain === null) throw validation(VERSION_MESSAGE);
+  return { ...out, expectedUpdatedAt: plain };
 }
 
 export const createAgentRequest: CreateAgentRequest = async (ctx, req) => {
@@ -2564,6 +2638,13 @@ async function approveRequest(
   const meta = metaOf(row);
   const firstOfTwo = needs.twoPerson && !row.decidedBy;
 
+  // The second of two approvals: the first one still counts only while its giver could still give
+  // it (D8). Otherwise the request waits for two people again, and nothing runs.
+  if (needs.twoPerson && row.decidedBy) {
+    const lapsed = await firstApprovalLapsed(db, ctx.companyId, row.decidedBy, target, needs);
+    if (lapsed) await withdrawFirstApproval(person, row, lapsed);
+  }
+
   // Plan §7.4: once the books changed under a request it holds a new preview, and it goes ahead
   // only for someone who was shown that preview in a "the books changed" answer and says yes to it
   // again (acceptStale). Anyone else, or a yes without acceptStale, is shown it first; nothing runs.
@@ -3217,6 +3298,7 @@ export const batchApprove: BatchApprove = async (ctx, ids, opts) => {
     if (needs.hostOnly) throw validation(`${label} can be approved only at the host computer, so approve it on its own.`);
     if (questionsOf(target).length) throw validation(`${label} has questions to answer, so approve it on its own.`);
   }
+  await refuseTogetherOverTwoPerson(person, rows);
 
   // Each on its own: one that is not approved, fails or finds the books changed never stops the others.
   const results: ApproveResult[] = [];
@@ -3231,6 +3313,54 @@ export const batchApprove: BatchApprove = async (ctx, ids, opts) => {
   }
   return results;
 };
+
+/**
+ * D8 for work split into pieces: one person approving many of an agent's requests in one click is
+ * one approval of all of them, so each agent's chosen requests are added up (their stored amounts,
+ * by size) and held to that agent's two-person amount as it is set now. When the total is above it,
+ * or any chosen request's amount is not known while the amount is set, nothing is approved: the
+ * person approves them one at a time from their cards. An agent whose settings cannot be read is
+ * left to each approval's own judge, which refuses a removed agent's requests.
+ */
+async function refuseTogetherOverTwoPerson(person: Person, rows: readonly Row[]): Promise<void> {
+  const byAgent = new Map<string, Row[]>();
+  for (const row of rows) byAgent.set(row.agentId, [...(byAgent.get(row.agentId) ?? []), row]);
+  const states = await agentStates(person.ctx.db, person.ctx.companyId, [...byAgent.keys()]);
+  for (const [agentId, group] of byAgent) {
+    const policy = await loadAgentPolicy(person.ctx, agentId).catch(() => null);
+    if (!policy || policy.twoPersonOver === null || policy.twoPersonOver === undefined) continue;
+    const sum = batchPassesTwoPerson(policy, group.map((r) => metaOf(r).facts.amount));
+    if (!sum.over) continue;
+    const agent = plainName(states.get(agentId)?.name ?? 'this agent');
+    const limit = moneyWords(policy.twoPersonOver);
+    const chosen = group.length === 1 ? 'The chosen request' : `The ${group.length} chosen requests`;
+    if (sum.unknown > 0) {
+      throw validation(
+        `${sum.unknown === group.length ? chosen : `${sum.unknown} of the chosen requests`} from ${agent} ${sum.unknown === 1 ? 'shows' : 'show'} no amount, ` +
+          `and work by ${agent} above ${limit} needs two people to approve it, so they cannot be approved together. Approve them one at a time from their cards.`,
+      );
+    }
+    throw validation(
+      `${chosen} from ${agent} ${group.length === 1 ? 'comes to' : 'come to'} ${moneyWords(sum.total)}${group.length === 1 ? '' : ' together'}, ` +
+        `more than ${limit}, the amount above which work by ${agent} needs two people to approve it. ` +
+        'Approve them one at a time from their cards, reading each one, or ask a second person to look at them too.',
+    );
+  }
+}
+
+/** An amount as the card shows one ("$14,997.00"), or the text as given when it cannot be read. */
+function moneyWords(v: string): string {
+  try {
+    return formatCurrency(v);
+  } catch {
+    return v;
+  }
+}
+
+/** A stored name on one line, for a message. */
+function plainName(v: string): string {
+  return oneLine(v) || 'this agent';
+}
 
 /**
  * What one approval of a batch came to when it threw: read from where the request stands now, not

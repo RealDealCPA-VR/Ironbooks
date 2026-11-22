@@ -55,15 +55,15 @@ const COMPANY_BACKUP_MASKED = ['ssn', 'employeeSsn', 'taxId', 'accountNumber', '
 
 /** Why a read of Users & Roles is 'admin' (see the header), said once for each of them. */
 const USERS_READ_WHY =
-  'A read of Users & Roles, so class admin (plan 4.2): it shows who can sign in to the books and what each of them may do, which is where an attacker would start. An Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.';
+  'A read of Users & Roles, so class admin: it shows who can sign in to the books and what each of them may do, which is where an attacker would start. An Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.';
 
 /** Why a File Utilities read that shows the files on disk is 'file' (see the header). */
 const FILE_READ_WHY =
-  'A File Utilities read that shows the company file on disk (backup, archive or copy names, folders, or a file to download), so class file (plan 4.2): an Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.';
+  'A File Utilities read that shows the company file on disk (backup, archive or copy names, folders, or a file to download), so class file: an Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.';
 
 /** Why a pure check of the books stays 'read' although it sits in File Utilities. */
 const BOOKS_CHECK_WHY =
-  'Stays class read on purpose, although File Utilities: a pure check of the books (plan 4.2 lets those stay read). It runs read-only queries and answers pass or fail per check, with no file names, folders or backups. Through the door it runs without asking for an agent whose role may view File Utilities; an agent\'s own request never reaches it (lib/permissions/agentAccess.ts AGENT_DOOR_ONLY_AREAS).';
+  'Stays class read on purpose, although File Utilities: a pure check of the books (those may stay read). It runs read-only queries and answers pass or fail per check, with no file names, folders or backups. Through the door it runs without asking for an agent whose role may view File Utilities; an agent\'s own request never reaches it (lib/permissions/agentAccess.ts AGENT_DOOR_ONLY_AREAS).';
 
 export const ADMIN_CLASSES: ClassificationMap = {
   // ---- Users (Users & Roles) ----
@@ -71,7 +71,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'POST /api/users': {
     class: 'admin',
     describe: 'Add user {name} (login: {login})',
-    why: "Adds a person who can sign in to the books. A new login needs a password (body field password), which the approving Admin types on the card (plan 5.8, inputs); the agent never sees it and must never supply it, or it could sign in as that person. Nothing is produced for this request: the Admin already knows the password they typed, so the answer holds no secret. A login that already exists in the file is added as it is, without a password.",
+    why: "Adds a person who can sign in to the books. A new login needs a password (body field password), which the approving Admin types on the card; the agent never sees it and must never supply it, or it could sign in as that person. Nothing is produced for this request: the Admin already knows the password they typed, so the answer holds no secret. A login that already exists in the file is added as it is, without a password.",
     needsSecret: ['new_user_password'],
     sensitiveFields: ['password'],
   },
@@ -121,12 +121,12 @@ export const ADMIN_CLASSES: ClassificationMap = {
     // {name} is the name in the route's answer, the role as it will be. Worded so the line reads
     // naturally both ways: the same name twice when the role keeps its name, the new one on a rename.
     describe: 'Change what role {id} allows (called {name} after the change)',
-    why: "Changes what everyone holding the role may do. Agents can hold custom roles (agents.ts checks an agent's roles against the same list), and agentAccess reads a role live, so editing a role an agent holds would change that agent at once. So no agent may change a role that ANY agent holds (agents.roleKeys), not only the agent asking: that is the hard floor (plan 4.6, D9). The door refuses it on every path (dry run, run, ask, asking for standing permission, a run under it) and checks again when a person approves, with a note that names the role and says an agent holds it. The service refuses it again as a backstop whenever the caller is an agent (lib/services/users.ts updateRole, refuseAgentOnAgentRole). Built-in roles cannot be edited at all.",
+    why: "Changes what everyone holding the role may do. Agents can hold custom roles (agents.ts checks an agent's roles against the same list), and agentAccess reads a role live, so editing a role an agent holds would change that agent at once. So no agent may change a role that ANY agent holds (agents.roleKeys), not only the agent asking: that is the hard floor. The door refuses it on every path (dry run, run, ask, asking for standing permission, a run under it) and checks again when a person approves, with a note that names the role and says an agent holds it. The service refuses it again as a backstop whenever the caller is an agent (lib/services/users.ts updateRole, refuseAgentOnAgentRole). Built-in roles cannot be edited at all.",
   },
   'DELETE /api/roles/[id]': {
     class: 'admin',
     describe: 'Delete role {id}',
-    why: "A Users & Roles change, Admin-approved like the rest of them. The service refuses it while a person holds the role. No agent may delete a role that ANY agent holds (agents.roleKeys) either: the hard floor (plan 4.6, D9). The door refuses it on every path (dry run, run, ask, asking for standing permission, a run under it) and checks again when a person approves, with a note that names the role and says an agent holds it. The service refuses it again as a backstop whenever the caller is an agent (lib/services/users.ts deleteRole, refuseAgentOnAgentRole). Built-in roles cannot be deleted at all.",
+    why: "A Users & Roles change, Admin-approved like the rest of them. The service refuses it while a person holds the role. No agent may delete a role that ANY agent holds (agents.roleKeys) either: the hard floor. The door refuses it on every path (dry run, run, ask, asking for standing permission, a run under it) and checks again when a person approves, with a note that names the role and says an agent holds it. The service refuses it again as a backstop whenever the caller is an agent (lib/services/users.ts deleteRole, refuseAgentOnAgentRole). Built-in roles cannot be deleted at all.",
   },
 
   // ---- Company file password ----
@@ -391,14 +391,14 @@ export const ADMIN_CLASSES: ClassificationMap = {
     class: 'admin',
     describe: 'List the agents of this company',
     availability: 'hard_floor',
-    why: 'Agents never manage agents (plan 4.6, D9). The service already refuses any caller that is not a person (assertAdminPerson), and the answer tells where the connector lives on this computer.',
+    why: 'Agents never manage agents. The service already refuses any caller that is not a person (assertAdminPerson), and the answer tells where the connector lives on this computer.',
     dryRun: 'none',
   },
   'POST /api/agents': {
     class: 'admin',
     describe: 'Make agent {name}',
     availability: 'hard_floor',
-    why: 'Agents never make agents or choose their roles (plan 4.6, D9): a prompt-injected agent would ask to widen itself until someone clicks yes. The answer holds the new agent\'s token, a secret; it stays class admin (not secret) only because the hard floor means an agent never reaches it.',
+    why: 'Agents never make agents or choose their roles: a prompt-injected agent would ask to widen itself until someone clicks yes. The answer holds the new agent\'s token, a secret; it stays class admin (not secret) only because the hard floor means an agent never reaches it.',
     hostOnly: true,
     sensitiveFields: ['token'],
   },
@@ -406,47 +406,47 @@ export const ADMIN_CLASSES: ClassificationMap = {
     class: 'admin',
     describe: 'Take away the access of agent {id}',
     availability: 'hard_floor',
-    why: 'Agents never change or remove agents (plan 4.6, D9). A person does it in two clicks in the Agents tab.',
+    why: 'Agents never change or remove agents. A person does it in two clicks in the Agents tab.',
     hostOnly: true,
   },
   'GET /api/agents/[id]': {
     class: 'admin',
     describe: 'Show agent {id} with its roles and permissions',
     availability: 'hard_floor',
-    why: "Agents never manage agents (plan 4.6, D9): the detail page is where a person decides what an agent may do, so even reading it is a person's, in their own window. An agent reads its own permissions with get_my_permissions.",
+    why: "Agents never manage agents: the detail page is where a person decides what an agent may do, so even reading it is a person's, in their own window. An agent reads its own permissions with get_my_permissions.",
     dryRun: 'none',
   },
   'PATCH /api/agents/[id]': {
     class: 'admin',
     describe: 'Change what agent {id} may do: preset, Allow / Ask / Never, limits and folders',
     availability: 'hard_floor',
-    why: 'Agents never change their own or another agent\'s permissions (plan 4.6, D9): a prompt-injected agent would ask to widen itself until someone clicks yes. A person does it in the Agents tab, at the computer that holds the company file (the folders are folders of that computer).',
+    why: 'Agents never change their own or another agent\'s permissions: a prompt-injected agent would ask to widen itself until someone clicks yes. A person does it in the Agents tab, at the computer that holds the company file (the folders are folders of that computer).',
     hostOnly: true,
   },
   'POST /api/agents/[id]/pause': {
     class: 'admin',
     describe: 'Pause or resume agent {id} (paused: {paused})',
     availability: 'hard_floor',
-    why: 'Pausing and resuming agents stays with people (plan 4.6, D9): an agent could otherwise resume itself or stop another.',
+    why: 'Pausing and resuming agents stays with people: an agent could otherwise resume itself or stop another.',
   },
   'POST /api/agents/pause-all': {
     class: 'admin',
     describe: 'Pause or resume every agent of this company (paused: {paused})',
     availability: 'hard_floor',
-    why: 'The kill switch (the Integrated Applications switch, one click away) stays with people in both directions (plan 4.6).',
+    why: 'The kill switch (the Integrated Applications switch, one click away) stays with people in both directions.',
   },
   'GET /api/agents/[id]/grants': {
     class: 'admin',
     describe: 'List the standing permissions of agent {id}',
     availability: 'hard_floor',
-    why: "Agents never manage agents' standing permissions (plan 4.6, D9); this list is the person's, with Revoke beside each one. An agent reads its own live grants with get_my_permissions.",
+    why: "Agents never manage agents' standing permissions; this list is the person's, with Revoke beside each one. An agent reads its own live grants with get_my_permissions.",
     dryRun: 'none',
   },
   'GET /api/agents/[id]/activity': {
     class: 'admin',
     describe: 'Show what agent {id} ran and asked for',
     availability: 'hard_floor',
-    why: "Part of a person watching over agents (plan 7.1, 4.6): one agent's record is not another agent's to read.",
+    why: "Part of a person watching over agents: one agent's record is not another agent's to read.",
     dryRun: 'none',
   },
 
@@ -464,7 +464,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
     class: 'read',
     describe: 'Count the agent requests waiting for my answer',
     availability: 'hard_floor',
-    why: "The title bar's badge for the signed-in person (plan 7.2). An agent has no requests to answer.",
+    why: "The title bar's badge for the signed-in person. An agent has no requests to answer.",
   },
   'GET /api/agent-requests/[id]': {
     class: 'read',
@@ -476,20 +476,20 @@ export const ADMIN_CLASSES: ClassificationMap = {
     class: 'admin',
     describe: 'Approve agent request {id}',
     availability: 'hard_floor',
-    why: 'Approving is what a person does in their own window (plan 4.5, 4.6): an agent that could approve would approve itself. The body carries the secrets the approver typed on the card, and the answer secrets the run produced: both for that person only.',
+    why: 'Approving is what a person does in their own window: an agent that could approve would approve itself. The body carries the secrets the approver typed on the card, and the answer secrets the run produced: both for that person only.',
     sensitiveFields: ['secrets.*', 'produced.*.value'],
   },
   'POST /api/agent-requests/[id]/deny': {
     class: 'admin',
     describe: 'Deny agent request {id}',
     availability: 'hard_floor',
-    why: 'Answering a request is a person\'s (plan 4.6): an agent never approves, denies or alters a permission request.',
+    why: 'Answering a request is a person\'s: an agent never approves, denies or alters a permission request.',
   },
   'POST /api/agent-requests/batch-approve': {
     class: 'admin',
     describe: 'Approve several agent requests of the same kind at once',
     availability: 'hard_floor',
-    why: 'Approving is what a person does in their own window (plan 4.5, 4.6). Each request is still approved and reported on its own.',
+    why: 'Approving is what a person does in their own window. Each request is still approved and reported on its own.',
     sensitiveFields: ['results.*.produced.*.value'],
   },
   'DELETE /api/agent-grants/[id]': {
@@ -497,15 +497,15 @@ export const ADMIN_CLASSES: ClassificationMap = {
     describe: 'Take back standing permission {id}',
     id: 'agent-grants.revoke',
     availability: 'hard_floor',
-    why: "Agents never change standing permissions, their own or another agent's (plan 4.6, D9). Taking one back ends nothing for good: a person can give it again.",
+    why: "Agents never change standing permissions, their own or another agent's. Taking one back ends nothing for good: a person can give it again.",
   },
 
   // ---- Backup and restore of the whole company file ----
   'GET /api/backup': {
     class: 'file',
-    describe: 'Download a backup of the whole company file',
+    describe: 'Download a backup of the whole company file, to be saved in a folder (the agent cannot read it)',
     id: 'backup.download',
-    why: 'Not a pure read: a copy of every company and every login in the file, nothing masked (full SSNs and account numbers), recorded in the backup history on disk. The service reads the files on disk, so no dry run.',
+    why: 'Not a pure read: a copy of every company and every login in the file, nothing masked (full SSNs and account numbers, password hashes), recorded in the backup history on disk. The service reads the files on disk, so no dry run. The agent cannot read the copy or use it in another request: it can only ask to have it saved in a folder an Admin allowed for it (save_file, approved by an Admin at the computer that holds the company file).',
     fileAdmin: true,
     output: 'file',
     dryRun: 'none',
@@ -633,8 +633,8 @@ export const ADMIN_CLASSES: ClassificationMap = {
   // ---- Portable company file and shareable ledger ----
   'GET /api/portable': {
     class: 'file',
-    describe: 'Download a portable company file without a password',
-    why: 'Not a pure read: a full copy of the company file with every company, user and password hash, nothing masked. Takes its own snapshot of the database, so no dry run.',
+    describe: 'Download a portable company file without a password, to be saved in a folder (the agent cannot read it)',
+    why: 'Not a pure read: a full copy of the company file with every company, user and password hash, nothing masked. Takes its own snapshot of the database, so no dry run. The agent cannot read the copy or use it in another request: it can only ask to have it saved in a folder an Admin allowed for it (save_file, approved by an Admin at the computer that holds the company file).',
     fileAdmin: true,
     output: 'file',
     dryRun: 'none',
@@ -642,7 +642,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'POST /api/portable': {
     class: 'file',
     describe: 'Download a portable copy of the whole company file, with or without a password (protect: {protect})',
-    why: 'A full copy of the company file with every company, user and password hash, nothing masked. With protect left out or true, the password the approver types protects it. With { protect: false } the route ignores any password and answers the copy WITHOUT one, so the card must not read as protected; GET /api/portable is the honest way to ask for an unprotected copy.',
+    why: 'A full copy of the company file with every company, user and password hash, nothing masked. With protect left out or true, the password the approver types protects it. With { protect: false } the route ignores any password and answers the copy WITHOUT one, so an agent can never send protect (it is taken out): its copy is always protected with the password the approver types, which the agent never sees, and so the agent may read it. GET /api/portable is the way to ask for an unprotected copy, which the agent cannot read.',
     fileAdmin: true,
     output: 'file',
     dryRun: 'none',
@@ -679,7 +679,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'GET /api/company-file/info': {
     class: 'file',
     describe: "Show the company file's name and whether it has a password",
-    why: "What the sign-in screen shows before anyone signs in: the company file's name (the folder it is in only to the app's own window on this computer, never to an agent) and whether the file has a password or protection. A read that shows the company file on disk is class file, like the File Utilities reads (plan 4.2): asked for through the door, an Admin approves it, and it is described only, never dry run (a dry run would hand the agent the answer before anyone approved it). The class does not make the answer secret: the route is public (lib/permissions/routes.ts), because the sign-in screen reads it before anyone signs in. It never asks for a signed-in context, so the check on an agent's own request (lib/agentContext.ts) never runs for it, and anything that can reach Ironbooks reads the same answer, without the folder, with or without an agent's token.",
+    why: "What the sign-in screen shows before anyone signs in: the company file's name (the folder it is in only to the app's own window on this computer, never to an agent) and whether the file has a password or protection. A read that shows the company file on disk is class file, like the File Utilities reads: asked for through the door, an Admin approves it, and it is described only, never dry run (a dry run would hand the agent the answer before anyone approved it). The class does not make the answer secret: the route is public (lib/permissions/routes.ts), because the sign-in screen reads it before anyone signs in. It never asks for a signed-in context, so the check on an agent's own request (lib/agentContext.ts) never runs for it, and anything that can reach Ironbooks reads the same answer, without the folder, with or without an agent's token.",
     dryRun: 'none',
   },
   'POST /api/company-file/save': {

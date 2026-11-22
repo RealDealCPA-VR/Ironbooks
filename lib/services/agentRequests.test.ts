@@ -53,6 +53,11 @@
  * request (closed-period work) is typed before the claim; a reveal's own timer ends it when nothing
  * reads it. Not covered here: a request asked through the door itself (operate.ts askPerson), which
  * passes no names; its tests are lib/agent/operate.test.ts.
+ *
+ * Wave 6: the first of two approvals no longer counts once its giver is deactivated, removed, made
+ * view-only or loses the route's right or a flag (the request waits for two people again, audited);
+ * batch approval adds up each agent's chosen amounts against its two-person amount; a version time
+ * with no zone is refused.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -407,7 +412,9 @@ beforeAll(async () => {
   people.cy = await personCtx(cy);
   people.rae = await personCtx(rae);
 
-  for (const key of ['a', 'b', 'cap', 'two', 'note', 'batch']) await makeAgent(key, { unattended: key === 'note' });
+  // 'lapse', 'split' and 'later' (the waiting, notice and copied-proposal tests) are agents of their
+  // own: by then 'a' has asked more than the hourly limit allows, which pauses it.
+  for (const key of ['a', 'b', 'cap', 'two', 'note', 'batch', 'lapse', 'split', 'later']) await makeAgent(key, { unattended: key === 'note' });
 
   op('test.enter');
   op('test.admin', { class: 'admin', area: 'customers' });
@@ -576,7 +583,8 @@ describe('an agent asks', () => {
 
     // One the bridge could not send is refused before anyone is asked: dropping it would let the
     // run overwrite a person's edit.
-    for (const bad of ['yesterday', 'x'.repeat(41), 20261122, `${VERSION}\nX-Other: 1`]) {
+    // A time with no zone would be read in this computer's own time zone (guards.ts plainIsoTime).
+    for (const bad of ['yesterday', 'x'.repeat(41), 20261122, `${VERSION}\nX-Other: 1`, '2026-11-22T14:05:09', '2026-11-22 14:05:09Z']) {
       await expectError(
         ask('a', 'test.change', { input: { body: { name: 'D', amount: '1.00' }, expectedUpdatedAt: bad as string } }),
         'VALIDATION',
@@ -1468,6 +1476,93 @@ describe('approving', () => {
     expect(m.runApproved).not.toHaveBeenCalled();
   });
 
+  it('the first of two approvals no longer counts once its giver is deactivated, loses the right or the flag', async () => {
+    m.policies.set(agentCtx.lapse.agent!.id, { twoPersonOver: '1000.00' });
+    const first = await person('Fay', 'bookkeeper');
+    const fay = await personCtx(first);
+    const membership = and(eq(userCompanies.userId, first), eq(userCompanies.companyId, companyId));
+    const roles = and(eq(userRoleAssignments.userId, first), eq(userRoleAssignments.companyId, companyId));
+    try {
+      // 1. Deactivated after the first yes: the second yes runs nothing and the request waits for two again.
+      const view = await ask('lapse', 'test.enter', { facts: facts({ amount: '5000.00' }) });
+      expect((await approveAgentRequest(fay, view.id, { note: 'Fine by me.' }, { atHost: true })).status).toBe('needs_second_approver');
+      await db.update(userCompanies).set({ isActive: false }).where(membership);
+      await expectError(
+        approveAgentRequest(people.cy, view.id, {}, { atHost: true }),
+        'CONFLICT',
+        /^Nothing was done\. Fay approved this first, but is no longer an active member of this company, so that approval no longer counts\./,
+      );
+      expect(m.runApproved).not.toHaveBeenCalled();
+      const back = await rowOf(view.id);
+      expect(back.status).toBe('pending');
+      expect(back.decidedBy).toBeNull();
+      expect(back.decidedAt).toBeNull();
+      expect(back.note).toBeNull();
+      const audits = await db
+        .select()
+        .from(auditLogs)
+        .where(and(eq(auditLogs.entityType, 'agent_permission_request'), eq(auditLogs.entityId, view.id)));
+      const withdrawn = audits.find((a) => (a.newValues as Record<string, unknown> | null)?.firstApprovalWithdrawn);
+      expect(withdrawn?.newValues).toMatchObject({ firstApprovalWithdrawn: first, waitingFor: 'two approvals', noticedBy: people.cy.userId });
+      // It now takes two people again: Cy's yes is the first, Bo's the second.
+      expect((await approveAgentRequest(people.cy, view.id, {}, { atHost: true })).status).toBe('needs_second_approver');
+      expect((await approveAgentRequest(people.bo, view.id, {}, { atHost: true })).status).toBe('executed');
+      expect(m.runApproved).toHaveBeenCalledTimes(1);
+
+      // 2. Moved to a role that only views the books.
+      await db.update(userCompanies).set({ isActive: true }).where(membership);
+      const viewOnly = await ask('lapse', 'test.enter', { facts: facts({ amount: '5000.00' }) });
+      expect((await approveAgentRequest(fay, viewOnly.id, {}, { atHost: true })).status).toBe('needs_second_approver');
+      await db.update(userRoleAssignments).set({ roleKey: 'reports_only' }).where(roles);
+      await expectError(approveAgentRequest(people.cy, viewOnly.id, {}, { atHost: true }), 'CONFLICT', /can now only view the books/);
+      expect((await rowOf(viewOnly.id)).decidedBy).toBeNull();
+
+      // 2b. Moved to a role that may still change the books, but not this work (A/R Clerk: no bills).
+      op('test.bill', { rule: { area: 'vendors', action: 'create' }, area: 'vendors' });
+      await db.update(userRoleAssignments).set({ roleKey: 'bookkeeper' }).where(roles);
+      const routeGone = await ask('lapse', 'test.bill', { facts: facts({ amount: '5000.00' }) });
+      expect((await approveAgentRequest(await personCtx(first), routeGone.id, {}, { atHost: true })).status).toBe('needs_second_approver');
+      await db.update(userRoleAssignments).set({ roleKey: 'ar_clerk' }).where(roles);
+      await expectError(approveAgentRequest(people.cy, routeGone.id, {}, { atHost: true }), 'CONFLICT', /no longer has the right to do this work/);
+      expect((await rowOf(routeGone.id)).decidedBy).toBeNull();
+
+      // 3. Still allowed the route, but the request needs a flag the first approver no longer holds.
+      await db.update(userRoleAssignments).set({ roleKey: 'full_access' }).where(roles);
+      const flagged = await ask('lapse', 'test.enter', {
+        facts: facts({ amount: '5000.00' }),
+        needs: { ...NO_NEEDS, flag: 'sensitivePayroll', flags: ['sensitivePayroll'] },
+      });
+      expect((await approveAgentRequest(await personCtx(first), flagged.id, {}, { atHost: true })).status).toBe('needs_second_approver');
+      await db.update(userRoleAssignments).set({ roleKey: 'bookkeeper' }).where(roles);
+      await expectError(approveAgentRequest(people.ada, flagged.id, {}, { atHost: true }), 'CONFLICT', /no longer has "View sensitive payroll data \(full SSNs\)" in their role/);
+
+      // 4. Removed from the company.
+      await db.update(userRoleAssignments).set({ roleKey: 'full_access' }).where(roles);
+      const removed = await ask('lapse', 'test.enter', { facts: facts({ amount: '5000.00' }) });
+      expect((await approveAgentRequest(await personCtx(first), removed.id, {}, { atHost: true })).status).toBe('needs_second_approver');
+      await db.delete(userRoleAssignments).where(roles);
+      await db.delete(userCompanies).where(membership);
+      await expectError(approveAgentRequest(people.cy, removed.id, {}, { atHost: true }), 'CONFLICT', /no longer an active member/);
+      expect(m.runApproved).toHaveBeenCalledTimes(1);
+    } finally {
+      m.policies.delete(agentCtx.lapse.agent!.id);
+    }
+  });
+
+  it('a first approval whose giver still qualifies counts as before', async () => {
+    m.policies.set(agentCtx.lapse.agent!.id, { twoPersonOver: '1000.00' });
+    try {
+      const view = await ask('lapse', 'test.enter', { facts: facts({ amount: '5000.00' }) });
+      expect((await approveAgentRequest(people.bo, view.id, { note: 'Checked the bill.' }, { atHost: true })).status).toBe('needs_second_approver');
+      expect((await approveAgentRequest(people.cy, view.id, {}, { atHost: true })).status).toBe('executed');
+      const row = await rowOf(view.id);
+      expect(row.decidedBy).toBe(people.bo.userId);
+      expect(row.note).toBe('Checked the bill.');
+    } finally {
+      m.policies.delete(agentCtx.lapse.agent!.id);
+    }
+  });
+
   it('batch approve takes same-operation enter or change requests only, each approved on its own', async () => {
     const one = await ask('a', 'test.enter');
     const two = await ask('a', 'test.enter');
@@ -1495,6 +1590,44 @@ describe('approving', () => {
       m.policies.delete(agentCtx.two.agent!.id);
     }
     expect(m.runApproved).not.toHaveBeenCalled();
+  });
+
+  it("batch approve adds up each agent's chosen amounts and refuses a total above its two-person amount", async () => {
+    m.policies.set(agentCtx.split.agent!.id, { twoPersonOver: '5000.00' });
+    try {
+      // Three pieces of 4,999.00: each under the amount, 14,997.00 together.
+      const pieces = [];
+      for (let i = 0; i < 3; i++) pieces.push(await ask('split', 'test.enter', { facts: facts({ amount: '4999.00' }) }));
+      for (const p of pieces) expect(p.needs?.twoPerson).toBe(false);
+      await expectError(
+        batchApprove(people.ada, pieces.map((p) => p.id), { atHost: true }),
+        'VALIDATION',
+        /^The 3 chosen requests from Agent split come to \$14,997\.00 together, more than \$5,000\.00, .*Approve them one at a time/,
+      );
+      expect(m.runApproved).not.toHaveBeenCalled();
+      for (const p of pieces) expect((await rowOf(p.id)).status).toBe('pending');
+      // A refund counts by its size.
+      const refund = await ask('split', 'test.enter', { facts: facts({ amount: '-4999.00' }) });
+      await expectError(batchApprove(people.ada, [pieces[0].id, refund.id], { atHost: true }), 'VALIDATION', /\$9,998\.00 together/);
+      // One whose amount is not known counts as above it. (Asked before the amount was set, so it
+      // does not need two people on its own: one asked now would, and is refused for that.)
+      m.policies.delete(agentCtx.split.agent!.id);
+      const unknown = await ask('split', 'test.enter', { facts: facts({ amount: null }) });
+      m.policies.set(agentCtx.split.agent!.id, { twoPersonOver: '5000.00' });
+      expect(unknown.needs?.twoPerson).toBe(false);
+      await expectError(batchApprove(people.ada, [pieces[0].id, unknown.id], { atHost: true }), 'VALIDATION', /shows no amount/);
+      expect(m.runApproved).not.toHaveBeenCalled();
+      // At or below the amount together, they go through, each on its own.
+      const small = await ask('split', 'test.enter', { facts: facts({ amount: '1.00' }) });
+      const results = await batchApprove(people.ada, [pieces[0].id, small.id], { atHost: true });
+      expect(results.map((r) => r.status)).toEqual(['executed', 'executed']);
+      // Each agent is added up on its own: another agent's requests do not count toward this one.
+      const others = [await ask('b', 'test.enter', { facts: facts({ amount: '4999.00' }) }), await ask('b', 'test.enter', { facts: facts({ amount: '4999.00' }) })];
+      const mixed = await batchApprove(people.ada, [pieces[1].id, ...others.map((o) => o.id)], { atHost: true });
+      expect(mixed.map((r) => r.status)).toEqual(['executed', 'executed', 'executed']);
+    } finally {
+      m.policies.delete(agentCtx.split.agent!.id);
+    }
   });
 
   it('batch approve reports where each request stands when one is refused part way', async () => {
@@ -1739,17 +1872,17 @@ describe('the hourly limit', () => {
 
 describe('waiting for a decision', () => {
   it('resolves at once when already decided', async () => {
-    const view = await ask('a', 'test.enter');
+    const view = await ask('later', 'test.enter');
     await denyAgentRequest(people.bo, view.id, null);
     const t = Date.now();
-    expect((await waitForDecision(agentCtx.a, view.id, 30)).status).toBe('denied');
+    expect((await waitForDecision(agentCtx.later, view.id, 30)).status).toBe('denied');
     expect(Date.now() - t).toBeLessThan(1000);
   });
 
   it('resolves when a person decides, well before the time is up', async () => {
-    const view = await ask('a', 'test.enter');
+    const view = await ask('later', 'test.enter');
     const t = Date.now();
-    const waiting = waitForDecision(agentCtx.a, view.id, 30);
+    const waiting = waitForDecision(agentCtx.later, view.id, 30);
     await new Promise((r) => setTimeout(r, 100));
     await denyAgentRequest(people.bo, view.id, 'Not this month.');
     const got = await waiting;
@@ -1759,9 +1892,9 @@ describe('waiting for a decision', () => {
   });
 
   it('resolves with the request still waiting when the time is up', async () => {
-    const view = await ask('a', 'test.enter');
+    const view = await ask('later', 'test.enter');
     const t = Date.now();
-    const got = await waitForDecision(agentCtx.a, view.id, 0.3);
+    const got = await waitForDecision(agentCtx.later, view.id, 0.3);
     expect(got.status).toBe('pending');
     expect(Date.now() - t).toBeGreaterThanOrEqual(250);
     expect(Date.now() - t).toBeLessThan(2000);
@@ -1782,9 +1915,9 @@ describe('waiting for a decision', () => {
   });
 
   it('marks an overdue request expired when it sees one', async () => {
-    const view = await ask('a', 'test.enter');
+    const view = await ask('later', 'test.enter');
     await db.update(agentPermissionRequests).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(agentPermissionRequests.id, view.id));
-    expect((await waitForDecision(agentCtx.a, view.id, 5)).status).toBe('expired');
+    expect((await waitForDecision(agentCtx.later, view.id, 5)).status).toBe('expired');
     expect((await rowOf(view.id)).status).toBe('expired');
   });
 });
@@ -1812,13 +1945,13 @@ describe('notice by email for an unattended agent', () => {
   });
 
   it('a notice that cannot be sent never fails the request; an attended agent sends none', async () => {
-    m.policies.set(agentCtx.a.agent!.id, { notifyEmail: true });
+    m.policies.set(agentCtx.later.agent!.id, { notifyEmail: true });
     try {
-      expect((await ask('a', 'test.enter')).status).toBe('pending');
+      expect((await ask('later', 'test.enter')).status).toBe('pending');
       await new Promise((r) => setTimeout(r, 50));
       expect(m.sendMail).not.toHaveBeenCalled();
     } finally {
-      m.policies.delete(agentCtx.a.agent!.id);
+      m.policies.delete(agentCtx.later.agent!.id);
     }
     m.sendMail.mockRejectedValue(new Error('mail server down'));
     await makeAgent('note2', { unattended: true });
@@ -1852,7 +1985,7 @@ describe('notice by email for an unattended agent', () => {
 
 describe('requests copied from old proposals', () => {
   async function copied(name: string, needs: ApprovalNeeds | null = null): Promise<{ proposalId: string; requestId: string }> {
-    const agent = agentCtx.a.agent!;
+    const agent = agentCtx.later.agent!;
     const [p] = await db
       .insert(aiProposals)
       .values({
@@ -1906,7 +2039,7 @@ describe('requests copied from old proposals', () => {
 
   it('withdrawn or expired shows in Ask AI as not done, in words it knows', async () => {
     const withdrawn = await copied('Legacy Withdrawn LLC');
-    expect((await cancelAgentRequest(agentCtx.a, withdrawn.requestId)).status).toBe('cancelled');
+    expect((await cancelAgentRequest(agentCtx.later, withdrawn.requestId)).status).toBe('cancelled');
     expect(await proposalOf(withdrawn.proposalId)).toMatchObject({ status: 'rejected', error: 'The agent withdrew this request.' });
 
     const overdue = await copied('Legacy Overdue LLC');

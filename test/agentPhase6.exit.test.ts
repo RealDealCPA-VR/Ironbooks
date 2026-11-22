@@ -14,7 +14,9 @@
  *    in a folder the Admin allowed; the Admin approves at the host; the shell is asked once, with
  *    a ticket for that request and that Admin, which cannot be used again. A folder outside the
  *    allowed ones is refused before any ask, again before the shell is asked, and by the shell
- *    itself. The same for a downloaded backup saved with save_file.
+ *    itself. The same for a downloaded backup saved with save_file. The agent never reads that
+ *    backup (every password hash and unmasked number of the file is in it): get_file is refused,
+ *    and only the save gets its bytes (lib/agent/files.ts PERSON_ONLY_FILE_OPERATIONS).
  *  - Add a user: the Admin approves and types the temporary password on the card; it is never in
  *    the agent's view of the request nor in any stored row, and nothing is "produced" for it.
  *  - The hard floor: no verb reaches the routes of agents, policies, grants or approvals, nor does
@@ -323,8 +325,9 @@ describe('Phase 6 exit: a backup to a named folder (a copy of the company file, 
 
 describe('Phase 6 exit: a downloaded backup saved in a named folder (save_file)', { timeout: 240_000 }, () => {
   let backupFileId: string;
+  let backupSize: number;
 
-  it('the agent asks for a backup of the company file; the Admin approves; the agent gets it as a staged file', async () => {
+  it('the agent asks for a backup of the company file; the Admin approves; it is staged for saving, and the agent cannot read it', async () => {
     const asked = await agent.run({ operation: BACKUP_DOWNLOAD(), requestId: requestKey('backup'), reason: 'A backup to keep with the month-end papers.' });
     expect(asked.outcome).toBe('asked');
     expect(asked.needs?.fileAdmin).toBe(true);
@@ -334,6 +337,9 @@ describe('Phase 6 exit: a downloaded backup saved in a named folder (save_file)'
     expect(view?.file?.fileId).toBeTruthy();
     expect(view!.file!.size).toBeGreaterThan(0);
     backupFileId = view!.file!.fileId;
+    backupSize = view!.file!.size;
+    // A whole copy of the company file: never handed to the agent.
+    await expect(agent.verb('get_file', { fileId: backupFileId })).rejects.toThrow(/full copy of the company file.*save_file/);
   });
 
   it('a folder outside the allowed ones is refused before any ask', async () => {
@@ -356,8 +362,9 @@ describe('Phase 6 exit: a downloaded backup saved in a named folder (save_file)'
     expect(done.status, JSON.stringify(done.request.error)).toBe('executed');
     const saved = path.join(allowed, 'Month-end backup.bka');
     expect(fs.existsSync(saved)).toBe(true);
-    const staged = await agent.verb('get_file', { fileId: backupFileId });
-    expect(fs.statSync(saved).size).toBe(staged.file.size);
+    expect(fs.statSync(saved).size).toBe(backupSize);
+    // Saved, it is still the person's: the agent cannot read it back either.
+    await expect(agent.verb('get_file', { fileId: backupFileId })).rejects.toThrow(/full copy of the company file/);
     expect(rec.calls.at(-1)).toMatchObject({ operation: SAVE_FILE, approverId: s.admin.id, approverIsAgent: false, ok: true });
   });
 });

@@ -109,6 +109,8 @@ vi.mock('@/lib/agent/files', async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
   uploadChunk: m.uploadChunk,
   readStagedFile: m.readStagedFile,
+  // The save's own reader (lib/agent/shell.ts saveStagedFile) reads the same stand-in.
+  readStagedFileForSave: (...a: unknown[]) => m.readStagedFile(...a),
   stagedFileInfo: m.stagedFileInfo,
   allowedFolder: m.allowedFolder,
   stageFile: vi.fn(),
@@ -191,6 +193,7 @@ import type { BridgeActor, BridgeMode, BridgeResult, OperationInput, OperationPr
 import {
   AGENT_CALLS_PER_MINUTE,
   AGENT_RUNS_AT_ONCE,
+  CHANGED_SINCE_TRIED,
   AgentRateLimited,
   NO_REASON_NOTE,
   agentRetryAfter,
@@ -1149,6 +1152,47 @@ describe('operate', () => {
     const giver = await resolveAccess(db, companyId, ownerId);
     expect(commit.actor.access).toEqual(maskedForAgent(intersectAccess(giver.access, CEILING)));
     expect(commit.actor).toMatchObject({ userId: null, reveal: false, secrets: {}, role: 'accountant' });
+  });
+
+  it('a run judged on its dry run is judged again on what its commit did, inside its transaction: a record changed in between keeps nothing (WAVE5C F5)', async () => {
+    const committed = { customer: 'cust-x', total: '10.00' };
+    const checks: Array<string | null> = [];
+    m.runOperation.mockImplementation(
+      async (_b: unknown, operation: Operation, input: OperationInput, mode: BridgeMode, _a: unknown, opts?: { commitCheck?: (r: BridgeResult) => string | null }) => {
+        const atCommit = mode === 'commit';
+        const f = { ...bodyFacts(operation, input, { closingDate: null }), entityIds: [atCommit ? committed.customer : 'cust-x'], amount: atCommit ? committed.total : '10.00' };
+        const r = bridged(mode, { facts: f });
+        if (!atCommit) return r;
+        // The bridge calls the check before its transaction ends, and rolls back on a message.
+        const stale = opts?.commitCheck ? opts.commitCheck(r) : 'no check';
+        checks.push(stale);
+        return stale ? bridged(mode, { outcome: 'error', httpStatus: 201, result: null, preview: null, facts: f, error: { message: stale, code: 'CONFLICT', details: null } }) : r;
+      },
+    );
+    const ask = (key = rid()) => operate(agentCtx, { operation: 'invoices.create', body: { total: '10.00' }, requestId: key });
+
+    // Under a grant for customer X up to 500.
+    usePolicy('ask_every_change');
+    const grantId = randomUUID();
+    grants = [grantOf({ id: grantId, constraints: { entityIds: ['cust-x'], maxAmount: '500' } })];
+    expect(await ask()).toMatchObject({ outcome: 'posted', grantId });
+    expect(checks).toEqual([null]);
+    committed.customer = 'cust-y';
+    const moved = rid();
+    await expectError(ask(moved), 'CONFLICT', CHANGED_SINCE_TRIED);
+    expect(await claimRow(moved)).toBeNull();
+    committed.customer = 'cust-x';
+    committed.total = '900.00';
+    await expectError(ask(), 'CONFLICT', CHANGED_SINCE_TRIED);
+
+    // Under Allow with a two-person limit: the commit is over it.
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    grants = [];
+    committed.total = '10.00';
+    expect((await ask()).outcome).toBe('posted');
+    committed.total = '5000.00';
+    await expectError(ask(), 'CONFLICT', CHANGED_SINCE_TRIED);
+    expect(checks.filter((c) => c === CHANGED_SINCE_TRIED)).toHaveLength(3);
   });
 
   it('a grant runs within what its giver may do: narrower than the agent, the run is narrower too', async () => {
@@ -2918,6 +2962,19 @@ describe("describe_operation's notes match how the door treats it", () => {
     expect(m.runOperation).not.toHaveBeenCalled();
   });
 
+  it('a payroll adjustment says its amount is unknown, never that it is read from a field', async () => {
+    const realRegistry = await vi.importActual<typeof import('./operations/registry')>('./operations/registry');
+    const real = realRegistry.operationById('payroll.adjustments.create');
+    expect(real?.amountField).toBe('lines');
+    m.ops.set(real!.id, real!);
+    const notes = ((await handleVerb(agentCtx, 'describe_operation', { operation: real!.id })) as Out).notes.join(' ');
+    expect(notes).toMatch(/Its amount is not known, before a dry run or after it/);
+    expect(notes).not.toMatch(/The amount is read from/);
+    // Any other operation with an amount field still says where it is read from.
+    const invoice = ((await handleVerb(agentCtx, 'describe_operation', { operation: 'invoices.create' })) as Out).notes.join(' ');
+    expect(invoice).toMatch(/The amount is read from "total"/);
+  });
+
   it('the operations of the registry that need a typed secret say a person types it on the card, never the agent', async () => {
     const realRegistry = await vi.importActual<typeof import('./operations/registry')>('./operations/registry');
     for (const id of ['users.create', 'users.reset-password', 'email.settings.update', 'email.test', 'company.closing-date.update']) {
@@ -2952,6 +3009,14 @@ describe('the version of the record the agent last read (OperationInput.expected
       /already used for a different request/,
     );
     await expectError(handleVerb(agentCtx, 'run_operation', { operation: 'employees.update', params: { id: 'emp-1' }, body: {}, expectedUpdatedAt: 5, requestId: rid() }), 'VALIDATION');
+    // A time with no zone would be read in this computer's own time zone: refused before any run.
+    const runs = m.runOperation.mock.calls.length;
+    await expectError(
+      handleVerb(agentCtx, 'run_operation', { operation: 'employees.update', params: { id: 'emp-1' }, body: {}, expectedUpdatedAt: '2026-11-22T14:05:09', requestId: rid() }),
+      'VALIDATION',
+      /with its time zone/,
+    );
+    expect(m.runOperation.mock.calls.length).toBe(runs);
 
     m.runOperation.mockClear();
     const id = await storedRequest(null, 'employees.update', { amount: null });

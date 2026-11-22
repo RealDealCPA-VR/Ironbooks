@@ -7,6 +7,7 @@ import { describeSchemas } from '../schemas';
 import type { Operation } from '../types';
 import type { OperationInput } from '@/lib/agent/contract';
 import { describeRequest } from '@/lib/agent/describe';
+import { guardInput } from '@/lib/agent/guards';
 
 const BUCKET: ClassBucket = 'admin';
 const ops = (): Operation[] => allOperations().filter((o) => o.kind === 'route' && bucketOfRoute(o.route) === BUCKET);
@@ -180,6 +181,33 @@ describe('classification: admin', () => {
     expect(line({ beforeDate: '2025-01-01', dryRun: true })).toMatch(/2025-01-01.*preview only: yes/);
     expect(line({ beforeDate: '2025-01-01', dryRun: false })).toMatch(/preview only: no/);
     expect(line({ beforeDate: '2025-01-01' })).not.toMatch(/preview/);
+  });
+
+  it('condense: a dryRun that is not true or false is refused, and the line says "yes" only for a real true', () => {
+    // The route runs the real, irreversible condense unless dryRun is the boolean true.
+    const line = (body: Record<string, unknown>) => describeRequest(op('condense'), { params: {}, query: {}, body });
+    for (const dryRun of ['yes', 'true', 1, null, {}, ['yes']]) {
+      expect(line({ beforeDate: '2025-01-01', dryRun }), JSON.stringify(dryRun)).not.toMatch(/preview only: yes/);
+      const g = guardInput(op('condense'), { body: { beforeDate: '2025-01-01', dryRun } });
+      expect(g.refused, JSON.stringify(dryRun)).toMatch(/dryRun must be true or false/);
+    }
+    expect(line({ beforeDate: '2025-01-01', dryRun: 'yes' })).toMatch(/preview only: no/);
+    for (const dryRun of [true, false, undefined]) {
+      expect(guardInput(op('condense'), { body: { beforeDate: '2025-01-01', ...(dryRun === undefined ? {} : { dryRun }) } }).refused).toBeNull();
+    }
+  });
+
+  it('no why a person reads cites a plan section or decision', () => {
+    for (const o of ops()) expect(o.why ?? '', o.id).not.toMatch(/\(plan [0-9]|\bplan [0-9]+\.[0-9]|\bD[0-9]+\b/);
+  });
+
+  it('the whole-file copies the agent cannot read say so on the card: the line and the why', () => {
+    for (const id of ['backup.download', 'portable']) {
+      expect(op(id).describe, id).toMatch(/the agent cannot read it/);
+      expect(op(id).why, id).toMatch(/agent cannot read the copy.*save_file/);
+    }
+    // The copy an agent asks for with POST is always sealed with the approver's password.
+    expect(op('portable.post').why).toMatch(/an agent can never send protect/);
   });
 
   it('takes from an agent every "yes, I am sure" flag its body schema has', async () => {

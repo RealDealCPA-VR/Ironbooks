@@ -367,3 +367,22 @@ export const factsOf: FactsOf = (operation, input, opts) => {
   };
   return facts;
 };
+
+/**
+ * The facts with the accounts a run's ledger lines are on added to those the request names
+ * (lib/agent/bridge.ts factsFor): a bill's item line posts to the item's expense or asset account,
+ * an invoice's to the item's income account, which no body field names. An account already listed
+ * (in any letter case) is not listed twice. `accounts` null means they cannot be known (the ledger
+ * was not read, or not all of it could be): UNREADABLE_ID is added, so no grant limited to
+ * accounts covers the request (fail closed).
+ */
+export function withLedgerAccounts(facts: RequestFacts, accounts: readonly string[] | null): RequestFacts {
+  const ids = Array.isArray(facts.accountIds) ? [...facts.accountIds] : [];
+  const have = new Set(ids.map((id) => id.toLowerCase()));
+  for (const id of accounts === null ? [UNREADABLE_ID] : accounts) {
+    if (typeof id !== 'string' || id === '' || have.has(id.toLowerCase())) continue;
+    have.add(id.toLowerCase());
+    ids.push(id);
+  }
+  return { ...facts, accountIds: ids };
+}

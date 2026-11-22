@@ -194,8 +194,12 @@ const MONEY_CLASSES: readonly RiskClass[] = ['prepare', 'enter', 'change', 'bulk
 
 /** Said where the amount of a request is not known (lib/agent/facts.ts: null is "not known", never 0). */
 export const AMOUNT_UNKNOWN = 'Amount unknown';
+// Not "any limit": Prepare work never needs two people (lib/agent/policy.ts needsTwoPerson), so the
+// two-person amount treats an unknown amount as above it only for work that changes the books or
+// pays or posts money; standing permission with an amount limit never covers it (grantCovers).
 export const AMOUNT_UNKNOWN_WHY =
-  'Ironbooks could not work out this amount ahead of time. Any amount limit treats it as more than the limit.';
+  'Ironbooks could not work out this amount ahead of time. Standing permission with an amount limit never covers it. ' +
+  'If this agent needs two people above an amount, work that changes the books or pays or posts money counts as above it.';
 
 /**
  * The amount of a request as the list and the card show it: money, or "unknown" for work that may
@@ -1425,6 +1429,48 @@ export function batchChoice(requests: readonly AgentRequestForPerson[], selected
   return picked.filter((r) => batchBlock(r, operation) === null).slice(0, BATCH_MAX);
 }
 
+/** What one agent's chosen requests come to together, for the batch dialog (batchTotals). */
+export interface BatchTotal {
+  agentId: string;
+  agentName: string;
+  count: number;
+  /** The amounts that are known, added up by size (a refund counts as much as a charge), as money. */
+  total: string;
+  /** How many show no amount (or one that cannot be read). */
+  unknown: number;
+}
+
+/**
+ * The chosen requests added up agent by agent, in list order, as the server adds them up before it
+ * approves any (lib/agent/policy.ts batchPassesTwoPerson, from lib/services/agentRequests.ts
+ * batchApprove): when an agent's total passes its two-person amount, or one of them shows no amount
+ * while that amount is set, none is approved together. The person sees the total before clicking.
+ */
+export function batchTotals(requests: readonly AgentRequestForPerson[]): BatchTotal[] {
+  const out = new Map<string, BatchTotal>();
+  for (const r of requests) {
+    const t = out.get(r.agentId) ?? { agentId: r.agentId, agentName: plain(r.agentName), count: 0, total: '0.00', unknown: 0 };
+    t.count += 1;
+    const m = moneyOf(r.amount);
+    if (m === null) t.unknown += 1;
+    else t.total = toAmountString(Money.add(t.total, Money.abs(m)));
+    out.set(r.agentId, t);
+  }
+  return [...out.values()];
+}
+
+/** "Agent X: 3 requests, $14,997.00 together" (and how many show no amount). */
+export function batchTotalText(t: BatchTotal): string {
+  const what = `${t.agentName}: ${t.count} ${t.count === 1 ? 'request' : 'requests'}, ${formatCurrency(t.total)}${t.count === 1 ? '' : ' together'}`;
+  if (t.unknown === 0) return what;
+  return `${what}, ${t.unknown === t.count ? (t.count === 1 ? 'which shows' : 'all of which show') : `${t.unknown} of which ${t.unknown === 1 ? 'shows' : 'show'}`} no amount`;
+}
+
+/** Under the totals: what the server does with them. */
+export const BATCH_TOTAL_RULE =
+  'If an agent needs two people for work above an amount, its requests here are added up: when together they come to more, or one shows no amount, ' +
+  'none is approved together, and you approve them one at a time.';
+
 // ---------------------------------------------------------------------------
 // Standing permission: "Approve similar…" (plan 4.4)
 // ---------------------------------------------------------------------------
@@ -1548,7 +1594,17 @@ export function initialGrantForm(r: AgentRequestForPerson, now: Date): GrantForm
   const minutes = options.find((o) => o.minutes === preferred)?.minutes ?? options[0]?.minutes ?? 0;
   const body = r.input?.body;
   const entityIds = c.entityIds?.length ? [...c.entityIds] : idsIn(body, ENTITY_KEYS);
-  const accountIds = c.accountIds?.length ? [...c.accountIds] : idsIn(body, ACCOUNT_KEYS);
+  // The accounts the request touches. The server judges a grant on every account the trial run
+  // posts to (an item's account, A/P, the bank), not only those the body names, so they are all
+  // offered together. A preview cut short could leave one out, and the limit would then cover
+  // nothing: none is offered.
+  const ledger = r.preview?.ledger ?? null;
+  const ledgerAccounts = ledger ? ledger.entries.flatMap((e) => e.lines.map((l) => l.accountId)).filter((x): x is string => typeof x === 'string' && x !== '') : [];
+  const accountIds = c.accountIds?.length
+    ? [...c.accountIds]
+    : r.preview?.truncated
+      ? []
+      : [...new Set([...idsIn(body, ACCOUNT_KEYS), ...ledgerAccounts])];
   const month = monthOf(now);
   const datesOffered = Boolean(c.dateFrom || c.dateTo) || hasDate(body);
   const amount = c.maxAmount ?? r.amount ?? '';

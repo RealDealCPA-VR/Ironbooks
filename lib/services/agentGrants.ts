@@ -277,6 +277,14 @@ function grantRules(ctx: ServiceContext, operationId: unknown, facts: RequestFac
       "This is company-file work, which the file's Admin approves one request at a time, so nobody can give standing permission for it, an Admin included.",
     );
   }
+  // What the approver types (a password, the closing-date password) is typed for each request:
+  // under standing permission nobody is there to type it (plan D3).
+  if (needs.secrets.length > 0 || operation.needsSecret.length > 0) {
+    throw new ServiceError(
+      'FORBIDDEN',
+      'This needs a password typed by the person who approves it, each time, so nobody can give standing permission for it, an Admin included.',
+    );
+  }
   if (grantNeedsAdmin(operation, facts) && !access.isAdmin) {
     throw new ServiceError(
       'FORBIDDEN',

@@ -51,6 +51,7 @@ import { companyToday } from './preferences';
 import { AiError } from '@/lib/ai/types';
 import { canRef, type AccessRef } from '@/lib/permissions/model';
 import { requirePermission } from './access';
+import { inServiceScope } from '@/lib/serviceScope';
 
 // ---------------------------------------------------------------------------
 // Read-only tools
@@ -873,8 +874,23 @@ export async function createPaymentProposal(ctx: ServiceContext, input: unknown,
   });
 }
 
+/**
+ * Said with an agent's Ask AI answer that held a proposal (WAVE5C F1). An Ask AI proposal is
+ * approved in Ask AI by any person, outside the agent's rules (its policy, role ceiling, two-person
+ * amount and dry-run card), so an agent's are never stored: the suggestion comes back as text.
+ */
+export const AGENT_PROPOSAL_NOT_STORED_MESSAGE =
+  "An agent's proposals are not stored as Ask AI proposals, so nothing here awaits approval. To have this entered, ask for the work itself (for example a journal entry or a bill) as its own request.";
+
+/** True for an agent's context: the agent itself, or any run of the route bridge. */
+function agentCaller(ctx: ServiceContext): boolean {
+  return Boolean(ctx.agent) || inServiceScope();
+}
+
 /** A model proposal of any kind ("type": "journal_entry" by default, "bill", "invoice" or "payment"). */
 export async function createProposal(ctx: ServiceContext, input: unknown, rationale?: string | null): Promise<ProposalView> {
+  // Never stored for an agent (see AGENT_PROPOSAL_NOT_STORED_MESSAGE); ask() answers it as text.
+  if (agentCaller(ctx)) throw new ServiceError('FORBIDDEN', AGENT_PROPOSAL_NOT_STORED_MESSAGE);
   const type = input && typeof input === 'object' ? (input as { type?: unknown }).type : undefined;
   if (type === 'bill') return createBillProposal(ctx, input, rationale);
   if (type === 'invoice') return createInvoiceProposal(ctx, input, rationale);
@@ -1570,7 +1586,11 @@ export async function ask(
 
       let answer = (s.answer ?? '').trim();
       const proposals: ProposalView[] = [];
-      if (s.proposal !== undefined && s.proposal !== null && ctx.role === 'viewer') {
+      if (s.proposal !== undefined && s.proposal !== null && agentCaller(ctx)) {
+        // An agent's: the suggestion as text, never an Ask AI proposal a person could approve
+        // outside the agent's rules.
+        answer += `\n\nSuggested: ${JSON.stringify(s.proposal).slice(0, 4000)}\n\n(${AGENT_PROPOSAL_NOT_STORED_MESSAGE})`;
+      } else if (s.proposal !== undefined && s.proposal !== null && ctx.role === 'viewer') {
         answer += '\n\n(Your role is view-only, so the proposed entry was not saved for approval.)';
       } else if (s.proposal !== undefined && s.proposal !== null) {
         try {
@@ -1584,7 +1604,11 @@ export async function ask(
         answer,
         toolCalls,
         proposals,
-        unverifiedNumbers: findUnverifiedNumbers(answer, results, [proposals.map((p) => p.payload), question]),
+        unverifiedNumbers: findUnverifiedNumbers(answer, results, [
+          proposals.map((p) => p.payload),
+          question,
+          ...(agentCaller(ctx) && s.proposal != null ? [s.proposal] : []),
+        ]),
         mode: 'llm',
         providerId,
         redacted,

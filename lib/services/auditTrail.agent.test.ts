@@ -727,3 +727,40 @@ describe('Agent Activity report (Reports > Accountant & Taxes)', () => {
     await expect(runStandardReport(asAgent(), 'agent-activity', {})).rejects.toMatchObject({ code: 'FORBIDDEN', message: expect.stringMatching(/people only.*list_my_requests/) });
   });
 });
+
+describe('work two people approved names both', () => {
+  it('approved by two people (the two-person rule): "<Agent> (agent), approved by <first> and <second>" (WAVE5C F16)', async () => {
+    const [req] = await db
+      .insert(agentPermissionRequests)
+      .values({
+        companyId: owner.companyId,
+        agentId,
+        requestKey: 'two-people',
+        operation: 'customers.update',
+        class: 'change',
+        summary: 'Change a customer',
+        status: 'approved',
+        decidedBy: people.approver,
+        secondApprover: people.second,
+        decidedAt: new Date(),
+        expiresAt: new Date(Date.now() + 86_400_000),
+      })
+      .returning();
+    const entityId = '11111111-0000-4000-8000-000000000016';
+    await writeAudit(asAgent({ userId: people.second, approval: { approvedBy: people.second, requestId: req.id, grantId: null } }), {
+      action: 'update',
+      entityType: 'customer',
+      entityId,
+      newValues: { displayName: 'Two-person change' },
+    });
+    const words = 'Ledger bot (agent), approved by Pat Approver and Sam Second';
+    const row = await trailName(entityId);
+    expect(row).toMatchObject({ actorName: words, approvedById: people.second, approvedByName: 'Sam Second', agentRequestId: req.id });
+    expect((await getAuditLog(owner, row!.id)).actorName).toBe(words);
+    expect(logRecord(entityId)?.userName).toBe(words);
+    // One person's approval (the request names no second approver) still names one.
+    expect((await trailName(ids.approved))?.actorName).toBe('Ledger bot (agent), approved by Pat Approver');
+    // Out of the Agent Activity report's counts below.
+    await db.delete(agentPermissionRequests).where(eq(agentPermissionRequests.id, req.id));
+  });
+});

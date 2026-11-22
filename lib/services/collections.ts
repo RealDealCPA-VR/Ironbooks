@@ -25,6 +25,7 @@ import { addNote } from './lists/notes';
 import { companyToday } from './salesDates';
 import { docRef } from './docNumbers';
 import { isRealIsoDay } from '@/lib/validation/prefs';
+import { inServiceScope } from '@/lib/serviceScope';
 
 export const CONTACT_METHODS = ['call', 'email', 'letter', 'statement', 'visit', 'other'] as const;
 export type ContactMethod = (typeof CONTACT_METHODS)[number];
@@ -222,7 +223,12 @@ export async function emailCollectionReminder(
   const failed: CollectionEmailResult['failed'] = [];
   let firstError: unknown = null;
   if (input.what === 'statement') {
-    const r = await emailCustomerStatement(ctx, cust.id, { email: to });
+    // The screen fills "Send to" with the customer's email on file, which may be a list
+    // ("ap@acme.com; ar@acme.com"). A person sending to that address sends as to the address on
+    // file, as before (the statement's typed-address check takes one address). An agent's typed
+    // address is always checked as typed: one plain address.
+    const onFile = !ctx.agent && !inServiceScope() && to !== null && to === cust.email?.trim();
+    const r = await emailCustomerStatement(ctx, cust.id, { email: onFile ? null : to });
     sent.push({ id: cust.id, label: 'Statement', to: r.to });
   } else {
     let list: Array<{ id: string; num: number; ref: string | null }> = await overdueInvoices(ctx, cust.id);

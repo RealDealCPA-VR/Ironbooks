@@ -532,6 +532,8 @@ domTest('several new entries of one kind are approved together, after a confirma
   const listed = textOf($('[data-batch-list]', confirm));
   check(listed.includes('Enter invoice 1050 for Acme Supply') && listed.includes('Enter invoice 1051 for Acme Supply'), `it lists them: ${listed}`);
   check(!listed.includes('Staples'), 'only those');
+  const totals = textOf($('[data-batch-totals]', confirm));
+  check(totals.includes('2 requests, $300.00 together'), `it adds them up before the click: ${totals}`);
   equal(calls.filter((c) => c.method === 'POST').length, 0, 'nothing is approved before the answer');
   await click(button('Approve all 2', confirm), 'Approve all 2');
   await until(() => textOf(dialog()).includes('What happened'), 'what happened');
@@ -561,7 +563,8 @@ domTest('Approve similar… opens with narrow limits taken from the request, and
   const month = monthOf(new Date());
   equal(
     JSON.stringify(body.grant),
-    JSON.stringify({ minutes: 60, constraints: { maxAmount: '1250.00', entityIds: [ACME], dateFrom: month.dateFrom, dateTo: month.dateTo, maxUses: 10 } }),
+    // The accounts are every account the trial run posts to (its ledger preview), as the server judges a grant (wave 5c F2).
+    JSON.stringify({ minutes: 60, constraints: { maxAmount: '1250.00', entityIds: [ACME], accountIds: ['x1', 'x2'], dateFrom: month.dateFrom, dateTo: month.dateTo, maxUses: 10 } }),
     'the limits were sent',
   );
   check(textOf(dialog()).includes('may do more of the same without asking for 1 hour, until about'), 'the card says for how long');
@@ -1251,7 +1254,7 @@ domTest('the card shows the warnings the agent said yes to, an amount it could n
   equal(textOf($('[data-amount-unknown]', row)), 'Unknown', 'the list says the amount is unknown, never blank');
   const card = await openCard(DUP.id);
   equal(textOf($('[data-amount-unknown]', card)), 'Amount unknown', 'and so does the card');
-  check(textOf(card).includes('Any amount limit treats it as more than the limit.'), 'saying what that means');
+  check(textOf(card).includes('Standing permission with an amount limit never covers it.'), 'saying what that means');
   const warnings = $('[data-warnings]', card);
   check(warnings && textOf(warnings).includes('Invoice number 1042 is already used for Acme Supply.'), `the warning in the app's own words: ${textOf(warnings)}`);
   check($('[data-warning="accepted"]', warnings!) && textOf(warnings).includes('The agent said to go ahead anyway.'), 'marked as one the agent said yes to');

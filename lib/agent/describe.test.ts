@@ -84,6 +84,22 @@ function registryOp(key: string): Operation {
 /** Words that only lead to a value; a line may end in one only where its template does. */
 const CONNECTOR_AT_END = /(?:^|\s)(?:to|for|from|on|of|with|as|at|by|in|into|and|or|through|against)$/i;
 
+describe('describeRequest: a flag the route compares strictly shows as the route reads it', () => {
+  it('"yes" only for a real true where the route acts on true; "no" only for a real false where it acts on false', () => {
+    const condense = operationById('condense')!;
+    const line = (dryRun: unknown) => describeRequest(condense, { body: { beforeDate: '2025-01-01', dryRun } });
+    expect(line(true)).toMatch(/preview only: yes/);
+    for (const v of [false, 'yes', 'true', 1, {}]) expect(line(v), JSON.stringify(v)).toMatch(/preview only: no/);
+    const currency = operationById('currencies.create') ?? allOperations().find((o) => o.route === '/api/currencies' && o.method === 'POST')!;
+    expect(describeRequest(currency, { body: { code: 'EUR', rateToBase: '1.1', isBase: 'yes' } })).toMatch(/home currency: no/);
+    expect(describeRequest(currency, { body: { code: 'EUR', rateToBase: '1.1', isBase: true } })).toMatch(/home currency: yes/);
+    const portable = allOperations().find((o) => o.route === '/api/portable' && o.method === 'POST')!;
+    // The route answers a copy without a password only for a real false.
+    expect(describeRequest(portable, { body: { protect: 'no' } })).toMatch(/protect: yes/);
+    expect(describeRequest(portable, { body: { protect: false } })).toMatch(/protect: no/);
+  });
+});
+
 describe('describeRequest: where values come from', () => {
   it('fills from params, query, the body (dotted) and the answer', () => {
     expect(line('Show invoice {id}', { params: { id: 'inv-9' } })).toBe('Show invoice inv-9');

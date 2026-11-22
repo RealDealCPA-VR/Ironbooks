@@ -11,6 +11,7 @@
  */
 import { and, asc, desc, eq, gte, inArray, isNull, lt, lte, ne, sql, type SQL } from 'drizzle-orm';
 import { maskAccountsInText } from '@/lib/agent/guards';
+import { inServiceScope } from '@/lib/serviceScope';
 import {
   accounts,
   classes,
@@ -494,14 +495,42 @@ export function onOrBeforeDay(to: Date) {
  * Only answers go through this. The stored memo stays as it is: a save that sends a memo back as
  * it was shown keeps the stored text (keepHiddenMemos).
  *
- * Deliberate, and fail closed: after a label with "#" everything to the end of the memo is masked,
- * chart-of-accounts numbers too ("Reclass to account #6100 Office Supplies" shows as "Reclass to
- * account #••••lies"), because the app writes "Acct # <vendor's account number>" itself and that
- * number is free text: nothing in the memo tells where it ends. "account 6100" (no "#") is shown as
- * typed. A caller with the right sees every memo as typed.
+ * After a label with "#" everything to the end of the memo is masked, because the app writes
+ * "Acct # <vendor's account number>" itself and that number is free text: nothing in the memo tells
+ * where it ends. One exception, for a person only: a chart-of-accounts reference written out as
+ * "account #6100 Office Supplies" (CHART_REFERENCE: the word "account", a chart-shaped number, then
+ * an account name starting with a capital) is shown as typed, and the masking goes on after it.
+ * "Acct #" (the app's own label), "account #0012345", "account #4471234 autopay" and a bare
+ * "account #6100" stay masked. An agent (ctx.agent, or an agent's run) sees every such memo masked,
+ * as before. "account 6100" (no "#") is shown as typed. A caller with the right sees every memo as
+ * typed.
  */
-export function lineMemoFor(ctx: Pick<ServiceContext, 'access'>, memo: string | null): string | null {
+export function lineMemoFor(ctx: Pick<ServiceContext, 'access' | 'agent'>, memo: string | null): string | null {
   if (!memo || hasFlag(ctx, 'fullAccountNumbers')) return memo;
+  if (ctx.agent || inServiceScope()) return maskAccountsInText(memo);
+  return memoShownToPerson(memo);
+}
+
+/**
+ * "account #6100 Office Supplies": the spelled-out word "account" (not "Acct", the app's own label
+ * for a vendor's number), "#", a chart-of-accounts number (no leading 0, 7 digits at most, groups
+ * joined by "." or "-": "6100", "6100.10", "1000-2"), then a space and a word that starts with a
+ * capital letter and holds no digit (the account's name). No "i" flag: with it \p{Lu} takes small
+ * letters too.
+ */
+const CHART_REFERENCE = /\b(?:[Aa]ccounts?|ACCOUNTS?)\s*#\s*([1-9]\d*(?:[.-]\d+)*)(?=\s+\p{Lu}[^\s\d]*(?:\s|$))/gu;
+
+/** A memo as a person without "view full account numbers" sees it (lineMemoFor). */
+function memoShownToPerson(memo: string): string {
+  const ref = new RegExp(CHART_REFERENCE.source, CHART_REFERENCE.flags);
+  for (let m = ref.exec(memo); m !== null; m = ref.exec(memo)) {
+    if (m[1].replace(/\D/g, '').length > 7) continue;
+    // Fail closed: a protected number before the reference may run on through it.
+    const head = memo.slice(0, m.index);
+    if (maskAccountsInText(head) !== head) break;
+    const end = m.index + m[0].length;
+    return `${memo.slice(0, end)}${memoShownToPerson(memo.slice(end))}`;
+  }
   return maskAccountsInText(memo);
 }
 
@@ -602,14 +631,16 @@ export function ilikeMatches(text: string | null | undefined, pattern: string): 
  *   2. the same account and name, amounts or class changed;
  *   3. the same amounts, account or name changed (a reclass), when exactly one stored line shows
  *      that memo with those amounts and exactly one submitted line carries it.
- * The text typed on a line that is none of these (the masked memo pasted onto the other side of
- * the entry, say) is saved as typed: a hidden number moves only with its own line. A line whose
- * account and amounts both changed, memo left as shown, is saved as shown, so the number is lost
- * on it: nothing then tells which stored line it was, and guessing could put a number on a line it
- * never belonged to. Undo needs none of this: it snapshots the entry as stored (getEntry).
+ *   4. any other line whose memo is still exactly a masked memo of this entry (its account and
+ *      amounts both changed, or the shown memo copied onto another line): it gets that memo's
+ *      stored text, when only one stored text shows that way. When two or more do, nothing tells
+ *      which one it was, and the save is refused with a plain message.
+ * A save can never write a masked rendering into the books: the masked text is not something the
+ * caller typed, and saving it would lose the number for good. Undo needs none of this: it
+ * snapshots the entry as stored (getEntry).
  */
 function keepHiddenMemos(
-  ctx: Pick<ServiceContext, 'access'>,
+  ctx: Pick<ServiceContext, 'access' | 'agent'>,
   stored: ReadonlyArray<JournalEntryLine>,
   lines: PostingLine[],
 ): PostingLine[] {
@@ -646,6 +677,18 @@ function keepHiddenMemos(
     const from = hidden.filter((s) => amountsOf(s) === amounts && shows(s, memo));
     const to = lines.filter((o, j) => !settled.has(j) && o.memo === memo && amountsOf(o) === amounts);
     if (from.length === 1 && to.length === 1) keep(i, from[0]);
+  });
+  lines.forEach((nl, i) => {
+    if (settled.has(i) || !nl.memo) return;
+    const texts = new Set(hidden.filter((s) => lineMemoFor(ctx, s.memo) === nl.memo).map((s) => s.memo!));
+    if (texts.size === 0) return;
+    if (texts.size > 1) {
+      throw validation(
+        `Line ${i + 1}: its memo "${nl.memo}" hides an account number, and more than one line of this entry shows that same text, so the save cannot tell which number it is. Type the memo again, or ask someone who can view full account numbers to make this change.`,
+      );
+    }
+    settled.add(i);
+    out[i] = { ...lines[i], memo: [...texts][0] };
   });
   return out;
 }

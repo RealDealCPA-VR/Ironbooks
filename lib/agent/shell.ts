@@ -48,7 +48,8 @@ import { loadAgentPolicy } from '@/lib/services/agentPolicies';
 import { setPrintHandler, type PrintHandler } from '@/lib/effects';
 import { currentServiceScope } from '@/lib/serviceScope';
 import type { ShellOperationDef } from './contract';
-import { allowedFolder, isThisComputerShare, overlapsAppData, readStagedFile } from './files';
+import { allowedFolder, holdsAppDataBesideTheBooks, isThisComputerShare, overlapsAppData, PERSON_ONLY_FILE_MESSAGE, readStagedFile, readStagedFileForSave } from './files';
+import { runnableNameProblem } from './guards';
 import { SHELL_OPERATIONS } from './operations/shell';
 import { makeShellTicket, sealShellPrivate, shellAnswerChecks, shellFileRef, type ShellPrivate } from './shellTicket';
 
@@ -229,23 +230,62 @@ async function policyFolders(approver: ServiceContext, agentId: string): Promise
 }
 
 /**
+ * Whether `dir` is a broad personal folder, or holds one: the user's profile folder (home), its
+ * Desktop, Documents and Downloads, and Documents where the desktop shell says it is (OneDrive can
+ * move it). Such a folder is never a default folder agents may use: through it a save could reach
+ * the Startup folder or a PowerShell profile. By the words, without regard to case on Windows and
+ * macOS; a folder inside one of them (Documents\Books) is not broad. electron/agentShell.js
+ * broadPersonalFolder is the same rule (test/agentShell.test.ts holds the two to one table).
+ */
+export function isBroadPersonalFolder(dir: string, where: { home: string; documents?: string | null; platform?: NodeJS.Platform }): boolean {
+  const platform = where.platform ?? process.platform;
+  const P = platform === 'win32' ? path.win32 : path.posix;
+  if (typeof dir !== 'string' || !dir.trim() || typeof where.home !== 'string' || !where.home.trim()) return true;
+  const fold = (p: string) => {
+    const r = P.resolve(p).replace(/[\\/]+$/, '');
+    return platform === 'win32' || platform === 'darwin' ? r.normalize('NFC').toLowerCase() : r;
+  };
+  const home = where.home;
+  const personal = [home, P.join(home, 'Desktop'), P.join(home, 'Documents'), P.join(home, 'Downloads')];
+  if (typeof where.documents === 'string' && where.documents.trim()) personal.push(where.documents);
+  const d = fold(dir);
+  return personal.some((p) => {
+    const f = fold(p);
+    return f === d || f.startsWith(d.endsWith(P.sep) ? d : d + P.sep);
+  });
+}
+
+/**
  * The folders agents may use without the Admin naming them: the open company file's folder, and
  * Documents\Ironbooks with its Agent Outbox. Documents is the one the desktop shell told this
  * server (the same the shell's own check uses); without the shell, the one in this account's home.
- * A company file at the top of a drive or share, or opened through a share of this very computer,
- * adds no folder of its own: only Documents applies.
+ * The company file's folder is left out (only Documents applies) when the file is at the top of a
+ * drive or share, when it was opened through a share of this very computer, when the folder is a
+ * broad personal one (isBroadPersonalFolder: the profile folder, Desktop, Documents, Downloads)
+ * and when it is, lies inside or holds a place of Ironbooks' own data other than the company file
+ * itself (lib/agent/files.ts holdsAppDataBesideTheBooks), as an Admin's own folder is judged.
  */
 export function defaultAgentFolders(): string[] {
   const out: string[] = [];
+  const told = process.env[SHELL_DOCUMENTS_ENV]?.trim();
+  const docs = told && path.isAbsolute(told) ? told : path.join(os.homedir(), 'Documents');
   const companyFile = process.env.BKA_COMPANY_FILE?.trim();
   if (companyFile) {
     const dir = path.dirname(path.resolve(companyFile));
-    if (!isDriveOrShareRoot(dir) && !isThisComputerShare(dir)) out.push(dir);
+    const shared = isDriveOrShareRoot(dir) || isThisComputerShare(dir);
+    if (!shared && !isBroadPersonalFolder(dir, { home: os.homedir(), documents: docs }) && !holdsAppDataSafely(dir)) out.push(dir);
   }
-  const told = process.env[SHELL_DOCUMENTS_ENV]?.trim();
-  const docs = told && path.isAbsolute(told) ? told : path.join(os.homedir(), 'Documents');
   out.push(path.join(docs, 'Ironbooks'), path.join(docs, 'Ironbooks', AGENT_OUTBOX_NAME));
   return out;
+}
+
+/** holdsAppDataBesideTheBooks, true when it cannot tell (fail closed). */
+function holdsAppDataSafely(dir: string): boolean {
+  try {
+    return holdsAppDataBesideTheBooks(dir);
+  } catch {
+    return true;
+  }
 }
 
 /** How an answer is checked: the launch key and the MAC of the ticket the request carried. */
@@ -327,7 +367,9 @@ export function sendShellLine(line: string, timeLimitMs: number | undefined, che
 /** The PDF of a staged file of this agent, ready for the line, or why it cannot be printed. */
 async function stagedPdf(companyId: string, agentId: string, fileId: unknown): Promise<{ name: string; type: string; base64: string } | string> {
   if (typeof fileId !== 'string' || !fileId) return 'Say which staged file to print (its fileId).';
-  const staged = await readStagedFile({ companyId, agentId }, fileId).catch(() => null);
+  // A whole copy of the company file is the person's: never printed (PERSON_ONLY_FILE_MESSAGE).
+  const staged = await readStagedFile({ companyId, agentId }, fileId).catch((err: unknown) => (personOnlyRefusal(err) ? PERSON_ONLY_FILE_MESSAGE : null));
+  if (typeof staged === 'string') return staged;
   if (!staged) return 'There is no staged file with that id for this agent (staged files are kept for 24 hours). Stage it again first.';
   const bytes = Buffer.from(staged.bytes);
   if (bytes.subarray(0, 5).toString('latin1') !== '%PDF-') return `${staged.file.name} is not a PDF. Only a PDF can be printed this way.`;
@@ -394,7 +436,13 @@ function nameProblem(name: string): string | null {
   }
   if (DEVICE_NAME.test(name)) return `"${shown}" cannot be used as a file name: Windows keeps that name for a device. Choose another name.`;
   if (name.length > 255) return 'The file name is too long. Use at most 255 characters.';
-  return null;
+  // A program, script or shortcut is never saved for an agent, in any folder (lib/agent/guards.ts).
+  return runnableNameProblem(name);
+}
+
+/** The refusal readStagedFile gives for a whole copy of the company file. */
+function personOnlyRefusal(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { message?: unknown }).message === PERSON_ONLY_FILE_MESSAGE;
 }
 
 /** A disk failure in plain words, never with a path (the system's message names the file). */
@@ -432,7 +480,9 @@ async function saveStagedFile(approver: ServiceContext, request: { agentId: stri
   if (typeof fileId !== 'string' || !fileId) return fail('Say which staged file to save (its fileId).');
   if (typeof folder !== 'string' || !folder.trim()) return fail('Say which folder to save it in.');
   if (name !== undefined && name !== null && typeof name !== 'string') return fail('The name must be text.');
-  const staged = await readStagedFile({ companyId: approver.companyId, agentId: request.agentId }, fileId).catch(() => null);
+  // The save is the one reader that may have a whole copy of the company file: its bytes go to
+  // the disk, in a folder agents may use, never to the agent (lib/agent/files.ts readStagedFileForSave).
+  const staged = await readStagedFileForSave({ companyId: approver.companyId, agentId: request.agentId }, fileId).catch(() => null);
   if (!staged) return fail('There is no staged file with that id for this agent (staged files are kept for 24 hours). Stage it again first.');
   const allowed = usableFolders([...defaultAgentFolders(), ...(await policyFolders(approver, request.agentId))]);
   const dir = await allowedFolder(allowed, folder);

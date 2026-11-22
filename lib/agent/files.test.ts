@@ -57,16 +57,23 @@ import {
   allowedFolder,
   appDataPlaces,
   clearStagedFiles,
+  holdsAppDataBesideTheBooks,
   isThisComputerShare,
   overlapsAppData,
+  PERSON_ONLY_FILE_MESSAGE,
+  PERSON_ONLY_FILE_OPERATIONS,
   readStagedFile,
+  readStagedFileForSave,
   REMOVE_FILE_VERB,
   removeStagedFile,
+  stageAnswerFile,
   stagedFileInfo,
+  stagedFileIsPersonOnly,
   stagedFilesRoot,
   stageFile,
   uploadChunk,
 } from './files';
+import { operationById } from './operations/registry';
 import thisComputerShares from './thisComputerShares.json';
 import { ServiceError } from '@/lib/services/errors';
 
@@ -384,6 +391,93 @@ describe('owners are kept apart', () => {
   it('an id in capitals (the same file on a Windows disk) is refused', async () => {
     const file = await stageFile(me, { name: 'a.txt', type: 'text/plain', bytes: Buffer.from('a') });
     expect(await readStagedFile(me, file.fileId.toUpperCase())).toBeNull();
+  });
+});
+
+// F9: a whole copy of the company file (every password hash and two-step secret, every SSN and
+// account number) is the person's. The agent may have it saved in a folder, never read it.
+describe('a whole copy of the company file is kept for a person only', () => {
+  const zip = (rest: string) => Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from(rest)]);
+  const sealed = (rest: string) => Buffer.concat([Buffer.from('IRONBOOKS-PROTECTED\n'), Buffer.from(rest)]);
+
+  it('the operations named are the whole-file copies of the registry, and each answers a file', () => {
+    expect([...PERSON_ONLY_FILE_OPERATIONS].sort()).toEqual(['backup.download', 'dashboard.auto-backup', 'portable']);
+    for (const id of PERSON_ONLY_FILE_OPERATIONS) {
+      const op = operationById(id);
+      expect(op, id).toBeTruthy();
+      expect(op!.output, id).toBe('file');
+      // The card says so: the agent cannot read the copy.
+      expect(op!.why, id).toMatch(/agent cannot read (the|that) copy/);
+    }
+    expect(operationById('backup.download')!.describe).toMatch(/the agent cannot read it/);
+    expect(operationById('portable')!.describe).toMatch(/the agent cannot read it/);
+    // The portable copy an agent asks for with POST is always sealed with the approver's password: readable.
+    expect(PERSON_ONLY_FILE_OPERATIONS.has('portable.post')).toBe(false);
+  });
+
+  it("a backup an operation answered: get_file and a request's file reference are refused, the save gets the bytes", async () => {
+    const bytes = zip('PG_VERSION and every password hash');
+    const file = await stageAnswerFile(me, { name: 'Month end.bin', type: 'application/zip', bytes }, 'backup.download');
+    expect(file).toEqual({ fileId: file.fileId, name: 'Month end.bin', type: 'application/zip', size: bytes.length });
+    const err = await refusal(readStagedFile(me, file.fileId));
+    expect(err.code).toBe('FORBIDDEN');
+    expect(err.message).toBe(PERSON_ONLY_FILE_MESSAGE);
+    expect(err.message).toMatch(/save_file/);
+    // Its name, type and size are no secret (the request's answer names them).
+    expect(await stagedFileInfo(me, file.fileId)).toEqual(file);
+    expect(await stagedFileIsPersonOnly(me, file.fileId)).toBe(true);
+    const saved = await readStagedFileForSave(me, file.fileId);
+    expect(Buffer.from(saved!.bytes).equals(bytes)).toBe(true);
+    // Marked in its .json; another owner still gets nothing at all.
+    const meta = JSON.parse(fs.readFileSync(path.join(ownerFolder(me), `${file.fileId}.json`), 'utf8'));
+    expect(meta.personOnly).toBe(true);
+    expect(await readStagedFileForSave(otherAgent, file.fileId)).toBeNull();
+    expect(await readStagedFile(otherAgent, file.fileId)).toBeNull();
+  });
+
+  it('a portable copy without a password and the legacy automatic backup are the same; other answers are not', async () => {
+    for (const id of ['portable', 'dashboard.auto-backup']) {
+      const f = await stageAnswerFile(me, { name: 'Acme.bkp', type: 'application/octet-stream', bytes: sealed(id) }, id);
+      expect((await refusal(readStagedFile(me, f.fileId))).code, id).toBe('FORBIDDEN');
+    }
+    const report = await stageAnswerFile(me, { name: 'report.pdf', type: 'application/pdf', bytes: Buffer.from('%PDF-1.7') }, 'reports.std.get');
+    expect((await readStagedFile(me, report.fileId))?.file.name).toBe('report.pdf');
+    expect(await stagedFileIsPersonOnly(me, report.fileId)).toBe(false);
+  });
+
+  it('by its name and bytes when the operation is not said (stageFile): a whole-file backup, or a portable copy that is a plain zip', async () => {
+    const personal = [
+      { name: 'ironbooks-backup-acme-2026-11-22T10-00-00.bka', bytes: zip('data dir') },
+      { name: 'ironbooks-backup-2026-11-22.bka', bytes: Buffer.from('a protected backup still carries the key slots') },
+      { name: 'IRONBOOKS-BACKUP-ACME.BKA', bytes: zip('data dir') },
+      { name: 'Acme Books.bkp', bytes: zip('bookkeeper-portable.json') },
+    ];
+    for (const c of personal) {
+      const f = await stageFile(me, { name: c.name, type: 'application/octet-stream', bytes: c.bytes });
+      expect((await refusal(readStagedFile(me, f.fileId))).message, c.name).toBe(PERSON_ONLY_FILE_MESSAGE);
+      expect(await readStagedFileForSave(me, f.fileId), c.name).not.toBeNull();
+    }
+    const readable = [
+      // A portable copy sealed with the password the approver typed.
+      { name: 'Acme Books.bkp', bytes: sealed('{"v":1}') },
+      // A one-company backup, masked for the agent.
+      { name: 'ironbooks-company-acme-2026-11-22.bka', bytes: zip('company-data.json') },
+      { name: 'statement.zip', bytes: zip('statement.csv') },
+    ];
+    for (const c of readable) {
+      const f = await stageFile(me, { name: c.name, type: 'application/octet-stream', bytes: c.bytes });
+      expect((await readStagedFile(me, f.fileId))?.file.name, c.name).toBe(c.name);
+    }
+  });
+
+  it("a .json that marks the file in any way but a plain false keeps it the person's", async () => {
+    const f = await stageFile(me, { name: 'note.txt', type: 'text/plain', bytes: Buffer.from('hi') });
+    const json = path.join(ownerFolder(me), `${f.fileId}.json`);
+    const meta = JSON.parse(fs.readFileSync(json, 'utf8'));
+    fs.writeFileSync(json, JSON.stringify({ ...meta, personOnly: 'yes' }));
+    expect((await refusal(readStagedFile(me, f.fileId))).code).toBe('FORBIDDEN');
+    fs.writeFileSync(json, JSON.stringify({ ...meta, personOnly: false }));
+    expect((await readStagedFile(me, f.fileId))?.file.name).toBe('note.txt');
   });
 });
 
@@ -1866,6 +1960,26 @@ describe('overlapsAppData (for the folder rules of other units)', () => {
       expect(overlapsAppData(folder), folder).toBe(false);
     }
     if (process.platform !== 'darwin') expect(overlapsAppData(path.join(local, 'Other'))).toBe(false);
+  });
+
+  it("holdsAppDataBesideTheBooks: the company file's own folder is judged without the file itself", () => {
+    // The folder that holds only the company file (and its archives) is not Ironbooks' data.
+    expect(overlapsAppData(filed)).toBe(true);
+    expect(holdsAppDataBesideTheBooks(filed)).toBe(false);
+    expect(holdsAppDataBesideTheBooks(path.join(filed, 'Receipts'))).toBe(false);
+    // Every other place still counts: the working copies, the staged files, Ironbooks' own folder.
+    for (const folder of [base, staged, data, work, working, appLocal()]) expect(holdsAppDataBesideTheBooks(folder), folder).toBe(true);
+    // A backup folder the shell named inside the company file's folder makes that folder Ironbooks' data.
+    const keep = process.env.BKA_BACKUP_DIR;
+    process.env.BKA_BACKUP_DIR = path.join(filed, 'Backups');
+    try {
+      expect(holdsAppDataBesideTheBooks(filed)).toBe(true);
+    } finally {
+      if (keep === undefined) delete process.env.BKA_BACKUP_DIR;
+      else process.env.BKA_BACKUP_DIR = keep;
+    }
+    // Fail closed for what is no full path.
+    expect(holdsAppDataBesideTheBooks('Books')).toBe(true);
   });
 
   it('through a link, and in a spelling that may be the same folder', (ctx) => {

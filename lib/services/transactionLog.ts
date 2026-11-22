@@ -48,7 +48,7 @@ import { createHash } from 'node:crypto';
 import { and, eq, inArray, is, sql } from 'drizzle-orm';
 import { PgTransaction } from 'drizzle-orm/pg-core';
 import type { DB } from '@/lib/db';
-import { agentGrants, companies, journalEntries, transactionLogAnchor, users } from '@/lib/db/schema';
+import { agentGrants, agentPermissionRequests, companies, journalEntries, transactionLogAnchor, users } from '@/lib/db/schema';
 import { afterCommit, dataDirOf, rootDbOf } from '@/lib/db/txHooks';
 import { formatCurrency, Money } from '@/lib/money';
 import { localDateTime } from '@/lib/reports/dates';
@@ -419,6 +419,39 @@ function forgetGrantWords(db: DB): void {
   if (key) grantWordsByTransaction.delete(key);
 }
 
+/**
+ * The first of two approvers of work that needed two people: the request's decidedBy, when the
+ * person running it is its secondApprover and someone else gave the first yes (agentRequests.ts
+ * approveRequest stores both before the work runs). Null for work one person approved.
+ */
+async function firstApproverOf(db: DB, companyId: string | null, requestId: string | null, approvedBy: string): Promise<string | null> {
+  if (!companyId || !requestId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) return null;
+  // Read once per transaction: a run under one approval writes many records.
+  const key = transactionKey(db);
+  const cacheKey = `${companyId}\u0000${requestId}\u0000${approvedBy}`;
+  const known = key ? firstApproverByTransaction.get(key) : undefined;
+  if (known?.has(cacheKey)) return known.get(cacheKey) ?? null;
+  const first = await readFirstApprover(db, companyId, requestId, approvedBy);
+  if (key) {
+    const map = known ?? new Map<string, string | null>();
+    map.set(cacheKey, first);
+    if (!known) firstApproverByTransaction.set(key, map);
+  }
+  return first;
+}
+
+/** The first approvers read in each transaction (firstApproverOf), as grantWordsByTransaction. */
+const firstApproverByTransaction = new WeakMap<object, Map<string, string | null>>();
+
+async function readFirstApprover(db: DB, companyId: string, requestId: string, approvedBy: string): Promise<string | null> {
+  const [row] = await db
+    .select({ decidedBy: agentPermissionRequests.decidedBy, secondApprover: agentPermissionRequests.secondApprover })
+    .from(agentPermissionRequests)
+    .where(and(eq(agentPermissionRequests.companyId, companyId), eq(agentPermissionRequests.id, requestId)));
+  if (!row?.decidedBy || row.secondApprover !== approvedBy || row.decidedBy === approvedBy) return null;
+  return row.decidedBy;
+}
+
 /** The full actor name of an agent's change at the time it is logged (see agentActorName). */
 async function agentActorAtWrite(
   db: DB,
@@ -427,7 +460,10 @@ async function agentActorAtWrite(
 ): Promise<string> {
   const ap = change.approval;
   if (ap?.approvedBy) {
-    return agentActorName(change.actorName, { approvedBy: (await resolveUserName(db, ap.approvedBy)) ?? REMOVED_PERSON });
+    const second = (await resolveUserName(db, ap.approvedBy)) ?? REMOVED_PERSON;
+    const firstId = await firstApproverOf(db, change.companyId ?? null, ap.requestId ?? null, ap.approvedBy);
+    const first = firstId ? ((await resolveUserName(db, firstId)) ?? REMOVED_PERSON) : null;
+    return agentActorName(change.actorName, { approvedBy: first ? `${first} and ${second}` : second });
   }
   if (ap?.grantId) {
     const words = change.companyId ? await grantWordsForLog(db, change.companyId, ap.grantId) : undefined;

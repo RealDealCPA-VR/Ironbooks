@@ -271,7 +271,7 @@ The banking tools follow the same rules as everything else:
 | Most records one request may change | The records limit above. "Full, with asks" comes with 200. |
 | Two people approve above this amount | Off unless set. Above it, two different people must approve. Work that changes the books, or pays or posts money, whose amount Ironbooks cannot work out ahead of time counts as above it. With no amount set, one person approves such work, and the card says the amount is unknown. |
 | Days a request waits for an answer | 7 unless set. After that the request expires and the agent is told. |
-| Folders it may read from or save to | The only folders the agent may take files from on this computer (none unless an Admin adds them). Saving, which an Admin always approves, may also go to the company file's folder, `Documents\Ironbooks` and its `Agent Outbox`. A whole drive or share is never one of them. |
+| Folders it may read from or save to | The only folders the agent may take files from on this computer (none unless an Admin adds them). Saving, which an Admin always approves, may also go to the company file's folder (unless that is the profile folder, Desktop, Documents or Downloads itself, or holds Ironbooks' own data), `Documents\Ironbooks` and its `Agent Outbox`. A whole drive or share is never one of them. |
 | Email notice | Off unless an Admin turns it on: an email to the Admins when the agent asks while nobody is signed in. |
 
 ## Answering an agent: Agent requests
@@ -609,10 +609,14 @@ prompt `ironbooks_guide`.
   agent (`get_my_permissions` lists them), never inside Ironbooks' own folders, and never through a
   share of this very computer. Anywhere else it is refused before the file is opened.
 - What an operation produces (a PDF, an export, a backup) is staged and returned as a file id;
-  `get_file` gives you its content.
-- `save_file` writes a staged file into the company file's folder, `Documents\Ironbooks`, its
-  `Agent Outbox`, or a folder the Admin added. It is company-file work: an Admin approves it at the
-  host computer, and it never replaces a file that is there.
+  `get_file` gives you its content. A whole copy of the company file (a backup, or a portable copy
+  without a password) is the exception: you cannot read it or use it in a request, only save it with
+  `save_file`.
+- `save_file` writes a staged file into the company file's folder (unless that is your profile
+  folder, Desktop, Documents or Downloads itself, or holds Ironbooks' own data), `Documents\Ironbooks`,
+  its `Agent Outbox`, or a folder the Admin added. It is company-file work: an Admin approves it at
+  the host computer, and it never replaces a file that is there. It never saves a program, script or
+  shortcut (.exe, .bat, .cmd, .ps1, .js, .lnk, .reg and the like).
 - Staged files are kept outside the company file and removed after 24 hours, and when the file
   closes.
 
@@ -670,10 +674,9 @@ full path of a request.
 - What an agent's own request may reach directly is narrow: its own requests, and reads the
   operation registry classes as plain reads outside Users & Roles and File Utilities. Those run on a
   read-only connection to the books, masked, never as an Admin. Everything else goes through one
-  door, `POST /api/agent/actions`, where the policy decides. One exception, a known gap: the
-  sign-in screen's public read of the company file (its name, its id, whether it has a password or
-  protection) also answers an agent's token directly, with nobody asked. It never shows the folder
-  the file is in. This lasts until that read refuses a request that carries a token.
+  door, `POST /api/agent/actions`, where the policy decides. The sign-in screen's public read of
+  the company file's name refuses any request that carries an agent's token; an agent asks for it
+  through the door, and an Admin approves.
 - Every operation is the app's own route, run inside Ironbooks for the agent with the agent's
   access, so it meets exactly the checks a person's request meets. A dry run and the trial run behind
   every approval card run inside a database transaction that is always rolled back. Emails, saved

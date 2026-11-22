@@ -85,7 +85,15 @@ export async function POST(req: NextRequest) {
     const credentials = archiveCredentialsFrom(req.headers);
     const ownerId = ctx.userId;
     const result = await withArchiveCredentialLimit(credentials, originFromHeaders(req.headers).addr, () =>
-      restoreCompanyBackup(ctx.db, Buffer.from(arrayBuffer), { ownerId, name, credentials }),
+      // An agent's restore (run by the route bridge) is recorded in the new company as the agent's,
+      // with the approval it ran under, as any agent's change is.
+      restoreCompanyBackup(ctx.db, Buffer.from(arrayBuffer), {
+        ownerId,
+        name,
+        credentials,
+        agent: ctx.agent ?? null,
+        approval: ctx.approval ?? null,
+      }),
     );
     return NextResponse.json(result, { status: 201 });
   } catch (err) {

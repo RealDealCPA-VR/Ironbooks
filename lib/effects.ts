@@ -28,8 +28,11 @@
  * In memory only. The queue lives in this process until release(); it is not written anywhere.
  * If the app stops between the commit and release() (a crash, a power cut), the books are saved
  * but the queued emails are never sent, the files never written, the pages never printed. Nothing
- * retries them later. The caller records what release() reported in the audit trail, so an effect
- * with no "sent" line there is one that did not happen, and a person can do it again by hand. A
+ * retries them later. The caller records in the audit trail every effect release() reported as
+ * failed (lib/agent/bridge.ts recordFailedEffects), so a record that says an email went out is
+ * followed by one that says it did not, and a person can do it again by hand. A service names the
+ * record an effect belongs to, and what to put back when it fails, with effectsAbout (a form's "to
+ * be emailed" flag): the report carries it as `about`. A
  * lasting outbox (a table retried at start-up) was not built on purpose: an email to a customer
  * that goes out hours late, after the person has moved on, surprises more than one that is missing.
  *
@@ -108,6 +111,20 @@ export interface EffectReport {
   error: string | null;
   /** True for a call to another computer: it ran during the operation, not at release. */
   ranDuringOperation: boolean;
+  /** The record it belongs to, as the service named it (effectsAbout); absent when it named none. */
+  about?: EffectAbout;
+}
+
+/**
+ * The record an effect belongs to (an invoice an email sends, say), as the service that asked for
+ * it names it with effectsAbout, and what the service wants put back when it fails after the
+ * commit. Plain data: this module only carries it to the report; the caller acts on it.
+ */
+export interface EffectAbout {
+  entityType: string;
+  entityId: string;
+  /** What to put back on that record when the effect failed (the form's flags before the send). */
+  onFailure?: Record<string, unknown>;
 }
 
 /** What runWithEffects resolves to once fn has finished without throwing. */
@@ -289,6 +306,8 @@ interface Entry {
   outcome: { status: 'sent' | 'failed'; error: string | null } | null;
   /** A file save: where the caller pinned it (pinFile), read by its run at release. */
   file: FileTarget | null;
+  /** The record it belongs to (effectsAbout), or null. */
+  about: EffectAbout | null;
 }
 
 /** Where a queued file goes: the real folder the caller approved, once pinned. */
@@ -323,6 +342,8 @@ interface EffectsState {
   printHandler: PrintHandler | null;
   /** What each run that threw had asked for, by the error it threw (effectsOfFailedRun). */
   failed: WeakMap<object, { mode: EffectsMode; entries: Entry[] }>;
+  /** The record the effects asked for in this async work belong to (effectsAbout). */
+  about: AsyncLocalStorage<EffectAbout>;
 }
 
 // On globalThis: Next can load this module more than once (the bridge's bundle and a route's).
@@ -331,11 +352,12 @@ const g = globalThis as typeof globalThis & { __ironbooksEffects?: EffectsState 
 
 function state(): EffectsState {
   if (!g.__ironbooksEffects) {
-    g.__ironbooksEffects = { scope: new AsyncLocalStorage<Scope>(), printHandler: null, failed: new WeakMap() };
+    g.__ironbooksEffects = { scope: new AsyncLocalStorage<Scope>(), printHandler: null, failed: new WeakMap(), about: new AsyncLocalStorage<EffectAbout>() };
   }
   // A store an older copy of this module left behind (a reload while developing) may lack the map;
   // without it a failed run would throw a TypeError in place of its own error.
   if (!g.__ironbooksEffects.failed) g.__ironbooksEffects.failed = new WeakMap();
+  if (!g.__ironbooksEffects.about) g.__ironbooksEffects.about = new AsyncLocalStorage<EffectAbout>();
   return g.__ironbooksEffects;
 }
 
@@ -367,7 +389,12 @@ function closeScope(scope: Scope): Entry[] {
 /** How a call to another computer made during the run went. */
 function ranReport(e: Entry): EffectReport {
   const outcome = e.outcome ?? { status: 'failed' as const, error: STILL_RUNNING };
-  return { effect: e.preview, ...outcome, ranDuringOperation: true };
+  return { effect: e.preview, ...outcome, ranDuringOperation: true, ...aboutOf(e) };
+}
+
+/** The report's `about`, only when the service named one (every other report keeps its shape). */
+function aboutOf(e: Entry): { about?: EffectAbout } {
+  return e.about ? { about: e.about } : {};
 }
 
 function isObject(v: unknown): v is object {
@@ -422,9 +449,9 @@ export async function runWithEffects<T>(mode: EffectsMode, fn: () => T | Promise
         if (!run) continue;
         try {
           await run();
-          reports.push({ effect: e.preview, status: 'sent', error: null, ranDuringOperation: false });
+          reports.push({ effect: e.preview, status: 'sent', error: null, ranDuringOperation: false, ...aboutOf(e) });
         } catch (err) {
-          reports.push({ effect: e.preview, status: 'failed', error: errorText(err), ranDuringOperation: false });
+          reports.push({ effect: e.preview, status: 'failed', error: errorText(err), ranDuringOperation: false, ...aboutOf(e) });
         }
       }
       return reports;
@@ -474,6 +501,14 @@ export function outsideEffects<T>(fn: () => T): T {
   return state().scope.exit(fn);
 }
 
+/**
+ * Run fn with every effect it asks for marked as belonging to `about`: the record, and what to put
+ * back on it when the effect fails after the commit (EffectReport.about). Changes nothing else: with
+ * no scope the effect happens at once, exactly as before, and the mark is never read.
+ */
+export function effectsAbout<T>(about: EffectAbout, fn: () => T): T {
+  return state().about.run({ ...about, ...(about.onFailure ? { onFailure: { ...about.onFailure } } : {}) }, fn);
+}
 /** Register (or, with null, remove) what does the printing. The desktop shell calls this. */
 export function setPrintHandler(handler: PrintHandler | null): void {
   state().printHandler = handler;
@@ -813,7 +848,7 @@ function record(
   // Asked again here: writeFile looks at the disk first, and the work may have finished meanwhile.
   if (!scope.open) throw refusedLate(what);
   const defer = scope.mode === 'defer';
-  const entry: Entry = { preview, run: defer ? run : null, ran: defer && ran, outcome: null, file };
+  const entry: Entry = { preview, run: defer ? run : null, ran: defer && ran, outcome: null, file, about: state().about.getStore() ?? null };
   scope.entries.push(entry);
   return entry;
 }

@@ -208,7 +208,7 @@ export const REPORTS_CLASSES: ClassificationMap = {
   'GET /api/report-schedules': {
     class: 'file',
     describe: 'List scheduled reports and the folder they save to',
-    why: "Decided 'file', not 'read' (plan 4.2): a File Utilities read whose answer names the report-export folder on this computer (exportFolder, the full path next to the company file) and each schedule's sub-folder, besides the recipients every schedule emails. An Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.",
+    why: "Decided 'file', not 'read': a File Utilities read whose answer names the report-export folder on this computer (exportFolder, the full path next to the company file) and each schedule's sub-folder, besides the recipients every schedule emails. An Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.",
     dryRun: 'none',
   },
   'POST /api/report-schedules': {
@@ -316,7 +316,7 @@ export const REPORTS_CLASSES: ClassificationMap = {
   'POST /api/dashboard/auto-backup': {
     class: 'file',
     describe: 'Make an automatic backup of the whole company file, deleting automatic backups older than the kept number, or start the backup timer',
-    why: "The desktop shell's quit-time backup. For a signed-in caller it needs an Admin of every company in the file. ?save=1 writes a full copy of the file into the backup folder, records it in the backup history and then deletes the older automatic backup versions beyond the number the backup settings keep. Without ?save it answers the whole file as a download and records it in the history. ?start=1 makes no backup: it starts the app's own scheduled-backup timer, which then backs up by itself. The service reads and writes the files on disk, so no dry run.",
+    why: "The desktop shell's quit-time backup. For a signed-in caller it needs an Admin of every company in the file. ?save=1 writes a full copy of the file into the backup folder, records it in the backup history and then deletes the older automatic backup versions beyond the number the backup settings keep. Without ?save it answers the whole file as a download and records it in the history; the agent cannot read that copy or use it in another request, and can only ask to have it saved in a folder an Admin allowed for it (save_file). ?start=1 makes no backup: it starts the app's own scheduled-backup timer, which then backs up by itself. The service reads and writes the files on disk, so no dry run.",
     fileAdmin: true,
     body: 'none',
     output: 'file',
@@ -377,7 +377,7 @@ export const REPORTS_CLASSES: ClassificationMap = {
   'GET /api/export/[list]': {
     class: 'file',
     describe: 'Export the {list} list as a file',
-    why: "A File Utilities read that produces a file (the route map asks for File Utilities' Print right), so class file (plan 4.2): an Admin approves it. CSV and XLSX leave tax IDs and SSNs out. The IIF format of vendors, employees and \"all\" leaves tax IDs and SSNs blank unless revealed (it never writes a masked value). Described only, never dry run: a dry run would hand the agent the file before anyone approved it.",
+    why: "A File Utilities read that produces a file (the route map asks for File Utilities' Print right), so class file: an Admin approves it. CSV and XLSX leave tax IDs and SSNs out. The IIF format of vendors, employees and \"all\" leaves tax IDs and SSNs blank unless revealed (it never writes a masked value). Described only, never dry run: a dry run would hand the agent the file before anyone approved it.",
     output: 'file',
     reveal: 'ssn',
     dryRun: 'none',

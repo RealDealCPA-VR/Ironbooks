@@ -663,6 +663,11 @@ export function grantCovers(grant: AgentGrant, operation: Operation, facts: Requ
   if (until - at > longest) return false;
   if (effectiveClass(operation, facts) !== own) return false;
   if (revealAsked(facts) || closedPeriodAsked(facts) || readConfirm(facts.confirm).any) return false;
+  // Work a person must be present for is never standing permission's (plan D3): what the approver
+  // types (a password), work approved only at the host's own window or only by the file's Admin,
+  // and closing-date work. Checked here too, not only when the grant is given, so a grant that
+  // outlives a change to the operation's classification covers nothing.
+  if (operation.needsSecret?.length || operation.hostOnly || operation.fileAdmin || closingDateWork(operation, facts)) return false;
 
   const c = grant.constraints ?? {};
   if (c.maxUses !== undefined) {
@@ -793,6 +798,31 @@ export function needsTwoPerson(
   const amount = parseDecimal(facts.amount);
   if (!amount) return true;
   return amount.abs().greaterThan(limit);
+}
+
+/**
+ * Requests of one agent that one person approves together (batch approval), held to the agent's
+ * two-person amount as one piece of work: work split into pieces under the amount must not get
+ * past the second person in one click (D8). `total` adds up the amounts that can be read, by size
+ * (a refund counts as much as a charge), as a 2-decimal string; `unknown` counts the requests whose
+ * amount is missing or cannot be read. `over` is set when the agent has a two-person amount and
+ * either the total is above it or any amount is unknown (fail closed: nobody can show the whole is
+ * below it). With no two-person amount set, `over` is never set.
+ */
+export function batchPassesTwoPerson(
+  policy: Pick<AgentPolicy, 'twoPersonOver'>,
+  amounts: readonly unknown[],
+): { total: string; unknown: number; over: boolean } {
+  let total = new Decimal(0);
+  let unknown = 0;
+  for (const a of amounts) {
+    const d = parseDecimal(a);
+    if (d) total = total.plus(d.abs());
+    else unknown += 1;
+  }
+  const set = policy.twoPersonOver !== null && policy.twoPersonOver !== undefined;
+  const limit = set ? (parseDecimal(policy.twoPersonOver) ?? new Decimal(0)) : null;
+  return { total: total.toFixed(2), unknown, over: limit !== null && (unknown > 0 || total.greaterThan(limit)) };
 }
 
 type ApproverFlag = NonNullable<ApprovalNeeds['flag']>;

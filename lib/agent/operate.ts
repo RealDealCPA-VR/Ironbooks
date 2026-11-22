@@ -97,11 +97,11 @@ import { cancelAgentRequest, createAgentRequest, listRequestsForAgent, requestFo
 import { listActiveSessions } from '@/lib/services/sessions';
 import { effects, pinFile, runWithEffects } from '@/lib/effects';
 import { REQUEST_ID_MESSAGE, agentInputHash, type ChangePreview } from '@/lib/agent/actions';
-import { runOperation } from '@/lib/agent/bridge';
-import { guardInput } from '@/lib/agent/guards';
-import { factsOf } from '@/lib/agent/facts';
+import { EXPECTED_VERSION_MESSAGE, REVEAL_FILE_ENDED, revealFileEnded as stagedRevealEnded, runOperation, type CommitCheck } from '@/lib/agent/bridge';
+import { guardInput, plainIsoTime, runnableNameProblem } from '@/lib/agent/guards';
+import { factsOf, withLedgerAccounts } from '@/lib/agent/facts';
 import { describeRequest, type DescribeNames } from '@/lib/agent/describe';
-import { allowedFolder, overlapsAppData, readStagedFile, stagedFileInfo, uploadChunk } from '@/lib/agent/files';
+import { allowedFolder, overlapsAppData, readStagedFile, readStagedFileForSave, stagedFileInfo, uploadChunk } from '@/lib/agent/files';
 import { AGENT_OUTBOX_NAME, defaultAgentFolders, runShellOperation } from '@/lib/agent/shell';
 import { findOperations, operationById, operationForRoute } from '@/lib/agent/operations/registry';
 import { describeSchemas, examplesOf, type OperationExample } from '@/lib/agent/operations/schemas';
@@ -1813,39 +1813,13 @@ function folderNotAllowed(added: readonly string[]): string {
   return `That folder is not one this agent may save to, or it does not exist. Use the company file's folder, Documents\\Ironbooks\\${AGENT_OUTBOX_NAME}${theirs}.`;
 }
 
-const REVEAL_FILE_ENDED =
-  'That file held protected values a person let this agent see for a while, and that time is over, so it can no longer be fetched or saved. If it is still needed, ask for it again with reveal: true and a reason.';
-
 /**
- * The staged file is the answer of an approved reveal whose time is up (D6). The requests service
- * removes such a file then (lib/services/agentRequests.ts letGoRevealFile); until it has (Ironbooks
- * stopped in between, or the removal failed and waits for the next try), the door hands it over no
- * more, nor saves it anywhere. A reveal whose end cannot be read counts as over (fail closed).
+ * The staged file is the answer of an approved reveal whose time is up (D6): the door hands it over
+ * no more, nor saves or prints it (bridge.ts revealFileEnded, which also refuses it as a FileRef in
+ * a request's body, an approved one included). A reveal whose end cannot be read counts as over.
  */
-async function revealFileEnded(ctx: ServiceContext, agentId: string, fileId: string): Promise<boolean> {
-  if (!fileId || !UUID_RE.test(agentId)) return false;
-  const rows = await ctx.db
-    .select({ result: agentPermissionRequests.result })
-    .from(agentPermissionRequests)
-    .where(
-      and(
-        eq(agentPermissionRequests.companyId, ctx.companyId),
-        eq(agentPermissionRequests.agentId, agentId),
-        eq(agentPermissionRequests.status, 'executed'),
-        or(
-          sql`(${agentPermissionRequests.result} ->> 'revealFileLeft') = ${fileId}`,
-          sql`(${agentPermissionRequests.result} -> 'file' ->> 'fileId') = ${fileId}`,
-        ),
-      ),
-    );
-  const now = Date.now();
-  return rows.some(({ result }) => {
-    if (!plainObject(result)) return false;
-    if (result.revealFileLeft === fileId) return true;
-    if (!Object.hasOwn(result, 'revealUntil')) return false;
-    const ends = typeof result.revealUntil === 'string' ? Date.parse(result.revealUntil) : NaN;
-    return !(Number.isFinite(ends) && now < ends);
-  });
+function revealFileEnded(ctx: ServiceContext, agentId: string, fileId: string): Promise<boolean> {
+  return stagedRevealEnded(ctx.db, ctx.companyId, agentId, fileId);
 }
 
 /** The staged files a desktop or server action names: the values of its 'fileId' fields (lib/agent/operations/shell.ts). */
@@ -1884,12 +1858,15 @@ function alreadyThere(name: string): string {
 async function savePreview(ctx: ServiceContext, door: Door, input: OperationInput): Promise<{ preview: OperationPreview } | { refused: string }> {
   const b = bodyFields(input.body);
   if (await revealFileEnded(ctx, door.agent.id, text(b.fileId))) return { refused: REVEAL_FILE_ENDED };
-  const staged = await readStagedFile({ companyId: ctx.companyId, agentId: door.agent.id }, text(b.fileId));
+  // The save's own reader: a whole copy of the company file (person-only) may be saved, never read.
+  const staged = await readStagedFileForSave({ companyId: ctx.companyId, agentId: door.agent.id }, text(b.fileId));
   if (!staged) throw new ServiceError('NOT_FOUND', FILE_GONE);
   const folders = await saveFolders(door);
   const dir = await allowedFolder(folders.all, text(b.folder));
   if (!dir) return { refused: folderNotAllowed(folders.added) };
   const name = text(b.name) || staged.file.name;
+  const runnable = runnableNameProblem(name);
+  if (runnable) return { refused: runnable };
   // The name is checked first (writeFile refuses separators and the like), so looking for the
   // file never reaches outside the allowed folder. The folder is checked above, so the save is
   // pinned to it ({ pinFiles }): the disk is looked at only there, as the bridge does.
@@ -1930,11 +1907,16 @@ function inputOf(req: z.infer<typeof runOperationArgs>): OperationInput {
  * (OperationInput.expectedUpdatedAt): the guards keep only the parts they know, and this one is
  * neither a secret nor anything only a person sets. The bridge checks its form and sends it to the
  * route, whose own version check compares it inside the committing transaction, so a person's
- * edit made in between is a 409, never overwritten. An approved run carries it too.
+ * edit made in between is a 409, never overwritten. An approved run carries it too. A version that
+ * is not a plain ISO time with its zone (guards.ts plainIsoTime) is refused: one with no zone would
+ * be read in this computer's own time zone.
  */
 function withVersion(guarded: OperationInput, given: OperationInput | null | undefined): OperationInput {
   const v = (given as { expectedUpdatedAt?: unknown } | null | undefined)?.expectedUpdatedAt;
-  return v === undefined || v === null ? guarded : { ...guarded, expectedUpdatedAt: v as string };
+  if (v === undefined || v === null || v === '') return guarded;
+  const plain = plainIsoTime(v);
+  if (plain === null) throw validation(EXPECTED_VERSION_MESSAGE, { fields: { expectedUpdatedAt: 'a time with its zone, as Ironbooks answered it' } });
+  return { ...guarded, expectedUpdatedAt: plain };
 }
 
 /**
@@ -2175,7 +2157,10 @@ async function change(
   // needsTwoPerson). When nothing showed the real figures, on the worst of them: the amount counts
   // as unknown, so the two-person rule and a grant's amount never rest on the body's own figures.
   const judged = known ? facts : unchecked(facts);
-  const { decision, lent } = await settleGrant(ctx, door, operation, judged, decideFor(door, operation, judged));
+  // With no ledger seen, which accounts the work posts to is not known either: no grant limited to
+  // accounts covers it (an item line posts to the item's own account, which no body field names).
+  const forRun = known ? judged : withLedgerAccounts(judged, null);
+  const { decision, lent } = await settleGrant(ctx, door, operation, forRun, decideFor(door, operation, forRun));
 
   const summary = summaryOf(door, operation, input, answerSoFar);
   if (decision.outcome === 'refuse') return refused(operation.id, decision.message, { summary });
@@ -2209,7 +2194,27 @@ async function change(
       note: untried,
     });
   }
-  return commit(ctx, door, operation, input, await runActor(door, lent), requestKey, hash);
+  return commit(ctx, door, operation, input, await runActor(door, lent), requestKey, hash, stillRuns(door, operation, known, judged, lent?.grantId ?? null));
+}
+
+/** Why a commit that was judged on its dry run is refused when what it really did is not covered (stillRuns). */
+export const CHANGED_SINCE_TRIED =
+  'The books changed after this was tried, and what it would do now is not something this agent may do on its own. Nothing was done. Send it again to have it judged on what it would do now.';
+
+/**
+ * The check a commit under a grant or under Allow makes inside its own transaction (bridge.ts
+ * RunOptions.commitCheck): what it really did is judged again, by the same rules as its dry run,
+ * against the policy and only the grant it runs under. A record changed between the two (a
+ * teammate's edit, or another of the agent's own requests: a new customer or a larger total) can
+ * take it out of the grant, or over the two-person amount; then nothing is kept.
+ */
+function stillRuns(door: Door, operation: Operation, known: boolean, before: RequestFacts, grantId: string | null): CommitCheck {
+  return (committed) => {
+    const seen = dryRunFacts(operation, { ...committed, mode: 'dry_run' }, before);
+    const facts = known ? seen : withLedgerAccounts(unchecked(seen), null);
+    const grants = grantId ? door.grants.filter((g) => g.id === grantId) : [];
+    return decideFor({ ...door, grants }, operation, facts).outcome === 'run' ? null : CHANGED_SINCE_TRIED;
+  };
 }
 
 async function commit(
@@ -2220,6 +2225,7 @@ async function commit(
   actor: BridgeActor,
   requestKey: string,
   hash: string,
+  check?: CommitCheck,
 ): Promise<AgentOperationAnswer> {
   const grantId = actor.approval.grantId;
   const claimId = await claimRequestId(ctx, door.agent.id, requestKey, operation.id, hash);
@@ -2230,7 +2236,7 @@ async function commit(
   }
   let r: BridgeResult;
   try {
-    r = await runOperation(ctx, operation, input, 'commit', actor);
+    r = check ? await runOperation(ctx, operation, input, 'commit', actor, { commitCheck: check }) : await runOperation(ctx, operation, input, 'commit', actor);
   } catch (err) {
     if (operation.dryRun !== 'none') {
       await releaseClaim(claimId);
@@ -2791,6 +2797,13 @@ async function summaryFor(ctx: ServiceContext, door: Door, operation: Operation)
 }
 
 /**
+ * Operations whose amount field only marks the amount as unknown (lib/agent/operations/classes/
+ * payroll.ts: no figure of a payroll adjustment is right for every one, so amountField names a
+ * list, which is never read as an amount). Their notes say so, not where the amount is read from.
+ */
+const AMOUNT_NEVER_KNOWN: ReadonlySet<string> = new Set(['payroll.adjustments.create']);
+
+/**
  * The notes of describe_operation: how it is tried, and what that means for how it is judged. They
  * follow the door's own rules (bridgePreviewable, figuresSeenAhead), so a note never promises a
  * try the door will not make: a route that needs something only the approver types (a password, a
@@ -2815,7 +2828,11 @@ function notesFor(operation: Operation): string[] {
         : 'Because it cannot be tried ahead of time, its amount counts as unknown: above any two-person limit, and outside the amount of standing permission.',
     );
   }
-  if (operation.amountField) notes.push(`The amount is read from "${operation.amountField}", and from the answer of a dry run when that is larger.`);
+  if (AMOUNT_NEVER_KNOWN.has(operation.id)) {
+    notes.push('Its amount is not known, before a dry run or after it: it counts as over every two-person limit, and the approval card says the amount is unknown.');
+  } else if (operation.amountField) {
+    notes.push(`The amount is read from "${operation.amountField}", and from the answer of a dry run when that is larger.`);
+  }
   if (operation.countField) notes.push(`The number of records it changes is the length of "${operation.countField}".`);
   if (operation.confirmFlags.length) {
     notes.push(`If it answers needs_confirmation, read the warning; to go ahead anyway resend with the flag in confirm (${operation.confirmFlags.join(', ')}).`);

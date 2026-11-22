@@ -11,6 +11,13 @@
  * never with teammates connecting through multi-user hosting, nor with another program on this
  * computer that lacks the desktop shell's per-launch pass (both count as remote:
  * lib/net/requestInfo.ts). A web page naming another host never gets here (middleware.ts).
+ *
+ * Never for an agent's own request: a request that carries an Authorization header (an agent's
+ * token) is refused before anything is read, 403 "This is not available to agents." The app's own
+ * window and the desktop shell never send one, and neither does an approved run through the door
+ * (lib/agent/bridge.ts runs it in a service scope whose headers never hold Authorization:
+ * lib/serviceScope.ts SERVICE_SCOPE_HEADERS), so the only way an agent reads this is the operation
+ * company-file.info, which an Admin approves.
  */
 import path from 'node:path';
 import { NextResponse } from 'next/server';
@@ -23,8 +30,22 @@ import { companyFilePath } from '@/lib/services/companyFileSave';
 import { readProtection, sealedFileInfo } from '@/lib/services/fileProtection';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { routeError } from '@/lib/routeErrors';
+import { requestHeaders } from '@/lib/serviceScope';
+import { AGENT_NOT_AVAILABLE_MESSAGE } from '@/lib/agentContext';
+
+/** The request carries an Authorization header (outside a request, as in scripts and tests, it carries none). */
+async function carriesAuthorization(): Promise<boolean> {
+  try {
+    return (await requestHeaders()).get('authorization') !== null;
+  } catch {
+    return false;
+  }
+}
 
 export async function GET() {
+  if (await carriesAuthorization()) {
+    return NextResponse.json({ error: AGENT_NOT_AVAILABLE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
+  }
   try {
     return await withDamagedFileAccess(async () => {
       const { remote } = await getRequestOrigin();

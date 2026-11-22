@@ -78,6 +78,7 @@ import { allOperations, operationById } from '@/lib/agent/operations/registry';
 import type { Operation, RequestFacts } from '@/lib/agent/operations/types';
 import type { BridgeActor, BridgeMode, BridgeResult, FileOwner, OperationInput } from '@/lib/agent/contract';
 import { runOperation } from '@/lib/agent/bridge';
+import { PERSON_ONLY_FILE_MESSAGE, readStagedFile, readStagedFileForSave } from '@/lib/agent/files';
 import { approvalNeeds } from '@/lib/agent/policy';
 import { notePersonSignedIn } from '@/lib/agent/endpointFile';
 import { approveAgentRequest } from '@/lib/services/agentRequests';
@@ -782,8 +783,10 @@ describe('an approved reveal shows the value: on that one call, of that kind, fo
  * with no reveal asked. Run as an approved run runs them (lib/agent/operate.ts runApproved:
  * commit, the approver's access within the agent's ceiling, approvedBy set, reveal off). Not
  * here: the copies of the whole company file (backup.download, backup.company.download,
- * portable), which are compressed database files this scan cannot read, and the raw transaction
- * log file (transaction-log.download), which is never for agents (checked on its own below).
+ * portable), which are compressed database files this scan cannot read (the whole-file ones are
+ * kept for a person only and never reach the agent: checked on their own below), and the raw
+ * transaction log file (transaction-log.download), which is never for agents (checked on its own
+ * below).
  */
 const APPROVED_SCANS: Array<{ label: string; op: string; input: OperationInput }> = [
   { label: 'export.get vendors (CSV)', op: 'export.get', input: { params: { list: 'vendors' } } },
@@ -852,6 +855,21 @@ describe('a GET of another class, approved without a reveal, shows only what its
       expect(findSecrets(JSON.stringify(r)), mode).toEqual([]);
     }
   });
+
+  // A whole copy of the company file holds every password hash, two-step secret and unmasked
+  // number: approved, it is staged for saving to a folder only, and the agent can never read it.
+  it('backup.download and portable: approved, the copy is staged for a person only; the agent cannot read it, the save can', async () => {
+    for (const id of ['backup.download', 'portable']) {
+      const op = operationById(id)!;
+      const r = await runOperation(agent.base, op, {}, 'commit', approved());
+      expect(r.outcome, `${id} ${JSON.stringify(r.error ?? null)}`).toBe('ok');
+      expect(r.file?.fileId, id).toBeTruthy();
+      expect(findSecrets(JSON.stringify(r)), id).toEqual([]);
+      await expect(readStagedFile(owner, r.file!.fileId), id).rejects.toThrow(PERSON_ONLY_FILE_MESSAGE);
+      const saved = await readStagedFileForSave(owner, r.file!.fileId);
+      expect(saved?.bytes.byteLength, id).toBe(r.file!.size);
+    }
+  }, 120_000);
 
   it('APPROVED_UNGATED names scans above', () => {
     expect(Object.keys(APPROVED_UNGATED).filter((l) => !APPROVED_SCANS.some((a) => a.label === l))).toEqual([]);

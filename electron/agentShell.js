@@ -504,18 +504,85 @@ function driveOrShareRoot(p, platform = process.platform) {
   return platform !== 'win32' && posixVolumeTop(resolved);
 }
 
+/** `p` folded for comparing by the words: without regard to case on Windows and macOS, no trailing separator. */
+function foldedPath(p, platform) {
+  const P = platform === 'win32' ? path.win32 : path.posix;
+  const r = P.resolve(p).replace(/[\\/]+$/, '');
+  return platform === 'win32' || platform === 'darwin' ? r.normalize('NFC').toLowerCase() : r;
+}
+
+/** `child` is `parent` or inside it, both folded (foldedPath). */
+function foldedWithin(child, parent, platform) {
+  const sep = platform === 'win32' ? '\\' : '/';
+  return child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+}
+
+/**
+ * Whether `dir` is a broad personal folder, or holds one: the user's profile folder (home), its
+ * Desktop, Documents and Downloads, and Documents where this window has it (OneDrive can move it).
+ * Such a folder is never a default folder agents may use: through it a save could reach the
+ * Startup folder or a PowerShell profile. By the words; a folder inside one of them is not broad.
+ * lib/agent/shell.ts isBroadPersonalFolder is the same rule (test/agentShell.test.ts holds the two
+ * to one table).
+ */
+function broadPersonalFolder(dir, { home, documents, platform = process.platform } = {}) {
+  const P = platform === 'win32' ? path.win32 : path.posix;
+  if (typeof dir !== 'string' || !dir.trim() || typeof home !== 'string' || !home.trim()) return true;
+  const personal = [home, P.join(home, 'Desktop'), P.join(home, 'Documents'), P.join(home, 'Downloads')];
+  if (typeof documents === 'string' && documents.trim()) personal.push(documents);
+  const d = foldedPath(dir, platform);
+  return personal.some((p) => foldedWithin(foldedPath(p, platform), d, platform));
+}
+
+/** The names the settings folder has had (lib/agent/files.ts SETTINGS_FOLDER_NAMES). */
+const SETTINGS_FOLDER_NAMES = ['Ironbooks', 'ironbooks', 'BookKeeper AI', 'bookkeeper-ai'];
+
+/**
+ * The places of Ironbooks' own data this window knows by the words, beside the company file
+ * itself: the settings folder under every name it has had, Ironbooks' local folder (the working
+ * copies, sandboxes, staged files, the agent connection files), ~/.ironbooks, and any `own` the
+ * caller adds (app.getPath('userData')). As lib/agent/files.ts appDataPlaces lists them.
+ */
+function ownDataPlaces({ home, env = process.env, platform = process.platform, own = [] } = {}) {
+  const P = platform === 'win32' ? path.win32 : path.posix;
+  const out = [];
+  if (typeof home === 'string' && home) {
+    const settingsParent =
+      platform === 'win32'
+        ? env.APPDATA || P.join(home, 'AppData', 'Roaming')
+        : platform === 'darwin'
+          ? P.join(home, 'Library', 'Application Support')
+          : env.XDG_CONFIG_HOME || P.join(home, '.config');
+    for (const name of SETTINGS_FOLDER_NAMES) out.push(P.join(settingsParent, name));
+    if (platform === 'win32') out.push(P.join(env.LOCALAPPDATA || P.join(home, 'AppData', 'Local'), 'Ironbooks'));
+    else if (platform !== 'darwin') out.push(P.join(env.XDG_STATE_HOME || P.join(home, '.local', 'state'), 'ironbooks'));
+    out.push(P.join(home, '.ironbooks'));
+  }
+  for (const p of own) if (typeof p === 'string' && p) out.push(p);
+  return out;
+}
+
 /**
  * The folders agents may use without the Admin naming them: the open company file's folder, and
- * Documents\Ironbooks with its Agent Outbox. A company file at the top of a drive or share (a USB
- * stick's E:\Books.ironbooks, a mapped Q:\, \\office\books\Books.ironbooks) adds no folder of its
- * own: only the Documents ones apply.
+ * Documents\Ironbooks with its Agent Outbox. The company file's folder adds nothing (only the
+ * Documents ones apply) when the file is at the top of a drive or share (a USB stick's
+ * E:\Books.ironbooks, a mapped Q:\, \\office\books\Books.ironbooks), when the folder is a broad
+ * personal one (broadPersonalFolder: the profile folder, Desktop, Documents, Downloads), and when
+ * it is, lies inside or holds a place of Ironbooks' own data (ownDataPlaces), as the company
+ * server judges it (lib/agent/shell.ts defaultAgentFolders). `home`, `env` and `own` are this
+ * computer's unless a caller (a test) says otherwise.
  */
-function defaultFolders({ companyFile, documents, platform = process.platform } = {}) {
+function defaultFolders({ companyFile, documents, platform = process.platform, home = os.homedir(), env = process.env, own = [] } = {}) {
   const P = platform === 'win32' ? path.win32 : path.posix;
   const out = [];
   if (typeof companyFile === 'string' && companyFile) {
     const dir = P.dirname(P.resolve(companyFile));
-    if (!driveOrShareRoot(dir, platform)) out.push(dir);
+    const d = foldedPath(dir, platform);
+    const holdsOwnData = ownDataPlaces({ home, env, platform, own }).some((p) => {
+      const f = foldedPath(p, platform);
+      return foldedWithin(f, d, platform) || foldedWithin(d, f, platform);
+    });
+    if (!driveOrShareRoot(dir, platform) && !broadPersonalFolder(dir, { home, documents, platform }) && !holdsOwnData) out.push(dir);
   }
   if (typeof documents === 'string' && documents) {
     out.push(P.join(documents, 'Ironbooks'));
@@ -1939,6 +2006,7 @@ module.exports = {
   signAnswer,
   createReplayMemory,
   driveOrShareRoot,
+  broadPersonalFolder,
   defaultFolders,
   cleanPath,
   windowsFold,

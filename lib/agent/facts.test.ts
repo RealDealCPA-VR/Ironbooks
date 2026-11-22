@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { OperationInput } from './contract';
-import { UNREADABLE_ID, amountOf, amountShown, factsOf } from './facts';
+import { UNREADABLE_ID, amountOf, amountShown, factsOf, withLedgerAccounts } from './facts';
 import type { Operation } from './operations/types';
 
 function op(over: Partial<Operation> = {}): Operation {
@@ -302,5 +302,26 @@ describe('factsOf: whatever it is given', () => {
       date: null,
       closedPeriod: false,
     });
+  });
+});
+
+describe('withLedgerAccounts: the accounts the run posts to', () => {
+  const A = '11111111-1111-4111-8111-111111111111';
+  const B = '22222222-2222-4222-8222-222222222222';
+  const base = facts(op({ id: 'bills.create', route: '/api/bills' }), { body: { lines: [{ accountId: A.toUpperCase() }, { itemId: 'i' }] } });
+
+  it('adds an account only the ledger shows (an item line), once, whatever its letter case', () => {
+    expect(base.accountIds).toEqual([A.toUpperCase()]);
+    expect(withLedgerAccounts(base, [A, B]).accountIds).toEqual([A.toUpperCase(), B]);
+  });
+
+  it('accounts that cannot be known: no account limit can cover it', () => {
+    expect(withLedgerAccounts(base, null).accountIds).toEqual([A.toUpperCase(), UNREADABLE_ID]);
+    expect(withLedgerAccounts(withLedgerAccounts(base, null), null).accountIds).toEqual([A.toUpperCase(), UNREADABLE_ID]);
+  });
+
+  it('leaves everything else as it was', () => {
+    const out = withLedgerAccounts(base, [B]);
+    expect({ ...out, accountIds: base.accountIds }).toEqual(base);
   });
 });

@@ -47,6 +47,7 @@ import {
   PRESET_DEFAULTS,
   approvalNeeds,
   baseClass,
+  batchPassesTwoPerson,
   classRank,
   decide,
   effectiveClass,
@@ -1256,6 +1257,30 @@ describe('two-person approval (D8)', () => {
 // Grants
 // ---------------------------------------------------------------------------
 
+describe('requests approved together (batch approval) and the two-person amount (D8)', () => {
+  const limit = { twoPersonOver: '5000.00' };
+  it('adds the amounts up by size and holds the total to the amount', () => {
+    expect(batchPassesTwoPerson(limit, ['4999.00', '4999.00', '4999.00'])).toEqual({ total: '14997.00', unknown: 0, over: true });
+    expect(batchPassesTwoPerson(limit, ['2500.00', '-2500.00'])).toEqual({ total: '5000.00', unknown: 0, over: false });
+    expect(batchPassesTwoPerson(limit, ['2500.00', '-2500.01'])).toEqual({ total: '5000.01', unknown: 0, over: true });
+    expect(batchPassesTwoPerson(limit, [4999, '1'])).toEqual({ total: '5000.00', unknown: 0, over: false });
+  });
+  it('an amount that is not known counts as above it', () => {
+    for (const unknown of [null, undefined, '', 'lots', 'NaN', {}]) {
+      expect(batchPassesTwoPerson(limit, ['1.00', unknown]), String(unknown)).toEqual({ total: '1.00', unknown: 1, over: true });
+    }
+  });
+  it('with no two-person amount set, nothing is over', () => {
+    for (const twoPersonOver of [null, undefined]) {
+      expect(batchPassesTwoPerson({ twoPersonOver } as Pick<AgentPolicy, 'twoPersonOver'>, ['9999999.00', null]).over).toBe(false);
+    }
+  });
+  it('an amount setting it cannot read is read as 0 (as needsTwoPerson reads it)', () => {
+    expect(batchPassesTwoPerson({ twoPersonOver: 'lots' }, ['0.01']).over).toBe(true);
+    expect(needsTwoPerson({ twoPersonOver: 'lots' }, { amount: '0.01' })).toBe(true);
+  });
+});
+
 describe('grantCovers', () => {
   const operation = op({ id: 'bills.create', class: 'enter' });
   const base = facts({ amount: '120.00', entityIds: ['v1'], accountIds: ['a1', 'a2'], date: '2026-11-15', count: 1 });
@@ -1309,6 +1334,29 @@ describe('grantCovers', () => {
       const covered = grantCovers(grant({ operation: 'x.op', constraints: { maxCount: 10 } }), o, facts({ count: 1 }), NOW);
       expect(covered, cls).toBe(GRANTABLE[cls] !== 'no');
     }
+  });
+
+  it('never covers work a person must be there for: a secret typed, the host computer, the file Admin, closing-date work (D3)', () => {
+    for (const cls of RISK_CLASSES.filter((c) => GRANTABLE[c] !== 'no')) {
+      const at = (over: Partial<Operation>, f: RequestFacts = facts({ count: 1, amount: '1.00' })) =>
+        grantCovers(grant({ operation: 'p.op', constraints: { maxCount: 10 } }), op({ id: 'p.op', class: cls, ...over }), f, NOW);
+      expect(at({}), cls).toBe(true);
+      expect(at({ needsSecret: ['mail_password'] }), cls).toBe(false);
+      expect(at({ needsSecret: ['closing_password'] }), cls).toBe(false);
+      expect(at({ hostOnly: true }), cls).toBe(false);
+      expect(at({ fileAdmin: true }), cls).toBe(false);
+      expect(at({}, facts({ count: 1, amount: '1.00', closedPeriod: true })), cls).toBe(false);
+    }
+    // An operation that is itself closing-date work (moving the closing date) is never grantable.
+    expect(grantCovers(grant({ operation: 'p.period', constraints: {} }), op({ id: 'p.period', class: 'period' }), facts(), NOW)).toBe(false);
+  });
+
+  it('an amount limit never covers a request whose amount is unknown, whatever else it meets', () => {
+    for (const amount of [null, '', '  ', 'lots', 'NaN', 'Infinity']) {
+      expect(grantCovers(g({ maxAmount: '1000000' }), operation, { ...base, amount } as RequestFacts, NOW), String(amount)).toBe(false);
+    }
+    // Without an amount limit, a request of unknown amount is covered as before.
+    expect(grantCovers(g({}), operation, { ...base, amount: null }, NOW)).toBe(true);
   });
 
   it('a "now" it cannot read covers nothing', () => {

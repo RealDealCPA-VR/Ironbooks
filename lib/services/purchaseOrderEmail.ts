@@ -18,6 +18,7 @@ import { requireActivity } from './access';
 import { getCompany, getPreferences } from './company';
 import { getHomeCurrencyCode } from './currencies';
 import { emailNotSetUpError, isConfigured, sendMail } from './email';
+import { effectsAbout } from '@/lib/effects';
 import { senderMergeFields } from './emailSettings';
 import { getPurchaseOrder } from './purchaseOrders';
 import { assertNotSandbox } from './sandboxState';
@@ -95,16 +96,19 @@ export async function emailPurchaseOrder(
     date: po.date,
     expectedDate: po.expectedDate,
   });
-  await sendMail(
-    {
-      to: recipient,
-      subject,
-      text,
-      attachments: [
-        { filename: `po-${String(number).replace(/[^A-Za-z0-9._-]+/g, '-')}.pdf`, content: Buffer.from(bytes), contentType: 'application/pdf' },
-      ],
-    },
-    ctx,
+  // Named for the bridge, which records a send that fails after an agent's run committed.
+  await effectsAbout({ entityType: 'purchase_order', entityId: poId }, () =>
+    sendMail(
+      {
+        to: recipient,
+        subject,
+        text,
+        attachments: [
+          { filename: `po-${String(number).replace(/[^A-Za-z0-9._-]+/g, '-')}.pdf`, content: Buffer.from(bytes), contentType: 'application/pdf' },
+        ],
+      },
+      ctx,
+    ),
   );
   // Emailing changes nothing in the books: a member who may only print P.O.s may send one, so
   // audit under a context without the read-only role (writeAudit would refuse it after the send).

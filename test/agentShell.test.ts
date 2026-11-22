@@ -49,6 +49,7 @@ import {
   AGENT_OUTBOX_NAME,
   defaultAgentFolders,
   installShellPrinting,
+  isBroadPersonalFolder,
   isDriveOrShareRoot,
   printThroughShell,
   runShellOperation,
@@ -65,6 +66,8 @@ import thisComputerShares from '@/lib/agent/thisComputerShares.json';
 const mocks = vi.hoisted(() => ({
   folders: [] as string[],
   staged: new Map<string, { file: { fileId: string; name: string; type: string; size: number }; bytes: Uint8Array }>(),
+  /** Staged files kept for a person only (a whole copy of the company file): only the save reads them. */
+  personOnly: new Set<string>(),
   scope: undefined as unknown,
 }));
 
@@ -77,7 +80,15 @@ vi.mock('@/lib/agent/files', async (orig) => ({
   isThisComputerShare: (await orig<typeof import('@/lib/agent/files')>()).isThisComputerShare,
   // So is the one that leaves out an Admin's folder that has come to hold Ironbooks' own data.
   overlapsAppData: (await orig<typeof import('@/lib/agent/files')>()).overlapsAppData,
-  readStagedFile: vi.fn(async (owner: { companyId: string; agentId: string }, fileId: string) => mocks.staged.get(`${owner.companyId}/${owner.agentId}/${fileId}`) ?? null),
+  readStagedFile: vi.fn(async (owner: { companyId: string; agentId: string }, fileId: string) => {
+    const key = `${owner.companyId}/${owner.agentId}/${fileId}`;
+    if (mocks.personOnly.has(key)) throw Object.assign(new Error((await orig<typeof import('@/lib/agent/files')>()).PERSON_ONLY_FILE_MESSAGE), { code: 'FORBIDDEN' });
+    return mocks.staged.get(key) ?? null;
+  }),
+  readStagedFileForSave: vi.fn(async (owner: { companyId: string; agentId: string }, fileId: string) => mocks.staged.get(`${owner.companyId}/${owner.agentId}/${fileId}`) ?? null),
+  PERSON_ONLY_FILE_MESSAGE: (await orig<typeof import('@/lib/agent/files')>()).PERSON_ONLY_FILE_MESSAGE,
+  // The rule on the company file's own folder is the real one too.
+  holdsAppDataBesideTheBooks: (await orig<typeof import('@/lib/agent/files')>()).holdsAppDataBesideTheBooks,
   allowedFolder: vi.fn(async (allowed: readonly string[], folder: string) => {
     const want = path.resolve(folder).toLowerCase();
     const ok = allowed.some((a) => {
@@ -559,6 +570,101 @@ describe('the folders agents may use', () => {
     }
     expect(isDriveOrShareRoot(top)).toBe(true);
     expect(isDriveOrShareRoot(TMP)).toBe(false);
+  });
+
+  // F10: a company file kept in the profile folder, Desktop, Documents or Downloads must not make
+  // that whole folder an agent's (a save could reach the Startup folder or a PowerShell profile).
+  const BROAD_CASES: Array<{ platform: NodeJS.Platform; home: string; documents: string; file: string; broad: boolean }> = [
+    ...[
+      ['C:\\Users\\Pat\\Books.ironbooks', true],
+      ['C:\\Users\\Pat\\Desktop\\Books.ironbooks', true],
+      ['C:\\Users\\Pat\\Documents\\Books.ironbooks', true],
+      ['C:\\Users\\Pat\\Downloads\\Books.ironbooks', true],
+      ['C:\\Users\\Pat\\OneDrive\\Documents\\Books.ironbooks', true],
+      ['c:\\users\\pat\\documents\\Books.ironbooks', true],
+      ['C:\\Users\\Pat\\Documents\\\\Books.ironbooks', true],
+      ['C:\\Users\\Books.ironbooks', true], // holds the profile folder
+      ['C:\\Users\\Pat\\OneDrive\\Books.ironbooks', true], // holds Documents as the shell has it
+      ['C:\\Users\\Pat\\Documents\\Books\\Acme.ironbooks', false],
+      ['C:\\Users\\Pat\\Desktop\\Clients\\Acme.ironbooks', false],
+      ['D:\\Accounting\\Acme.ironbooks', false],
+      ['C:\\Users\\Patrick\\Acme.ironbooks', false],
+    ].map(([file, broad]) => ({ platform: 'win32' as const, home: 'C:\\Users\\Pat', documents: 'C:\\Users\\Pat\\OneDrive\\Documents', file: file as string, broad: broad as boolean })),
+    ...[
+      ['/home/pat/Books.ironbooks', true],
+      ['/home/pat/Documents/Books.ironbooks', true],
+      ['/home/pat/Desktop/Books.ironbooks', true],
+      ['/home/Books.ironbooks', true],
+      ['/home/pat/documents/Books.ironbooks', false], // another folder on Linux
+      ['/home/pat/Books/Acme.ironbooks', false],
+      ['/srv/books/Acme.ironbooks', false],
+    ].map(([file, broad]) => ({ platform: 'linux' as const, home: '/home/pat', documents: '/home/pat/Documents', file: file as string, broad: broad as boolean })),
+    ...[
+      ['/Users/pat/documents/Books.ironbooks', true], // macOS disks mostly ignore case
+      ['/Users/pat/Downloads/Books.ironbooks', true],
+      ['/Users/pat/Documents/Books/Acme.ironbooks', false],
+    ].map(([file, broad]) => ({ platform: 'darwin' as const, home: '/Users/pat', documents: '/Users/pat/Documents', file: file as string, broad: broad as boolean })),
+  ];
+
+  it("the company file's folder is no default when it is a broad personal folder: the server and the shell judge alike", () => {
+    for (const c of BROAD_CASES) {
+      const P = c.platform === 'win32' ? path.win32 : path.posix;
+      const dir = P.dirname(P.resolve(c.file));
+      const what = `${c.platform} ${c.file}`;
+      expect(isBroadPersonalFolder(dir, { home: c.home, documents: c.documents, platform: c.platform }), `server ${what}`).toBe(c.broad);
+      expect(agentShell.broadPersonalFolder(dir, { home: c.home, documents: c.documents, platform: c.platform }), `shell ${what}`).toBe(c.broad);
+      const folders = agentShell.defaultFolders({ companyFile: c.file, documents: c.documents, platform: c.platform, home: c.home, env: {} });
+      expect(folders.includes(dir), `shell defaults ${what}`).toBe(!c.broad);
+      expect(folders).toEqual(expect.arrayContaining([P.join(c.documents, 'Ironbooks'), P.join(c.documents, 'Ironbooks', AGENT_OUTBOX_NAME)]));
+    }
+    // Without a home to judge by, nothing is taken as a default (fail closed).
+    expect(isBroadPersonalFolder('D:\\Accounting', { home: '', platform: 'win32' })).toBe(true);
+    expect(agentShell.broadPersonalFolder('D:\\Accounting', { home: '', platform: 'win32' })).toBe(true);
+  });
+
+  it("the shell leaves out a company file's folder that is, lies inside or holds Ironbooks' own data", () => {
+    const env = { APPDATA: 'C:\\Users\\Pat\\AppData\\Roaming', LOCALAPPDATA: 'C:\\Users\\Pat\\AppData\\Local' };
+    const at = (file: string, own: string[] = []) =>
+      agentShell.defaultFolders({ companyFile: file, documents: 'C:\\Users\\Pat\\Documents', platform: 'win32', home: 'C:\\Users\\Pat', env, own })[0];
+    for (const file of [
+      'C:\\Users\\Pat\\AppData\\Roaming\\Books.ironbooks', // holds the settings folder
+      'C:\\Users\\Pat\\AppData\\Roaming\\Ironbooks\\companies\\Acme.ironbooks', // inside it
+      'C:\\Users\\Pat\\AppData\\Local\\Ironbooks\\Working\\Acme.ironbooks', // inside the working copies
+      'C:\\Users\\Pat\\AppData\\Books.ironbooks',
+      'C:\\Users\\Pat\\.ironbooks\\Acme.ironbooks',
+    ]) {
+      expect(at(file), file).toBe('C:\\Users\\Pat\\Documents\\Ironbooks');
+    }
+    expect(at('C:\\Users\\Pat\\AppData\\Roaming\\Other\\Acme.ironbooks')).toBe('C:\\Users\\Pat\\AppData\\Roaming\\Other');
+    expect(at('D:\\Office\\Acme.ironbooks', ['D:\\Office\\Settings'])).toBe('C:\\Users\\Pat\\Documents\\Ironbooks');
+  });
+
+  it("the server's own defaults: the profile folder, Documents itself, and a folder holding Ironbooks' data are left out", () => {
+    const keep = { company: process.env.BKA_COMPANY_FILE, docs: process.env[SHELL_DOCUMENTS_ENV], backups: process.env.BKA_BACKUP_DIR };
+    const home = os.homedir();
+    const docs = path.join(TMP, 'Told', 'Documents');
+    try {
+      process.env[SHELL_DOCUMENTS_ENV] = docs;
+      const onlyDocuments = [path.join(docs, 'Ironbooks'), path.join(docs, 'Ironbooks', AGENT_OUTBOX_NAME)];
+      for (const file of [path.join(home, 'Books.ironbooks'), path.join(home, 'Desktop', 'Books.ironbooks'), path.join(home, 'Downloads', 'Books.ironbooks'), path.join(docs, 'Books.ironbooks'), path.join(path.dirname(home), 'Books.ironbooks')]) {
+        process.env.BKA_COMPANY_FILE = file;
+        expect(defaultAgentFolders(), file).toEqual(onlyDocuments);
+      }
+      const books = path.join(TMP, 'Books');
+      process.env.BKA_COMPANY_FILE = path.join(books, 'Acme.ironbooks');
+      expect(defaultAgentFolders()[0]).toBe(books);
+      process.env.BKA_COMPANY_FILE = path.join(docs, 'Books', 'Acme.ironbooks');
+      expect(defaultAgentFolders()[0]).toBe(path.join(docs, 'Books'));
+      // The backup folder the shell named sits in the company file's folder: that folder is Ironbooks' data.
+      process.env.BKA_COMPANY_FILE = path.join(books, 'Acme.ironbooks');
+      process.env.BKA_BACKUP_DIR = path.join(books, 'Backups');
+      expect(defaultAgentFolders()).toEqual(onlyDocuments);
+    } finally {
+      for (const [k, v] of [['BKA_COMPANY_FILE', keep.company], [SHELL_DOCUMENTS_ENV, keep.docs], ['BKA_BACKUP_DIR', keep.backups]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   });
 });
 
@@ -1622,6 +1728,16 @@ describe('the endpoint and the server’s side of it', () => {
     const bigPdf = Buffer.concat([PDF, Buffer.alloc(1_600_000)]);
     mocks.staged.set(`${COMPANY}/${AGENT}/${big}`, { file: { fileId: big, name: 'Year.pdf', type: 'application/pdf', size: bigPdf.length }, bytes: bigPdf });
     expect((await run('shell.print.file', { fileId: big })).error).toMatch(/too large to print without a person/);
+    // A whole copy of the company file is the person's: printing reads it as any agent reader does.
+    const copy = 'b'.repeat(32);
+    const key = `${COMPANY}/${AGENT}/${copy}`;
+    mocks.staged.set(key, { file: { fileId: copy, name: 'Checks.pdf', type: 'application/pdf', size: PDF.length }, bytes: PDF });
+    mocks.personOnly.add(key);
+    try {
+      expect((await run('shell.print.file', { fileId: copy })).error).toMatch(/full copy of the company file/);
+    } finally {
+      mocks.personOnly.delete(key);
+    }
   });
 
   it('the effects outbox prints through the shell, for the agent of the open scope, with an approval', async () => {
@@ -1821,8 +1937,11 @@ describe('files.save', () => {
     const allowed = vi.mocked((await import('@/lib/agent/files')).allowedFolder);
     const name = `ib-agent-shell-device-${process.pid}.pdf`;
     try {
-      // They are among the defaults as the shell told them, so only usableFolders can leave them out.
-      expect(defaultAgentFolders()).toEqual(expect.arrayContaining(odd));
+      // Documents is among the defaults as the shell told it, so only usableFolders can leave it out.
+      // The company file's folder is left out before that: a device path cannot be judged against
+      // Ironbooks' own data (holdsAppDataBesideTheBooks fails closed, by the words).
+      expect(defaultAgentFolders()).toEqual(expect.arrayContaining(odd.slice(1)));
+      expect(defaultAgentFolders()).not.toContain(odd[0]);
       allowed.mockClear();
       const r = await save({ fileId, folder: OUTSIDE, name });
       expect(r.ok, r.error ?? '').toBe(true);
@@ -1838,6 +1957,34 @@ describe('files.save', () => {
         else process.env[k] = v;
       }
       fs.rmSync(path.join(OUTSIDE, name), { force: true });
+    }
+  });
+
+  it('a program, script or shortcut is never saved, by the name given or the staged file\'s own', async () => {
+    for (const name of ['Ironbooks sync.cmd', 'Microsoft.PowerShell_profile.ps1', 'Report.pdf.exe', 'Open me.LNK', 'x.js', 'x.reg']) {
+      const r = await save({ fileId, folder: OUTSIDE, name });
+      expect(r.ok, name).toBe(false);
+      expect(r.error, name).toMatch(/never saves a program, script or shortcut/);
+      expect(fs.existsSync(path.join(OUTSIDE, name)), name).toBe(false);
+    }
+    const script = '2'.repeat(32);
+    mocks.staged.set(`${COMPANY}/${AGENT}/${script}`, { file: { fileId: script, name: 'sync.bat', type: 'application/octet-stream', size: 3 }, bytes: Buffer.from('dir') });
+    expect((await save({ fileId: script, folder: OUTSIDE })).error).toMatch(/\.bat file/);
+    expect(fs.existsSync(path.join(OUTSIDE, 'sync.bat'))).toBe(false);
+  });
+
+  it('a whole copy of the company file, kept for a person only, is still saved: the bytes go to the disk, never to the agent', async () => {
+    const backup = '3'.repeat(32);
+    const key = `${COMPANY}/${AGENT}/${backup}`;
+    const bytes = Buffer.from('PK\u0003\u0004 a backup', 'latin1');
+    mocks.staged.set(key, { file: { fileId: backup, name: 'ironbooks-backup-acme.bka', type: 'application/zip', size: bytes.length }, bytes });
+    mocks.personOnly.add(key);
+    try {
+      const r = await save({ fileId: backup, folder: OUTSIDE, name: 'Month-end backup.bka' });
+      expect(r.ok, r.error ?? '').toBe(true);
+      expect(fs.readFileSync(path.join(OUTSIDE, 'Month-end backup.bka'))).toEqual(bytes);
+    } finally {
+      mocks.personOnly.delete(key);
     }
   });
 

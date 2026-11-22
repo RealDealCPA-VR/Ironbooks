@@ -102,7 +102,7 @@ vi.mock('./contract', async (orig) => {
 // The real modules, watched.
 vi.mock('./files', async (orig) => {
   const real = await orig<typeof import('./files')>();
-  return { ...real, stageFile: vi.fn(real.stageFile), allowedFolder: vi.fn(real.allowedFolder) };
+  return { ...real, stageFile: vi.fn(real.stageFile), stageAnswerFile: vi.fn(real.stageAnswerFile), allowedFolder: vi.fn(real.allowedFolder) };
 });
 vi.mock('@/lib/services/agentGrants', async (orig) => {
   const real = await orig<typeof import('@/lib/services/agentGrants')>();
@@ -162,10 +162,17 @@ import { allOperations, operationForRoute } from './operations/registry';
 import type { Operation } from './operations/types';
 import { PREVIEW_ROW_LIMIT, type BridgeActor, type OperationInput } from './contract';
 import { PRODUCED_SECRET_TEXT, SECRET_HEADERS, encodeSecretParts } from './guards';
-import { allowedFolder, stageFile } from './files';
+import { allowedFolder, stageAnswerFile, stageFile } from './files';
 import { postJournalEntry } from '@/lib/services/posting';
 import { localDateISO } from '@/lib/dates';
-import { CLOSING_PASSWORD_WRONG_MESSAGE, IRREVERSIBLE_COMMIT_TIME_LIMIT_MS, OPTIONAL_ROUTE_SECRETS, runOperation } from './bridge';
+import { CLOSING_PASSWORD_WRONG_MESSAGE, IRREVERSIBLE_COMMIT_TIME_LIMIT_MS, OPTIONAL_ROUTE_SECRETS, REVEAL_FILE_ENDED, runOperation } from './bridge';
+import { agentPermissionRequests } from '@/lib/db/schema';
+import { UNREADABLE_ID } from './facts';
+import { grantCovers } from './policy';
+import { createItem } from '@/lib/services/items';
+import { mailTransport, saveEmailSetup } from '@/lib/services/emailSettings';
+import { emailSalesForm } from '@/lib/services/salesForms';
+import { invoices } from '@/lib/db/schema';
 
 type Out = Record<string, any>;
 let db: DB;
@@ -531,7 +538,7 @@ describe('reads', () => {
     expect(r.outcome).toBe('ok');
     expect(r.result).toBeNull();
     expect(r.file).toMatchObject({ name: 'Estimate 1001.pdf', type: 'application/pdf', size: 5 });
-    expect(vi.mocked(stageFile)).toHaveBeenLastCalledWith({ companyId: rich.ctx.companyId, agentId }, expect.objectContaining({ name: 'Estimate 1001.pdf' }));
+    expect(vi.mocked(stageAnswerFile)).toHaveBeenLastCalledWith({ companyId: rich.ctx.companyId, agentId }, expect.objectContaining({ name: 'Estimate 1001.pdf' }), 'estimates.pdf');
   });
 });
 
@@ -1362,6 +1369,47 @@ describe('staged files in', () => {
     expect(missing.error!.code).toBe('FILE_NOT_FOUND');
   });
 
+  it('a FileRef to the file of a reveal whose time is up is refused, before the route runs, approved or not', async () => {
+    const staged = await stageFile(owner(), { name: 'w2.pdf', type: 'application/pdf', bytes: new Uint8Array([1]) });
+    const reached: string[] = [];
+    h.handler = async () => {
+      reached.push('ran');
+      return NextResponse.json({ ok: true }, { status: 201 });
+    };
+    const [req] = await db
+      .insert(agentPermissionRequests)
+      .values({
+        companyId: rich.ctx.companyId,
+        agentId,
+        requestKey: `reveal-${randomUUID()}`,
+        operation: 'employees.get',
+        class: 'read_sensitive',
+        summary: 'Show an employee',
+        status: 'executed',
+        result: { file: { fileId: staged.fileId }, revealUntil: new Date(Date.now() - 60_000).toISOString() },
+        expiresAt: new Date(Date.now() + 86_400_000),
+      })
+      .returning();
+    try {
+      for (const over of [{}, { approval: { approvedBy: rich.ctx.userId!, requestId: randomUUID(), grantId: null }, userId: rich.ctx.userId! }]) {
+        const r = await run(op('estimates.create'), { body: { ...estimateBody(), attachment: { fileId: staged.fileId } } }, 'commit', over);
+        expect(r.outcome).toBe('error');
+        expect(r.error).toMatchObject({ code: 'FILE_NOT_FOUND', message: REVEAL_FILE_ENDED });
+      }
+      expect(reached).toEqual([]);
+    } finally {
+      await db.delete(agentPermissionRequests).where(eq(agentPermissionRequests.id, req.id));
+    }
+  });
+
+  it("a FileRef to a file kept for a person only (a whole copy of the company file) is refused with the files' own words, never thrown", async () => {
+    const { PERSON_ONLY_FILE_MESSAGE } = await import('./files');
+    const staged = await stageAnswerFile(owner(), { name: 'copy.bka', type: 'application/octet-stream', bytes: new Uint8Array([1, 2]) }, 'backup.download');
+    const r = await run(op('estimates.create'), { body: { ...estimateBody(), attachment: { fileId: staged.fileId } } }, 'dry_run');
+    expect(r.outcome).toBe('error');
+    expect(r.error).toMatchObject({ code: 'FORBIDDEN', message: PERSON_ONLY_FILE_MESSAGE, details: { fileId: staged.fileId } });
+  });
+
   it('a bytes body is the file itself; a multipart body carries fields and files', async () => {
     const staged = await stageFile(owner(), { name: 'backup.bkp', type: 'application/octet-stream', bytes: new Uint8Array([9, 8, 7]) });
     let got: number[] = [];
@@ -1638,6 +1686,155 @@ describe('the amount: the whole of what the run moves in the ledger (factsFor)',
     expect(voided.outcome, JSON.stringify(voided.error)).toBe('ok');
     expect(voided.preview!.ledger!.entries).toEqual([expect.objectContaining({ journalEntryId: draft.id, touched: 'voided' })]);
     expect(voided.facts.amount).toBe('0.00');
+  });
+});
+
+describe("what a commit did is checked before its transaction ends (RunOptions.commitCheck, WAVE5C F5)", () => {
+  it('a check that answers a message keeps nothing and says so; one that answers null keeps the work', async () => {
+    const before = await fingerprint();
+    const seen: unknown[] = [];
+    const refused = await runOperation(agentBase, op('estimates.create'), { body: estimateBody() }, 'commit', actorFor(), {
+      commitCheck: (r) => {
+        seen.push(r.facts.amount);
+        return 'The books changed after this was tried. Nothing was done.';
+      },
+    });
+    expect(refused.outcome).toBe('error');
+    expect(refused.error).toMatchObject({ message: 'The books changed after this was tried. Nothing was done.', code: 'CONFLICT' });
+    expect(seen).toEqual(['300.00']);
+    expect(await fingerprint()).toEqual(before);
+    const kept = await runOperation(agentBase, op('estimates.create'), { body: estimateBody() }, 'commit', actorFor(), { commitCheck: () => null });
+    expect(kept.outcome, JSON.stringify(kept.error)).toBe('ok');
+  });
+});
+
+describe("an agent's email that fails after its run committed is recorded, and the form goes back in its queue (WAVE5C F12)", () => {
+  const realCreate = mailTransport.create;
+  const transport = { refuse: true, handed: 0 };
+  let invoiceId: string;
+  const formState = async () =>
+    (await db.select({ toBeEmailed: invoices.toBeEmailed, lastEmailedAt: invoices.lastEmailedAt }).from(invoices).where(eq(invoices.id, invoiceId)))[0];
+  const rowsOf = async () =>
+    (await db.select().from(auditLogs).where(eq(auditLogs.entityId, invoiceId))).map((r) => ({ ...r, what: (r.newValues as Out | null)?.action }));
+
+  beforeAll(async () => {
+    mailTransport.create = (() => ({
+      sendMail: async () => {
+        if (transport.refuse) throw new Error('535 5.7.8 Authentication credentials invalid');
+        transport.handed += 1;
+        return { messageId: 'ok' };
+      },
+    })) as never;
+    await saveEmailSetup(admin, {
+      host: '127.0.0.1',
+      port: 2525,
+      security: 'starttls',
+      username: 'billing@acme.test',
+      password: 'S3cret-mail-pass!',
+      fromName: 'Acme Billing',
+      fromEmail: 'billing@acme.test',
+    } as never);
+    const [inv] = await db.select({ id: invoices.id }).from(invoices).where(and(eq(invoices.companyId, rich.ctx.companyId), eq(invoices.customerId, rich.customerId)));
+    invoiceId = inv.id;
+  });
+  afterAll(() => {
+    mailTransport.create = realCreate;
+  });
+  beforeEach(() => {
+    transport.refuse = true;
+  });
+
+  it('a failed send writes a row that says so (who to, why, the agent and approval) and puts the "to be emailed" flag back', async () => {
+    const earlier = new Date('2026-01-05T10:00:00.000Z');
+    await db.update(invoices).set({ toBeEmailed: true, lastEmailedAt: earlier }).where(eq(invoices.id, invoiceId));
+    const before = (await rowsOf()).length;
+    const approval = { approvedBy: rich.ctx.userId!, requestId: randomUUID(), grantId: null };
+    const r = await run(operationForRoute('POST', '/api/invoices/[id]/email')!, { params: { id: invoiceId }, body: {} }, 'commit', { approval });
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.effects).toEqual([expect.objectContaining({ status: 'failed', ranDuringOperation: false })]);
+    expect(r.effects[0]).not.toHaveProperty('about');
+    expect(transport.handed).toBe(0);
+    // Back in the queue, its last-emailed time as it was.
+    expect(await formState()).toEqual({ toBeEmailed: true, lastEmailedAt: earlier });
+    const rows = (await rowsOf()).slice(before);
+    expect(rows.map((x) => x.what)).toEqual(['emailed', 'email_failed']);
+    const failed = rows[1];
+    expect(failed).toMatchObject({ agentId, approvedBy: approval.approvedBy, agentRequestId: approval.requestId, entityType: 'invoice' });
+    expect(failed.newValues).toMatchObject({ to: ['ap@acme.test'], putBack: { toBeEmailed: true, lastEmailedAt: earlier.toISOString() } });
+    expect(String((failed.newValues as Out).error)).toBeTruthy();
+
+    // Sent: no row of failure, the form out of the queue.
+    transport.refuse = false;
+    const ok = await run(operationForRoute('POST', '/api/invoices/[id]/email')!, { params: { id: invoiceId }, body: {} }, 'commit');
+    expect(ok.effects).toEqual([expect.objectContaining({ status: 'sent' })]);
+    expect((await formState()).toBeEmailed).toBe(false);
+    expect((await rowsOf()).slice(before).map((x) => x.what)).toEqual(['emailed', 'email_failed', 'emailed']);
+  });
+
+  it("a person's own send is as before: refused at once by the mail server, nothing recorded, the flag as it was", async () => {
+    await db.update(invoices).set({ toBeEmailed: true }).where(eq(invoices.id, invoiceId));
+    const before = (await rowsOf()).length;
+    await expect(emailSalesForm(admin, 'invoice', invoiceId)).rejects.toThrow();
+    expect((await formState()).toBeEmailed).toBe(true);
+    expect((await rowsOf()).length).toBe(before);
+  });
+});
+
+describe('the accounts: every account the run posts to (factsFor, WAVE5C F2)', () => {
+  it("a bill whose item line posts to the item's own account names that account too, so a grant for the body's account does not cover it", async () => {
+    const desk = await createItem(admin, { name: `Desk ${randomUUID().slice(0, 6)}`, type: 'non_inventory', expenseAccountId: rich.acct['6400'] });
+    const body = {
+      vendorId: rich.vendorId,
+      date: '2026-03-02',
+      lines: [
+        { accountId: rich.acct['6300'], description: 'Paper', amount: '1.00' },
+        { itemId: desk.id, quantity: '1', amount: '399.00' },
+      ],
+    };
+    const bills = op('bills.create');
+    const dry = await run(bills, { body }, 'dry_run');
+    expect(dry.outcome, JSON.stringify(dry.error)).toBe('ok');
+    const posted = dry.preview!.ledger!.entries.flatMap((e) => e.lines.map((l) => String(l.accountId).toLowerCase()));
+    expect(posted).toContain(rich.acct['6400'].toLowerCase());
+    expect(dry.facts.accountIds).toContain(rich.acct['6300']);
+    expect(dry.facts.accountIds.map((a) => a.toLowerCase())).toContain(rich.acct['6400'].toLowerCase());
+    // Every account of the ledger, the payable side included, and none twice.
+    for (const a of new Set(posted)) expect(dry.facts.accountIds.map((x) => x.toLowerCase())).toContain(a);
+    expect(new Set(dry.facts.accountIds.map((x) => x.toLowerCase())).size).toBe(dry.facts.accountIds.length);
+    const now = new Date().toISOString();
+    const grant = (accountIds: string[]) => ({
+      id: randomUUID(),
+      agentId,
+      operation: bills.id,
+      constraints: { accountIds },
+      givenBy: rich.ctx.userId!,
+      expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+      revokedAt: null,
+      uses: 0,
+    });
+    expect(grantCovers(grant([rich.acct['6300']]), bills, dry.facts, now)).toBe(false);
+    expect(grantCovers(grant(dry.facts.accountIds), bills, dry.facts, now)).toBe(true);
+    // The commit is judged the same way.
+    const done = await run(bills, { body }, 'commit');
+    expect(done.outcome, JSON.stringify(done.error)).toBe('ok');
+    expect(done.facts.accountIds.map((a) => a.toLowerCase())).toContain(rich.acct['6400'].toLowerCase());
+  });
+
+  it('accounts that cannot be known (lines rewritten in place, where a line may have left an account) let no account limit cover the run', async () => {
+    const { allowLedgerRewrite } = await import('@/lib/services/posting');
+    const made = await run(op('journal-entries.create'), { body: journalBody() }, 'commit');
+    expect(made.outcome, JSON.stringify(made.error)).toBe('ok');
+    expect(made.facts.accountIds).not.toContain(UNREADABLE_ID);
+    const id = made.preview!.ledger!.entries[0].journalEntryId;
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      await allowLedgerRewrite(ctx, 'reclassify');
+      await ctx.db.execute(sql`update journal_entry_lines set memo = 'moved' where journal_entry_id = ${id}`);
+      return NextResponse.json({ ok: true });
+    };
+    const r = await run(op('journal-entries.update'), { params: { id }, body: {} }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.facts.accountIds).toContain(UNREADABLE_ID);
   });
 });
 
@@ -1980,10 +2177,10 @@ describe("files are looked at only inside the agent's folders, and saved only wh
     // Staging the answer runs after the check and before the commit: the folder is swapped for a
     // link to another folder right then.
     const realFiles = await vi.importActual<typeof import('./files')>('./files');
-    vi.mocked(stageFile).mockImplementationOnce(async (owner, file) => {
+    vi.mocked(stageAnswerFile).mockImplementationOnce(async (owner, file, operationId) => {
       fs.rmSync(out, { recursive: true, force: true });
       linkFolder(elsewhere, out);
-      return realFiles.stageFile(owner, file);
+      return realFiles.stageAnswerFile(owner, file, operationId);
     });
     const r = await run(op('estimates.create'), { body: estimateBody() }, 'commit', { folders: [allowed] });
     expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
@@ -2603,7 +2800,8 @@ describe('the version the agent last read goes to the route (OperationInput.expe
     const r = await run(op('customers.update'), { params: { id: rich.customerId }, body: { phone: '555-0150' }, expectedUpdatedAt: v }, 'dry_run');
     expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
     expect(seen).toEqual([{ request: v, scope: v }]);
-    for (const bad of ['yesterday', '2026-11-22T14:05:09.123Z\r\nx-closing-password: 1', 42]) {
+    // A time with no zone would be read in this computer's own time zone: refused too.
+    for (const bad of ['yesterday', '2026-11-22T14:05:09.123Z\r\nx-closing-password: 1', 42, '2026-11-22T14:05:09', '2026-11-22 14:05:09.123Z']) {
       h.handler = async () => NextResponse.json({ ok: true });
       const refused = await run(op('customers.update'), { params: { id: rich.customerId }, body: {}, expectedUpdatedAt: bad } as unknown as OperationInput, 'dry_run');
       expect(refused.outcome).toBe('error');

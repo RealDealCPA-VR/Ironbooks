@@ -29,10 +29,12 @@ import {
   PRODUCED_SECRET_TABLE,
   PRODUCED_SECRET_TEXT,
   RECIPIENT_FIELDS,
+  RUNNABLE_EXTENSIONS,
   SECRET_HEADERS,
   SECRET_PARTS_MARKER,
   SECRET_ROUTE_TABLE,
   SHOWN_HOST_MAX,
+  STRICT_BOOLEANS,
   applySecrets,
   cleanText,
   encodeSecretParts,
@@ -44,7 +46,9 @@ import {
   notFullPath,
   plainAddress,
   redactAnswer,
+  runnableNameProblem,
 } from './guards';
+import { operationById } from './operations/registry';
 
 /**
  * Makes this process read as running on `platform` until the returned function puts it back. The
@@ -291,6 +295,60 @@ describe('guardInput: confirmation flags', () => {
 
   it('refuses any flag on an operation that accepts none, and says so', () => {
     expect(guardInput(op(), { confirm: ['allowDuplicateNumber'] }).refused).toMatch(/it accepts none/);
+  });
+});
+
+describe('guardInput: a flag the route compares strictly with true or false', () => {
+  it('every route listed is a registry operation with a body', () => {
+    for (const key of Object.keys(STRICT_BOOLEANS)) expect(reg(key).body, key).toBe('json');
+  });
+
+  it.each([['yes'], ['true'], [1], [0], [null], [''], [{}], [['yes']]])('condense with dryRun %j is refused before anyone is asked', (dryRun) => {
+    const out = guardInput(reg('POST /api/condense'), { body: { beforeDate: '2025-01-01', dryRun } });
+    expect(out.refused).toBe('dryRun must be true or false, not text, a number or empty. Send it again with true or false, or leave it out.');
+  });
+
+  it('a real true or false, or none, goes through; so does a currency made the home one with a real true', () => {
+    for (const body of [{ beforeDate: '2025-01-01', dryRun: true }, { beforeDate: '2025-01-01', dryRun: false }, { beforeDate: '2025-01-01' }]) {
+      expect(guardInput(reg('POST /api/condense'), { body }).refused, JSON.stringify(body)).toBeNull();
+    }
+    expect(guardInput(reg('POST /api/currencies'), { body: { code: 'EUR', name: 'Euro', rateToBase: '1.1', isBase: true } }).refused).toBeNull();
+    expect(guardInput(reg('POST /api/currencies'), { body: { code: 'EUR', name: 'Euro', rateToBase: '1.1', isBase: 'no' } }).refused).toMatch(/isBase must be true or false/);
+  });
+
+  it("a flag only a person may set is taken out first, so it is never refused for its type: it is gone", () => {
+    const out = guardInput(reg('POST /api/portable'), { body: { protect: 'no' } });
+    expect(out.refused).toBeNull();
+    expect(out.stripped).toContain('body.protect');
+  });
+});
+
+describe('guardInput: a program, script or shortcut is never saved for an agent', () => {
+  const save = () => operationById('files.save')!;
+
+  it.each([
+    ['Ironbooks sync.cmd'],
+    ['Microsoft.PowerShell_profile.ps1'],
+    ['report.pdf.exe'],
+    ['RUN.BAT'],
+    ['link.lnk'],
+    ['x.js'],
+    ['setup.msi'],
+    ['tweak.reg'],
+    ['x.hta '],
+    ['x.vbs.'],
+  ])('%j is refused by the name it gives', (name) => {
+    expect(guardInput(save(), { body: { fileId: 'a'.repeat(32), folder: process.platform === 'win32' ? 'C:\\Users\\Dana\\Documents\\Ironbooks' : '/home/dana/Documents/Ironbooks', name } }).refused).toMatch(/never saves a program, script or shortcut/);
+  });
+
+  it('other names pass; the extension list is the one the save checks', () => {
+    for (const name of ['Month-end backup.bka', 'statement.pdf', 'notes.txt', 'cmd', 'exe report.csv', 'x.jsx']) {
+      expect(runnableNameProblem(name), name).toBeNull();
+    }
+    for (const ext of ['exe', 'bat', 'cmd', 'com', 'ps1', 'psm1', 'vbs', 'vbe', 'js', 'jse', 'wsf', 'wsh', 'lnk', 'scr', 'msi', 'hta', 'reg', 'pif', 'cpl', 'dll']) {
+      expect(RUNNABLE_EXTENSIONS, ext).toContain(ext);
+      expect(runnableNameProblem(`a.${ext.toUpperCase()}`), ext).toMatch(new RegExp(`\\.${ext} file`));
+    }
   });
 });
 

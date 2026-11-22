@@ -47,12 +47,15 @@ import { requestsChanged } from './notify';
 import {
   AMOUNT_UNKNOWN_WHY,
   BATCH_MAX,
+  BATCH_TOTAL_RULE,
   STATUS_FILTERS,
   ageText,
   amountShown,
   amountText,
   batchBlock,
   batchChoice,
+  batchTotalText,
+  batchTotals,
   isId,
   isWaiting,
   plain,
@@ -528,6 +531,16 @@ function AgentRequestsContent() {
           Each one is approved and carried out on its own, as if you approved it from its card. Read the list: approving many at once is where
           mistakes slip through.
         </p>
+        <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-navy" data-batch-totals="">
+          <ul className="space-y-0.5">
+            {batchTotals(chosen).map((t) => (
+              <li key={t.agentId} data-batch-total={t.agentId} className="tabular-nums">
+                {batchTotalText(t)}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-1 text-xs text-navy/60">{BATCH_TOTAL_RULE}</p>
+        </div>
         <ul className="mt-3 max-h-80 space-y-1 overflow-y-auto" data-batch-list="">
           {chosen.map((r) => (
             <li key={r.id} className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy">

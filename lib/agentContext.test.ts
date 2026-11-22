@@ -426,27 +426,32 @@ describe('after a person signed in', () => {
     expect((await getServerContext()).agent?.id).toBe(agentId);
   });
 
-  it("the company file's name: whatever an agent's own request gets, it never shows the folder", async () => {
+  it("the company file's name: an agent's own request gets nothing of it, not even the folder", async () => {
     // The registry classes it file (classes/admin.ts), but the route is public and never calls
-    // getServerContext, so the way-in check above does not run for it. Today it answers an agent's
-    // request as it answers anything that reaches Ironbooks before anyone signs in (the FINDING
-    // below). Answered or refused, what must always hold is that an agent is never the app's own
-    // window, so nothing in the answer shows the folder the file is in.
+    // getServerContext, so the way-in check above does not run for it. The route itself refuses any
+    // request that carries Authorization (an agent's token), before it reads anything; the app's own
+    // window and the desktop shell never send one, nor does an approved run through the door.
     expect(operationForRoute('GET', '/api/company-file/info')).toMatchObject({ rule: 'public', class: 'file' });
-    request('GET', '/api/company-file/info', { token });
-    const res = await companyFileInfoGET();
-    const body = (await res.json()) as Record<string, unknown>;
-    if (res.ok) expect(body).toMatchObject({ remote: true, location: null });
-    const showsAFolder = Object.values(body).filter((v) => typeof v === 'string' && v.includes(ROOT));
-    expect(showsAFolder).toEqual([]);
+    for (const auth of [{ token }, { auth: 'Bearer not-a-token' }, { auth: 'Basic eDp5' }]) {
+      request('GET', '/api/company-file/info', auth);
+      const res = await companyFileInfoGET();
+      expect(res.status, JSON.stringify(auth)).toBe(403);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body).toEqual({ error: 'This is not available to agents.', code: 'FORBIDDEN' });
+      const showsAFolder = Object.values(body).filter((v) => typeof v === 'string' && v.includes(ROOT));
+      expect(showsAFolder).toEqual([]);
+    }
+    // The app's own window (no Authorization) still gets its answer.
+    request('GET', '/api/company-file/info');
+    const own = await companyFileInfoGET();
+    expect(own.status).toBe(200);
+    expect(await own.json()).toHaveProperty('fileName');
   });
 
-  // FINDING (known gap, for the owner of app/api/company-file/info/route.ts and middleware.ts): the
-  // class says an Admin approves this read through the door, yet an agent's own GET still gets the
-  // company file's name, whether it has a password or protection, and its id, with nobody asked.
-  // The app's own window and the desktop shell never send Authorization, so either place can refuse
-  // every request to this route that carries one. Once one does, this case fails: flip it.fails to it.
-  it.fails("FINDING: an agent's own request for the company file's name is refused, at the edge or in the route", async () => {
+  // Was a FINDING: an agent's own GET got the company file's name, whether it has a password or
+  // protection, and its id, with nobody asked. The route now refuses every request that carries
+  // Authorization.
+  it("an agent's own request for the company file's name is refused, at the edge or in the route", async () => {
     const edge = middleware(
       new NextRequest('http://localhost:45123/api/company-file/info', { headers: { host: 'localhost:45123', authorization: `Bearer ${token}` } }),
     );

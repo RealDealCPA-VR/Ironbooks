@@ -51,7 +51,7 @@ import {
 } from '@/lib/db/schema';
 import { effectsOfFailedRun, runWithEffects } from '@/lib/effects';
 import { isNotRunInPreview } from '@/lib/ai/outbound';
-import { fullAccess, withoutAreas, type EffectiveAccess } from '@/lib/permissions/model';
+import { builtinRole, fullAccess, unionRoles, withoutAreas, type EffectiveAccess } from '@/lib/permissions/model';
 import type { ServiceContext } from '@/lib/services/_base';
 import { createCompany } from '@/lib/services/company';
 import { createExpense } from '@/lib/services/expenses';
@@ -530,9 +530,20 @@ describe('5. line memos already in the books', () => {
     expect(performance.now() - started).toBeLessThan(5000);
   });
 
-  it('lineMemoFor: masks after "account #" too, chart numbers included (deliberate, fail closed)', () => {
-    // The end of a vendor's account number cannot be told from the words after it.
-    expect(lineMemoFor(masked, 'Reclass to account #6100 Office Supplies')).toBe('Reclass to account #••••lies');
+  it('lineMemoFor: a person sees a chart-of-accounts reference after "account #"; the rest stays masked (fail closed)', () => {
+    // "account #<chart number> <Account Name>" is shown to a person as typed (WAVE5C F13).
+    expect(lineMemoFor(masked, 'Reclass to account #6100 Office Supplies')).toBe('Reclass to account #6100 Office Supplies');
+    expect(lineMemoFor(masked, 'Reclass to account # 6100.10 Rent, see note')).toBe('Reclass to account # 6100.10 Rent, see note');
+    // Not a chart reference: the end of a vendor's account number cannot be told from the words after it.
+    expect(lineMemoFor(masked, 'Reclass to Acct #6100 Office Supplies')).toBe('Reclass to Acct #••••lies');
+    expect(lineMemoFor(masked, 'account #0012345 Rent')).toBe('account #••••Rent');
+    expect(lineMemoFor(masked, 'account #4471234 autopay')).toBe('account #••••opay');
+    expect(lineMemoFor(masked, 'Reclass to account #6100')).toBe('Reclass to account #••••');
+    expect(lineMemoFor(masked, `Acct # ${FULL_NUMBER} to account #6100 Rent`)).not.toContain('1234');
+    expect(lineMemoFor(masked, `account #6100 Rent; Acct # ${FULL_NUMBER}`)).toBe('account #6100 Rent; Acct # ••••6789');
+    // An agent sees every such memo masked, as before.
+    const agent = { ...masked, agent: { id: 'a', name: 'Helper', mode: 'post' as const } };
+    expect(lineMemoFor(agent, 'Reclass to account #6100 Office Supplies')).toBe('Reclass to account #••••lies');
     // Without "#", "No" or "Number" the memo is shown as typed.
     expect(lineMemoFor(masked, 'Reclass to account 6100 Office Supplies')).toBe('Reclass to account 6100 Office Supplies');
     expect(lineMemoFor(masked, 'ONLINE TRANSFER TO ACCOUNT 4455')).toBe('ONLINE TRANSFER TO ACCOUNT 4455');
@@ -710,7 +721,7 @@ describe('5. line memos already in the books', () => {
     expect(await storedMemos(replacement.id)).toEqual([MEMO, 'Deposit, refundable']);
   });
 
-  it('a memo typed as shown on another line is saved as typed: a hidden number moves only with its own line', async () => {
+  it('a memo copied as shown onto another line gets the stored text: a masked rendering is never saved', async () => {
     const created = await createManualEntry(ctx, {
       date: d('2027-03-11'),
       description: 'Moved memo',
@@ -725,7 +736,7 @@ describe('5. line memos already in the books', () => {
       ...shown,
       lines: shown.lines.map((l) => ({ ...l, memo: l.memo === SHOWN ? 'Water' : SHOWN })),
     });
-    expect(await memoByAccount(created.id)).toEqual({ [acct['6600']]: 'Water', [acct['1000']]: SHOWN });
+    expect(await memoByAccount(created.id)).toEqual({ [acct['6600']]: 'Water', [acct['1000']]: MEMO });
   });
 
   it('a line moved to another account, its memo left as shown, keeps the stored memo', async () => {
@@ -765,11 +776,11 @@ describe('5. line memos already in the books', () => {
         { ...shown.lines.find((l) => l.accountId === acct['1000'])!, credit: '10.00' },
       ],
     });
-    expect(await memoByAccount(replacement.id)).toEqual({ [acct['6700']]: SHOWN, [acct['6600']]: MEMO, [acct['1000']]: 'Paid' });
+    expect(await memoByAccount(replacement.id)).toEqual({ [acct['6700']]: MEMO, [acct['6600']]: MEMO, [acct['1000']]: 'Paid' });
   });
 
-  it('a line whose account and amounts both changed, memo left as shown, is saved as shown (deliberate)', async () => {
-    // Nothing tells which stored line it was: the number is not guessed onto it.
+  it('a line whose account and amounts both changed, memo left as shown, keeps the stored memo (WAVE5C F13)', async () => {
+    // Only one stored memo shows that way, so it is that one.
     const created = await createManualEntry(ctx, {
       date: d('2027-03-15'),
       description: 'Reclass and new amount',
@@ -785,7 +796,60 @@ describe('5. line memos already in the books', () => {
         l.accountId === acct['6600'] ? { ...l, accountId: acct['6700'], debit: '4.50' } : { ...l, credit: '4.50' },
       ),
     });
-    expect(await memoByAccount(replacement.id)).toEqual({ [acct['6700']]: SHOWN, [acct['1000']]: 'Paid' });
+    expect(await memoByAccount(replacement.id)).toEqual({ [acct['6700']]: MEMO, [acct['1000']]: 'Paid' });
+  });
+
+  it('an Accountant (built-in role) who changes the account and amount of a line keeps the memo as stored (WAVE5C F13)', async () => {
+    const accountant: ServiceContext = { ...masked, access: unionRoles([builtinRole('accountant')!]) };
+    expect(accountant.access!.flags.fullAccountNumbers).toBe(false);
+    const typed = 'Reclass to account #6100 Office Supplies';
+    const created = await createManualEntry(ctx, {
+      date: d('2027-03-16'),
+      description: 'Accountant reclass',
+      lines: [
+        { accountId: acct['6600'], debit: '3.00', memo: MEMO },
+        { accountId: acct['6700'], debit: '2.00', memo: typed },
+        { accountId: acct['1000'], credit: '5.00', memo: 'Paid' },
+      ],
+    });
+    const shown = asShownOnSave(await getEntryForCaller(accountant, created.id));
+    // The chart reference is shown as typed; the vendor number stays masked.
+    expect(shown.lines.map((l) => l.memo)).toEqual([SHOWN, typed, 'Paid']);
+    const replacement = await updateEntry(accountant, created.id, {
+      ...shown,
+      lines: shown.lines.map((l) =>
+        l.accountId === acct['6600']
+          ? { ...l, accountId: acct['6700'], debit: '3.50' }
+          : l.accountId === acct['6700']
+            ? { ...l, accountId: acct['6600'], debit: '2.50' }
+            : { ...l, credit: '6.00' },
+      ),
+    });
+    expect((await storedMemos(replacement.id)).sort()).toEqual([MEMO, 'Paid', typed].sort());
+    expect(JSON.stringify(await storedMemos(replacement.id))).not.toContain('••••');
+  });
+
+  it('a masked memo that two stored memos show the same way is refused, not saved (WAVE5C F13)', async () => {
+    const other = 'Acct # 999923456789';
+    const created = await createManualEntry(ctx, {
+      date: d('2027-03-17'),
+      description: 'Two hidden numbers',
+      lines: [
+        { accountId: acct['6600'], debit: '1.00', memo: MEMO },
+        { accountId: acct['6700'], debit: '2.00', memo: other },
+        { accountId: acct['1000'], credit: '3.00', memo: 'Paid' },
+      ],
+    });
+    const shown = asShownOnSave(await getEntryForCaller(masked, created.id));
+    expect(shown.lines.filter((l) => l.memo === SHOWN)).toHaveLength(2);
+    await expect(
+      updateEntry(masked, created.id, {
+        ...shown,
+        // The bank line gets the masked text, which either stored memo shows.
+        lines: shown.lines.map((l) => (l.accountId === acct['1000'] ? { ...l, memo: SHOWN } : l)),
+      }),
+    ).rejects.toThrow(/hides an account number/);
+    expect(await storedMemos(created.id)).toEqual([MEMO, other, 'Paid'].sort());
   });
 
   it('a hidden memo stays on its own line of the same account when the amounts change', async () => {

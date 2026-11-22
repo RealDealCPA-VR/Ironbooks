@@ -42,9 +42,15 @@ delete process.env.BKA_DEVICE_VAULT;
 vi.mock('@/lib/agent/operations/registry', async (importOriginal) => {
   const real = await importOriginal<typeof import('@/lib/agent/operations/registry')>();
   const made = { ...real.operationById('invoices.create')!, id: 'test.file-admin-enter', fileAdmin: true };
-  return { ...real, operationById: (id: string) => (id === made.id ? made : real.operationById(id)) };
+  // And everyday entry that takes a password the approver types (SECRET_ENTER): no real grantable
+  // operation takes one today, so without it the D3 rule "never for work needing a secret" would
+  // never be reached on its own.
+  const secret = { ...real.operationById('invoices.create')!, id: 'test.secret-enter', needsSecret: ['mail_password'] };
+  const made2 = new Map<string, unknown>([[made.id, made], [secret.id, secret]]);
+  return { ...real, operationById: (id: string) => made2.get(id) ?? real.operationById(id) };
 });
 const FILE_ADMIN_ENTER = 'test.file-admin-enter';
+const SECRET_ENTER = 'test.secret-enter';
 
 import { getDb, closeDb, type DB } from '@/lib/db';
 import {
@@ -438,6 +444,15 @@ describe('giving standing permission', () => {
       }
       // The same work without the file-Admin rule has a window.
       expect(await grantMinutesFor(admin, ENTER.id, facts())).toBeGreaterThan(0);
+    });
+
+    it('work that needs a password typed by the approver, for anyone, an Admin included (D3)', async () => {
+      const secretEnter = op(SECRET_ENTER);
+      expect(secretEnter).toMatchObject({ class: 'enter', hostOnly: false, fileAdmin: false, needsSecret: ['mail_password'] });
+      for (const who of [admin, secondAdmin]) {
+        await expectError(give(who, secretEnter, { minutes: 10 }), 'FORBIDDEN', /needs a password typed by the person who approves it, each time/);
+        expect(await grantMinutesFor(who, secretEnter.id, facts())).toBe(0);
+      }
     });
 
     it('outside sends from anyone but an Admin (D5)', async () => {
