@@ -2891,6 +2891,34 @@ function effectKey(e: EffectPreview, rules: KeyRules): string {
 }
 
 /**
+ * Who carries the work out is not a change in the books: the agent's own trial run when it asks
+ * has no person, the run at approval is the approver's. Columns that name the person acting
+ * (createdBy, userId …) are left out of a record's values, at the top level (the record's own
+ * columns). A record changed by someone else since still moves its version, which the key keeps.
+ */
+const ACTOR_KEYS: ReadonlySet<string> = new Set([
+  'createdBy',
+  'created_by',
+  'updatedBy',
+  'updated_by',
+  'enteredBy',
+  'entered_by',
+  'userId',
+  'user_id',
+  'modifiedBy',
+  'modified_by',
+  'approvedBy',
+  'approved_by',
+]);
+
+function withoutActors(values: unknown): unknown {
+  if (!isObject(values)) return values;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(values)) if (!ACTOR_KEYS.has(k)) out[k] = v;
+  return out;
+}
+
+/**
  * The staleness key (plan §7.4): a hash over what the run read and what it did, with what the run
  * assigns to itself left out (KeyRules: the ids it made, the numbers it took, times). Lists are
  * sorted: the audit trail's own order is not the order of the work (its ids are random).
@@ -2962,8 +2990,8 @@ function stalenessKeyOf(parts: {
         action: r.action,
         kind: r.entity_type,
         id: own ?? id,
-        before: keyValue(r.old_values, rules, own !== undefined),
-        after: keyValue(after, rules, own !== undefined),
+        before: keyValue(withoutActors(r.old_values), rules, own !== undefined),
+        after: keyValue(withoutActors(after), rules, own !== undefined),
       }),
     );
     const v = own !== undefined ? null : versionIn(r.old_values);

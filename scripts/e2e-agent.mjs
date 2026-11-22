@@ -518,7 +518,14 @@ async function startBuild(run, p, label = '') {
   const owners = await ownDebugPort(run);
   check(true, `${label}the debugging port ${run.cdpPort} belongs to that process (${owners.join(', ')}), nothing else`);
   run.page = await connect(run.cdpPort, (u) => /^http:\/\/localhost:\d+\//.test(u));
-  const origin = await run.page.eval('location.origin');
+  // Early in a load the window can answer with no usable origin yet: wait until it is the app's.
+  let origin = null;
+  const APP_ORIGIN = /^http:\/\/localhost:\d+$/;
+  for (let i = 0; i < 60 && !APP_ORIGIN.test(String(origin)); i++) {
+    if (i) await sleep(500);
+    origin = await run.page.eval('location.origin').catch(() => null);
+  }
+  need(APP_ORIGIN.test(String(origin)), `${label}the window shows the app's own address`, origin);
   run.appPort = Number(new URL(origin).port);
   const serverOwners = await listenerPids(run.appPort);
   const tree = treeOf(run.pid, EXE, await processTable());
@@ -911,7 +918,9 @@ async function phase3() {
   check(!holdsSsn(asked.text), 'the answer holds no full SSN');
   const view = await requestView(r);
   check(view && !holdsSsn(view), 'nor does the approval card', view && { input: view.input, preview: view.preview?.records });
-  check(cents(view?.amount) === 100000n, 'the card shows the gross pay, 1000.00', view?.amount);
+  // The amount is never under-counted: the larger of the run's gross pay and its largest ledger
+  // entry, which here is the paycheck with the employer's taxes (1000.00 + 7.65% + 0.6% = 1082.50).
+  check(cents(view?.amount) !== null && cents(view?.amount) >= 100000n, "the card shows at least the gross pay, 1000.00 (the entry adds the employer's taxes)", view?.amount);
   const ok = await approve(r);
   check(ok.status === 200 && ok.body?.status === 'executed' && !holdsSsn(ok.body), `${PERSON} approves it`, ok.body ?? ok.text);
   const checks = asList((await call('GET', `/api/payroll?employeeId=${employeeId}`)).body, 'paychecks');

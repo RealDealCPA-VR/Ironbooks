@@ -36,6 +36,7 @@ import {
   type Flag,
 } from '@/lib/permissions/model';
 import { activityLabel, activityDef } from '@/lib/permissions/activities';
+import { SHELL_OPERATIONS } from './operations/shell';
 import type { AgentMode } from '@/lib/permissions/agentAccess';
 import {
   ADMIN_APPROVAL_CLASSES,
@@ -557,8 +558,14 @@ export function roleProblem(access: EffectiveAccess, operation: Operation): stri
   // A desktop action has no route rule. When the registry names its area and action, the role
   // needs that right; otherwise only an Admin passes (as for a request nothing could authorize).
   if (operation.area && operation.action) return checkRight(access, operation.area, operation.action, operation.activity);
+  // A desktop action any role may ask for (ShellOperationDef.anyRole, files.save): still asked
+  // every time and approved as its class says.
+  if (operation.kind === 'shell' && ANY_ROLE_SHELL.has(operation.id)) return null;
   return access.isAdmin ? null : 'the Admin role';
 }
+
+/** Desktop actions any agent role may ask for (lib/agent/operations/shell.ts anyRole). */
+const ANY_ROLE_SHELL: ReadonlySet<string> = new Set(SHELL_OPERATIONS.filter((d) => d.anyRole === true).map((d) => d.id));
 
 /**
  * A route the permission map has no rule for. roleProblem refuses it for every role, an Admin too,

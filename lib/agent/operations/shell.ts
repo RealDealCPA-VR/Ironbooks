@@ -435,5 +435,8 @@ export const SHELL_OPERATIONS: readonly ShellOperationEntry[] = [
     hostOnly: true,
     fileAdmin: false,
     restarts: false,
+    // Saving a file the agent already holds is no Admin-only right for a person; an Admin at the
+    // host approves every save (class 'file'), with the folder and name on the card.
+    anyRole: true,
   },
 ];

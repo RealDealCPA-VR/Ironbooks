@@ -639,6 +639,12 @@ export interface ShellOperationDef {
   fileAdmin: boolean;
   /** Ironbooks restarts (or changes company file): the agent's connection ends and it must ask again. */
   restarts: boolean;
+  /**
+   * Any agent role may ask for it (it is still asked every time, and approved as its class says:
+   * an Admin at the host for 'file'). Without it a desktop operation needs an agent with the Admin
+   * role, as no right in the permission map describes it.
+   */
+  anyRole?: boolean;
 }
 
 /** HMAC ticket the server makes when a person approves a shell operation (lib/agent/shellTicket.ts). */

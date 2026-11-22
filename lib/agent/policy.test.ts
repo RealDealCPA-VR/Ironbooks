@@ -1910,3 +1910,20 @@ describe('inputs of the wrong shape fail closed', () => {
     expect(d).toMatchObject({ outcome: 'ask', effectiveClass: 'prepare' });
   });
 });
+
+describe('desktop actions any agent role may ask for', () => {
+  it("saving a staged file needs no Admin-role agent (an Admin still approves it at the host); the other desktop actions do", async () => {
+    const { operationById } = await import('./operations/registry');
+    const save = operationById('files.save');
+    expect(save?.kind).toBe('shell');
+    expect(save?.class).toBe('file');
+    expect(save?.hostOnly).toBe(true);
+    for (const access of [BOOKKEEPER, ACCOUNTANT, PAYROLL]) expect(roleProblem(access, save!)).toBeNull();
+    for (const id of ['shell.company.switch', 'shell.print.file', 'shell.update.install']) {
+      const other = operationById(id);
+      expect(other, id).not.toBeNull();
+      expect(roleProblem(BOOKKEEPER, other!), id).toBe('the Admin role');
+      expect(roleProblem(ADMIN, other!), id).toBeNull();
+    }
+  });
+});
