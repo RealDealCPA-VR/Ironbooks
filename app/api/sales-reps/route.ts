@@ -10,6 +10,8 @@ import { getServerContext } from '@/lib/context';
 import { listSalesReps, createSalesRep } from '@/lib/services/salesReps';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject, assertStringFields } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { createSalesRepSchema } from '@/lib/validation/salesReps';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -40,6 +42,10 @@ export async function POST(req: NextRequest) {
     if (!body.name?.trim()) {
       return NextResponse.json({ error: 'name is required', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/salesReps.ts). The checks above answer
+    // first; the service checks the email and the rate with its own messages.
+    const checked = createSalesRepSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     const rep = await createSalesRep(ctx, {
       name: body.name,
       email: body.email ?? null,

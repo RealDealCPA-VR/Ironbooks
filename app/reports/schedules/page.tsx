@@ -14,19 +14,14 @@
  * Such a row says "Waiting for you: an agent set this up" and offers "Confirm recipients": saving
  * the recipients is the one step that ends that wait. Pause and Resume do not, and the row says so.
  *
- * Whether a schedule waits for a person is to be the server's call, made from the audit trail each
- * time the list is loaded (`waitingForAPerson`), so that it is the same after a reload, in another
- * window and for another person; the page never guesses it from what happened on this page. The
- * page reads that answer when the listing carries it, but today's server does not send it yet:
- * GET /api/report-schedules returns listReportSchedules, a plain select of the stored rows, and
- * runDueSchedules' internet branch writes its message only when the schedule is not already held,
- * so a stored agent message is never replaced by the internet reason. Until both change
- * (lib/services/memorizedReports.ts, not this page), the page reads the stored message instead
- * (agentHoldNow), which errs towards waiting: after a person confirms, the row keeps saying it waits
- * for an agent's change until the schedule really runs, a hold for internet services behind it is
- * not shown, and a schedule an agent made that has not reached its first run shows no badge.
- * test/dom/agentChrome.dom.tsx pins both: what the page shows with today's listing, and with the
- * server's answer.
+ * Whether a schedule waits for a person is the server's call, made from the audit trail each time
+ * the list is loaded (`waitingForAPerson`, lib/services/memorizedReports.ts listReportSchedules),
+ * so that it is the same after a reload, in another window and for another person; the page never
+ * guesses it from what happened on this page. The stored message is only what the schedule's last
+ * run said (the timer rewrites it when the reason it is held for changes), so the row shows the
+ * current reason from the server's answer (shownRow). A listing without that answer (an older
+ * server) is read from the stored message instead (agentHoldNow), which errs towards waiting.
+ * test/dom/agentChrome.dom.tsx pins both.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { Bot, CalendarClock, Mail, Pause, Play, Plus, Trash2 } from 'lucide-react';
@@ -50,8 +45,8 @@ interface Schedule {
   emailTo: string | null;
   /**
    * Waits for a person because an agent set it up or changed it, as the server decides it now
-   * (memorizedReports' schedulesWaitingForAPerson). GET /api/report-schedules does not carry it
-   * yet; a listing without it is read from the stored message instead (agentHoldNow).
+   * (memorizedReports' schedulesWaitingForAPerson, sent by GET /api/report-schedules). A listing
+   * without it (an older server) is read from the stored message instead (agentHoldNow).
    */
   waitingForAPerson?: boolean;
 }
@@ -91,9 +86,9 @@ const AGENT_HOLD_NOW =
 
 /**
  * Whether the schedule waits for a person because of an agent, now: the server's answer. A listing
- * that does not carry it (today, every listing) is read from the stored message, which can be out
- * of date: the timer keeps it until the schedule really runs, even through a later hold for
- * internet services. It then errs towards waiting, which only asks a person to look again.
+ * that does not carry it (an older server) is read from the stored message, which can be out of
+ * date: it is what the last run said. It then errs towards waiting, which only asks a person to
+ * look again.
  */
 function agentHoldNow(s: Schedule): boolean {
   if (typeof s.waitingForAPerson === 'boolean') return s.waitingForAPerson;

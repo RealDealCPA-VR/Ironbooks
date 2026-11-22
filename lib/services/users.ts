@@ -13,8 +13,8 @@
  *    reset by an Admin of all of them (no cross-company account takeover).
  *  - Every change writes an audit row (passwords are never logged).
  */
-import { and, eq } from 'drizzle-orm';
-import { companies, companyRoles, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
+import { and, eq, isNull, sql } from 'drizzle-orm';
+import { agents, companies, companyRoles, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
 import { hashPassword, verifyPassword } from '@/lib/auth';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
@@ -736,6 +736,40 @@ export async function createRole(
   return getRoleDefinition({ ...ctx, access: undefined }, id);
 }
 
+/**
+ * Agent full access (plan 4.6, D9): a role an agent holds is part of what that agent may do, so no
+ * agent may change or delete it, whichever agent holds it (agents.roleKeys; a paused agent still
+ * holds its roles, a removed one no longer does). The agent door refuses this before anyone is
+ * asked and again when a person approves; this is the service's own backstop. A person's change of
+ * the role is not affected: the Agents tab and Users & Roles are where people change these.
+ */
+async function refuseAgentOnAgentRole(
+  ctx: ServiceContext,
+  role: { id: string; name: string },
+  doing: 'change' | 'delete',
+): Promise<void> {
+  if (!ctx.agent) return;
+  const holders = await ctx.db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(
+      and(
+        eq(agents.companyId, ctx.companyId),
+        isNull(agents.revokedAt),
+        sql`${agents.roleKeys} @> ${JSON.stringify([role.id])}::jsonb`,
+      ),
+    );
+  if (!holders.length) return;
+  // Only an agent reads this note, and agents may not list agents: it counts them, never names them
+  // (a name here would let an agent learn other agents' names by trying role ids).
+  const who = holders.length === 1 ? 'an agent holds it' : `${holders.length} agents hold it`;
+  throw new ServiceError(
+    'FORBIDDEN',
+    `An agent cannot ${doing} the role "${role.name}": ${who}, and changing a role an agent holds changes what that agent may do. A person can ${doing} it under Users & Roles.`,
+    { hardFloor: true, roleId: role.id },
+  );
+}
+
 /** Edit a custom role (built-in roles are read-only — clone them instead). */
 export async function updateRole(
   ctx: ServiceContext,
@@ -751,6 +785,7 @@ export async function updateRole(
     .from(companyRoles)
     .where(and(eq(companyRoles.id, roleId), eq(companyRoles.companyId, ctx.companyId)));
   if (!row) throw notFound('Role');
+  await refuseAgentOnAgentRole(ctx, row, 'change');
 
   const grant = input.permissions ? cleanGrant(input.permissions) : (row.permissions as PermissionGrant);
   const f = input.flags ? cleanFlags(input.flags) : (row.flags as RoleFlags);
@@ -802,6 +837,7 @@ export async function deleteRole(ctx: ServiceContext, roleId: string): Promise<v
     .from(companyRoles)
     .where(and(eq(companyRoles.id, roleId), eq(companyRoles.companyId, ctx.companyId)));
   if (!row) throw notFound('Role');
+  await refuseAgentOnAgentRole(ctx, row, 'delete');
   const holders = await ctx.db
     .select({ userId: userRoleAssignments.userId })
     .from(userRoleAssignments)

@@ -1,13 +1,15 @@
 /**
- * Zod schemas for the wave2 purchases routes: Loan Manager, unified Print Checks queue, check
- * printer setup, bank/card account currency.
+ * Zod schemas for the wave2 purchases routes: Loan Manager, unified Print Checks queue (and the
+ * customer refund checks it prints), check printer setup, bank/card account currency.
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zDecimalPositive, zMoney, zUuid } from './helpers';
+import { zDate, zDecimal, zDecimalPositive, zLenient, zMoney, zUuid } from './helpers';
 
 // POST /api/loans and PUT /api/loans/:id (lib/services/loans.ts createLoan / updateLoan). An edit
 // saves the loan's terms as sent: a field left out goes back to its default, except the last six
-// (balloonAmount to nextPaymentDate), which keep the saved value, and exchangeRate.
+// (balloonAmount to nextPaymentDate), which keep the saved value, and exchangeRate, which keeps the
+// saved rate only while the currency stays the same (validateLoanInput: on an edit that changes
+// the currency a blank rate takes the currency list's rate, like a new loan).
 export const loanSchema = z.object({
   name: z.string().trim().min(1, 'Give the loan a name.').max(255).describe('Name of the loan in the Loan Manager, such as "Truck loan".'),
   lenderVendorId: zUuid
@@ -42,7 +44,7 @@ export const loanSchema = z.object({
   exchangeRate: zDecimalPositive
     .nullish()
     .describe(
-      "Foreign-currency loans only: home-currency units per 1 unit of the loan currency, as decimal text such as \"1.10\"; on a new loan leave it out for the currency list's rate, and on an edit leaving it out keeps the saved rate.",
+      "Foreign-currency loans only: home-currency units per 1 unit of the loan currency, as decimal text such as \"1.10\"; leave it out for the currency list's rate, except on an edit that keeps the currency, where leaving it out keeps the saved rate.",
     ),
   // purchbank F1: balloon, compounding, the lender's payment amount, a loan already in progress
   balloonAmount: zMoney
@@ -240,4 +242,17 @@ export const updateTransferBodySchema = z.object({
   toAccountId: zUuid,
   amount: zMoney,
   memo: z.string().nullish(),
+});
+
+/**
+ * POST /api/print-queue/refunds — put a customer refund paid from a bank account in the Print
+ * Checks list, as a check made out to the customer (purchbank D3; lib/services/liabilityPayments.ts
+ * queueCustomerRefundCheck). The route checks entryId itself and takes the memo only when it is
+ * text, so the memo is zLenient and the route accepts what it always did.
+ */
+export const queueRefundCheckSchema = z.object({
+  entryId: z
+    .string()
+    .describe('Id of the refund entry to print a check for (GET /api/print-queue/refunds lists them, items[].entryId).'),
+  memo: zLenient(z.string().nullable()).describe("Memo printed on the check; leave out for the refund entry's own description."),
 });

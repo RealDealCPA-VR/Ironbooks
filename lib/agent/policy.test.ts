@@ -42,6 +42,8 @@ import {
 import {
   DEFAULT_BULK_CAP,
   FIELD_FLAGS,
+  NO_RULE_FOR_AGENT,
+  NO_RULE_FOR_APPROVER,
   PRESET_DEFAULTS,
   approvalNeeds,
   baseClass,
@@ -62,6 +64,7 @@ import {
   resolvePolicy,
   roleAllows,
   roleProblem,
+  routeWithoutRule,
   settingFor,
 } from './policy';
 
@@ -814,6 +817,18 @@ describe('the role (the ceiling)', () => {
     expect(roleAllows(VIEW_ONLY, op({ rule: 'member' }))).toBe(true);
   });
 
+  it('routeWithoutRule names exactly the routes no role can allow, and the approver is told to deny them', () => {
+    expect(routeWithoutRule(op({ rule: null, kind: 'route' }))).toBe(true);
+    for (const rule of ['public', 'self', 'member'] as const) expect(routeWithoutRule(op({ rule, kind: 'route' })), rule).toBe(false);
+    expect(routeWithoutRule(op({ rule: { area: 'customers', action: 'view' }, kind: 'route' }))).toBe(false);
+    // A desktop action has no route rule at all: a role question, not a missing rule.
+    expect(routeWithoutRule(op({ rule: null, kind: 'shell' }))).toBe(false);
+    // It agrees with roleProblem: refused for every role, an Admin too.
+    for (const access of [ADMIN, BOOKKEEPER, VIEW_ONLY]) expect(roleProblem(access, op({ rule: null, kind: 'route' }))).not.toBeNull();
+    expect(NO_RULE_FOR_APPROVER).toMatch(/^No role can allow this request, not even Admin.*Deny it;/);
+    expect(NO_RULE_FOR_APPROVER).not.toBe(NO_RULE_FOR_AGENT);
+  });
+
   it('a route with no rule tells the agent to ask a person, not to ask for a role change that cannot help', () => {
     const NO_RULE =
       'No role can allow this request, not even Admin, because Ironbooks has no permission rule for it. Ask a person to do it in Ironbooks.';
@@ -825,6 +840,8 @@ describe('the role (the ceiling)', () => {
         }
       }
     }
+    // The words are exported, for the approval center to say the same (lib/services/agentRequests.ts).
+    expect(NO_RULE_FOR_AGENT).toBe(NO_RULE);
     // A desktop action with no rule is a role question: an Admin role would pass it.
     const shell = run({ access: BOOKKEEPER, operation: op({ rule: null, kind: 'shell', area: null, action: null }) });
     expect(shell).toMatchObject({ outcome: 'refuse', code: 'role' });

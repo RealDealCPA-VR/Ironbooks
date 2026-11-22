@@ -4,9 +4,11 @@
  *
  * When an agent's permissions say "Ask" for something it wants to do, the request waits here for a
  * person. The list shows each one in plain words: the agent, what the request does (built by
- * Ironbooks from the operation, never from the agent's text), its kind of work, amount, age, what
- * approving it needs, a mark when the books changed since the agent asked, and its status. Rows
- * this person cannot approve stay listed, greyed, with the reason. Opening a row shows the card
+ * Ironbooks from the operation, never from the agent's text), its kind of work, amount ("Unknown"
+ * for work that may move money when Ironbooks could not work it out), age, what approving it needs,
+ * a mark when it needs a yes again (the books changed since the agent asked, or an approval sent it
+ * back with a note), and its status. Rows this person cannot approve stay listed, greyed, with the
+ * reason. Opening a row shows the card
  * (RequestCard.tsx): the agent's reason in its own words, what Ironbooks worked out it would do,
  * and Approve once, Approve similar… and Deny.
  *
@@ -23,7 +25,9 @@
  * list itself). Both are read from the address as it changes, not only when the page opens: a link
  * followed while the page is already open (the Ask AI panel's "Open in Agent requests") opens its
  * card or changes the filter. Once a card is opened from ?id=, the address drops it, so the same
- * link followed again opens the card again.
+ * link followed again opens the card again. A link never swaps out a card while its answer is on
+ * its way or while it shows a secret the run produced: the request from the link opens once the
+ * person closes that card.
  */
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
@@ -34,20 +38,23 @@ import { api } from '@/lib/client';
 import { AREAS, type Area } from '@/lib/permissions/model';
 import { RISK_CLASSES, RISK_CLASS_LABELS, type RiskClass } from '@/lib/agent/operations/types';
 import type { AgentRequestForPerson, ApproveResult } from '@/lib/agent/contract';
-import RequestCard from './RequestCard';
+import RequestCard, { type CardHold } from './RequestCard';
 import { NeedsChips } from './Preview';
 import ProducedSecrets from './ProducedSecrets';
 import { requestsChanged } from './notify';
 import {
+  AMOUNT_UNKNOWN_WHY,
   BATCH_MAX,
   STATUS_FILTERS,
   ageText,
+  amountShown,
   amountText,
   batchBlock,
   batchChoice,
   isId,
   isWaiting,
   plain,
+  staleKind,
   statusLabel,
   statusTone,
   type StatusFilter,
@@ -62,6 +69,8 @@ function errMsg(e: unknown) {
  * Not exported: a Next page file exports only its page.
  */
 const STALE_ROW_MARK = 'The books changed since the agent asked. Open it to see what would happen now: it needs your approval again.';
+/** The same, for a request an approval sent back with a note instead of running it (words.ts staleKind). */
+const SENT_BACK_ROW_MARK = 'An approval sent this back with a note before it ran. Open it to read the note: it needs your approval again.';
 
 /** The agent filter's entry for an agent named by a link whose name is not known here. */
 const LINKED_AGENT = 'The agent from the link';
@@ -76,7 +85,11 @@ function batchOutcome(r: ApproveResult): string {
     case 'needs_second_approver':
       return 'Recorded. A second person must also approve it.';
     case 'stale':
-      return 'Not done: the books changed since the agent asked. Open it to see what would happen now.';
+      // The approval can also send a tried request back with a note (the closing date moved since
+      // the ask, for one): said as the row and the card say it (words.ts staleKind).
+      return staleKind(r.request) === 'note'
+        ? 'Not done: Ironbooks sent this back with a note before it ran. Open it to read the note, then approve it on its own.'
+        : 'Not done: the books changed since the agent asked. Open it to see what would happen now.';
     case 'not_approved':
       return `Not approved, and nothing was done. ${plain(r.request.error) || 'It is still waiting: open it to answer it on its own.'}`;
   }
@@ -131,9 +144,35 @@ function AgentRequestsContent() {
   const router = useRouter();
   const linkedId = params?.get('id') ?? null;
   const linkedAgent = params?.get('agentId') ?? null;
+  // Whether the open card may not be swapped now (RequestCard CardHold), and the request a link
+  // named meanwhile: it opens once the person closes that card, so an answer on its way, or a
+  // secret shown only on that card, is never lost to a link.
+  const cardHold = useRef<CardHold>(null);
+  const nextId = useRef<string | null>(null);
+  const onHold = useCallback((hold: CardHold) => {
+    cardHold.current = hold;
+  }, []);
+  const closeCard = useCallback(() => {
+    const next = nextId.current;
+    nextId.current = null;
+    cardHold.current = null;
+    setOpenId(next);
+  }, []);
   useEffect(() => {
     if (!isId(linkedId)) return;
-    setOpenId(linkedId.toLowerCase());
+    const id = linkedId.toLowerCase();
+    if (openId && openId !== id && cardHold.current) {
+      nextId.current = id;
+      toast(
+        cardHold.current === 'busy'
+          ? 'Ironbooks is still answering the request that is open. The one from the link opens when you close it.'
+          : 'The request that is open shows a secret that is not shown again. The one from the link opens when you close it.',
+        'info',
+      );
+    } else {
+      nextId.current = null;
+      setOpenId(id);
+    }
     // Drop ?id= from the address (keeping the rest), so following the same link again is a change.
     const rest = new URLSearchParams(params?.toString() ?? '');
     rest.delete('id');
@@ -378,6 +417,7 @@ function AgentRequestsContent() {
                 const summary = plain(r.summary);
                 const waiting = isWaiting(r.status);
                 const isStale = r.stale === true && waiting;
+                const amount = amountShown(r);
                 const whyId = `ar-why-${r.id}`;
                 // While some are chosen, say on screen why this one cannot join them (its own reason
                 // is already shown when this person cannot approve it at all).
@@ -416,8 +456,8 @@ function AgentRequestsContent() {
                       <span className="block break-words">{summary}</span>
                       <NeedsChips needs={r.needs} />
                       {isStale && (
-                        <span data-stale-mark="" className="mt-1 block text-xs font-semibold text-amber-700">
-                          {STALE_ROW_MARK}
+                        <span data-stale-mark={staleKind(r)} className="mt-1 block text-xs font-semibold text-amber-700">
+                          {staleKind(r) === 'note' ? SENT_BACK_ROW_MARK : STALE_ROW_MARK}
                         </span>
                       )}
                       {!r.canApprove && waiting && (
@@ -433,7 +473,15 @@ function AgentRequestsContent() {
                     <Td>
                       <Badge tone="info">{RISK_CLASS_LABELS[r.class] ?? plain(r.class)}</Badge>
                     </Td>
-                    <Td numeric>{amountText(r.amount)}</Td>
+                    <Td numeric>
+                      {amount?.unknown ? (
+                        <span data-amount-unknown="" className="text-xs text-navy/60" title={AMOUNT_UNKNOWN_WHY}>
+                          Unknown
+                        </span>
+                      ) : (
+                        (amount?.text ?? '')
+                      )}
+                    </Td>
                     <Td className="whitespace-nowrap text-sm" title={new Date(r.createdAt).toLocaleString()}>
                       {ageText(r.createdAt)}
                     </Td>
@@ -454,7 +502,7 @@ function AgentRequestsContent() {
       )}
 
       {openId && (
-        <RequestCard key={openId} id={openId} initial={openRequest} onClose={() => setOpenId(null)} onChanged={changed} />
+        <RequestCard key={openId} id={openId} initial={openRequest} onClose={closeCard} onChanged={changed} onHold={onHold} />
       )}
 
       <Modal

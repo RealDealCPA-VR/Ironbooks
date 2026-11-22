@@ -69,18 +69,19 @@ function isObject(v) {
 
 /**
  * Check one value against the small subset of JSON Schema the tools use: strings (enum, pattern,
- * maxLength), integers and numbers (minimum, maximum), booleans, arrays (items, minItems,
+ * minLength, maxLength), integers and numbers (minimum, maximum), booleans, arrays (items, minItems,
  * maxItems), objects (properties, required, maxProperties, no unknown properties unless the
  * schema allows them, or checks them against its `additionalProperties` schema) and `anyOf`.
  * A schema without a type takes any value. Returns the first problem in plain words, or null.
  * @param {any} s  the schema
  * @param {unknown} v  the value
  * @param {string} name  how to call the value in a message
+ * @param {boolean} [optional]  the value is an optional field, which the caller may leave out
  * @returns {string | null}
  */
-function valueProblem(s, v, name) {
+function valueProblem(s, v, name, optional = false) {
   if (Array.isArray(s.anyOf)) {
-    const problems = s.anyOf.map((/** @type {any} */ branch) => valueProblem(branch, v, name));
+    const problems = s.anyOf.map((/** @type {any} */ branch) => valueProblem(branch, v, name, optional));
     if (problems.some((p) => p === null)) return null;
     return s.anyOfHint ? `${name} ${s.anyOfHint}.` : problems[0];
   }
@@ -88,6 +89,13 @@ function valueProblem(s, v, name) {
     if (typeof v !== 'string') return `${name} must be text.`;
     if (s.enum && !s.enum.includes(v)) return `${name} must be one of: ${s.enum.join(', ')}.`;
     if (s.pattern && !new RegExp(s.pattern).test(v)) return `${name} ${s.patternHint ?? 'is not in the expected form'}.`;
+    // Lengths as the app's own checks count them (JavaScript string length), so a value this lets
+    // through is never refused by Ironbooks for its length.
+    // Only an optional field can be left out; a required one, or an entry of a list, needs a value.
+    if (typeof s.minLength === 'number' && v.length < s.minLength) {
+      if (s.minLength !== 1) return `${name} must be at least ${s.minLength} characters.`;
+      return optional ? `${name} cannot be empty: give a value, or leave it out.` : `${name} cannot be empty: give a value.`;
+    }
     if (typeof s.maxLength === 'number' && v.length > s.maxLength) return `${name} is too long.`;
     return null;
   }
@@ -144,10 +152,11 @@ function objectProblem(schema, value, name = '') {
     const v = obj[key];
     if (v === undefined || v === null || v === '') return `${label(key)} is required.`;
   }
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
   for (const [key, spec] of Object.entries(props)) {
     const v = obj[key];
     if (v === undefined || v === null) continue;
-    const p = valueProblem(spec, v, label(key));
+    const p = valueProblem(spec, v, label(key), !required.has(key));
     if (p) return p;
   }
   return null;
@@ -167,6 +176,25 @@ export function argumentProblem(schema, args) {
 /** A failure whose message is plain words for the agent (ToolError, or an IronbooksError from the client). */
 function isKnownError(/** @type {unknown} */ err) {
   return err instanceof ToolError || (err instanceof Error && /** @type {any} */ (err).isIronbooksError === true);
+}
+
+/**
+ * What the agent is told after Ironbooks said "slow down" (429, with how long to wait in seconds;
+ * 0 when it gave no time). Ironbooks refuses such a request before doing any of it, so sending it
+ * again later, the same way, is safe: a request_id never does it twice.
+ * @param {number} seconds
+ */
+export function slowDownAdvice(seconds) {
+  const wait = seconds > 0 ? `${seconds} second${seconds === 1 ? '' : 's'}` : 'a little while';
+  return `Nothing was done. Wait ${wait}, then send it again as it was (with the same request_id, if it had one: it is never done twice).`;
+}
+
+/** The message of a known failure, with what to do after a "slow down". */
+function knownMessage(/** @type {Error} */ err) {
+  const e = /** @type {any} */ (err);
+  if (e.status !== 429) return err.message;
+  const said = err.message.trim();
+  return `${said}${/[.!?]$/.test(said) ? '' : '.'} ${slowDownAdvice(Number(e.retryAfter) || 0)}`;
 }
 
 /**
@@ -258,7 +286,7 @@ export function createServer(opts) {
           return ok(id, { contents });
         } catch (err) {
           if (!isKnownError(err)) process.stderr.write(`[ironbooks-mcp] reading ${uri} failed: ${err instanceof Error ? err.stack || err.message : String(err)}\n`);
-          return fail(id, ERR_INTERNAL, isKnownError(err) ? /** @type {Error} */ (err).message : 'Something went wrong reading from Ironbooks. Try again.');
+          return fail(id, ERR_INTERNAL, isKnownError(err) ? knownMessage(/** @type {Error} */ (err)) : 'Something went wrong reading from Ironbooks. Try again.');
         }
       }
     }
@@ -305,7 +333,7 @@ export function createServer(opts) {
         // The agent reads the reason and decides what to do next; nothing internal is passed on.
         const known = isKnownError(err);
         if (!known) process.stderr.write(`[ironbooks-mcp] ${tool.name} failed: ${err instanceof Error ? err.stack || err.message : String(err)}\n`);
-        return text(known ? /** @type {Error} */ (err).message : 'Something went wrong reading from Ironbooks. Try again.', true);
+        return text(known ? knownMessage(/** @type {Error} */ (err)) : 'Something went wrong reading from Ironbooks. Try again.', true);
       }
     }
     return fail(id, ERR_METHOD_NOT_FOUND, `Method not found: ${method}`);

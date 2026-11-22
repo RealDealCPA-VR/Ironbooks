@@ -6,8 +6,12 @@
  *    the Integrated Applications switch, "save the copy without a password") and refuses what an
  *    agent may never ask for, even with approval: an operation that is not an agent's, the hard
  *    floor reached through a body field, a "yes, I am sure" flag no warning of the route names, a
- *    reveal where nothing is masked, a path value that is not a plain id, and a mail server whose
- *    name the approval line could not show in full (the approver's mail password would go there).
+ *    reveal where nothing is masked, a path value that is not a plain id, a mail server whose
+ *    name the approval line could not show in full (the approver's mail password would go there),
+ *    an email recipient that is not one or more plain addresses (RECIPIENT_FIELDS: the line
+ *    shows each one's domain in full, and a plain address is read the same way by the mailer),
+ *    and a file path that is not plain (pathRefusal: a ".." or a device prefix would make the
+ *    start and end the line shows another place than where the file goes).
  *  - applySecrets: puts what the approving person typed on the card exactly where the route reads
  *    it (a header or a body field). The agent never sees it and it is never stored.
  *  - redactAnswer: takes every secret the route produced out of the answer (the approver sees it
@@ -243,6 +247,258 @@ function mailServerOf(operation: Pick<Operation, 'method' | 'route'>, input: Ope
   if (!spot) return 'none';
   if (spot.inside !== undefined && !(isPlainObject(input.body) && isPlainObject(input.body[spot.inside]))) return 'none';
   return hostShownInFull(valuesAt(input.body, spot.host)[0]) ? 'shown' : 'not_shown';
+}
+
+// ---------------------------------------------------------------------------
+// Email recipients an agent sends
+// ---------------------------------------------------------------------------
+
+/** One field an operation reads recipients from. `many`: it takes several, parted by "," or ";". */
+export interface RecipientField {
+  /** Dotted path in the body, * for any element of a list. */
+  path: string;
+  many: boolean;
+}
+
+/**
+ * Where each operation that sends email reads the recipients an agent may give (read off each
+ * handler; guards.test.ts holds the table against the registry's email operations). A field that
+ * takes one recipient takes one plain address and nothing else; a field that takes several takes
+ * plain addresses parted by "," or ";". The mailer (nodemailer) reads a name, quotes, brackets,
+ * parentheses or a comment in an address its own way, so an approval line could show one place and
+ * the mail go to another: a plain address it reads exactly as written, and the line shows each
+ * one's domain in full (lib/agent/describe.ts). A person's own sends keep the routes' own checks.
+ */
+export const RECIPIENT_FIELDS: Readonly<Record<string, readonly RecipientField[]>> = Object.freeze({
+  // body.to (else the customer's or vendor's address on file).
+  'POST /api/invoices/[id]/email': [{ path: 'to', many: false }],
+  'POST /api/purchase-orders/[id]/email': [{ path: 'to', many: false }],
+  'POST /api/sales-forms/[kind]/[id]/email': [{ path: 'to', many: false }],
+  // body.email; body.to there is the end of the statement's period, a date.
+  'POST /api/sales-forms/statement-email': [{ path: 'email', many: false }],
+  // { action, items: [{ kind, id, to? }] }: each form's own recipient.
+  'POST /api/sales-forms/queue': [{ path: 'items.*.to', many: false }],
+  'POST /api/attention/invoice-reminder': [{ path: 'to', many: false }],
+  'POST /api/collections/email': [{ path: 'to', many: false }],
+  'POST /api/email/test': [{ path: 'to', many: false }],
+  // "Always send a copy to" goes on every email the company sends; replies go to replyTo.
+  'PUT /api/email/settings': [
+    { path: 'bcc', many: true },
+    { path: 'replyTo', many: false },
+  ],
+  'POST /api/report-schedules': [{ path: 'emailTo', many: true }],
+  'PATCH /api/report-schedules/[id]': [{ path: 'emailTo', many: true }],
+});
+
+/**
+ * Field names that hold recipients wherever they appear in the body of an operation that sends
+ * email (fail closed: a field a route grows later is checked before anyone adds it to the table).
+ * "to" is not one: the statement email's "to" is a date.
+ */
+const RECIPIENT_NAMES_MANY: ReadonlySet<string> = new Set(['cc', 'bcc', 'recipients', 'emailTo', 'emailCc', 'emailBcc']);
+const RECIPIENT_NAMES_ONE: ReadonlySet<string> = new Set(['recipient', 'replyTo']);
+
+/** Whether a field of that name holds recipients (RECIPIENT_NAMES_*), for describe.ts. */
+export function recipientFieldName(name: string): boolean {
+  return RECIPIENT_NAMES_MANY.has(name) || RECIPIENT_NAMES_ONE.has(name);
+}
+
+/** The longest parts of an address the mail standards allow (RFC 5321). */
+export const ADDRESS_LOCAL_MAX = 64;
+export const ADDRESS_DOMAIN_MAX = 253;
+const DOMAIN_LABEL_MAX = 63;
+
+/**
+ * The part before "@" of a plain address: letters, digits and . _ + - # $ & * = ? ^ / { } | ~,
+ * dots only between other characters. No space, quote, apostrophe, backtick, parenthesis, angle or
+ * square bracket, backslash, comma, semicolon or colon (each starts a name, a quote, a comment, a
+ * group or a second address for the mailer), nor "%" or "!" (old ways of routing mail on to
+ * another server).
+ */
+const LOCAL_ATOM = String.raw`[A-Za-z0-9#$&*+/=?^_{|}~-]+`;
+const PLAIN_LOCAL = new RegExp(String.raw`^${LOCAL_ATOM}(?:\.${LOCAL_ATOM})*$`);
+/** One label of the domain: letters, digits and hyphens, not starting or ending with a hyphen. */
+const DOMAIN_LABEL = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/;
+
+/** A plain email address in its two parts. */
+export interface PlainAddress {
+  local: string;
+  domain: string;
+}
+
+/**
+ * `text` as a plain email address (see PLAIN_LOCAL): the part before one "@", and a domain of at
+ * least two labels of letters, digits and hyphens parted by single dots (no dot at either end; a
+ * domain in another alphabet only in its "xn--" form). Null for anything else. No length limit
+ * here: describe.ts shows a long one with its domain whole, and guardInput refuses it.
+ */
+export function plainAddress(text: string): PlainAddress | null {
+  const at = text.indexOf('@');
+  if (at <= 0 || at !== text.lastIndexOf('@')) return null;
+  const local = text.slice(0, at);
+  const domain = text.slice(at + 1);
+  if (!PLAIN_LOCAL.test(local)) return null;
+  const labels = domain.split('.');
+  if (labels.length < 2 || !labels.every((l) => DOMAIN_LABEL.test(l))) return null;
+  return { local, domain };
+}
+
+/** Why one address cannot be sent to as an agent gave it, or null. */
+function addressProblem(item: string, where: string): string | null {
+  const parts = plainAddress(item);
+  const shown = cleanText(item, 60);
+  if (!parts) {
+    return `"${shown}" in ${where} is not a plain email address. Send just the address, such as billing@acme.com: no name, quotes, brackets, parentheses or spaces, one @, and a domain of letters, digits, dots and hyphens (a domain in another alphabet in its xn-- form).`;
+  }
+  if (parts.local.length > ADDRESS_LOCAL_MAX || parts.domain.length > ADDRESS_DOMAIN_MAX || parts.domain.split('.').some((l) => l.length > DOMAIN_LABEL_MAX)) {
+    return `"${shown}" in ${where} is too long for an email address: at most ${ADDRESS_LOCAL_MAX} characters before the @, ${ADDRESS_DOMAIN_MAX} after it and ${DOMAIN_LABEL_MAX} between two dots. Send the address as it really is.`;
+  }
+  return null;
+}
+
+/** Why one recipient field cannot be used as an agent gave it, or null. Empty means "none given". */
+function recipientProblem(where: string, value: unknown, many: boolean, listsAllowed: boolean): string | null {
+  if (value === undefined || value === null) return null;
+  if (Array.isArray(value) && listsAllowed) {
+    for (const v of value) {
+      const p = recipientProblem(where, v, many, false);
+      if (p) return p;
+    }
+    return null;
+  }
+  if (typeof value !== 'string') {
+    return many
+      ? `${where} must be text: email addresses parted by commas, such as billing@acme.com, ap@acme.com. Send it again that way.`
+      : `${where} must be one email address as text, such as billing@acme.com. Send it again with just the address.`;
+  }
+  const text = value.trim();
+  if (text === '') return null;
+  if (!many && /[,;]/.test(text)) {
+    return `${where} takes one email address, and this holds more than one. Send just one address, such as billing@acme.com (one request for each recipient).`;
+  }
+  const items = many ? text.split(/[,;]/).map((s) => s.trim()).filter((s) => s !== '') : [text];
+  for (const item of items) {
+    const p = addressProblem(item, where);
+    if (p) return p;
+  }
+  return null;
+}
+
+/**
+ * The first recipient of this request that is not plain address(es), as a refusal, or null. Only
+ * for operations that send email: the table's fields, and any field named like a recipient list
+ * (RECIPIENT_NAMES_*) at any depth of the body.
+ */
+function recipientRefusal(operation: Pick<Operation, 'method' | 'route' | 'effects'>, input: OperationInput): string | null {
+  const listed = RECIPIENT_FIELDS[routeKey(operation)];
+  const sendsMail = listed !== undefined || listOf(operation.effects).includes('email');
+  if (!sendsMail || input.body === undefined) return null;
+  for (const field of listed ?? []) {
+    for (const p of placesAt(input.body, field.path)) {
+      const problem = recipientProblem(`body.${p.path}`, p.value, field.many, false);
+      if (problem) return problem;
+    }
+  }
+  let found: string | null = null;
+  const walk = (node: unknown, trail: string[]) => {
+    if (found !== null) return;
+    if (Array.isArray(node)) {
+      node.forEach((x, i) => walk(x, [...trail, String(i)]));
+      return;
+    }
+    if (!isPlainObject(node)) return;
+    for (const k of Object.keys(node)) {
+      const p = [...trail, k];
+      if (recipientFieldName(k)) {
+        found = recipientProblem(`body.${p.join('.')}`, node[k], RECIPIENT_NAMES_MANY.has(k), true);
+        if (found !== null) return;
+      } else walk(node[k], p);
+    }
+  };
+  walk(input.body, []);
+  return found;
+}
+
+// ---------------------------------------------------------------------------
+// File paths an agent sends
+// ---------------------------------------------------------------------------
+
+/**
+ * A field holding a file or folder path, by its name: where a file goes or comes from. By the
+ * field's name only, so a memo that starts with "/" or "C:\" is a memo.
+ */
+const PATH_FIELD_NAME = /(?:file|folder|target|path|dir|directory|destination)$/i;
+
+/**
+ * Whether the field `name` (dotted; its last name counts) holds a path with this text: it is
+ * named like one and the text has a "/" or "\". lib/agent/describe.ts shows such a value as a path
+ * (its start and its file name, the middle cut), and guardInput takes only a plain one from an
+ * agent (pathRefusal), so the start and end the line shows are where the file really goes.
+ */
+export function pathField(name: string, text: string): boolean {
+  return PATH_FIELD_NAME.test(name.split('.').pop() ?? name) && /[\\/]/.test(text);
+}
+
+/**
+ * "\\?\", "\\.\" and "\??\", with either slash: a device path. Windows reads one as it is, without
+ * resolving "." and "..", and "\\?\UNC\server\share" is a share under another spelling.
+ */
+export const DEVICE_PATH_PREFIX = /^(?:[\\/]{2}[?.](?:[\\/]|$)|[\\/]\?\?(?:[\\/]|$))/;
+
+/** A folder of only dots and spaces ("..", ".", "...", ".. "): Windows reads some of them as a step up. */
+export const DOTS_ONLY_FOLDER = /^[. ]*\.[. ]*$/;
+
+/** What is not plain about a path an agent gave, or null. The line removes what nobody can see, so a mark is first. */
+function pathOddity(value: string): string | null {
+  if (new RegExp(INVISIBLE.source, 'u').test(value) || new RegExp(LINE_BREAKS.source, 'u').test(value)) {
+    return 'it holds a line break, a control character or an invisible mark, which the person approving could not see';
+  }
+  if (DEVICE_PATH_PREFIX.test(value)) return 'it starts with \\\\?\\ or \\\\.\\ (a device path)';
+  if (/^[\\/]{3}/.test(value)) return 'it starts with three slashes or more';
+  if (value.split(/[\\/]/).some((s) => DOTS_ONLY_FOLDER.test(s))) return 'it holds "." or ".." as a folder';
+  return null;
+}
+
+/** Why a path an agent gave cannot be used as it is, or null. */
+function pathProblem(where: string, value: string): string | null {
+  const why = pathOddity(value);
+  if (why === null) return null;
+  return `${where} is not a plain path: ${why}. Send the full path written the plain way, such as C:\\Users\\Pat\\Documents\\Ironbooks Backups or \\\\server\\share\\Ironbooks Backups, so the person approving sees exactly where the file goes.`;
+}
+
+/**
+ * The first path in this request's body or query that is not plain, as a refusal, or null. The
+ * approval line shows a long path by its start and its end (lib/agent/describe.ts): a ".." in the
+ * part it leaves out, a device path's prefix or a mark nobody can see would make what it shows
+ * another place than where the file goes (C:\Users\VR\Documents\…\..\..\Public\x is in
+ * C:\Users\Public). A plain path reads the same whole or cut. Every field named like a path, at
+ * any depth, for every operation (the shell's file and target, the backups' folder).
+ */
+function pathRefusal(input: OperationInput): string | null {
+  let found: string | null = null;
+  const walk = (node: unknown, trail: string[]) => {
+    if (found !== null) return;
+    if (Array.isArray(node)) {
+      node.forEach((x, i) => walk(x, [...trail, String(i)]));
+      return;
+    }
+    if (!isPlainObject(node)) return;
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      const p = [...trail, k];
+      const texts = typeof v === 'string' ? [v] : Array.isArray(v) && v.every((x) => typeof x === 'string') ? (v as string[]) : null;
+      if (texts && PATH_FIELD_NAME.test(k)) {
+        for (const text of texts) {
+          if (!/[\\/]/.test(text)) continue;
+          found = pathProblem(p.join('.'), text);
+          if (found !== null) return;
+        }
+      } else walk(v, p);
+    }
+  };
+  walk(input.body, ['body']);
+  walk(input.query, ['query']);
+  return found;
 }
 
 /** Where a produced secret sits in the route's answer, and how the approver's screen names it. */
@@ -530,6 +786,14 @@ function refusalOf(operation: Operation, raw: OperationInput, cleaned: Operation
   // The mail password a person types goes to the server this request names: the approval line
   // must be able to show that name in full, or nobody could see where the password goes.
   if (mailServerOf(operation, cleaned) === 'not_shown') return REFUSE.mailServerNotShown;
+  // Every recipient an agent gives is a plain address, which the line shows whole and the mailer
+  // reads as written: refused before anyone is asked, and again when a person approves.
+  const recipient = recipientRefusal(operation, cleaned);
+  if (recipient) return recipient;
+  // Every path an agent gives is a plain one, so the start and end the line shows are where the
+  // file goes: refused before anyone is asked, and again when a person approves.
+  const path = pathRefusal(cleaned);
+  if (path) return path;
 
   if (raw.params !== undefined && !isPlainObject(raw.params)) return REFUSE.notAnObject;
   if (raw.query !== undefined && !isPlainObject(raw.query)) return REFUSE.notAnObject;
@@ -839,10 +1103,8 @@ function maskValue(key: string, value: unknown): unknown {
 const ACCT_LABEL = /(?:Acct|Account|A\/C)s?\.?\s*(?:#|No(?![a-z])\.?|Number(?![a-z]))\s*:?\s*/gi;
 
 /**
- * The words "Account number" written out in full (no "#", no "No", no colon): how the app writes
- * about a chart-of-accounts number ("Account number 1000 is already used, so "Checking" was created
- * as 1000-2.", lib/services/qbGlImport.ts; "account number 6100" alone, the reason given for a
- * guessed account type, lib/services/qbGlParse.ts).
+ * The words "Account number" written out in full (no "#", no "No", no colon): how the app starts
+ * its own sentences about a chart-of-accounts number (see appChartNumberSentence).
  */
 const PLAIN_ACCOUNT_NUMBER_LABEL = /^Accounts?\s+Number\s+$/i;
 
@@ -856,28 +1118,32 @@ function chartNumberShaped(word: string): boolean {
 }
 
 /**
- * What follows the number in the app's own sentence about a chart-of-accounts number
- * (lib/services/qbGlImport.ts): "is already used", "was created". Not the end of the text: a memo
- * such as "Utilities: Account number 4471234" ends there too, and that is a number someone wrote down.
+ * The rest of lib/services/qbGlImport.ts's warning after the number, word for word:
+ *   `Account number ${a.number} is already used, so "${a.fullName}" was created as ${code}.`
+ * (the account's name in quotes, the code it got, a full stop, then the end of the text or a
+ * space). Only that whole sentence: "is used for autopay", "was created by the utility" or "is
+ * already used" alone are words someone typed, and their number stays masked.
  */
-const CHART_NUMBER_AFTER = /^\s+(?:is\s+(?:already\s+)?used|was\s+created)\b/i;
+const GL_IMPORT_SENTENCE_REST = /^ is already used, so "[^"\r\n]*" was created as [^\s"]+\.(?=$|\s)/;
 
 /**
  * Whether the plain words "Account number" at `at`, then `number`, are one of the app's own
  * sentences about a chart-of-accounts number, the number shaped like one (chartNumberShaped):
- *  - qbGlImport.ts's warning: the words start the text or a clause (nothing before them, or ".",
- *    ";", ":", "!", "?" or "("), and the sentence goes on the way it does (CHART_NUMBER_AFTER);
+ *  - qbGlImport.ts's warning, in its full wording (GL_IMPORT_SENTENCE_REST), with a capital "A",
+ *    starting the text or a clause (nothing before it, or ".", ";", ":", "!", "?" or "(");
  *  - qbGlParse.ts's reason for a guessed account type, which is the whole text, in small letters:
  *    exactly "account number 6100".
  * Anything else is a number someone wrote down and stays masked: "Account number 4471234" (a whole
- * memo), "Utilities: Account number 4471234", "Vendor account number 4471234", "BankAccount number
- * 12345", "Account number 1234567 is the bank", "Account number 0001234".
+ * memo), "Utilities: Account number 4471234", "Account number 4471234 is used for autopay",
+ * "Account number 4471234 was created by the utility", "Vendor account number 4471234",
+ * "BankAccount number 12345", "Account number 1234567 is the bank", "Account number 0001234".
  */
 function appChartNumberSentence(text: string, at: number, number: string, after: string): boolean {
   if (!chartNumberShaped(number)) return false;
   if (text === `account number ${number}`) return true;
+  if (!text.startsWith('Account number ', at)) return false;
   const before = text.slice(0, at).trimEnd();
-  return (before === '' || /[.;:!?(]$/.test(before)) && CHART_NUMBER_AFTER.test(after);
+  return (before === '' || /[.;:!?(]$/.test(before)) && GL_IMPORT_SENTENCE_REST.test(after);
 }
 
 /**
@@ -894,34 +1160,11 @@ const WORD_STOP = /[\s,;]/;
  * mailer delivers what they take: "billing.acct#7'x@evil.com", "billing.acct#7(x)@evil.com",
  * 'billing.acct#7"@evil.com' and "billing.acct#7[x]@evil.com" all go to evil.com (nodemailer drops
  * the "(x)" and the stray quote), and "Name<x@evil.example>" goes to x@evil.example. So every mark
- * but those three can be part of an address, and is.
+ * but those three can be part of an address, and is. This broad shape is only for masking (an
+ * address is never masked as an account number); what an agent may SEND is a plain address
+ * (plainAddress, RECIPIENT_FIELDS).
  */
 const EMAIL_ADDRESS = /^([^\s@,;]+)@([^\s@,;]+\.[^\s@,;]+)$/;
-
-/** One email address (EMAIL_ADDRESS) in two parts: what may be cut to fit, and what decides where the mail goes. */
-export interface EmailAddressParts {
-  /**
-   * The part that may be cut when the address is too long for its room: in the "Name<addr>" form
-   * the name before the "<" (cut at its end: it only shows), otherwise the name before "@" (cut in
-   * its middle, so both its ends show).
-   */
-  head: string;
-  /**
-   * Where the mail goes, shown whole and as written: from the last "<" in the "Name<addr>" form
-   * ("<x@evil.example>", which is what the mailer delivers to), otherwise "@" and the domain.
-   */
-  kept: string;
-  form: 'name' | 'local';
-}
-
-/** `text` in its two parts (EmailAddressParts) when it is exactly one email address (EMAIL_ADDRESS); otherwise null. */
-export function emailAddressParts(text: string): EmailAddressParts | null {
-  if (!EMAIL_ADDRESS.test(text)) return null;
-  const bracket = text.lastIndexOf('<');
-  if (bracket >= 0) return { head: text.slice(0, bracket), kept: text.slice(bracket), form: 'name' };
-  const at = text.indexOf('@');
-  return { head: text.slice(0, at), kept: text.slice(at), form: 'local' };
-}
 
 /** Where the word holding `at` starts and ends (WORD_STOP ends one). */
 function wordAround(text: string, at: number): { start: number; end: number } {
@@ -985,9 +1228,10 @@ function addressItemAt(rest: string): number {
  *  - after a label written the way such numbers are labelled ("Acct No", "A/C Number", "Account
  *    No.", "Account Number:" with its colon), always;
  *  - after the plain words "Account number", unless they are one of the app's own sentences about
- *    a chart-of-accounts number (appChartNumberSentence): "Account number 1000 is already used"
- *    stays as it is; "Account number 12345678.", "Account number 4471234" (a whole memo), "Vendor
- *    account number 4471234" and "Account number 1234567 is the bank" do not.
+ *    a chart-of-accounts number in their full wording (appChartNumberSentence): "Account number
+ *    1000 is already used, so "Checking" was created as 1000-2." stays as it is; "Account number
+ *    12345678.", "Account number 4471234" (a whole memo), "Account number 4471234 is used for
+ *    autopay", "Vendor account number 4471234" and "Account number 1234567 is the bank" do not.
  * "Account number must be unique" holds no number, so nothing in it is masked. A label inside an
  * email address ("billing.acct#7@acme.com", "billing.acct#7'x@evil.com") is part of the address,
  * not a label (addressAround): the address stays whole, so a recipient reads, is stored and is

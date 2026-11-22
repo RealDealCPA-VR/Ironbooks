@@ -15,6 +15,8 @@ import {
 } from '@/lib/services/customFields';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { customFieldValuesSchema } from '@/lib/validation/company';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -45,6 +47,9 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
+    // The body as agents read it described (lib/validation/company.ts); the checks above answer first.
+    const checked = customFieldValuesSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const values = await setEntityCustomFields(
       ctx,

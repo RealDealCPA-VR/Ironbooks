@@ -74,8 +74,14 @@ describe('what may start with no window', () => {
 describe('questions asked while nobody is there', () => {
   it('get the answer that changes nothing: the cancel button', () => {
     expect(agentService.quietDialogAnswer([{ message: 'Take over?', buttons: ['Open Anyway', 'Cancel'], cancelId: 1 }])).toEqual({ response: 1, checkboxChecked: false });
-    // With a parent window first, as dialog.showMessageBox(window, options).
-    expect(agentService.quietDialogAnswer([{ id: 7 }, { message: 'x', buttons: ['Try Again', 'Close Anyway', 'Keep Working'], cancelId: 2 }]).response).toBe(2);
+    // With a parent window first, as dialog.showMessageBox(window, options). A window is an object
+    // of a class (BrowserWindow): Electron takes a plain object first as the options themselves.
+    const win = new (class BrowserWindow {
+      id = 7;
+    })();
+    expect(agentService.quietDialogAnswer([win, { message: 'x', buttons: ['Try Again', 'Close Anyway', 'Keep Working'], cancelId: 2 }]).response).toBe(2);
+    // A plain object first is the options, as Electron reads it: no buttons there, so a notice.
+    expect(agentService.quietDialogAnswer([{ id: 7 }, { message: 'x', buttons: ['Try Again', 'Close Anyway', 'Keep Working'], cancelId: 2 }]).response).toBe(0);
     expect(agentService.quietDialogAnswer([null, { message: 'x', buttons: ['A', 'B'], cancelId: 1 }]).response).toBe(1);
   });
 

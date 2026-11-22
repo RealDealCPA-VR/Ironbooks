@@ -51,6 +51,15 @@ interface ListResult {
 
 const PAGE_SIZE = 25;
 
+/** An audit entry's id (audit_logs.id is a UUID). */
+const ENTRY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** A message as a sentence, so the next step can follow it ("Internal server error" gets its period). */
+function sentence(s: string): string {
+  const t = s.trim();
+  return /[.!?]$/.test(t) ? t : `${t}.`;
+}
+
 const ACTION_OPTIONS = [
   { value: '', label: 'All actions' },
   { value: 'create', label: 'Create' },
@@ -214,10 +223,13 @@ function AuditRow({
           setDetail(full);
         }
       } catch (err) {
-        toast(err instanceof ApiError ? err.message : 'Failed to load details', 'danger');
-      } finally {
+        // A read that failed is not an entry with nothing recorded: the row stays closed, the
+        // reason is said, and clicking it again asks again.
+        toast(err instanceof ApiError ? err.message : 'The details could not be loaded. Click the row to try again.', 'danger');
         setLoading(false);
+        return;
       }
+      setLoading(false);
     }
     setExpanded((v) => !v);
   }
@@ -357,6 +369,12 @@ export default function AuditTrailPage() {
     if (!id) return;
     setFocusId(id);
     setFocusError('');
+    // Every entry's id has this form; any other text names no entry at all, so it is "not found"
+    // without asking (the server cannot even look one up, and would answer with an error).
+    if (!ENTRY_ID.test(id)) {
+      setFocusMissing(true);
+      return;
+    }
     let cancelled = false;
     api
       .get<AuditLogRow>(`/api/audit-trail/${encodeURIComponent(id)}`)
@@ -365,8 +383,10 @@ export default function AuditTrailPage() {
       })
       .catch((err) => {
         if (cancelled) return;
+        // Not there, or about records this person may not see (the server answers both alike).
         if (err instanceof ApiError && (err.status === 404 || err.status === 403)) setFocusMissing(true);
-        else setFocusError(err instanceof Error && err.message ? err.message : 'Something went wrong');
+        // Anything else (no connection, a busy file, a server error): the entry may well be there.
+        else setFocusError(sentence(err instanceof Error && err.message ? err.message : 'The entry could not be loaded.'));
       });
     return () => {
       cancelled = true;

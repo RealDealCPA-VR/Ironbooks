@@ -10,6 +10,8 @@ import { getServerContext } from '@/lib/context';
 import { getBom, setBom } from '@/lib/services/assemblies';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { setBomSchema } from '@/lib/validation/assemblies';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
@@ -58,6 +60,10 @@ export async function PUT(req: NextRequest): Promise<NextResponse> {
         { status: 400 },
       );
     }
+    // The body as agents read it described (lib/validation/assemblies.ts). The check above answers
+    // first; the service checks the components with its own messages.
+    const checked = setBomSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const bom = await setBom(ctx, assemblyItemId, components ?? []);
     return NextResponse.json({ assemblyItemId, components: bom });

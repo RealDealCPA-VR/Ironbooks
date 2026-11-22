@@ -21,11 +21,13 @@ import {
   REPORT_OPTION_PARAMS,
   REPORT_TOOLS,
   TXN_TYPES,
+  compactCollected,
   optionsOf,
   reportQuery,
   reportTable,
 } from '../../mcp/report-tools.mjs';
 import { IronbooksError } from '../../mcp/client.mjs';
+import { REQUEST_ID_MESSAGE } from '@/lib/agent/actions';
 import { REPORT_CATALOG, REPORT_GROUPS as APP_GROUPS } from '@/lib/reports/catalog';
 import { DRILLDOWN_REPORTS } from '@/lib/reports/drilldown';
 import { reportToTable, type StdReport } from '@/lib/reports/types';
@@ -309,30 +311,137 @@ describe('run_report', () => {
     expect(acted).toEqual([]);
   });
 
+  /**
+   * The door when an Admin set reading reports to Ask (lib/agent/operate.ts): the read sent without a
+   * request id is refused with its request-id message, a 400 VALIDATION, before anything is read; the
+   * same read as a dry run is not tried ('dry_run', nothing in it). `message`: the door's wording,
+   * the app's own REQUEST_ID_MESSAGE unless a test changes it.
+   */
+  const askedDoor = (message: string = REQUEST_ID_MESSAGE, also: (r: Any) => unknown = () => undefined) =>
+    fake((r) => {
+      const other = also(r);
+      if (other !== undefined) return other;
+      if (r.dryRun === true) return { operation: r.operation, outcome: 'dry_run', summary: 'Read a report', note: 'This cannot be tried without really doing it, so nothing was run. Sent without dry_run, it would ask a person first.' };
+      return new IronbooksError(message, { status: 400, code: 'VALIDATION' });
+    });
+
   it('a read a person must approve (an Admin set reports to Ask): the door asks for a request_id, and the tool says how to ask with run_operation', async () => {
-    // What the door answers then (lib/agent/actions.ts REQUEST_ID_MESSAGE, as a 400 VALIDATION).
-    const needsId = () =>
-      new IronbooksError('Give a request_id: any text of your own, unique to this change (for example "inv-acme-2026-03-01-a"). Asking again with the same request_id never enters the change twice.', {
-        status: 400,
-        code: 'VALIDATION',
-      });
-    const run = await call(fake(needsId).client, 'run_report', { key: 'profit-loss', options: { period: 'last_month' } });
+    const first = askedDoor();
+    const run = await call(first.client, 'run_report', { key: 'profit-loss', options: { period: 'last_month' } });
     expect(run.isError).toBe(true);
     expect(run.text).toBe(
-      'A person must approve this read before you see it, and this tool cannot ask for that. Ask with run_operation instead: operation "reports.std.get", params {"report":"profit-loss"}, query {"dates":"last_month"}, a request_id of your own and a reason. Then call wait_for_decision with the request_id it gives.',
+      'A person must approve this read before you see it, and this tool cannot ask for that. Ask with run_operation instead: operation "reports.std.get", params {"report":"profit-loss"}, query {"dates":"last_month"}, a request_id of your own and a reason. Then call wait_for_decision with the request_id it gives: once a person approves it, it gives you the report as run_report does.',
     );
-    const plain = await call(fake(needsId).client, 'run_report', { key: 'trial-balance' });
+    // The read, then the same read as a dry run to learn which 400 it was; never a request id or a reason.
+    expect(first.acted).toEqual([
+      { verb: 'run_operation', operation: 'reports.std.get', params: { report: 'profit-loss' }, query: { dates: 'last_month' } },
+      { verb: 'run_operation', operation: 'reports.std.get', params: { report: 'profit-loss' }, query: { dates: 'last_month' }, dryRun: true },
+    ]);
+    const plain = await call(askedDoor().client, 'run_report', { key: 'trial-balance' });
     expect(plain.text).toMatch(/operation "reports\.std\.get", params \{"report":"trial-balance"\}, a request_id of your own/);
-    const drill = await call(fake(needsId).client, 'report_drilldown', { key: 'profit-loss', row_id: 'acct:4000', column: 'amount' });
+    const drill = await call(askedDoor().client, 'report_drilldown', { key: 'profit-loss', row_id: 'acct:4000', column: 'amount' });
     expect(drill.text).toMatch(/operation "reports\.drilldown\.get", params \{"report":"profit-loss"\}, query \{"row":"acct:4000","col":"amount","limit":"200"\}, a request_id/);
+    expect(drill.text).toMatch(/as report_drilldown does\.$/);
     // The file step asked for, after the report was read: the rows are not repeated in the message.
-    const file = await call(fake((r) => (r.operation === 'reports.std.get' ? { operation: r.operation, outcome: 'read', result: REPORT } : needsId())).client, 'export_report', { key: 'profit-loss', format: 'pdf' });
+    const file = await call(
+      askedDoor(REQUEST_ID_MESSAGE, (r) => (r.operation === 'reports.std.get' ? { operation: r.operation, outcome: 'read', result: REPORT } : undefined)).client,
+      'export_report',
+      { key: 'profit-loss', format: 'pdf' },
+    );
     expect(file.isError).toBe(true);
     expect(file.text).toMatch(/operation "export\.reports", with the body describe_operation shows for it .*a request_id of your own and a reason\. Then call wait_for_decision/);
+    expect(file.text).toMatch(/the file_id of the file it made\.$/);
     expect(file.text.length).toBeLessThan(600);
-    // Any other error is the app's own, unchanged.
-    const other = await call(fake(() => new IronbooksError('Ironbooks is not ready: open the company file.', { status: 503 })).client, 'run_report', { key: 'profit-loss' });
+    // Any other error is the app's own, unchanged, and asks nothing more of the door.
+    const down = fake(() => new IronbooksError('Ironbooks is not ready: open the company file.', { status: 503 }));
+    const other = await call(down.client, 'run_report', { key: 'profit-loss' });
     expect(other.text).toBe('Ironbooks is not ready: open the company file.');
+    expect(down.acted).toHaveLength(1);
+  });
+
+  it('the asked read is told by the door\'s own answer, not by the words of its message', async () => {
+    // The door words it differently one day: still the same advice.
+    const reworded = await call(askedDoor('Send an id of your own with this, so it is never done twice.').client, 'run_report', { key: 'profit-loss' });
+    expect(reworded.text).toMatch(/^A person must approve this read before you see it/);
+    // The route's own 400 for the read (dates it cannot use): the dry run is read again, fails the
+    // same way, and the agent gets the app's message as it was, with no word about approval.
+    const badDates = new IronbooksError('The start date must be on or before the end date.', { status: 400, code: 'VALIDATION' });
+    const route = fake(() => badDates);
+    const r = await call(route.client, 'run_report', { key: 'profit-loss', options: { date_from: '2026-02-01', date_to: '2026-01-01' } });
+    expect(r.text).toBe('The start date must be on or before the end date.');
+    expect(route.acted.map((a) => a.dryRun === true)).toEqual([false, true]);
+    // A message that names request_id, from anything but the door's request-id check, is not taken for it.
+    const named = await call(fake(() => new IronbooksError('The request_id "x-1" was already used for a different request.', { status: 409, code: 'CONFLICT' })).client, 'run_report', { key: 'profit-loss' });
+    expect(named.text).toBe('The request_id "x-1" was already used for a different request.');
+    // Read after all on the second try: the report, as usual.
+    let n = 0;
+    const flaky = fake((q) => (n++ === 0 ? new IronbooksError(REQUEST_ID_MESSAGE, { status: 400, code: 'VALIDATION' }) : { operation: q.operation, outcome: 'read', result: REPORT }));
+    const ok = await call(flaky.client, 'run_report', { key: 'profit-loss' });
+    expect(ok.isError, ok.text).toBe(false);
+    expect(ok.data).toMatchObject({ key: 'profit-loss', report: 'Profit & Loss', row_count: 3 });
+    // Refused on the second try (paused meanwhile, say): a refusal, as any other.
+    const refusedNow = await call(
+      fake((q) => (q.dryRun ? { operation: q.operation, outcome: 'refused', note: 'This agent is paused' } : new IronbooksError(REQUEST_ID_MESSAGE, { status: 400, code: 'VALIDATION' }))).client,
+      'run_report',
+      { key: 'profit-loss' },
+    );
+    expect(refusedNow.text).toMatch(/^Refused: This agent is paused\. Nothing was done\./);
+  });
+
+  it('what the agent collects after a person approves the read is what run_report gives', async () => {
+    const shown = await call(fake(() => ({ operation: 'reports.std.get', outcome: 'read', result: REPORT })).client, 'run_report', { key: 'profit-loss' });
+    // wait_for_decision's request (mcp/operations-tools.mjs shapeRequest), with the route's raw report.
+    const request = { request_id: ID2, decision: 'approved', status: 'executed', operation: 'reports.std.get', summary: 'Read the profit-loss report', result: REPORT, next: 'It is done.' };
+    const collected = compactCollected(request);
+    expect(collected).toEqual({ ...request, result: shown.data });
+    // Already compact, or not a report: handed back as it is.
+    expect(compactCollected(collected)).toBe(collected);
+    const other = { ...request, operation: 'invoices.get', result: { id: ID } };
+    expect(compactCollected(other)).toBe(other);
+    expect(compactCollected({ ...request, result: null }).result).toBeNull();
+    // run_operation's answer names no operation: it is given.
+    const replay = { outcome: 'read', repeated: true, result: REPORT };
+    expect(compactCollected(replay, 'reports.std.get')).toEqual({ ...replay, result: shown.data });
+    expect(compactCollected(replay)).toBe(replay);
+    // A drill-down, as report_drilldown gives it.
+    const txn = { key: `je:${ID}`, entryId: ID, date: '2026-01-05', type: 'Invoice', num: '1001', name: 'Acme', memo: '', account: 'Sales', amount: '100.00' };
+    const raw = { report: 'profit-loss', rowLabel: 'Sales', columnLabel: 'Jan 2026', kind: 'transactions', cell: '100.00', total: '100.00', ties: true, count: 1, transactions: [txn], listTruncated: false, incomplete: false };
+    const drilled = await call(fake(() => ({ operation: 'reports.drilldown.get', outcome: 'read', result: raw })).client, 'report_drilldown', { key: 'profit-loss', row_id: 'acct:4000', column: 'amount' });
+    expect(compactCollected({ operation: 'reports.drilldown.get', result: raw })).toEqual({ operation: 'reports.drilldown.get', result: drilled.data });
+    // A report of a key this copy of the catalog does not know: still compact, without the drill-down parts.
+    const unknown = compactCollected({ operation: 'reports.std.get', result: { ...REPORT, key: 'brand-new-report' } });
+    expect(unknown.result).toMatchObject({ key: 'brand-new-report', report: 'Profit & Loss', row_count: 3, rows: [{ kind: 'section', level: 0, cells: ['Income', null] }, expect.anything(), expect.anything()] });
+    expect(unknown.result).not.toHaveProperty('drilldown');
+  });
+
+  it('a collected result the size limit cut says so inside the result, with the numbers it knows', () => {
+    const cutShort = { result: 'The result was too long to show in full: its longest lists were cut. It was carried out once, in full: do not send it again.' };
+    const base = { request_id: ID2, decision: 'approved', operation: 'reports.std.get', cut_short: cutShort };
+    const SEE = 'To see the rest, run it again with a shorter date range or a filter.';
+    // Made compact before it was held (mcp/tools.mjs): row_count is the report's own.
+    const compact = compactCollected({ operation: 'reports.std.get', result: REPORT }).result;
+    const held = { ...base, result: { ...compact, rows: compact.rows.slice(0, 1) } };
+    const marked = compactCollected(held);
+    expect(marked.result).toMatchObject({ row_count: 3, truncated: true });
+    expect(marked.result.rows).toHaveLength(1);
+    expect(marked.result.notes.at(-1)).toBe(`Showing the first 1 of 3 rows: the whole report was too long for one answer. ${SEE}`);
+    // Marked once.
+    expect(compactCollected(marked)).toBe(marked);
+    // Cut elsewhere (every row still there): said without a count it does not have.
+    expect(compactCollected({ ...base, result: compact }).result.notes.at(-1)).toBe(`Part of the report was left out: the whole report was too long for one answer. ${SEE}`);
+    // Held while still raw (an older order): the real count is gone, and the note says row_count counts only what is shown.
+    const raw = compactCollected({ ...base, result: { ...REPORT, rows: REPORT.rows.slice(0, 2) } });
+    expect(raw.result).toMatchObject({ row_count: 2, truncated: true });
+    expect(raw.result.notes.at(-1)).toBe(`Part of the report was left out (the whole report was too long for one answer), so row_count counts only the 2 rows shown. ${SEE}`);
+    // Nothing cut: nothing said.
+    expect(compactCollected({ ...base, cut_short: { would_post: 'x' }, result: compact }).result).not.toHaveProperty('truncated');
+    // A drill-down whose list was cut: the count and total still cover everything.
+    const txn = { key: `je:${ID}`, entryId: ID, date: '2026-01-05', type: 'Invoice', num: '1001', name: 'Acme', memo: '', account: 'Sales', amount: '100.00' };
+    const drill = { report: 'profit-loss', rowLabel: 'Sales', columnLabel: 'Jan 2026', kind: 'transactions', cell: '200.00', total: '200.00', ties: true, count: 2, transactions: [txn], listTruncated: false, incomplete: false };
+    const drilled = compactCollected({ operation: 'reports.drilldown.get', cut_short: cutShort, result: drill });
+    expect(drilled.result).toMatchObject({ count: 2, truncated: true });
+    expect(drilled.result.notes.at(-1)).toMatch(/^Only 1 of the transactions are listed here: the whole list was too long for one answer\. The count and the total still cover all of them\./);
+    expect(compactCollected(drilled)).toBe(drilled);
   });
 
   it('an asked answer (a read filed for a person) is worded like every other one', async () => {

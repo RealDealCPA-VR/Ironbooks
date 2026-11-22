@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import { amountOf } from '@/lib/agent/facts';
 import { operationById } from '../registry';
 import type { Operation } from '../types';
@@ -20,6 +22,25 @@ describe('classification: lists', () => {
     for (const id of ['classes.update', 'locations.update']) {
       expect(op(id), id).toMatchObject({ method: 'PATCH', class: 'remove', body: 'none' });
     }
+  });
+
+  it('says a class or location PATCH takes no body because its handler reads none (read off the route)', () => {
+    // If one of these starts reading a body, this fails: give the entry its body kind and schema.
+    for (const [id, service] of [['classes.update', 'deactivateClass'], ['locations.update', 'deactivateLocation']] as const) {
+      const file = path.join(process.cwd(), 'app', ...op(id).route.split('/').filter(Boolean), 'route.ts');
+      const src = fs.readFileSync(file, 'utf8');
+      const patch = src.slice(src.indexOf('export async function PATCH'));
+      expect(patch, id).toMatch(/\(\s*_req\b/);
+      expect(patch, id).not.toMatch(/\breq\.(?:json|text|formData|body)\b|requireJsonObject|searchParams/);
+      expect(patch, id).toMatch(new RegExp(String.raw`${service}\(ctx, id\)`));
+    }
+  });
+
+  it('never tells an agent that the vendor reveal shows the account number (it shows the tax ID only)', () => {
+    expect(op('vendors.get').reveal).toBe('ssn');
+    const assign = op('type-lists.vendor-assign').why ?? '';
+    expect(assign).toMatch(/shows the tax ID only/);
+    expect(assign).not.toMatch(/tax ID or the account number[^.]*reveal/);
   });
 
   it('sizes a voided home currency adjustment by every account it revalued', () => {

@@ -65,9 +65,10 @@ const TEST_SHELL: ShellOperationDef = vi.hoisted(() => ({
 
 /**
  * Examples planted where the registry test reads them: no classification has any yet (types.ts has
- * no field for them), so without these that test would loop over nothing. One good and one bad
- * on a real route's classification (POST /api/items/bulk, items.bulk.save), the same on the test
- * shell definition: the registry test expects exactly the bad ones, by operation id.
+ * no field for them), so without these that test would loop over nothing. Good and bad ones on a
+ * real route's classification (POST /api/items/bulk, items.bulk.save), the same on the test shell
+ * definition: the registry test expects exactly the bad ones, by operation id, and the good ones
+ * in the shape describe_operation answers them (contract.ts OperationDescription.examples).
  */
 const PLANTED = vi.hoisted(() => ({
   routeKey: 'POST /api/items/bulk',
@@ -76,6 +77,8 @@ const PLANTED = vi.hoisted(() => ({
     { body: { rows: [{ name: 'Widget', salesPrice: 5 }] }, note: 'Add one item' },
     { rows: [{ name: 'Gadget' }], dryRun: true },
     { body: { rows: [] } },
+    // Nothing in this operation's answer is masked, so the guards refuse a reveal.
+    { body: { rows: [{ name: 'Bolt' }] }, summary: 'Ask to see masked values', reveal: true },
   ] as unknown[],
   shell: [{ body: { folder: 'C:\\Backups', copies: 1 } }, { folder: 'C:\\Backups' }] as unknown[],
 }));
@@ -626,16 +629,41 @@ describe('operation schemas: examples', () => {
     expect(shellBefore).toBeGreaterThanOrEqual(0);
     expect(problems).toEqual([
       `items.bulk.save example ${routeBefore + 3} body $.rows: must have at least 1 item`,
+      expect.stringMatching(new RegExp(`^items\\.bulk\\.save example ${routeBefore + 4}: the guards would refuse it: Nothing in this answer is masked`)),
       `${TEST_SHELL.id} example ${shellBefore + 2} body $: must have copies`,
     ]);
+    // As describe_operation answers them (OperationDescription.examples, wave 4): each a request as
+    // run_operation takes it, with its title and note; an example written as a body alone is the body.
+    expect(examplesOf(route).slice(routeBefore)).toEqual([
+      { body: { rows: [{ name: 'Widget', salesPrice: 5 }] }, note: 'Add one item' },
+      { body: { rows: [{ name: 'Gadget' }], dryRun: true } },
+      { body: { rows: [] } },
+      { body: { rows: [{ name: 'Bolt' }] }, title: 'Ask to see masked values', reveal: true },
+    ]);
+    expect(examplesOf(shell).slice(shellBefore)).toEqual([{ body: { folder: 'C:\\Backups', copies: 1 } }, { body: { folder: 'C:\\Backups' } }]);
   }, 120_000);
 
   it('reads an example as a whole request, or as the body alone', () => {
     expect(examplesOf(exampleOp(undefined))).toEqual([]);
     expect(examplesOf(exampleOp({ name: 'A' }))).toEqual([{ body: { name: 'A' } }]);
     expect(examplesOf(exampleOp([{ body: { name: 'A' }, note: 'one' }, { params: { id: 'x' } }]))).toEqual([
-      { body: { name: 'A' } },
+      { body: { name: 'A' }, note: 'one' },
       { params: { id: 'x' } },
+    ]);
+    // The words beside a request travel with it (title, from title, describe or summary; note),
+    // trimmed; blank ones and a reveal that is not true are left out.
+    expect(
+      examplesOf(
+        exampleOp([
+          { body: { name: 'A' }, title: ' Plain ', note: '  ', reveal: false },
+          { body: { name: 'B' }, describe: 'Described', summary: 'Summed up', reveal: true },
+          { query: { q: 'acme' }, summary: 'Summed up' },
+        ]),
+      ),
+    ).toEqual([
+      { body: { name: 'A' }, title: 'Plain' },
+      { body: { name: 'B' }, title: 'Described', reveal: true },
+      { query: { q: 'acme' }, title: 'Summed up' },
     ]);
     // A body that happens to have a field called "body" next to others is a body.
     expect(examplesOf(exampleOp([{ body: 'text', name: 'B' }]))).toEqual([{ body: { body: 'text', name: 'B' } }]);
@@ -765,5 +793,173 @@ describe('operation schemas: caching and failures', () => {
     const props = Object.keys(((body as Record<string, unknown>).properties ?? {}) as object);
     const shape = zod instanceof z.ZodObject ? Object.keys(zod.shape) : props;
     expect(props).toEqual(shape);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wave 4: the routes that read their body by hand got schemas (plan §6.3)
+// ---------------------------------------------------------------------------
+
+/** Each operation and the schema its route now checks its body with (lib/validation). */
+const HAND_READ_ROUTES: Array<[string, string]> = [
+  ['ai.posts.undo', '@/lib/validation/ai#undoAiPostSchema'],
+  ['assemblies.pending.create', '@/lib/validation/assemblies#createPendingBuildSchema'],
+  ['assemblies.replace', '@/lib/validation/assemblies#setBomSchema'],
+  ['assemblies.update', '@/lib/validation/assemblies#setBomSchema'],
+  ['bank-accounts.create', '@/lib/validation/bankTransactions#createBankAccountSchema'],
+  ['billing-groups.create', '@/lib/validation/billingGroups#createBillingGroupSchema'],
+  ['billing-groups.update', '@/lib/validation/billingGroups#updateBillingGroupSchema'],
+  ['currencies.fx-adjustment', '@/lib/validation/currencies#fxAdjustmentSchema'],
+  ['custom-fields.values', '@/lib/validation/company#customFieldValuesSchema'],
+  ['customer-prices.create', '@/lib/validation/pricing#setCustomerPriceSchema'],
+  ['demo-feed', '@/lib/validation/bankTransactions#loadDemoFeedSchema'],
+  ['errors.apply', '@/lib/validation/ai#applyCorrectionSchema'],
+  ['fifo.adjust', '@/lib/validation/inventory#fifoActionSchema'],
+  ['inventory-transfers.action', '@/lib/validation/inventorySites#voidInventoryTransferSchema'],
+  ['invoices.post-draft', '@/lib/validation/invoices#postDraftInvoiceSchema'],
+  ['landed-cost.action', '@/lib/validation/inventorySites#voidLandedCostSchema'],
+  ['lists.action', '@/lib/validation/lists#simpleListEntrySchema'],
+  ['pay-liabilities.by-item.pay', '@/lib/validation/liabilities#payLiabilitiesByItemSchema'],
+  ['pay-liabilities.checks.action', '@/lib/validation/liabilities#voidLiabilityCheckSchema'],
+  ['print-queue.refunds.add', '@/lib/validation/purchases#queueRefundCheckSchema'],
+  ['reconciliations.pay', '@/lib/validation/reconciliations#payCreditCardBalanceSchema'],
+  ['sales-forms.flags.update', '@/lib/validation/sales#sendFlagsUpdateSchema'],
+  ['sales-reps.assign', '@/lib/validation/salesReps#assignSalesRepSchema'],
+  ['sales-reps.create', '@/lib/validation/salesReps#createSalesRepSchema'],
+  ['sales-reps.update', '@/lib/validation/salesReps#updateSalesRepSchema'],
+  ['sales-tax.payments.action', '@/lib/validation/liabilities#voidSalesTaxPaymentSchema'],
+];
+
+const ID = '7d3c1f9e-1a2b-4c3d-8e9f-0a1b2c3d4e5f';
+
+/**
+ * Bodies each route takes today, odd values included: past the handler's own checks, and either
+ * used as they are or turned away by the service with its own message. The schema the route now
+ * checks first must let every one of them through, so a person's request is answered as before.
+ */
+const STILL_ACCEPTED: Array<[string, string, unknown]> = [
+  ['reconciliations.pay', 'service-checked fields of any type', { paymentAccountId: ID, amount: 'x', date: 5, memo: 3, exchangeRate: {} }],
+  ['reconciliations.pay', 'only the bank account', { paymentAccountId: ID }],
+  [
+    'pay-liabilities.by-item.pay',
+    'item rows of any shape, check fields of any type',
+    { date: '2026-03-01', paymentAccountId: ID, items: [{ name: 'Federal Withholding', amount: '100.00' }, 'x', { amount: 5 }], vendorId: 7, payeeName: 3, toPrint: 'yes', checkNumber: 1001, memo: {} },
+  ],
+  ['sales-tax.payments.action', 'void', { action: 'void' }],
+  ['pay-liabilities.checks.action', 'void with extras', { action: 'void', reason: 'x' }],
+  ['currencies.fx-adjustment', 'a loss as a number', { accountId: ID, amount: 12.5, gain: false, date: '2026-03-01', memo: null }],
+  ['assemblies.replace', 'no components (clears the list)', { assemblyItemId: ID }],
+  ['assemblies.replace', 'a row the service refuses in its own words', { assemblyItemId: ID, components: [{ componentItemId: '', quantity: null }] }],
+  ['assemblies.update', 'components of the wrong type', { assemblyItemId: ID, components: 'x' }],
+  ['assemblies.pending.create', 'a memo of any type', { assemblyItemId: ID, quantity: '2', date: '2026-03-01', memo: 5 }],
+  [
+    'fifo.adjust',
+    'receive with site fields of any type',
+    { action: 'receive', itemId: ID, quantity: 5, unitCost: '2.50', date: '2026-03-01', siteId: 3, serialNumbers: 'x', lotExpiration: 7, classId: '', memo: null },
+  ],
+  ['fifo.adjust', 'consume with a quantity the route turns into text', { action: 'consume', itemId: ID, quantity: [5], date: '2026-03-01' }],
+  ['fifo.adjust', 'consume with a quantity of any type', { action: 'consume', itemId: ID, quantity: { n: 1 }, date: '2026-03-01', adjustmentAccountId: 4 }],
+  ['inventory-transfers.action', 'void', { action: 'void' }],
+  ['landed-cost.action', 'void', { action: 'void' }],
+  ['invoices.post-draft', 'no flags', {}],
+  ['invoices.post-draft', 'a body that is not an object', null],
+  ['invoices.post-draft', 'a list as the body', [1, 2]],
+  ['invoices.post-draft', 'flags that are not exactly true', { overrideCreditLimit: 'yes', allowOverBilling: 1 }],
+  ['print-queue.refunds.add', 'a memo of any type', { entryId: ID, memo: 5 }],
+  ['ai.posts.undo', 'undo', { action: 'undo', id: 'any-text' }],
+  ['errors.apply', 'only the correction', { correctionId: ID }],
+  ['errors.apply', 'approved of any type, no entry', { correctionId: ID, approved: 'yes', entry: null }],
+  [
+    'errors.apply',
+    'an edited entry with loosely read line fields',
+    { correctionId: ID, approved: true, entry: { date: '2026-03-01', description: 'Fix', lines: [{ accountId: ID, debit: 5, credit: {}, memo: 3, entityType: 'x', entityId: 4 }] } },
+  ],
+  ['bank-accounts.create', 'nothing (the service says what is missing)', {}],
+  ['bank-accounts.create', 'fields of any type', { bankName: 5, accountId: 'x', accountNumber: 7 }],
+  ['demo-feed', 'a bank account', { bankAccountId: ID }],
+  ['billing-groups.create', 'nothing (the service says what is missing)', {}],
+  ['billing-groups.create', 'fields of any type', { name: 5, customerIds: 'x' }],
+  ['billing-groups.update', 'customers to add of any type', { addCustomerIds: [1], name: null }],
+  ['custom-fields.values', 'values of any type', { entity: 'item', id: ID, values: { Region: 5, Other: null, Size: { a: 1 } } }],
+  ['customer-prices.create', 'nothing (the service says what is missing)', {}],
+  ['customer-prices.create', 'fields of any type', { customerId: 5, itemId: 'x', price: 'abc' }],
+  ['lists.action', 'nothing (the service says what is missing)', {}],
+  ['lists.action', 'a body that is not an object', 5],
+  ['lists.action', 'fields the list schema refuses in its own words', { name: '', netDays: 'x', kind: 'weird', taxable: 'yes', code: 'TOOLONG', address: 'x' }],
+  ['sales-forms.flags.update', 'no flags', {}],
+  ['sales-forms.flags.update', 'flags that are not true or false', { toBePrinted: 'yes', toBeEmailed: 1 }],
+  ['sales-reps.create', 'a rate and an email the service checks', { name: 'Pat Lee', email: 'not-an-email', commissionRate: 'x' }],
+  ['sales-reps.update', 'nothing', {}],
+  ['sales-reps.update', 'a numeric rate the service refuses in its own words', { commissionRate: 5 }],
+  ['sales-reps.update', 'a null email and a null rate (clears the email, sets the rate to 0)', { name: 'Pat Lee', email: null, commissionRate: null }],
+  ['sales-reps.assign', 'a rep id of any type', { invoiceId: ID, salesRepId: 5 }],
+  ['sales-reps.assign', 'no rep (takes it off)', { invoiceId: ID }],
+];
+
+describe('operation schemas: the routes that read their body by hand (wave 4)', () => {
+  const byId = (id: string) => allOperations().find((o) => o.id === id);
+
+  it('each of them names its schema, which loads and is described', async () => {
+    const problems: string[] = [];
+    for (const [id, ref] of HAND_READ_ROUTES) {
+      const op = byId(id);
+      if (!op) {
+        problems.push(`${id}: not in the registry`);
+        continue;
+      }
+      if (op.bodySchema !== ref) problems.push(`${id}: body schema ${op.bodySchema}, expected ${ref}`);
+      const body = (await describeSchemas(op)).body as Record<string, unknown> | null;
+      if (!body || body.type !== 'object') problems.push(`${id}: no object body schema`);
+    }
+    expect(problems).toEqual([]);
+  });
+
+  it.each(STILL_ACCEPTED)('%s accepts what its route took before: %s', async (id, _what, body) => {
+    const op = byId(id);
+    expect(op, id).toBeDefined();
+    const schema = await loadBodySchema(op!);
+    const parsed = schema!.safeParse(body);
+    expect(parsed.success, JSON.stringify(parsed.success ? null : parsed.error.issues)).toBe(true);
+  });
+
+  it('still refuses a value the service could never use, where the route checks the field itself', async () => {
+    const refused: Array<[string, unknown]> = [
+      ['currencies.fx-adjustment', { accountId: ID, amount: '5', gain: 'true', date: '2026-03-01' }],
+      ['fifo.adjust', { action: 'receive', itemId: ID, quantity: [5], unitCost: '1', date: '2026-03-01' }],
+      ['assemblies.pending.create', { assemblyItemId: 7, quantity: '1', date: '2026-03-01' }],
+      ['landed-cost.action', { action: 'edit' }],
+    ];
+    for (const [id, body] of refused) {
+      const schema = await loadBodySchema(byId(id)!);
+      expect(schema!.safeParse(body).success, id).toBe(false);
+    }
+  });
+
+  it('sales-reps.update says what the route does with each field, and refuses the null name the service cannot read', async () => {
+    const op = byId('sales-reps.update')!;
+    const schema = await loadBodySchema(op);
+    // The service calls name.trim() on it: the route answered 500. Now a 400 that says what to do.
+    const nullName = schema!.safeParse({ name: null });
+    expect(nullName.success).toBe(false);
+    expect(nullName.success ? '' : nullName.error.issues[0].message).toMatch(/leave the name out/);
+    // The route hands the service every field, so an email left out is cleared: the text says so.
+    const fields = ((await describeSchemas(op)).body as { properties: Record<string, { description?: string }> }).properties;
+    expect(fields.email.description).toMatch(/leaving it out, or sending null or empty text, clears it/);
+    expect(fields.email.description).not.toMatch(/leave out to keep/i);
+    expect(fields.commissionRate.description).toMatch(/null sets it to 0/);
+  });
+
+  it('the inventory cogs quantity is read as the route reads it (String), so [5] is taken as before', async () => {
+    const op = byId('inventory.adjust')!;
+    expect(op.bodySchema).toBe('@/lib/validation/inventory#inventoryActionSchema');
+    const schema = await loadBodySchema(op);
+    expect(schema!.safeParse({ action: 'cogs', itemId: ID, quantity: [5], date: '2026-03-01' }).success).toBe(true);
+    // Still required: the route refuses a missing one first, and the description says it is needed.
+    expect(schema!.safeParse({ action: 'cogs', itemId: ID, date: '2026-03-01' }).success).toBe(false);
+    const described = (await describeSchemas(op)).body as Record<string, unknown>;
+    const branches = [...((described.anyOf ?? described.oneOf ?? []) as Array<Record<string, unknown>>)];
+    const cogs = branches.find((b) => JSON.stringify(b.properties ?? {}).includes('"const":"cogs"'));
+    expect(cogs, JSON.stringify(described).slice(0, 300)).toBeDefined();
+    expect(cogs!.required).toEqual(expect.arrayContaining(['quantity']));
   });
 });

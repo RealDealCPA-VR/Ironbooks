@@ -27,6 +27,7 @@ import {
   RESTART_GRACE_MS,
   START_ENV,
   UPDATE_GRACE_MS,
+  UPDATE_MAYBE_MESSAGE,
   UPDATE_OPERATION,
   UPDATING_MESSAGE,
   WAITS_BUSY_CODE,
@@ -241,6 +242,15 @@ describe('what the agent is told when Ironbooks says no', () => {
         return;
       }
       const retry = url.searchParams.get('retry');
+      // The door's own answer to too many calls: the wait in the body as well (contract wave 4).
+      if (url.searchParams.get('body') === 'door') {
+        res.writeHead(429, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'Too many calls.', code: 'RATE_LIMITED', details: { retryAfterSeconds: 7 } }));
+        return;
+      }
+      if (url.searchParams.get('body') === 'answer') {
+        res.writeHead(429, { 'content-type': 'application/json' }).end(JSON.stringify({ operation: 'x.y', outcome: 'refused', note: 'Wait a moment.', retryAfterSeconds: 9 }));
+        return;
+      }
       res
         .writeHead(429, { 'content-type': 'application/json', ...(retry ? { 'retry-after': retry } : {}) })
         .end(JSON.stringify({ error: 'You are already waiting on 4 requests at once.', code: 'RATE_LIMITED', details: { waitsAtOnce: 4 } }));
@@ -257,6 +267,9 @@ describe('what the agent is told when Ironbooks says no', () => {
       expect((await failure(c.get('/api/agent/requests/r-1', { retry: '99999' }))).retryAfter).toBe(3600);
       // The lane a wait used is free again after a refusal.
       expect((await failure(c.get('/api/agent/requests/r-1', { wait: 50 }, { wait: true }))).code).toBe('RATE_LIMITED');
+      // No Retry-After: the wait the answer itself gives, the door's details or an answer's retryAfterSeconds.
+      expect(await failure(c.get('/api/agent/requests/r-1', { body: 'door' }))).toMatchObject({ status: 429, retryAfter: 7, message: 'Too many calls.' });
+      expect(await failure(c.get('/api/agent/requests/r-1', { body: 'answer' }))).toMatchObject({ status: 429, retryAfter: 9, message: 'Wait a moment.' });
     } finally {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -632,9 +645,14 @@ describe('when Ironbooks restarts (a company file switched or restored, an updat
       c.noteRequest({ id: 'req-other', operation: 'invoices.create', status: 'pending' }); // not a restart: ignored
       await before.close();
       fs.rmSync(endpointFile(), { force: true });
-      expect((await failure(c.get('/api/accounts'))).message).toBe(UPDATING_MESSAGE);
-      // Longer than a plain restart is waited out: still not started, still told it is updating.
+      // Still waiting for a person as far as the connector knows: it may be installing, or not.
+      expect((await failure(c.get('/api/accounts'))).message).toBe(UPDATE_MAYBE_MESSAGE);
+      // Longer than a plain restart is waited out: still not started.
       await new Promise((r) => setTimeout(r, 250));
+      expect((await failure(c.get('/api/accounts'))).message).toBe(UPDATE_MAYBE_MESSAGE);
+      expect(started).toBe(0);
+      // Heard to be approved (wait_for_decision, while Ironbooks is away): now it is installing it.
+      c.noteRequest({ id: 'req-update', operation: UPDATE_OPERATION, status: 'approved', decidedAt: new Date().toISOString() });
       expect((await failure(c.get('/api/accounts'))).message).toBe(UPDATING_MESSAGE);
       expect(started).toBe(0);
       // The person denied it after all: the silence is not an update, and the usual rule applies.
@@ -643,6 +661,11 @@ describe('when Ironbooks restarts (a company file switched or restored, an updat
       expect(started).toBe(1);
       expect(UPDATING_MESSAGE).toMatch(/several minutes/);
       expect(UPDATING_MESSAGE).toMatch(/Nothing was sent/);
+      // While nobody may have approved it, the agent is not told it is installing: it says both.
+      expect(UPDATE_MAYBE_MESSAGE).not.toMatch(/most likely because it is installing/);
+      expect(UPDATE_MAYBE_MESSAGE).toMatch(/If a person has approved the update you asked for since you last checked, Ironbooks is installing it/);
+      expect(UPDATE_MAYBE_MESSAGE).toMatch(/otherwise it may be restarting, or it was closed/);
+      expect(UPDATE_MAYBE_MESSAGE).toMatch(/Nothing was sent/);
     } finally {
       await before.close();
     }
@@ -681,56 +704,120 @@ describe('when Ironbooks restarts (a company file switched or restored, an updat
       fs.rmSync(endpointFile(), { force: true });
       setTimeout(() => writeEndpoint(app.port), 100);
       expect(await c.get('/api/accounts')).toEqual({ ok: true });
-      const grace = () => (c as unknown as { _grace: () => { graceMs: number; update: boolean } })._grace();
-      expect(grace()).toEqual({ graceMs: 100, update: false });
+      const grace = () => (c as unknown as { _grace: () => { graceMs: number; update: boolean; updateApproved: boolean } })._grace();
+      expect(grace()).toEqual({ graceMs: 100, update: false, updateApproved: false });
       // Reading that request again later (list_my_requests says executed) does not bring it back.
       c.noteRequest({ id: 'req-update-2', operation: UPDATE_OPERATION, status: 'executed' });
-      expect(grace()).toEqual({ graceMs: 100, update: false });
+      expect(grace()).toEqual({ graceMs: 100, update: false, updateApproved: false });
     } finally {
       await first.close();
     }
   });
 
   it('an approved restart counts from when it was approved: one approved long ago, read again after the connector started, explains nothing', () => {
-    type Grace = { graceMs: number; update: boolean };
+    type Grace = { graceMs: number; update: boolean; updateApproved: boolean };
     const c = client({ startApp: null, restartGraceMs: 100, updateGraceMs: 60_000 });
     const inside = c as unknown as { _grace: () => Grace; restarts: Map<string, { approvedAt: number | null }>; restartsOver: Set<string> };
     const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
     // Yesterday's executed update, listed by list_my_requests: over long ago, not "installing now".
     c.noteRequest({ id: 'old-update', operation: UPDATE_OPERATION, status: 'executed', decidedAt: ago(24 * 60 * 60_000) });
-    expect(inside._grace()).toEqual({ graceMs: 100, update: false });
+    expect(inside._grace()).toEqual({ graceMs: 100, update: false, updateApproved: false });
     expect(inside.restartsOver.has('old-update')).toBe(true);
     // Read again, with or without its time: still over.
     c.noteRequest({ id: 'old-update', operation: UPDATE_OPERATION, status: 'executed' });
-    expect(inside._grace()).toEqual({ graceMs: 100, update: false });
+    expect(inside._grace()).toEqual({ graceMs: 100, update: false, updateApproved: false });
     // Approved a minute ago: it counts, from when it was approved, not from when it was heard of.
     const before = Date.now();
     c.noteRequest({ id: 'new-update', operation: UPDATE_OPERATION, status: 'approved', decidedAt: ago(60_000) });
-    expect(inside._grace()).toEqual({ graceMs: 60_000, update: true });
+    expect(inside._grace()).toEqual({ graceMs: 60_000, update: true, updateApproved: true });
     expect(inside.restarts.get('new-update')!.approvedAt!).toBeLessThanOrEqual(before - 60_000 + 1_000);
     // A first of two approvals leaves it pending, with a time: it has not restarted anything yet.
     c.noteRequest({ id: 'two-people', operation: 'shell.company.switch', status: 'pending', decidedAt: ago(1_000), expiresAt: new Date(Date.now() + 60_000).toISOString() });
     expect(inside.restarts.get('two-people')!.approvedAt).toBeNull();
   });
 
+  it('an approval the connector hears of only after Ironbooks came back from it explains no later silence', async () => {
+    type Grace = { graceMs: number; update: boolean; updateApproved: boolean };
+    const plain: Grace = { graceMs: 100, update: false, updateApproved: false };
+    const first = await stub();
+    try {
+      writeEndpoint(first.port);
+      const c = client({ startApp: null, reconnectWaitMs: 2000, restartGraceMs: 100, updateGraceMs: 60_000, ...quick });
+      const inside = c as unknown as { _grace: () => Grace; restarts: Map<string, unknown>; restartsOver: Set<string> };
+      await c.get('/api/accounts');
+      // run_operation asked for the update: the connector knows it only as waiting.
+      c.noteRequest({ id: 'req-update', operation: UPDATE_OPERATION, status: 'pending' });
+      // A person approves it; Ironbooks installs it and is back, and the connector sees it come back.
+      const approvedAt = new Date(Date.now() - 1_000).toISOString();
+      await first.close();
+      fs.rmSync(endpointFile(), { force: true });
+      setTimeout(() => writeEndpoint(app.port), 100);
+      expect(await c.get('/api/accounts')).toEqual({ ok: true });
+      // Only now does wait_for_decision read it as executed, approved before Ironbooks came back: over.
+      c.noteRequest({ id: 'req-update', operation: UPDATE_OPERATION, status: 'executed', decidedAt: approvedAt });
+      expect(inside._grace()).toEqual(plain);
+      expect(inside.restartsOver.has('req-update')).toBe(true);
+      // One approved after Ironbooks came back still counts: that restart has not happened yet.
+      await new Promise((r) => setTimeout(r, 5));
+      c.noteRequest({ id: 'req-switch', operation: 'shell.company.switch', status: 'approved', decidedAt: new Date().toISOString() });
+      expect(inside.restarts.has('req-switch')).toBe(true);
+      expect(inside.restartsOver.has('req-switch')).toBe(false);
+      c.noteRequest({ id: 'req-update-2', operation: UPDATE_OPERATION, status: 'approved', decidedAt: new Date().toISOString() });
+      expect(inside._grace()).toEqual({ graceMs: 60_000, update: true, updateApproved: true });
+    } finally {
+      await first.close();
+    }
+  });
+
+  it('a new run of Ironbooks counts as having come back, even when nothing was sent while it was away', async () => {
+    type Grace = { graceMs: number; update: boolean; updateApproved: boolean };
+    const first = await stub();
+    const second = await stub();
+    const NEW_CHECK = 'cd'.repeat(32);
+    second.check = NEW_CHECK;
+    try {
+      writeEndpoint(first.port);
+      const c = client({ startApp: null, restartGraceMs: 100, updateGraceMs: 60_000, ...quick });
+      const inside = c as unknown as { _grace: () => Grace };
+      await c.get('/api/accounts');
+      c.noteRequest({ id: 'req-update', operation: UPDATE_OPERATION, status: 'pending' });
+      const approvedAt = new Date(Date.now() - 1_000).toISOString();
+      // Ironbooks was updated and started again while the agent sent nothing: a new run, with a new value in its file.
+      await first.close();
+      writeEndpoint(second.port, { check: NEW_CHECK });
+      expect(await c.get('/api/accounts')).toEqual({ ok: true });
+      c.noteRequest({ id: 'req-update', operation: UPDATE_OPERATION, status: 'executed', decidedAt: approvedAt });
+      expect(inside._grace()).toEqual({ graceMs: 100, update: false, updateApproved: false });
+      // The same run answering again is no restart: an update approved now still counts.
+      await new Promise((r) => setTimeout(r, 5));
+      await c.get('/api/accounts');
+      c.noteRequest({ id: 'req-update-2', operation: UPDATE_OPERATION, status: 'approved', decidedAt: new Date().toISOString() });
+      await c.get('/api/accounts');
+      expect(inside._grace()).toEqual({ graceMs: 60_000, update: true, updateApproved: true });
+    } finally {
+      await first.close();
+      await second.close();
+    }
+  });
+
   it('a restart request still waiting counts only until it expires', async () => {
-    type Grace = { graceMs: number; update: boolean };
+    type Grace = { graceMs: number; update: boolean; updateApproved: boolean };
     const c = client({ startApp: null, restartGraceMs: 100, updateGraceMs: 60_000, pendingRestartKeepMs: 80 });
     const inside = c as unknown as { _grace: () => Grace; restarts: Map<string, unknown> };
     // Expired already: nobody can approve it, so it explains no silence.
     c.noteRequest({ id: 'gone', operation: UPDATE_OPERATION, status: 'pending', expiresAt: new Date(Date.now() - 1_000).toISOString() });
     expect(inside.restarts.has('gone')).toBe(false);
-    expect(inside._grace()).toEqual({ graceMs: 100, update: false });
+    expect(inside._grace()).toEqual({ graceMs: 100, update: false, updateApproved: false });
     // Still waiting, until the time its view gives.
     c.noteRequest({ id: 'waiting', operation: UPDATE_OPERATION, status: 'pending', expiresAt: new Date(Date.now() + 60_000).toISOString() });
-    expect(inside._grace()).toEqual({ graceMs: 60_000, update: true });
+    expect(inside._grace()).toEqual({ graceMs: 60_000, update: true, updateApproved: false });
     // Heard of with no time (run_operation's "asked"): kept PENDING_RESTART_KEEP_MS at most.
     const d = client({ startApp: null, restartGraceMs: 100, updateGraceMs: 60_000, pendingRestartKeepMs: 80 });
     const dIn = d as unknown as { _grace: () => Grace };
     d.noteRequest({ id: 'asked', operation: UPDATE_OPERATION, status: 'pending' });
-    expect(dIn._grace()).toEqual({ graceMs: 60_000, update: true });
+    expect(dIn._grace()).toEqual({ graceMs: 60_000, update: true, updateApproved: false });
     await new Promise((r) => setTimeout(r, 120));
-    expect(dIn._grace()).toEqual({ graceMs: 100, update: false });
+    expect(dIn._grace()).toEqual({ graceMs: 100, update: false, updateApproved: false });
     // The documented bound: seven days, how long a request waits by default.
     expect(PENDING_RESTART_KEEP_MS).toBe(7 * 24 * 60 * 60_000);
     expect(PENDING_RESTART_KEEP_MS).toBe(DEFAULT_REQUEST_EXPIRY_DAYS * 24 * 60 * 60_000);

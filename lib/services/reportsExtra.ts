@@ -2782,8 +2782,24 @@ export async function transactionDetail(
         : sql`(${journalEntries.description} ILIKE ${like} OR ${journalEntryLines.memo} ILIKE ${like} OR ${journalEntries.sourceRef} ILIKE ${like})`,
     );
   }
-  // Matched in code: read past the lines the memo check may drop (the General Ledger's scan cap).
-  const readCap = shownMemoSearch ? Math.max(limit + 1, GL_LIMITS.postFilterScan) : limit + 1;
+  // Matched in code: the check below can drop only a line whose memo the mask may change and that
+  // matched nothing else (its description or source), so the read goes that many lines past the
+  // limit, never past the General Ledger's scan cap. Such memos are few ("Acct # …"): a broad search
+  // ("rent") reads about what it read before the mask, not the whole scan cap every time.
+  let readCap = limit + 1;
+  let capped = false;
+  if (shownMemoSearch) {
+    const [counted] = await ctx.db
+      .select({ n: sql<number>`COUNT(*)` })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(and(...conds, memoMayHoldAccountNumber(), sql`NOT COALESCE(${otherHit}, false)`));
+    const wanted = limit + 1 + Number(counted?.n ?? 0);
+    const most = Math.max(limit + 1, GL_LIMITS.postFilterScan);
+    capped = wanted > most;
+    readCap = Math.min(wanted, most);
+  }
 
   const read = await ctx.db
     .select({
@@ -2819,7 +2835,8 @@ export async function transactionDetail(
       })
     : read;
 
-  const truncated = lineRows.length > limit || (shownMemoSearch && read.length >= readCap);
+  // Past the limit, or the read stopped at the scan cap with lines it may have left unread.
+  const truncated = lineRows.length > limit || (capped && read.length >= readCap);
   const slice = truncated ? lineRows.slice(0, limit) : lineRows;
 
   let running = Money.zero();

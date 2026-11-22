@@ -12,16 +12,33 @@
  *    goes whole ("(on: {enabled})", "(to {to} when given)");
  *  - each value is cut to 60 characters, and line breaks, control characters and invisible marks
  *    (a U+202E mark reverses what follows it, so "Invoice<U+202E>fdp.exe" reads as "Invoiceexe.pdf") are removed;
- *    a list shows as many whole items as fit and then "and N more", so none is hidden unsaid; an
- *    email address too long to show keeps where it goes whole, its "@" and domain or the "<addr>"
- *    of "Name<addr>" (the middle of the name before "@", or the end of the display name, is cut);
- *    a server name shows in full (see below); a line too long for 200 characters cuts its values
+ *    a list shows as many whole items as fit and then "and N more", so none is hidden unsaid;
+ *  - the recipients of an email are never hidden (RECIPIENTS below): every one shows. A plain
+ *    address shows with its domain whole and in small letters (the mailer treats "ACME.COM" as
+ *    "acme.com", and "paypaI.com" with a capital i reads as what it is: "paypai.com"); when the line
+ *    is short of room only the middle of the part before "@" is cut ("accounts…payable@acme.com"),
+ *    never the domain, and never "and N more": past that the line is left long and wraps on the
+ *    card. Any other recipient text (an address on file the route's answer names) shows as written
+ *    and not in small letters, whole when it holds an "@" (recipientItems). guardInput takes only
+ *    plain addresses from an agent (lib/agent/guards.ts
+ *    RECIPIENT_FIELDS), so what shows is what the mailer reads;
+ *  - a file path keeps its start and its whole file name, and is cut in the middle
+ *    ("C:\Users\…\Backups\Books backup.ironbooks"): its end says where a file goes. Its start is
+ *    the drive or the share, with the server, also when written as a device path
+ *    ("\\?\UNC\server\share\"), and is never cut or masked. Its "." and ".." folders are resolved
+ *    first ("C:\a\…\..\..\Public\x" is shown as the C:\Public\x it is), and a path that cannot be
+ *    resolved for sure is shown whole (resolvedPath). guardInput takes only plain paths from an
+ *    agent (lib/agent/guards.ts pathRefusal), so a cut never leaves out what decides where it goes;
+ *  - a server name shows in full (see below); a line too long for 200 characters cuts its values
  *    shorter before it cuts its own words, and, as a last resort, its own words before its values;
  *  - passwords and keys never show, SSNs and account numbers show masked, and so does an account
- *    number inside any text ("Acct # ••••6789"); an email address is recognised before that, on
- *    the text as written and in the shape the app's senders take one (any mark but a space, ","
- *    or ";", exactly one "@"), and shows as it is, domain and all ("billing.acct#7'x@evil.com" is
- *    an address at evil.com, not an account number), and a server name is never masked;
+ *    number inside any text ("Acct # ••••6789"); an email address is recognised before that and
+ *    shows as it is ("billing.acct#7@evil.com" is an address at evil.com, not an account number),
+ *    and a server name is never masked;
+ *  - a record is named the way a person knows it where the door says how (`names`: a role's name
+ *    for its id), or where the route's own answer names the record the request is about;
+ *  - making or changing a memorized transaction lists its next three dates (plan §8, Recurring),
+ *    worked out by the rules of lib/services/recurring.ts;
  *  - the values show exactly as rendered: the tidying of what a missing value leaves ("()", a
  *    dangling "to") is done on the template's own words only;
  *  - what the route did beats what the agent wrote: when the answer holds a value, it wins over a
@@ -46,12 +63,30 @@
  */
 import type { DescribeRequest, OperationInput } from './contract';
 import { amountShown } from './facts';
-import { cleanText, emailAddressParts, hostShownInFull, maskAccountsInText, maskedForDisplay, protectedKindOf, valuesAt, type EmailAddressParts } from './guards';
+import {
+  DEVICE_PATH_PREFIX,
+  DOTS_ONLY_FOLDER,
+  RECIPIENT_FIELDS,
+  cleanText,
+  hostShownInFull,
+  maskAccountsInText,
+  maskedForDisplay,
+  pathField,
+  plainAddress,
+  protectedKindOf,
+  recipientFieldName,
+  valuesAt,
+} from './guards';
 import type { Operation } from './operations/types';
 
 /** Longest a filled-in value may be, and the whole line. */
 export const DESCRIBE_VALUE_MAX = 60;
 export const DESCRIBE_LINE_MAX = 200;
+/**
+ * Longest a file path shows before its middle is cut. Longer than other values: the folder and the
+ * file name say where a file goes, and a person approves where every company's books are copied.
+ */
+export const DESCRIBE_PATH_MAX = 120;
 
 /**
  * What the line shows in place of a figure when none can be shown (facts.ts amountShown): the
@@ -60,7 +95,15 @@ export const DESCRIBE_LINE_MAX = 200;
  */
 export const AMOUNT_UNREADABLE_TEXT = 'an unknown amount';
 
-const PLACEHOLDER = /^\{([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)\}$/;
+/**
+ * The name a person knows a record by, by its id, as the door read it from the books before the
+ * run: { "<role id>": "Clerk", "<invoice id>": "1042" }. A value that is one of these ids shows as
+ * its name. Optional: without it a line shows the id (or the name the route's own answer gives).
+ */
+export type DescribeNames = Readonly<Record<string, string>>;
+
+/** A placeholder: dotted names, "*" for every element of a list (only the clauses below use it). */
+const PLACEHOLDER = /^\{([A-Za-z0-9_]+(?:\.(?:[A-Za-z0-9_]+|\*))*)\}$/;
 
 /**
  * Routes with a body whose handler reads these placeholders from its query string instead (read
@@ -89,6 +132,47 @@ export const SECRET_GOES_TO: Readonly<Record<string, { placeholder: string; clau
   'POST /api/email/test': { placeholder: '{draft.host}', clause: ' through {draft.host}' },
   'PUT /api/email/settings': { placeholder: '{host}', clause: ' (mail server {host})' },
 });
+
+/**
+ * Per operation that sends email, the recipients the line shows beyond its template's own words:
+ *  - `answer`: where the route's answer says whom it sent to, when that is not under the same name
+ *    (the statement email answers { to } for the address it took from body.email; a collection
+ *    email and the Send Forms queue list each recipient in `sent`, the address on file included).
+ *    What the route did beats what the agent wrote, as for every other value;
+ *  - `clause`: added when the template does not name the recipients at all (the queue's own
+ *    recipients, the mail set-up's copies and reply address, which every later email uses).
+ * Every field of guards.ts RECIPIENT_FIELDS is on the line, by its template or by a clause here
+ * (describe.test.ts holds the two together).
+ */
+export const RECIPIENTS_SHOWN: Readonly<Record<string, ReadonlyArray<{ placeholder: string; answer?: string; clause?: string }>>> = Object.freeze({
+  'POST /api/sales-forms/statement-email': [{ placeholder: 'email', answer: 'to' }],
+  'POST /api/collections/email': [{ placeholder: 'to', answer: 'sent.*.to' }],
+  'POST /api/sales-forms/queue': [{ placeholder: 'items.*.to', answer: 'sent.*.to', clause: ' (to {items.*.to})' }],
+  'PUT /api/email/settings': [
+    { placeholder: 'bcc', clause: ' (a copy of every email to {bcc})' },
+    { placeholder: 'replyTo', clause: ' (replies to {replyTo})' },
+  ],
+});
+
+/**
+ * Operations that make or change a memorized transaction, and where the route's answer holds the
+ * template row (the schedule as saved: frequency, nextRunDate, anchorDay, remaining, mode,
+ * isActive). Their line ends with the next three dates (RUN_DATES). `fromBody`: before its dry run
+ * (no answer yet) the dates can be worked out from the body alone, because the body is the whole
+ * schedule (a new one, anchored as createTemplate anchors it). A change cannot: updateTemplate
+ * keeps the stored day of the month (a template on the 31st, moved to 2027-02-28, runs on 03-31,
+ * not 03-28), the stored mode and the stored count left, none of which the body holds, so its
+ * line shows no dates until the dry run's answer says what was saved.
+ */
+export const RECURRING_SCHEDULES: Readonly<Record<string, { answer: string | null; fromBody: boolean }>> = Object.freeze({
+  'POST /api/recurring': { answer: null, fromBody: true },
+  'PATCH /api/recurring/[id]': { answer: null, fromBody: false },
+  // { template } (lib/services/aiRecurring.ts memorizeSuggestion through createTemplate).
+  'POST /api/ai/recurring': { answer: 'template', fromBody: true },
+});
+
+/** The placeholder the run dates fill (not a field of any body). */
+const RUN_DATES = '__runDates';
 
 /** A server name says where it goes: it shows in full when it can, and otherwise keeps its end. */
 const HOST_NAMES = /^(?:host|hostname|smtpHost|server)$/i;
@@ -141,6 +225,12 @@ function bodyFields(operation: Operation, input: OperationInput): unknown {
   return undefined;
 }
 
+/** Every value a dotted name with a "*" names, or the first one of a plain name. */
+function pick(root: unknown, name: string): unknown {
+  const values = valuesAt(root, name);
+  return name.includes('*') ? values.filter((v) => !absent(v)) : first(values);
+}
+
 /** The raw value for one placeholder, from the one place the route reads it (or the route's answer, which beats it). */
 function lookup(operation: Operation, input: OperationInput, answer: unknown, name: string): unknown {
   if (operation.amountField && name === operation.amountField) {
@@ -167,13 +257,180 @@ function lookup(operation: Operation, input: OperationInput, answer: unknown, na
     if (Object.prototype.hasOwnProperty.call(query, name)) chosen = query[name];
   } else {
     const fields = bodyFields(operation, input);
-    if (fields !== undefined) chosen = first(valuesAt(fields, name));
+    if (fields !== undefined) chosen = pick(fields, name);
   }
   if (answer !== undefined) {
-    const done = first(valuesAt(answer, name));
+    // Where the route says whom it sent to under another name (RECIPIENTS_SHOWN), that is read.
+    const alias = (RECIPIENTS_SHOWN[routeKey(operation)] ?? []).find((r) => r.placeholder === name)?.answer;
+    const done = pick(answer, alias ?? name);
     if (!absent(done) && asText(done) !== asText(chosen)) return done;
   }
   return chosen;
+}
+
+/** `raw` with every id the door named shown as its name (DescribeNames). */
+function withNames(raw: unknown, names: DescribeNames | undefined): unknown {
+  if (!names) return raw;
+  const one = (v: unknown): unknown => {
+    if (typeof v !== 'string') return v;
+    const key = v.trim();
+    const named = Object.prototype.hasOwnProperty.call(names, key) ? names[key] : undefined;
+    return typeof named === 'string' && named.trim() !== '' ? named : v;
+  };
+  return Array.isArray(raw) ? raw.map(one) : one(raw);
+}
+
+/**
+ * The record's name from the route's own answer, for the route's own [id]: the answer is that
+ * record ({ id, name, … }, as a role's change answers), so "Change what role <id> allows" reads
+ * "Change what role Clerk allows". Not when the request renames it (a name field in its body): the
+ * answer then holds the new name, and the line would read as another record; the id stays.
+ */
+function nameFromAnswer(operation: Operation, input: OperationInput, answer: unknown, name: string, raw: unknown): unknown {
+  if (name !== 'id' || !Array.isArray(operation.params) || !operation.params.includes('id') || typeof raw !== 'string') return raw;
+  if (!isPlainObject(answer) || answer.id !== raw) return raw;
+  const named = answer.name;
+  if (typeof named !== 'string' || cleanText(named, Number.POSITIVE_INFINITY) === '') return raw;
+  const fields = bodyFields(operation, input);
+  if (isPlainObject(fields) && Object.keys(fields).some((k) => /name$/i.test(k))) return raw;
+  return named;
+}
+
+// ---------------------------------------------------------------------------
+// The next dates of a memorized transaction (the rules of lib/services/recurring.ts)
+// ---------------------------------------------------------------------------
+//
+// A copy of recurring.ts's schedule helpers (advanceDate, storedAnchorFor, scheduleAnchor), which
+// sit in a module that opens the database: describe stays pure. describe.test.ts holds this copy
+// against recurring.ts projectOccurrences for every frequency and many start dates. Dates are at
+// UTC midnight, as the service stores them, and all the arithmetic uses the UTC calendar.
+
+const FREQUENCY_DAYS: Readonly<Record<string, number>> = { daily: 1, weekly: 7, biweekly: 14, every_four_weeks: 28 };
+const FREQUENCY_MONTHS: Readonly<Record<string, number>> = { monthly: 1, bimonthly: 2, quarterly: 3, semiannually: 6, yearly: 12 };
+
+function lastDayOfMonth(y: number, m: number): number {
+  return new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+}
+
+function monthDayAnchor(date: Date, anchorDay: number | null | undefined): number {
+  const day = date.getUTCDate();
+  if (anchorDay == null || !Number.isInteger(anchorDay) || anchorDay < 1 || anchorDay > 31) return day;
+  return Math.min(anchorDay, lastDayOfMonth(date.getUTCFullYear(), date.getUTCMonth())) === day ? anchorDay : day;
+}
+
+function addMonthsClamped(date: Date, months: number, anchorDay?: number | null): Date {
+  const d = new Date(date);
+  const dayOfMonth = monthDayAnchor(d, anchorDay);
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth() + months);
+  d.setUTCDate(Math.min(dayOfMonth, lastDayOfMonth(d.getUTCFullYear(), d.getUTCMonth())));
+  return d;
+}
+
+function validAnchor(anchorDay: number | null | undefined): number | null {
+  return anchorDay != null && Number.isInteger(anchorDay) && anchorDay >= 1 && anchorDay <= 15 ? anchorDay : null;
+}
+
+function semimonthlyAnchor(date: Date): number {
+  const dayOfMonth = date.getUTCDate();
+  if (dayOfMonth <= 15) return dayOfMonth;
+  if (dayOfMonth === lastDayOfMonth(date.getUTCFullYear(), date.getUTCMonth()) && dayOfMonth < 30) return 15;
+  return Math.min(dayOfMonth - 15, 15);
+}
+
+function inSemimonthlyPair(date: Date, anchor: number): boolean {
+  const dayOfMonth = date.getUTCDate();
+  const last = lastDayOfMonth(date.getUTCFullYear(), date.getUTCMonth());
+  return dayOfMonth === Math.min(anchor, last) || dayOfMonth === Math.min(anchor + 15, last);
+}
+
+/** The anchor createTemplate / updateTemplate store for a schedule starting on `date`. */
+function storedAnchorFor(date: Date, frequency: string, stored: number | null | undefined): number {
+  if (FREQUENCY_MONTHS[frequency] !== undefined) return monthDayAnchor(date, stored);
+  const keep = validAnchor(stored);
+  return keep != null && inSemimonthlyPair(date, keep) ? keep : semimonthlyAnchor(date);
+}
+
+function scheduleAnchor(frequency: string, anchorDay: number | null | undefined, date: Date): number | null {
+  if (frequency === 'semimonthly') return validAnchor(anchorDay) ?? semimonthlyAnchor(date);
+  return anchorDay ?? null;
+}
+
+function advanceDate(date: Date, frequency: string, anchorDay: number | null): Date | null {
+  const days = FREQUENCY_DAYS[frequency];
+  if (days !== undefined) {
+    const d = new Date(date);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d;
+  }
+  if (frequency === 'semimonthly') {
+    const y = date.getUTCFullYear();
+    const m = date.getUTCMonth();
+    const dayOfMonth = date.getUTCDate();
+    if (dayOfMonth <= 15) return new Date(Date.UTC(y, m, Math.min(dayOfMonth + 15, lastDayOfMonth(y, m))));
+    return new Date(Date.UTC(y, m + 1, validAnchor(anchorDay) ?? semimonthlyAnchor(date)));
+  }
+  const months = FREQUENCY_MONTHS[frequency];
+  return months === undefined ? null : addMonthsClamped(date, months, anchorDay);
+}
+
+/**
+ * The first `count` run dates of a schedule starting on `start` (YYYY-MM-DD), as the Memorized
+ * Transaction List and the calendar project them. `anchorDay` is the template's stored anchor;
+ * left out, the one createTemplate stores for that start. Empty for 'never' or an unknown frequency.
+ */
+export function nextRunDates(start: Date, frequency: string, count: number, anchorDay?: number | null): string[] {
+  if (FREQUENCY_DAYS[frequency] === undefined && FREQUENCY_MONTHS[frequency] === undefined && frequency !== 'semimonthly') return [];
+  const stored = anchorDay === undefined ? storedAnchorFor(start, frequency, null) : anchorDay;
+  const anchor = scheduleAnchor(frequency, stored, start);
+  const out: string[] = [];
+  let d: Date | null = new Date(start);
+  while (d && out.length < count) {
+    out.push(d.toISOString().slice(0, 10));
+    d = advanceDate(d, frequency, anchor);
+  }
+  return out;
+}
+
+/** A schedule date as the service reads one (new Date of an ISO date or date-time); null for anything else. */
+function scheduleDate(v: unknown): Date | null {
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  if (!/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/.test(s)) return null;
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/**
+ * "next dates: 2026-12-01, 2027-01-01, 2027-02-01" for a request that makes or changes a memorized
+ * transaction (RECURRING_SCHEDULES), from the template row the route answered (the schedule as
+ * saved), else, for a new schedule only, from the body. Fewer when only that many entries remain;
+ * nothing when it repeats never, is entered only when someone chooses Enter Now, is made inactive,
+ * has none left, or its dates are not known yet (a change before its dry run: `fromBody`).
+ */
+function runDatesText(operation: Operation, input: OperationInput, answer: unknown): string {
+  const spot = RECURRING_SCHEDULES[routeKey(operation)];
+  if (!spot) return '';
+  const fields = bodyFields(operation, input);
+  const body = isPlainObject(fields) ? fields : {};
+  const answered = answer === undefined ? undefined : spot.answer === null ? answer : valuesAt(answer, spot.answer)[0];
+  const row = isPlainObject(answered) && 'nextRunDate' in answered ? answered : null;
+  if (!row && !spot.fromBody) return '';
+  const get = (k: string): unknown => (row ? row[k] : body[k]);
+
+  const frequency = get('frequency');
+  const start = scheduleDate(get('nextRunDate'));
+  if (typeof frequency !== 'string' || start === null) return '';
+  if (get('mode') === 'never' || get('isActive') === false) return '';
+  const remaining = get('remaining');
+  const left = typeof remaining === 'number' && Number.isInteger(remaining) && remaining >= 0 ? remaining : null;
+  if (left === 0) return '';
+  const count = left === null ? 3 : Math.min(3, left);
+  const anchorDay = row ? (typeof row.anchorDay === 'number' ? row.anchorDay : null) : undefined;
+  const dates = nextRunDates(start, frequency, count, anchorDay);
+  if (dates.length === 0) return '';
+  if (left !== null && left <= 3) return left === 1 ? `its last date: ${dates[0]}` : `its last ${dates.length} dates: ${dates.join(', ')}`;
+  return `next dates: ${dates.join(', ')}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,50 +452,36 @@ function keepEnd(text: string, max: number): string {
   return chars.length > max ? `…${chars.slice(chars.length - (max - 1)).join('').trimStart()}` : text;
 }
 
-/**
- * The shortest an email address may be cut to (cutAddress) while what says where it goes stays
- * whole: that part, "…", and two characters of the name before "@" (none of a display name).
- */
-function addressFloor(parts: EmailAddressParts): number {
-  return length(parts.kept) + (parts.form === 'name' ? 1 : 3);
+/** The shortest the part before "@" is cut to: its first and last character around "…". */
+const LOCAL_FLOOR = 3;
+
+/** The part before "@" in `max` characters at most: its middle cut, so both its ends show. */
+function cutLocal(local: string, max: number): string {
+  const chars = Array.from(local);
+  const room = Math.max(LOCAL_FLOOR, max);
+  if (chars.length <= room) return local;
+  const front = Math.ceil((room - 1) / 2);
+  return `${chars.slice(0, front).join('')}…${chars.slice(chars.length - (room - 1 - front)).join('')}`;
 }
 
 /**
- * One email address (lib/agent/guards.ts emailAddressParts, the shape the app's senders take), cut
- * to `max`. What says where it goes stays whole and as written: "@" and the domain, or in the
- * "Name<addr>" form the address in angle brackets, which is what the mailer delivers to. The rest
- * is cut: the middle of the name before "@" ("averylongmail…box@acme.com", "o'bri…team@evil.example"),
- * or the end of a display name ("billing.acme.com.payables.depa…<x@evil.example>"). A domain too
- * long even for that keeps its end, as a server name does. Null when `text` is not one address.
- */
-function cutAddress(text: string, max: number): string | null {
-  const parts = emailAddressParts(text);
-  if (!parts) return null;
-  if (length(text) <= max) return text;
-  if (max < addressFloor(parts)) return keepEnd(parts.kept, max);
-  const head = Array.from(parts.head);
-  const room = max - length(parts.kept) - 1;
-  if (parts.form === 'name') return `${head.slice(0, room).join('')}…${parts.kept}`;
-  const front = Math.ceil(room / 2);
-  return `${head.slice(0, front).join('')}…${head.slice(head.length - (room - front)).join('')}${parts.kept}`;
-}
-
-/**
- * An email address as a value shows it (cutAddress): in `max` characters or, when that is too few
- * to keep where it goes whole, in as many as that takes, up to DESCRIBE_VALUE_MAX. A line made
- * shorter to fit cuts its other values and its words instead; only a domain too long for a whole
- * value keeps its end. Null when `text` is not one address.
+ * A plain address (lib/agent/guards.ts plainAddress) in `max` characters, its domain whole and in
+ * small letters: only the middle of the part before "@" is cut, and never below LOCAL_FLOOR, so a
+ * long domain makes the value longer than `max` rather than lose any of itself. Null when `text`
+ * is not one plain address.
  */
 function addressShown(text: string, max: number): string | null {
-  const parts = emailAddressParts(text);
-  return parts ? cutAddress(text, Math.max(max, Math.min(addressFloor(parts), DESCRIBE_VALUE_MAX))) : null;
+  const parts = plainAddress(text);
+  if (!parts) return null;
+  const domain = parts.domain.toLowerCase();
+  return `${cutLocal(parts.local, max - length(domain) - 1)}@${domain}`;
 }
 
 /**
- * Text as a value may show, cut to `max`. An email address is recognised first, on the text as it
- * was written, and shows as it is (addressShown): it is not an account number, and masking an
- * "acct#" inside it would hide its domain ("billing.acme.com.acct#••••.com" for mail that goes to
- * evil.com). Anything else has its account numbers masked and is cut at its end.
+ * Text as a value may show, cut to `max`. A plain email address is recognised first, on the text
+ * as it was written, and keeps its domain (addressShown): it is not an account number, and masking
+ * an "acct#" inside it would hide its domain ("billing.acme.com.acct#••••.com" for mail that goes
+ * to evil.com). Anything else has its account numbers masked and is cut at its end.
  */
 function shown(text: string, max: number): string {
   const clean = flat(text);
@@ -246,12 +489,12 @@ function shown(text: string, max: number): string {
 }
 
 /**
- * A list of plain values (recipients, ids): as many whole items as fit, then how many more, so a
- * person always sees that there are others ("a@acme.com, b@acme.com and 2 more"). Cutting the
- * joined text instead would hide the last ones behind "…", and the last could be the outside one.
+ * A list of plain values that are not recipients (ids, names): as many whole items as fit, then
+ * how many more, so a person always sees that there are others ("a1, a2 and 2 more").
  */
 function listText(items: readonly unknown[], max: number): string {
-  const texts = items.map((x) => shown(asText(x), max)).filter((s) => s !== '');
+  const raws = items.map((x) => flat(asText(x))).filter((s) => s !== '');
+  const texts = raws.map((x) => shown(x, max));
   const more = (n: number) => (n > 0 ? ` and ${n} more` : '');
   for (let k = texts.length; k >= 1; k--) {
     const text = `${texts.slice(0, k).join(', ')}${more(texts.length - k)}`;
@@ -260,65 +503,250 @@ function listText(items: readonly unknown[], max: number): string {
   if (texts.length === 0) return '';
   // Not even the first item fits whole: cut it (an address keeps its domain), and still say how many follow.
   const rest = more(texts.length - 1);
-  const room = Math.max(2, max - length(rest));
-  return `${addressShown(texts[0], room) ?? cleanText(texts[0], room)}${rest}`;
+  return `${shown(raws[0], Math.max(2, max - length(rest)))}${rest}`;
 }
 
 /**
- * Text that is a list of recipients ("a@acme.com, b@x.example"): items parted by "," or ";", each a
- * single word, at least one of them an email address. Shown as a list, each address recognised on
- * the text as written (see shown), so none of them is masked away and none hides the ones after it.
- * The mailer reads the same text as several recipients, whatever the other items are: the
- * reminder's check (lib/services/attention.ts) takes "acct#1,b@evil.com" as one address, and the
- * mail goes to b@evil.com, so the line shows "acct#••••, b@evil.com".
+ * Text that is a list of addresses written as one ("a@acme.com, b@x.example"): items parted by ","
+ * or ";", each a single word, at least one of them a plain address. Shown as a list (or as
+ * recipients, in a recipient field).
  */
 function addressList(text: string): string[] | null {
   const parts = flat(text).split(/\s*[,;]\s*/).filter((s) => s !== '');
   if (parts.length < 2 || parts.some((p) => /\s/.test(p))) return null;
-  return parts.some((p) => emailAddressParts(p) !== null) ? parts : null;
+  return parts.some((p) => plainAddress(p) !== null) ? parts : null;
+}
+
+/**
+ * One recipient: a plain address (its domain whole, in small letters) or, for anything else, its
+ * text: whole when it holds an "@" (the mailer may read a name, a quote or brackets around an
+ * address its own way, so none of it is cut), cut as any value when it holds none (no mail can go
+ * to it, and a long one would only push the others off the line).
+ */
+type RecipientItem = { local: string; domain: string } | { text: string };
+
+/**
+ * Every recipient a recipient field holds, one per item (text parted by "," or ";", the way the
+ * mailer reads it; a list's elements). Account numbers are masked on the whole text first, so a
+ * "," inside one cannot let its digits out; an address is never masked (maskAccountsInText).
+ * guardInput takes only plain addresses from an agent; anything else here came from the books
+ * (the route's answer: the address on file it sent to).
+ */
+function recipientItems(raw: unknown): RecipientItem[] {
+  const out: RecipientItem[] = [];
+  const add = (v: unknown) => {
+    if (!isScalar(v)) return;
+    for (const piece of maskAccountsInText(flat(asText(v))).split(/[,;]/)) {
+      const item = piece.trim();
+      if (item === '') continue;
+      const parts = plainAddress(item);
+      if (parts) out.push({ local: parts.local, domain: parts.domain.toLowerCase() });
+      else out.push({ text: item.includes('@') ? item : cleanText(item, DESCRIBE_VALUE_MAX) });
+    }
+  };
+  if (Array.isArray(raw)) raw.forEach(add);
+  else add(raw);
+  return out;
+}
+
+/** The recipients joined, each part before "@" cut to `localMax`; everything else whole. */
+function recipientsText(items: readonly RecipientItem[], localMax: number): string {
+  return items.map((r) => ('text' in r ? r.text : `${cutLocal(r.local, localMax)}@${r.domain}`)).join(', ');
+}
+
+/** Whether a placeholder of this operation holds email recipients, which the line never hides. */
+function isRecipientField(operation: Operation, name: string): boolean {
+  const key = routeKey(operation);
+  if ((RECIPIENT_FIELDS[key] ?? []).some((f) => f.path === name)) return true;
+  if ((RECIPIENTS_SHOWN[key] ?? []).some((r) => r.placeholder === name)) return true;
+  return recipientFieldName(name.split('.').pop() ?? name);
+}
+
+/**
+ * Where a path starts: the part a cut never touches, which says what disk or server it is on. A
+ * drive ("C:\", or "C:" alone), a share ("\\server\share\", also written "//server/share/"),
+ * either of those as a device path ("\\?\C:\", "\\?\UNC\server\share\", "\\.\UNC\…",
+ * "//?/UNC/…"), the top folder ("/" or "\") or "~/". '' for a relative path. Null when its start
+ * does not say where it is: any other device path ("\\?\Volume{…}\", "\\.\pipe\…",
+ * "\\?\GLOBALROOT\…", whose server or disk may come later), a share with no share name, three
+ * slashes or more, or a server or share named only by dots. Such a path is never cut (cutPath).
+ */
+function pathRoot(text: string): string | null {
+  const device = DEVICE_PATH_PREFIX.exec(text)?.[0] ?? '';
+  const after = text.slice(device.length);
+  let named: string | null;
+  if (device !== '') named = /^(?:UNC[\\/][^\\/]+[\\/][^\\/]+(?:[\\/]|$)|[A-Za-z]:(?:[\\/]|$))/i.exec(after)?.[0] ?? null;
+  else if (/^[\\/]{3}/.test(text)) named = null;
+  else if (/^[\\/]{2}/.test(text)) named = /^[\\/]{2}[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.exec(text)?.[0] ?? null;
+  else named = /^(?:[A-Za-z]:[\\/]?|[\\/]|~[\\/])/.exec(text)?.[0] ?? '';
+  // The server and the share, past the device prefix's own "." ("\\.\"), are never only dots.
+  return named === null || holdsDots(named) ? null : `${device}${named}`;
+}
+
+/** Whether a path, or a part of one, holds a folder of only dots and spaces ("..", "."): one a cut could hide. */
+function holdsDots(text: string): boolean {
+  return text.split(/[\\/]/).some((s) => DOTS_ONLY_FOLDER.test(s));
+}
+
+/**
+ * A path with its "." and ".." folders resolved the way Windows, macOS and Linux all read them
+ * ("C:\a\b\..\c" is "C:\a\c", and ".." never climbs above the drive, the share or "/"), so the
+ * start the line shows is where the path really goes. Only where they read it the same, or where
+ * only Windows reads it as a path at all: on a drive ("C:\"), a share ("\\server\share\"), or
+ * under "/" with no "\" in it. Any other path with such a folder is left as written, and cutPath
+ * never cuts it: a device path (Windows does not resolve its dots), a relative one, one under "\"
+ * or "~/" alone ("\" is part of a name on macOS and Linux, and a route reads "~" as a folder's
+ * name), a share written "//server/share/" (on macOS and Linux that is "/server/share/", where
+ * ".." climbs past the server), and a folder of dots other than "." and ".." ("...", ".. "),
+ * which Windows reads its own way. `plain`: the text as written held
+ * no mark the line removes (a removed mark could have made ".\u200b." look like ".."). guardInput
+ * refuses all of these from an agent (lib/agent/guards.ts pathRefusal); this is for the rest.
+ */
+function resolvedPath(text: string, plain: boolean): string {
+  const root = pathRoot(text);
+  if (!plain || root === null) return text;
+  const rest = text.slice(root.length);
+  if (!holdsDots(rest)) return text;
+  const sure = /^[A-Za-z]:[\\/]$/.test(root) || (/^\\\\/.test(root) && !DEVICE_PATH_PREFIX.test(root)) || (root === '/' && !text.includes('\\'));
+  const segs = rest.split(/[\\/]/);
+  if (!sure || segs.some((s) => DOTS_ONLY_FOLDER.test(s) && s !== '.' && s !== '..')) return text;
+  const out: string[] = [];
+  for (const s of segs) {
+    if (s === '' || s === '.') continue;
+    if (s === '..') out.pop();
+    else out.push(s);
+  }
+  const sep = text.includes('\\') ? '\\' : '/';
+  const joined = out.join(sep);
+  const rootEnd = /[\\/]$/.test(root) || joined === '' ? root : `${root}${sep}`;
+  return `${rootEnd}${joined}${joined !== '' && /[\\/]$/.test(rest) ? sep : ''}`;
+}
+
+/**
+ * A path with an account number in any of its folders masked there, so the file name after it
+ * stays. Its start (pathRoot) is never masked: a drive or a server says where the file goes, and
+ * no account number is one.
+ */
+function maskedPath(text: string): string {
+  const root = pathRoot(text) ?? '';
+  return `${root}${text
+    .slice(root.length)
+    .split(/([\\/])/)
+    .map((piece) => (piece === '/' || piece === '\\' ? piece : maskAccountsInText(piece)))
+    .join('')}`;
+}
+
+/**
+ * A path in `max` characters: its start (pathRoot, and the first folders that fit) and its end
+ * (the folders before the file and the file name), the middle cut ("C:\Users\…\Backups\Books
+ * backup.ironbooks"). The file name is always whole, and the folder holding it whole when it fits:
+ * a path too long even for that is left longer than `max`. A path whose start does not say where
+ * it is, or that still holds a folder of only dots (resolvedPath could not resolve it for sure), is
+ * never cut: what the cut left out could change where it goes.
+ */
+function cutPath(text: string, max: number): string {
+  if (length(text) <= max) return text;
+  const root = pathRoot(text);
+  if (root === null || holdsDots(text.slice(root.length))) return text;
+  const rest = text.slice(root.length);
+  // Folders with their separator after them, then the last part (a file name, or the last folder).
+  const segs = rest.match(/[^\\/]*[\\/]|[^\\/]+$/g) ?? [];
+  let name = segs.length > 0 && !/[\\/]$/.test(segs[segs.length - 1]) ? (segs.pop() as string) : '';
+  if (name === '' && segs.length > 0) name = segs.pop() as string;
+  const sep = text.includes('\\') ? '\\' : '/';
+  const gap = `…${sep}`;
+  let head = root;
+  let tail = name;
+  let i = segs.length;
+  let j = 0;
+  const fits = (h: string, t: string) => length(h) + length(gap) + length(t) <= max;
+  const growTail = () => {
+    while (i > j && fits(head, segs[i - 1] + tail)) tail = segs[--i] + tail;
+  };
+  const growHead = (room: number) => {
+    while (j < i && length(head) + length(segs[j]) <= room && fits(head + segs[j], tail)) head += segs[j++];
+  };
+  // The folder holding the file first, then the start up to a third of the room, then as much of
+  // the end as fits, then of the start again.
+  if (i > j && fits(head, segs[i - 1] + tail)) tail = segs[--i] + tail;
+  growHead(Math.floor(max / 3));
+  growTail();
+  growHead(max);
+  return j === i ? `${head}${tail}` : `${head}${gap}${tail}`;
+}
+
+/** The shortest a path is cut to: its start, "…", and the file name. */
+function pathFloor(text: string): number {
+  return length(cutPath(text, 0));
 }
 
 interface Value {
   /** What the placeholder held (absent: shows nothing). */
   raw: unknown;
-  /** A server name shown in full: never cut, whatever the line's length. */
+  /** A server name shown in full, or the run dates: never cut, whatever the line's length. */
   fixed: boolean;
 }
 
-function valueOf(operation: Operation, input: OperationInput, answer: unknown, name: string): Value {
-  const raw = lookup(operation, input, answer, name);
+function valueOf(operation: Operation, input: OperationInput, answer: unknown, name: string, names: DescribeNames | undefined): Value {
+  if (name === RUN_DATES) {
+    const text = runDatesText(operation, input, answer);
+    return { raw: text, fixed: text !== '' };
+  }
+  const found = lookup(operation, input, answer, name);
+  const named = withNames(found, names);
+  const raw = named === found ? nameFromAnswer(operation, input, answer, name, found) : named;
   const last = name.split('.').pop() ?? name;
   const fixed = !protectedKindOf(operation, name) && HOST_NAMES.test(last) && hostShownInFull(raw);
   return { raw, fixed };
 }
 
-/** Each value's room on the line: lists (recipients) keep theirs longest, so none is hidden first. */
+/** Each value's room on the line: lists keep theirs longest, so none is hidden first. */
 interface Room {
   value: number;
   list: number;
 }
 
-/** A value as the line shows it. `list`: shown as a list (listText), which says itself how many it leaves out. */
+type Kind = 'value' | 'fixed' | 'list' | 'recipients' | 'path';
+
+/** A value as the line shows it, with what a later cut needs to cut it again from the whole. */
 interface Rendered {
   text: string;
-  list: boolean;
+  kind: Kind;
+  /** 'value' and 'path': the whole text as it may show, before it was cut to its room. */
+  source?: string;
+  /** 'recipients': each one. */
+  recipients?: RecipientItem[];
 }
 
 function render(operation: Operation, name: string, value: Value, room: Room): Rendered {
   const { raw } = value;
-  const one = (text: string): Rendered => ({ text, list: false });
+  const one = (text: string, source?: string): Rendered => ({ text, kind: 'value', source });
   if (absent(raw)) return one('');
   const kind = protectedKindOf(operation, name);
   if (kind) return one(cleanText(maskedForDisplay(name, kind, raw), room.value));
-  // Exactly the name the server is reached by (hostShownInFull allows nothing a mask or a cut would change).
-  if (value.fixed && typeof raw === 'string') return one(raw.trim());
-  if (Array.isArray(raw) && raw.every(isScalar)) return { text: listText(raw, room.list), list: true };
+  // Exactly the name the server is reached by (hostShownInFull allows nothing a mask or a cut would
+  // change), or the run dates the app worked out.
+  if (value.fixed && typeof raw === 'string') return { text: raw.trim(), kind: 'fixed' };
+  if (isRecipientField(operation, name)) {
+    const recipients = recipientItems(raw);
+    return { text: recipientsText(recipients, Number.POSITIVE_INFINITY), kind: 'recipients', recipients };
+  }
+  if (Array.isArray(raw) && raw.every(isScalar)) return { text: listText(raw, room.list), kind: 'list' };
   const last = name.split('.').pop() ?? name;
   // A server name is never masked either: it says where something goes, and no account number is one.
-  if (HOST_NAMES.test(last)) return one(keepEnd(flat(asText(raw)), room.value));
+  if (HOST_NAMES.test(last)) {
+    const text = flat(asText(raw));
+    return one(keepEnd(text, room.value), text);
+  }
   const text = asText(raw);
+  if (typeof raw === 'string' && pathField(name, flat(text))) {
+    const path = maskedPath(resolvedPath(flat(text), flat(text) === text.replace(/\s+/g, ' ').trim()));
+    return { text: cutPath(path, DESCRIBE_PATH_MAX), kind: 'path', source: path };
+  }
   const addresses = typeof raw === 'string' ? addressList(text) : null;
-  return addresses ? { text: listText(addresses, room.list), list: true } : one(shown(text, room.value));
+  if (addresses) return { text: listText(addresses, room.list), kind: 'list' };
+  const clean = flat(text);
+  return one(shown(clean, room.value), plainAddress(clean) ? clean : maskAccountsInText(clean));
 }
 
 // ---------------------------------------------------------------------------
@@ -513,8 +941,8 @@ function tidy(line: string): string {
 
 /**
  * The room of each value, tried in turn while the line is too long: values are cut before the
- * line's own words are, other values before lists (the recipients of an email stay whole longest),
- * and a server name shown in full never.
+ * line's own words are, other values before lists, and a server name shown in full, the
+ * recipients and the run dates never (a path keeps DESCRIBE_PATH_MAX here).
  */
 const ROOM_STEPS: readonly Room[] = [
   ...[DESCRIBE_VALUE_MAX, 48, 40, 32, 24, 16, 12].map((value) => ({ value, list: DESCRIBE_VALUE_MAX })),
@@ -528,7 +956,7 @@ const KEPT_VALUE = /\u0001(\d+)\u0001/g;
 /** A line with its values kept out (KEPT_MARK n KEPT_MARK), and those values. */
 interface Built {
   tidied: string;
-  kept: Array<{ text: string; fixed: boolean; list: boolean }>;
+  kept: Rendered[];
 }
 
 function restore(built: Built): string {
@@ -539,13 +967,18 @@ function restore(built: Built): string {
  * The last resort, for a line still too long with every value at its shortest. The values say what
  * the request touches and where it goes, so the line's own words are cut before any of them, the
  * longest stretch first, each at its end with "…"; the word that leads to a value stays with it
- * ("to", "through", "(mail server"). Only then the values, the longest first: an email address in
- * the middle of its name, never its domain (cutAddress), anything else at its end. Never a list,
- * which already says how many it leaves out, nor a server name shown in full (where a typed
- * password goes): only if those alone fill the line is it cut as any other line.
+ * ("to", "through", "(mail server"). Then the values, the longest first: an email address in the
+ * middle of the part before "@", anything else at its end; then a path, in its middle (its start
+ * and its file name stay); then the recipients, the middle of the part before "@" of each, all to
+ * one length. Never a domain, a list (it already says how many it leaves out), a server name shown
+ * in full (where a typed password goes) or the run dates. Null when the line cannot get within
+ * `max` that way because of what says where something goes (recipients, a path, a server name):
+ * describeRequest then leaves it long, at full length, and it wraps on the card. A line with only
+ * lists left is cut as any other line.
  */
-function cutKeepingFixed(built: Built, max: number): string {
-  type Part = { text: string; role: 'words' | 'lead' | 'value' | 'kept' };
+function cutKeepingFixed(built: Built, max: number): string | null {
+  type Role = 'words' | 'lead' | 'value' | 'path' | 'recipients' | 'kept';
+  type Part = { text: string; role: Role; value?: Rendered };
   const parts: Part[] = [];
   let at = 0;
   for (const m of built.tidied.matchAll(KEPT_VALUE)) {
@@ -556,16 +989,17 @@ function cutKeepingFixed(built: Built, max: number): string {
     parts.push({ text: lead ? words.slice(0, lead.index) : words, role: 'words' });
     if (lead) parts.push({ text: lead[0], role: 'lead' });
     const value = built.kept[Number(m[1])];
-    parts.push({ text: value?.text ?? '', role: value && !value.fixed && !value.list ? 'value' : 'kept' });
+    const role: Role = !value ? 'kept' : value.kind === 'value' ? 'value' : value.kind === 'path' ? 'path' : value.kind === 'recipients' ? 'recipients' : 'kept';
+    parts.push({ text: value?.text ?? '', role, value });
     at = index + m[0].length;
   }
   parts.push({ text: built.tidied.slice(at), role: 'words' });
 
   const total = () => parts.reduce((n, p) => n + length(p.text), 0);
   /** Cut the longest part of `role` by what the line is over, as `cut` cuts; false when none of them can be cut more. */
-  const cutLongest = (role: Part['role'], cut: (text: string, to: number) => string | null): boolean => {
+  const cutLongest = (role: Role, cut: (part: Part, to: number) => string | null): boolean => {
     for (const p of parts.filter((x) => x.role === role).sort((a, b) => length(b.text) - length(a.text))) {
-      const next = cut(p.text, length(p.text) - (total() - max));
+      const next = cut(p, length(p.text) - (total() - max));
       if (next !== null && length(next) < length(p.text)) {
         p.text = next;
         return true;
@@ -573,37 +1007,70 @@ function cutKeepingFixed(built: Built, max: number): string {
     }
     return false;
   };
-  const cutWords = (text: string, to: number): string | null => {
-    const core = text.trim();
+  const cutWords = (p: Part, to: number): string | null => {
+    const core = p.text.trim();
     if (length(core) <= 2) return null;
-    const before = /^\s/.test(text) ? ' ' : '';
-    const after = /\s$/.test(text) ? ' ' : '';
+    const before = /^\s/.test(p.text) ? ' ' : '';
+    const after = /\s$/.test(p.text) ? ' ' : '';
     return `${before}${cleanText(core, Math.max(2, to - before.length - after.length))}${after}`;
   };
-  const cutValue = (text: string, to: number): string | null => {
-    const address = emailAddressParts(text);
-    if (address) return cutAddress(text, Math.max(addressFloor(address), to));
-    if (length(text) <= 2) return null;
-    // A value already cut to keep its end (a long domain or server name) keeps it.
-    return text.startsWith('…') ? keepEnd(text, Math.max(2, to)) : cleanText(text, Math.max(2, to));
+  const cutValue = (p: Part, to: number): string | null => {
+    const source = p.value?.source ?? p.text;
+    const address = addressShown(source, to);
+    if (address !== null) return address;
+    if (length(p.text) <= 2) return null;
+    // A value already cut to keep its end (a long server name) keeps it.
+    return p.text.startsWith('…') ? keepEnd(source, Math.max(2, to)) : cleanText(source, Math.max(2, to));
   };
-  while (total() > max && cutLongest('words', cutWords));
-  while (total() > max && cutLongest('value', cutValue));
+  const cutPathPart = (p: Part, to: number): string | null => {
+    const source = p.value?.source ?? p.text;
+    return cutPath(source, Math.max(pathFloor(source), to));
+  };
+  // The recipients: the part before "@" of each, all to one length, never below LOCAL_FLOOR.
+  const recipients = parts.filter((p) => p.role === 'recipients' && p.value?.recipients);
+  const longest = Math.max(0, ...recipients.flatMap((p) => (p.value?.recipients ?? []).map((r) => ('local' in r ? length(r.local) : 0))));
+  const capRecipients = (cap: number) => {
+    for (const p of recipients) p.text = recipientsText(p.value?.recipients ?? [], cap);
+  };
+  const cutRecipients = () => {
+    for (let cap = longest - 1; total() > max && cap >= LOCAL_FLOOR; cap--) capRecipients(cap);
+  };
+  // First the recipients alone, so the line keeps all its words when that is enough ("Send to
+  // accounts…payable@acme.com, …"); when it is not, they are put back whole and cut only after the
+  // words, the other values and the paths.
+  cutRecipients();
+  if (total() > max) {
+    capRecipients(longest);
+    while (total() > max && cutLongest('words', cutWords));
+    while (total() > max && cutLongest('value', cutValue));
+    while (total() > max && cutLongest('path', cutPathPart));
+    cutRecipients();
+  }
 
   const line = cleanText(parts.map((p) => p.text).join(''), Number.POSITIVE_INFINITY);
-  return length(line) <= max ? line : cleanText(line, max);
+  if (length(line) <= max) return line;
+  const placeKept = parts.some((p) => p.role === 'recipients' || p.role === 'path' || (p.role === 'kept' && p.value?.kind === 'fixed'));
+  return placeKept ? null : cleanText(line, max);
 }
 
-/** Fill the operation's describe template. A missing value shows as nothing, never "null" or "{x}". */
-export const describeRequest: DescribeRequest = (operation, input, answer) => {
+/**
+ * Fill the operation's describe template. A missing value shows as nothing, never "null" or "{x}".
+ * `names` (optional, beyond the contract's DescribeRequest): the name a person knows each record
+ * by, by its id, as the door read it from the books (DescribeNames).
+ */
+export function describeRequest(operation: Operation, input: OperationInput, answer?: unknown, names?: DescribeNames): string {
   let template = typeof operation.describe === 'string' && operation.describe.trim() !== '' ? operation.describe : operation.id;
-  const goes = SECRET_GOES_TO[routeKey(operation)];
+  const key = routeKey(operation);
+  const goes = SECRET_GOES_TO[key];
   if (goes && !template.includes(goes.placeholder)) template = `${template}${goes.clause}`;
+  for (const r of RECIPIENTS_SHOWN[key] ?? []) if (r.clause && !template.includes(`{${r.placeholder}}`)) template = `${template}${r.clause}`;
+  if (RECURRING_SCHEDULES[key]) template = `${template} ({${RUN_DATES}})`;
   const safeInput: OperationInput = isPlainObject(input) ? input : {};
+  const safeNames = isPlainObject(names) ? (names as DescribeNames) : undefined;
 
   const tokens = tokensOf(template);
   const values = new Map<Token, Value>();
-  for (const t of tokens) if (t.name !== null) values.set(t, valueOf(operation, safeInput, answer, t.name));
+  for (const t of tokens) if (t.name !== null) values.set(t, valueOf(operation, safeInput, answer, t.name, safeNames));
   const empty = (t: Token) => render(operation, t.name as string, values.get(t) as Value, ROOM_STEPS[0]).text === '';
   const dropped = emptiedAsides(template, tokens, empty);
   const gone = (at: number) => dropped.some(([a, b]) => at >= a && at <= b);
@@ -613,14 +1080,13 @@ export const describeRequest: DescribeRequest = (operation, input, answer) => {
     // Every value shown is kept out of the tidying, which is for the template's own words: a value
     // shows exactly as rendered ("C:/Reports ()/x" keeps its "()", "-5.00" its sign, "[::1]" is not
     // a doubled colon).
-    const kept: Built['kept'] = [];
+    const kept: Rendered[] = [];
     for (const t of tokens) {
       if (t.name !== null) {
         if (gone(t.start)) continue;
-        const value = values.get(t) as Value;
-        const { text, list } = render(operation, t.name, value, room);
-        if (text !== '') {
-          kept.push({ text, fixed: value.fixed, list });
+        const rendered = render(operation, t.name, values.get(t) as Value, room);
+        if (rendered.text !== '') {
+          kept.push(rendered);
           segs.push({ text: `${KEPT_MARK}${kept.length - 1}${KEPT_MARK}`, placeholder: true, name: t.name });
         } else segs.push({ text: '', placeholder: true, name: t.name });
         continue;
@@ -639,5 +1105,12 @@ export const describeRequest: DescribeRequest = (operation, input, answer) => {
     const line = restore(built);
     if (length(line) <= DESCRIBE_LINE_MAX) return line;
   }
-  return built ? cutKeepingFixed(built, DESCRIBE_LINE_MAX) : '';
-};
+  if (!built) return '';
+  // Recipients (or a path, or a server name) too long for any line: every word and value as at
+  // first, and the line wraps, rather than a line cut to pieces that is still too long.
+  return cutKeepingFixed(built, DESCRIBE_LINE_MAX) ?? restore(lineAt(ROOM_STEPS[0]));
+}
+
+/** Held to the contract: a caller typed by DescribeRequest (three arguments) calls this same function. */
+const contractShape: DescribeRequest = describeRequest;
+void contractShape;

@@ -13,10 +13,19 @@
  *    effective roles, not the legacy role column), like a full copy of the file, AND may view
  *    every record in it (lib/services/auditVisibility.ts): it holds the same snapshots as the
  *    page (pay rates, user accounts, settings snapshots of older builds), which the page and the
- *    CSV leave out for that person.
+ *    CSV leave out for that person. The snapshots hold every vendor's full tax ID and account
+ *    number, the employer's state account number and check memos as recorded, which the page
+ *    masks for a reader without "View sensitive payroll data" or "View full bank / account
+ *    numbers"; the raw bytes cannot be masked without breaking their fingerprints, so the raw log
+ *    also needs both of those rights (in every company it records). An agent's run has them only
+ *    for the one kind a person approved revealing, so an agent never takes the raw log.
  *  - A CSV of the filtered, plain-language log with NO row cap, streamed in batches (the page
  *    shows the newest 5,000; the export used to stop there too). Like the page, it leaves out
- *    the records the person may not view.
+ *    the records the person may not view, and writes each summary as the page shows it
+ *    (auditTrail.ts logSummaryFor); its search matches that text.
+ *
+ * Both read with the page's reader (auditTrail.ts auditReaderFor): an agent never gets the
+ * records of Users & Roles or File Utilities, nor the whole log as an Admin would.
  */
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -28,6 +37,7 @@ import { dataDirOf } from '@/lib/db/txHooks';
 import { csvQuoted } from '@/lib/csv';
 import { ServiceError, notFound, type ServiceContext } from './_base';
 import { requireFileAdmin, resolveAccess } from './access';
+import { auditReaderFor, logSummaryFor } from './auditTrail';
 import { canSeeLogRecord, seesWholeLog } from './auditVisibility';
 import {
   entityLabel,
@@ -68,20 +78,37 @@ const RAW_LOG_HIDDEN_RECORDS =
 const RAW_LOG_DENIED =
   'This company file’s transaction log also records another company you do not manage, and the log cannot be split without breaking its fingerprints. Ask that company’s owner, or export the log as CSV instead.';
 
+const RAW_LOG_NEEDS_FLAGS =
+  'The transaction log holds full tax IDs and bank and account numbers as they were recorded, and it cannot be masked without breaking its fingerprints. Someone with “View sensitive payroll data” and “View full bank / account numbers” can download it; or export the log as CSV instead.';
+
+/** Both rights that show protected values in full: the raw log holds both kinds as recorded. */
+function seesProtectedValues(access: EffectiveAccess): boolean {
+  return access.flags.sensitivePayroll === true && access.flags.fullAccountNumbers === true;
+}
+
 /**
  * The raw log may be taken only by someone who manages every company it records: in the active
  * company the caller's own rights, in each other company their effective rights THERE (active
- * member; owner, Admin or the export right). Records of a company deleted since can no longer be
- * checked that way, so they go only to an Admin of every company in the file (requireFileAdmin).
+ * member; owner, Admin or the export right), each time with both View rights (the log holds full
+ * tax IDs and account numbers; seesProtectedValues). Records of a company deleted since can no
+ * longer be checked that way, so they go only to an Admin of every company in the file
+ * (requireFileAdmin). An agent reads with auditReaderFor's access: never Users & Roles or File
+ * Utilities records, never as an Admin, and with the View rights of its run only.
+ *
+ * `bytes` says whether the log's own bytes leave the app (the .bktlg download). The verification
+ * report holds only their size, fingerprints and the chain check, no recorded value, so it does not
+ * need the two View rights; everything else is checked the same, as it always was.
  */
-async function requireAllCompanies(ctx: ServiceContext, dir: string): Promise<void> {
-  if (ctx.access && !mayTakeRawLog({ access: ctx.access })) {
+async function requireAllCompanies(ctx: ServiceContext, dir: string, bytes: boolean): Promise<void> {
+  const reader = auditReaderFor(ctx);
+  if (reader && !mayTakeRawLog({ access: reader })) {
     throw new ServiceError('FORBIDDEN', 'Only the owner, an Admin or someone who may export the company file can download the transaction log.');
   }
+  if (bytes && reader && !seesProtectedValues(reader)) throw new ServiceError('FORBIDDEN', RAW_LOG_NEEDS_FLAGS);
   const records = readAllTransactionLog(dir).records;
   // Every record of this company (and the file-wide ones: users, the log's start) must be one the
   // caller may view: the download can't leave any out.
-  if (!seesWholeLog(ctx.access) && records.some((r) => (!r.companyId || r.companyId === ctx.companyId) && !canSeeLogRecord(ctx.access, r))) {
+  if (!seesWholeLog(reader) && records.some((r) => (!r.companyId || r.companyId === ctx.companyId) && !canSeeLogRecord(reader, r))) {
     throw new ServiceError('FORBIDDEN', RAW_LOG_HIDDEN_RECORDS);
   }
   const others = new Set<string>();
@@ -94,6 +121,7 @@ async function requireAllCompanies(ctx: ServiceContext, dir: string): Promise<vo
     if (!existing.has(id)) continue;
     const r = await resolveAccess(ctx.db, id, ctx.userId);
     if (!r.member || !r.active || !mayTakeRawLog(r)) throw new ServiceError('FORBIDDEN', RAW_LOG_DENIED);
+    if (bytes && !seesProtectedValues(r.access)) throw new ServiceError('FORBIDDEN', RAW_LOG_NEEDS_FLAGS);
     // …and the same rule as above for that company's records, with the caller's rights there.
     if (!r.access.isAdmin && records.some((rec) => rec.companyId === id && !canSeeLogRecord(r.access, rec))) {
       throw new ServiceError('FORBIDDEN', RAW_LOG_HIDDEN_RECORDS);
@@ -145,8 +173,8 @@ export interface RawLogDownload {
   bytes: number;
 }
 
-/** Checks and the file for the raw .bktlg download. */
-export async function prepareRawLogDownload(ctx: ServiceContext): Promise<RawLogDownload> {
+/** Checks and the file for the raw .bktlg download (`withBytes`: see requireAllCompanies). */
+async function prepareRawLog(ctx: ServiceContext, withBytes: boolean): Promise<RawLogDownload> {
   requireLogRole(ctx);
   const dir = logDir(ctx);
   const file = transactionLogPath(dir);
@@ -156,8 +184,13 @@ export async function prepareRawLogDownload(ctx: ServiceContext): Promise<RawLog
   } catch {
     throw notFound('Transaction log');
   }
-  await requireAllCompanies(ctx, dir);
+  await requireAllCompanies(ctx, dir, withBytes);
   return { file, filename: `${await baseName(ctx)}.bktlg`, bytes };
+}
+
+/** Checks and the file for the raw .bktlg download. */
+export function prepareRawLogDownload(ctx: ServiceContext): Promise<RawLogDownload> {
+  return prepareRawLog(ctx, true);
 }
 
 /** The first `bytes` bytes of a file as a web stream (1 MB chunks). */
@@ -215,7 +248,8 @@ export interface LogVerificationReport {
 
 /** The verification report that goes with a raw download (same checks as the page's banner). */
 export async function transactionLogVerificationReport(ctx: ServiceContext): Promise<{ filename: string; report: LogVerificationReport }> {
-  const raw = await prepareRawLogDownload(ctx);
+  // Sizes, fingerprints and the chain check only: not the two View rights the bytes need.
+  const raw = await prepareRawLog(ctx, false);
   const verification = await verifyTransactionLog(ctx.db, logDir(ctx));
   const [c] = await ctx.db.select({ name: companies.name }).from(companies).where(eq(companies.id, ctx.companyId));
   return {
@@ -252,6 +286,9 @@ export function streamTransactionLogCsv(ctx: ServiceContext, filter: LogExportFi
   requireLogRole(ctx);
   const dir = logDir(ctx);
   const enc = new TextEncoder();
+  // The page's reader and the page's words (app/api/transaction-log/route.ts).
+  const reader = auditReaderFor(ctx);
+  const shown = (r: TransactionLogRecord) => logSummaryFor(reader, r.summary);
   let offset = 0;
   let records: TransactionLogRecord[] | null = null;
   return new ReadableStream<Uint8Array>({
@@ -260,7 +297,8 @@ export function streamTransactionLogCsv(ctx: ServiceContext, filter: LogExportFi
         records = matchTransactionLog(dir, {
           ...filter,
           companyId: ctx.companyId,
-          ...(seesWholeLog(ctx.access) ? {} : { visible: (r: TransactionLogRecord) => canSeeLogRecord(ctx.access, r) }),
+          shownSummary: shown,
+          ...(seesWholeLog(reader) ? {} : { visible: (r: TransactionLogRecord) => canSeeLogRecord(reader, r) }),
         });
         controller.enqueue(enc.encode('﻿' + CSV_HEADER.map(csvQuoted).join(',') + '\r\n'));
         return;
@@ -273,7 +311,7 @@ export function streamTransactionLogCsv(ctx: ServiceContext, filter: LogExportFi
       offset += batch.length;
       const text = batch
         .map((r) =>
-          [r.seq, r.ts, r.userName ?? (r.userId ? 'Unknown user' : 'System'), r.action, entityLabel(r.entityType), r.summary, r.entityId ?? '']
+          [r.seq, r.ts, r.userName ?? (r.userId ? 'Unknown user' : 'System'), r.action, entityLabel(r.entityType), shown(r), r.entityId ?? '']
             .map((v) => csvQuoted(v))
             .join(','),
         )

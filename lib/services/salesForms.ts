@@ -37,7 +37,7 @@ import { getCompany, getPreferences } from './company';
 import { Money, formatCurrency } from '@/lib/money';
 import { docRef } from './docNumbers';
 import { emailNotSetUpError, isConfigured, sendMail } from './email';
-import { senderMergeFields } from './emailSettings';
+import { recipientProblem, senderMergeFields } from './emailSettings';
 import { getHomeCurrencyCode } from './currencies';
 import { companyTodayIso } from './preferences';
 import { fillMergeFields, type EmailTemplateType } from '@/lib/preferences';
@@ -394,12 +394,37 @@ export async function salesFormEmailText(ctx: ServiceContext, form: RenderedForm
   return { subject: fillMergeFields(template.subject, merge).trim() || form.title, text: fillMergeFields(template.body, merge) };
 }
 
+/**
+ * Refuse a typed recipient that is not one email address (lib/services/emailSettings.ts
+ * recipientProblem): it is a field for one recipient, so no comma or semicolon either, and none of
+ * the characters the mailer reads as a name, a comment or a second address. An agent's must be a
+ * plain address.
+ */
+function checkTypedRecipient(ctx: ServiceContext, to: string | null | undefined) {
+  if (to == null || to === '') return;
+  // Only spaces typed into a form's address: refused, as it always was, but saying what to do
+  // (the address shown in quotes would be empty).
+  if (!String(to).trim()) {
+    throw validation("Type an email address, like name@example.com, or leave the address empty to send to the one on the customer's record.");
+  }
+  const problem = recipientProblem(ctx, String(to), 'one');
+  if (problem) throw validation(problem);
+}
+
 async function deliver(ctx: ServiceContext, form: RenderedForm, to?: string | null) {
+  // Only spaces typed: the customer's address, as before.
+  if (to && to.trim()) checkTypedRecipient(ctx, to);
   const recipient = (to && to.trim()) || form.customerEmail;
   if (!recipient) {
     throw validation(
       `There is no email address for ${form.customerName}. Type one in, or add it to the customer record.`,
     );
+  }
+  // An agent's send to the address on file: that must be plain addresses too (the record may hold
+  // a list, or text imported from another program). A person's send to it is as it always was.
+  if (ctx.agent && !(to && to.trim())) {
+    const problem = recipientProblem(ctx, recipient, 'list');
+    if (problem) throw validation(`The email address on ${form.customerName}'s record cannot be used: ${problem}`);
   }
   const { subject, text } = await salesFormEmailText(ctx, form);
   await sendMail(
@@ -430,7 +455,6 @@ const SALES_FORM_ACTIVITY: Record<SalesFormKind, ActivityKey> = {
   credit_memo: 'customers.credit_memos',
   sales_order: 'customers.sales_orders',
 };
-const EMAIL_ADDRESS_RE = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
 
 /**
  * Email one sales form to the customer (or `to`). Clears its "to be emailed" flag. The PDF prints
@@ -447,7 +471,8 @@ export async function emailSalesForm(
   if (!(await isConfigured(ctx))) throw emailNotSetUpError();
   // The form's own right (print), not only Send Forms: a batch-only user emailed any receipt.
   requireActivity(ctx, SALES_FORM_ACTIVITY[kind], 'print');
-  if (to != null && to !== '' && !EMAIL_ADDRESS_RE.test(String(to).trim())) throw validation(`"${to}" is not an email address.`);
+  // Checked before the form is claimed from the queue (deliver checks it again).
+  checkTypedRecipient(ctx, to);
   const t = TABLE[kind];
   // Emailing changes nothing in the books: a member who may only view and print forms (the
   // legacy 'viewer' role) may send one. The flag and audit are written without that role —
@@ -494,6 +519,8 @@ export async function emailCustomerStatement(
   opts?: { from?: Date; to?: Date; email?: string | null },
 ): Promise<{ ok: true; to: string }> {
   if (!(await isConfigured(ctx))) throw emailNotSetUpError();
+  // One address, as on a form's email: before the statement is drawn up.
+  if (opts?.email && opts.email.trim()) checkTypedRecipient(ctx, opts.email);
   const form = await renderCustomerStatement(ctx, customerId, { from: opts?.from, to: opts?.to });
   const recipient = await deliver(ctx, form, opts?.email);
   // Audited without the view-only role (see emailSalesForm): the statement already went out.

@@ -31,6 +31,7 @@ import { assertListDeleteAllowed } from './accountantCopy/guard';
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { Money } from '@/lib/money';
 import { accounts, payrollItems } from '@/lib/db/schema';
+import { isReadOnlyDb } from '@/lib/db/readOnly';
 import { assertNotControlLineAccount } from './posting';
 import {
   inferDeductionTracking,
@@ -395,6 +396,10 @@ async function accountIdByCodeOrNull(ctx: ServiceContext, code: string): Promise
  * the company already has ANY payroll items. Requires accounts 6500 + 2300 to
  * exist (the default COA); otherwise seeding is silently skipped so companies
  * with a custom COA can create items by hand. Returns the company's items.
+ *
+ * A context that only reads (an agent's read: ctx.readOnly, or the read-only database handle of
+ * lib/db/readOnly.ts) never seeds: it gets what is there, an empty list on a company nobody has
+ * opened the payroll items of yet, as if nothing existed.
  */
 export async function ensureDefaultPayrollItems(ctx: ServiceContext) {
   const existing = await ctx.db
@@ -402,6 +407,7 @@ export async function ensureDefaultPayrollItems(ctx: ServiceContext) {
     .from(payrollItems)
     .where(eq(payrollItems.companyId, ctx.companyId));
   if (existing.length > 0) return existing;
+  if (ctx.readOnly || isReadOnlyDb(ctx.db)) return existing;
 
   const wagesId = await accountIdByCodeOrNull(ctx, '6500'); // Payroll Expense
   const liabId = await accountIdByCodeOrNull(ctx, '2300');  // Payroll Liabilities

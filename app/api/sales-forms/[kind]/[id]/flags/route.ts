@@ -6,6 +6,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { isSalesFormKind, setSendFlags } from '@/lib/services/salesForms';
 import { routeError, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { sendFlagsUpdateSchema } from '@/lib/validation/sales';
 
 type RouteContext = { params: Promise<{ kind: string; id: string }> };
 
@@ -17,6 +19,10 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json({ error: `Unknown form type "${kind}"`, code: 'NOT_FOUND' }, { status: 404 });
     }
     const body = (await requireJsonObject(req, { optional: true })) as { toBePrinted?: unknown; toBeEmailed?: unknown };
+    // The body as agents read it described (lib/validation/sales.ts). It refuses nothing: a flag
+    // counts only when it is true or false, as below.
+    const checked = sendFlagsUpdateSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     const flags: { toBePrinted?: boolean; toBeEmailed?: boolean } = {};
     if (typeof body.toBePrinted === 'boolean') flags.toBePrinted = body.toBePrinted;
     if (typeof body.toBeEmailed === 'boolean') flags.toBeEmailed = body.toBeEmailed;

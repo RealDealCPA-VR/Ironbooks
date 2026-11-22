@@ -9,6 +9,12 @@
  *
  * Built from the same services the in-app reports use (trialBalance, generalLedger,
  * balanceSheet), so the shared numbers always tie to what the app shows.
+ *
+ * Protected numbers stay out of it the way they stay out of the reports: vendor tax ids are left
+ * out, and a Journal line memo holding a payee's full account number ("Acct # 000123456789", on a
+ * Sales Tax Payment entry posted before the payment stopped copying its check memo, or typed) is
+ * written as the caller may see it (journal.ts lineMemoFor): masked for a person or agent without
+ * "view full account numbers", as stored for one with it.
  */
 import { asc, eq } from 'drizzle-orm';
 import { PDFDocument } from 'pdf-lib';
@@ -29,7 +35,7 @@ import { buildReportPdf } from '@/lib/export/reportPdf';
 import { notFound, type ServiceContext } from './_base';
 import { balanceSheet, trialBalance } from './reports';
 import { endOfToday } from './reportEngine';
-import { generalLedger } from './journal';
+import { generalLedger, lineMemoFor } from './journal';
 
 const iso = (d: Date | null | undefined) => (d ? d.toISOString().slice(0, 10) : '');
 
@@ -205,7 +211,7 @@ async function collect(ctx: ServiceContext): Promise<LedgerData> {
           return [
             e.entryNumber, iso(e.date), e.status, e.description, e.reference ?? '',
             a?.code ?? '', a?.name ?? '', l.debit ?? '', l.credit ?? '',
-            l.classId ? (classById.get(l.classId) ?? '') : '', l.memo ?? '',
+            l.classId ? (classById.get(l.classId) ?? '') : '', lineMemoFor(ctx, l.memo) ?? '',
           ] as XlsxCell[];
         }),
       ),

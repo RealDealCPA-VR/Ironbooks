@@ -16,29 +16,49 @@
  * A question asked without an answer stops the flow the way Cancel would, and the request fails
  * with a message naming the question. Nothing ever waits on screen.
  *
+ * An agent never switches the open company file by itself: the window's "Save a Copy and Open It"
+ * (a copy in Documents under a name the window picks, then opened) is never one of the choices, and
+ * the shell never presses it. A read-only company file therefore stops the request; a person opens
+ * it from the Ironbooks window.
+ *
+ * `why` and the questions are read by the person approving, on the card, as well as by the agent:
+ * they say in plain words what happens on this computer, and speak of "the agent" (never "you" for
+ * it: "you" on the card is the person approving).
+ *
  * The question ids and choices here must match the shell's own list (electron/agentShell.js
  * QUESTIONS), and the input fields its OPERATIONS table: test/agentShell.test.ts holds them together.
  */
 import type { FlowQuestion, ShellOperationDef } from '../contract';
+import type { SecretKind } from './types';
+
+/**
+ * A shell operation as listed here: the contract's ShellOperationDef, plus what the contract has no
+ * room for yet (kept here, read by lib/services/agentRequests.ts).
+ */
+export interface ShellOperationEntry extends ShellOperationDef {
+  /**
+   * Those of `needsSecret` the flow needs EVERY time, whatever file it meets: a yes without one
+   * typed is sent back to the card before the request is claimed. Each secret of `needsSecret`
+   * left out here is asked for only at the prompt the flow meets (a portable file saved with a
+   * password), so the approver may leave its box empty. Left out: none is always needed.
+   */
+  alwaysNeedsSecret?: SecretKind[];
+}
 
 // ---- The flows' questions, worded as the card should ask them ----
 
-/** confirmCompanyFileLocation: the file is in a temporary folder (an email attachment, a download). */
+/**
+ * confirmCompanyFileLocation: the file is in a temporary folder (an email attachment, a download).
+ * The window also offers "Save a Copy and Open It"; for an agent it is never a choice.
+ */
 const TEMPORARY_FOLDER: FlowQuestion = {
   id: 'temporaryFolder',
   text:
     'If the company file turns out to be in a temporary folder (opened from an email or a download), work saved there can ' +
-    'disappear when the folder is cleaned up. Save a copy in Documents and work on that, open it there anyway, or stop?',
+    'disappear when the folder is cleaned up. Open it there anyway, or stop? For an agent, Ironbooks never saves a copy ' +
+    'somewhere else and opens that instead; a person can do that from the Ironbooks window.',
   kind: 'choice',
-  choices: ['Save a Copy and Open It', 'Open It Here Anyway', 'Cancel'],
-};
-
-/** confirmCompanyFileLocation: the file is read-only, so Ironbooks cannot save into it. */
-const READ_ONLY_FILE: FlowQuestion = {
-  id: 'readOnlyFile',
-  text: 'If the company file turns out to be read-only, Ironbooks cannot work in it. Save a copy in Documents and work on that, or stop?',
-  kind: 'choice',
-  choices: ['Save a Copy and Open It', 'Cancel'],
+  choices: ['Open It Here Anyway', 'Cancel'],
 };
 
 /** confirmCompanyFileLocation: a OneDrive, Dropbox or other cloud-sync folder (asked once per file). */
@@ -53,7 +73,9 @@ const CLOUD_FOLDER: FlowQuestion = {
 /** After a restore: open the new company file now (Ironbooks restarts into it) or later. */
 const OPEN_NOW: FlowQuestion = {
   id: 'openNow',
-  text: 'Once it is ready, open the new company file now? Ironbooks then saves and closes the open company file and restarts into the new one.',
+  text:
+    'Once it is ready, open the new company file now? Ironbooks then saves and closes the open company file and restarts into ' +
+    "the new one, which ends the agent's connection. Answer no to leave it for later.",
   kind: 'yes_no',
 };
 
@@ -80,17 +102,20 @@ const CLOSE_OVER_UNSAVED_FORM: FlowQuestion = {
   kind: 'yes_no',
 };
 
-const LOCATION_QUESTIONS = [TEMPORARY_FOLDER, READ_ONLY_FILE, CLOUD_FOLDER];
+/** The location questions of a flow that opens a company file (a read-only one stops the request). */
+const LOCATION_QUESTIONS = [TEMPORARY_FOLDER, CLOUD_FOLDER];
 
 /** Every desktop-shell operation is approved at the host computer's own window, where it happens. */
 const SHELL = { runner: 'electron', area: null, hostOnly: true } as const;
 
 const COMPANY_FILE_PATH = 'The full path of a company file (it ends in .ironbooks).';
-const RESTART_NOTE =
-  'Ironbooks saves and closes the open company file and restarts, so your connection ends: connect again in a minute. ' +
-  'A person must sign in again unless you may work unattended in that file.';
 
-export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
+/** What a restart into another company file does, as the person approving reads it. */
+const restartInto = (what: string) =>
+  `Ironbooks saves and closes the open company file and restarts into ${what}. The agent's connection ends with the restart; ` +
+  'it can connect again a minute later. Someone must sign in there again, unless this agent may work unattended in that file.';
+
+export const SHELL_OPERATIONS: readonly ShellOperationEntry[] = [
   {
     ...SHELL,
     id: 'shell.company.new',
@@ -98,8 +123,9 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: 'Create a new, empty company file at {file} and switch to it',
     why:
-      `File > New Company. Creates an empty company file where you say (never over an existing file), then ${RESTART_NOTE} ` +
-      'The new file opens on its Admin set-up, which a person completes: it holds the Admin user name and password.',
+      'File > New Company: an empty company file at the path the request names (never over a file that is already there). ' +
+      `${restartInto('the new file')} The new file opens on its Admin set-up, which a person completes at this computer: ` +
+      'it sets the Admin user name and password.',
     input: { file: { type: 'path', required: true, describe: `Where the new company file goes. ${COMPANY_FILE_PATH}` } },
     questions: [TEMPORARY_FOLDER, CLOUD_FOLDER],
     needsSecret: [],
@@ -113,8 +139,8 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: 'Open company file {file}',
     why:
-      `File > Open or Restore Company, for a company file (.ironbooks). Backups, portable files and Accountant's Copies have ` +
-      `their own operations. ${RESTART_NOTE}`,
+      'File > Open or Restore Company, for a company file (.ironbooks) in a folder agents may use. Backups, portable files and ' +
+      `Accountant's Copies have requests of their own. A read-only company file is not opened. ${restartInto('the file asked for')}`,
     input: { file: { type: 'path', required: true, describe: COMPANY_FILE_PATH } },
     questions: LOCATION_QUESTIONS,
     needsSecret: [],
@@ -127,7 +153,7 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     flow: 'openCompany',
     class: 'file',
     describe: 'Switch to company file {file}',
-    why: `File > Recent Companies: only a company file on that list. ${RESTART_NOTE}`,
+    why: `File > Recent Companies: only a company file already on that list. ${restartInto('the file asked for')}`,
     input: { file: { type: 'path', required: true, describe: `A company file from Recent Companies. ${COMPANY_FILE_PATH}` } },
     questions: [],
     needsSecret: [],
@@ -141,8 +167,8 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: 'Close the company file',
     why:
-      'File > Close Company: saves the company file, releases it and restarts on "No Company Open". Your connection ends and ' +
-      'cannot come back by itself: no company file is open until a person opens one.',
+      'File > Close Company: Ironbooks saves the company file, releases it and restarts on "No Company Open". The agent\'s ' +
+      'connection ends and cannot come back by itself: no company file is open until a person opens one.',
     input: {},
     questions: [CLOSE_WHILE_HOSTING],
     needsSecret: [],
@@ -156,8 +182,9 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: 'Save a copy of the company file as {file}',
     why:
-      'File > Save Copy As: a separate company file holding every company and every user of this one, nothing masked. ' +
-      'Never saved over an existing file. Not available in a practice copy.',
+      'File > Save Copy As: a separate company file at the path the request names, holding all of this one, with every user ' +
+      'and nothing masked. Never saved over a file that is already there. The open company file stays open. Not available in ' +
+      'a practice copy.',
     input: { file: { type: 'path', required: true, describe: `Where the copy goes. ${COMPANY_FILE_PATH}` } },
     questions: [],
     needsSecret: [],
@@ -171,15 +198,18 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: 'Restore portable company file {file} as a new company file {target}',
     why:
-      'File > Open or Restore Company with a portable file (.bkp): restored, checked and saved as a new company file; the open ' +
-      'company file is not touched. A portable file saved with a password needs it, typed by the approver. If the approver ' +
-      `chooses to open it now: ${RESTART_NOTE}`,
+      'File > Open or Restore Company with a portable company file (.bkp): it is restored, checked and saved as a new company ' +
+      'file at the target path; the open company file is not touched. If the portable file was saved with a password, the ' +
+      'approver types it on the card (the agent never sees it); without one, leave the box empty. If the approver answers yes ' +
+      `to opening it now: ${restartInto('the new file')}`,
     input: {
       file: { type: 'path', required: true, describe: 'The portable company file (.bkp).' },
       target: { type: 'path', required: true, describe: `Where the new company file goes. ${COMPANY_FILE_PATH}` },
     },
     questions: [OPEN_NOW],
     needsSecret: ['backup_password'],
+    // Only a portable file saved with a password asks for it.
+    alwaysNeedsSecret: [],
     fileAdmin: true,
     restarts: true,
   },
@@ -190,15 +220,18 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: "Open Accountant's Copy {file} as a new company file {target}",
     why:
-      "Accountant > Open Accountant's Copy with a transfer file (.ibac): restored, checked and saved as a new company file to " +
-      "work in; the open company file is not touched. A transfer file saved with a password needs it, typed by the approver. " +
-      `If the approver chooses to open it now: ${RESTART_NOTE}`,
+      "Accountant > Open Accountant's Copy with a transfer file (.ibac): it is restored, checked and saved as a new company file " +
+      'at the target path, to work in; the open company file is not touched. If the transfer file was saved with a password, ' +
+      'the approver types it on the card (the agent never sees it); without one, leave the box empty. If the approver answers ' +
+      `yes to opening it now: ${restartInto('the new file')}`,
     input: {
       file: { type: 'path', required: true, describe: "The Accountant's Copy transfer file (.ibac)." },
       target: { type: 'path', required: true, describe: `Where the new company file goes. ${COMPANY_FILE_PATH}` },
     },
     questions: [OPEN_NOW],
     needsSecret: ['backup_password'],
+    // Only a transfer file saved with a password asks for it.
+    alwaysNeedsSecret: [],
     fileAdmin: true,
     restarts: true,
   },
@@ -209,9 +242,10 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: 'Restore backup {file} as a new company file {target}',
     why:
-      'File > Open or Restore Company with a backup (.bka), as a new company file: the open company file is not touched (restoring ' +
-      'INTO it is the Back Up and Restore page). A backup protected with passwords becomes a protected company file without ' +
-      `being opened here. If the approver chooses to open it now: ${RESTART_NOTE}`,
+      'File > Open or Restore Company with a backup (.bka), as a new company file at the target path: the open company file is ' +
+      'not touched (restoring INTO it is the Back Up and Restore page, a request of its own). A backup protected with passwords ' +
+      'becomes a protected company file without being opened here. If the approver answers yes to opening it now: ' +
+      restartInto('the new file'),
     input: {
       file: { type: 'path', required: true, describe: 'The backup file (.bka).' },
       target: { type: 'path', required: true, describe: `Where the new company file goes. ${COMPANY_FILE_PATH}` },
@@ -228,9 +262,9 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: 'Make a practice copy of the company file and switch to it',
     why:
-      'File > Try It on a Copy, for a PERSON to practise in: the window makes the copy with the approver\'s own sign-in and ' +
-      'Ironbooks restarts into it. Your connection ends there, and you cannot work in the practice copy at all: agents are ' +
-      'refused inside one (plan 4.6). You can work again once a person has left it.',
+      'File > Try It on a Copy, for a PERSON to practise in: the Ironbooks window makes the copy with the approver\'s own sign-in ' +
+      "and restarts into it. The agent's connection ends there, and the agent cannot work in the practice copy at all: agents " +
+      'are refused inside one. It can work again once a person has left the practice copy.',
     input: {},
     questions: [],
     needsSecret: [],
@@ -244,9 +278,9 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: 'Leave the practice copy',
     why:
-      'Only opens the Leave the Sandbox page for the person at the window, who chooses to discard the copy or keep it as a ' +
-      'training file; nothing is left or deleted by this request itself, and Ironbooks restarts only once that person leaves. ' +
-      'Agents are refused inside a practice copy (plan 4.6), so in practice this cannot be asked from one.',
+      'Only opens the Leave the Sandbox page for the person at the Ironbooks window, who chooses there to discard the copy or keep ' +
+      'it as a training file; nothing is left or deleted by this request itself, and Ironbooks restarts only once that person ' +
+      'leaves. Agents are refused inside a practice copy, so this is rarely asked.',
     input: {},
     questions: [],
     needsSecret: [],
@@ -262,8 +296,8 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     describe: 'Turn on multi-user access ({network})',
     why:
       'File > Switch to Multi-user Mode ("office": every computer on this office network can open the company file from the ' +
-      'shared drive) or File > Host multi-user access ("tailnet": computers on your Tailscale network). Each person still signs ' +
-      'in with their own user name. Not in a practice copy.',
+      'shared drive) or File > Host multi-user access ("tailnet": computers on the company\'s Tailscale network). Each person ' +
+      'still signs in with their own user name and password. Not available in a practice copy.',
     input: { network: { type: 'string', required: true, describe: '"office" (this office network) or "tailnet" (Tailscale).' } },
     questions: [],
     needsSecret: [],
@@ -276,7 +310,9 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     flow: 'switchToSingleUserFlow',
     class: 'file',
     describe: 'Turn off multi-user access',
-    why: 'File > Switch to Single-user Mode: other computers can no longer come in without asking.',
+    why:
+      'File > Switch to Single-user Mode: other computers can no longer work in the company file at the same time. The card ' +
+      'asks what to do if someone is working in it from another computer right now.',
     input: {},
     questions: [DISCONNECT_OTHERS],
     needsSecret: [],
@@ -293,10 +329,10 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
       'File > Open company on host. What joining really does: Ironbooks saves and closes the company file open on this computer, ' +
       'restarts, and from then on the Ironbooks window shows the pages the program at that address serves instead of its own, ' +
       'and people sign in there with their user names and passwords. So approve only the address of another computer you know ' +
-      'hosts your company file (its Company > Multi-user page shows it). Ironbooks contacts the address first to check it ' +
+      "hosts your company file (its Company > Multi-user page shows it). Ironbooks contacts the address first to check it " +
       "answers, and refuses this computer's own addresses and names and the virtual machines or containers it runs (such as WSL " +
-      'or Docker). Your connection ends with the restart, and this computer ' +
-      'then has no books of its own open: agents connect to the host computer instead.',
+      "or Docker). The agent's connection ends with the restart, and this computer then has no books of its own open: agents " +
+      'connect to the host computer instead.',
     input: {
       host: {
         type: 'string',
@@ -316,8 +352,8 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'file',
     describe: "Disconnect from the host and reopen this computer's company file",
     why:
-      'File > Disconnect, on a computer that is a client of another computer\'s company file. Such a computer has no books of ' +
-      `its own open, so an agent rarely reaches it. ${RESTART_NOTE}`,
+      'File > Disconnect, on a computer that works in a company file another computer hosts. Such a computer has no books of ' +
+      `its own open, so an agent rarely reaches it. ${restartInto("this computer's own company file")}`,
     input: {},
     questions: [],
     needsSecret: [],
@@ -331,9 +367,10 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'outside',
     describe: 'Install the Ironbooks update',
     why:
-      'Help > Check for Updates. With an update downloaded: Ironbooks saves the company file, installs it and restarts (your ' +
-      'connection ends; connect again in a few minutes). With one found but not downloaded yet: starts the download from the ' +
-      "release feed (the company's Privacy & Network settings must allow it); ask again once it is ready. Not from a practice copy.",
+      'Help > Check for Updates. With an update already downloaded: Ironbooks saves the company file, installs the update and ' +
+      "restarts (the agent's connection ends; it can connect again a few minutes later). With one found but not downloaded yet: " +
+      "the download starts from Ironbooks' release feed (the company's Privacy & Network settings must allow it), and the agent " +
+      'asks again once it is ready. Not from a practice copy.',
     input: {},
     questions: [CLOSE_OVER_UNSAVED_FORM],
     needsSecret: [],
@@ -348,8 +385,8 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     describe: 'Download and install Ollama, the free AI that runs on this computer',
     why:
       "AI & Automation > Set up free AI: downloads Ollama's own installer from ollama.com (about 1 GB), checks it is signed by " +
-      "Ollama and starts it (elsewhere than Windows: opens the download page). The company's Privacy & Network settings must " +
-      'allow downloads. The download goes on after the answer; the AI & Automation page shows how far it is.',
+      'Ollama and starts it (on a Mac or Linux it opens the download page instead). The company\'s Privacy & Network settings must ' +
+      'allow downloads. The download goes on after the approval; the AI & Automation page shows how far it is.',
     input: {},
     questions: [],
     needsSecret: [],
@@ -363,8 +400,9 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     class: 'print',
     describe: 'Print file {fileId} on a printer',
     why:
-      'Prints a staged PDF (a report, a form, checks) on this computer\'s default printer or the one named, without a print ' +
-      'dialog (D10). For checks, the approver confirms afterwards whether they printed correctly.',
+      "Prints a PDF the agent staged (a report, a form, checks) on this computer's default printer, or the printer the request " +
+      'names, without a print dialog. Printing records nothing by itself: check numbers are recorded only by a separate ' +
+      'request ("Did the checks print OK?" or marking a check printed).',
     input: {
       fileId: { type: 'fileId', required: true, describe: 'The PDF to print.' },
       printer: { type: 'string', required: false, describe: "The printer's name as this computer lists it; leave out for the default printer." },
@@ -383,9 +421,9 @@ export const SHELL_OPERATIONS: readonly ShellOperationDef[] = [
     area: null,
     describe: 'Save file {fileId} in {folder}',
     why:
-      'Writes one of your staged files (an upload, or a PDF or download an operation gave you) into a folder on this computer: ' +
-      "the open company file's folder, Documents\\Ironbooks and its Agent Outbox, or a folder the Admin added for you. Never " +
-      'over a file that is already there.',
+      'Writes one of the agent\'s staged files (an upload, or a PDF or download an operation gave it) into a folder on this ' +
+      "computer: the open company file's folder, Documents\\Ironbooks and its Agent Outbox, or a folder the Admin added for this " +
+      'agent. Never over a file that is already there.',
     input: {
       fileId: { type: 'fileId', required: true, describe: 'The staged file to save.' },
       folder: { type: 'path', required: true, describe: 'The folder it goes in; it must already exist.' },

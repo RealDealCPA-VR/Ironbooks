@@ -206,6 +206,23 @@ async function ok(token: string, name: string, args: Record<string, unknown> = {
   return r.data;
 }
 
+/**
+ * What the agent's door would do with this request right now, by its own dry run through
+ * run_operation (the registry's operation of the route, its class worked out at run time, the
+ * request's body included): 'done' when it would run on its own, 'asked' when a person approves
+ * it first, 'refused' otherwise. The tests compare a tool with this, never with a class copied here.
+ */
+async function doorWould(token: string, method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE', route: string, request: Record<string, unknown>): Promise<'done' | 'asked' | 'refused'> {
+  const operation = operationForRoute(method, route);
+  expect(operation, `${method} ${route}`).toBeTruthy();
+  const out = await clientFor(token).act({ verb: 'run_operation', operation: operation!.id, ...request, dryRun: true });
+  if (out?.outcome === 'refused') return 'refused';
+  expect(out?.outcome, JSON.stringify(out).slice(0, 300)).toBe('dry_run');
+  if (/would ask a person first/.test(String(out.note ?? ''))) return 'asked';
+  expect(String(out.note ?? ''), JSON.stringify(out).slice(0, 300)).toMatch(/would be done straight away/);
+  return 'done';
+}
+
 /** A fingerprint of the books: every table's row count, the audit trail and the transaction log. */
 async function fingerprint() {
   const tables = (await db.execute(
@@ -565,7 +582,20 @@ describe('the tools that change the books, against the real services', () => {
       request_id: 'mcp-je-1-edit',
       changes: { date: '2026-04-02', description: 'Supplies run (corrected)', lines: read.lines.map((l: Out) => ({ account_id: l.account_id, debit: l.debit ?? undefined, credit: l.credit ?? undefined, memo: l.memo })) },
     });
-    expect(edited.outcome).toBe('posted');
+    // Only the description changed: whether that counts as posting is the door's to say. The
+    // measure is run_operation's answer to the very same edit of a twin entry.
+    const twin = await ok(poster, 'enter_journal_entry', { ...je('64.20', 'Supplies run (twin)'), request_id: 'mcp-je-twin' });
+    const twinRead = await ok(poster, 'get_transaction', { type: 'journal_entry', id: twin.result.id });
+    const generic = await clientFor(poster).act({
+      verb: 'run_operation',
+      operation: 'journal-entries.update',
+      params: { id: twinRead.id },
+      body: { date: '2026-04-02', description: 'Supplies run (corrected)', lines: twinRead.lines.map((l: Out) => ({ accountId: l.account_id, debit: l.debit ?? undefined, credit: l.credit ?? undefined, memo: l.memo })) },
+      expectedUpdatedAt: twinRead.updated_at,
+      requestId: 'mcp-je-twin-edit',
+    });
+    expect(['posted', 'done'], JSON.stringify(generic).slice(0, 300)).toContain(generic.outcome);
+    expect(edited.outcome).toBe(generic.outcome);
     expect((await ok(poster, 'get_transaction', { type: 'journal_entry', id: edited.result.id })).description).toBe('Supplies run (corrected)');
     const stale = await run(poster, 'edit_transaction', { type: 'journal_entry', id: edited.result.id, expected_updated_at: '2020-01-01T00:00:00.000Z', request_id: 'mcp-je-1-stale', changes: je('64.20', 'Stale') });
     expect(stale.ok).toBe(false);
@@ -759,9 +789,25 @@ describe('a bank statement, start to finish', () => {
     // Undo and redo one, and set a stray line aside and put it back.
     await ok(poster, 'unmatch_bank_line', { bank_transaction_id: supplies.bank_transaction_id, request_id: 'recon-unmatch-1' });
     expect((await ok(poster, 'get_bank_feed', { bank_account_id: bankAccountId })).count).toBe(1);
-    expect((await ok(poster, 'exclude_bank_line', { bank_transaction_id: supplies.bank_transaction_id, request_id: 'recon-excl-1' })).result.excluded).toBe(true);
+    // Setting a line aside, and putting it back: the tool does what run_operation says of the very
+    // same request (the registry's class of an exclusion, worked out at run time). Asked, a person
+    // approves it, and the same request_id then gives what was done.
+    const setAside = async (restore: boolean, requestId: string): Promise<Out> => {
+      const would = await doorWould(poster, 'POST', '/api/bank-transactions/exclude', { body: { bankTransactionId: supplies.bank_transaction_id, ...(restore ? { restore: true } : {}) } });
+      expect(['asked', 'done'], would).toContain(would);
+      const args = { bank_transaction_id: supplies.bank_transaction_id, ...(restore ? { restore: true } : {}), request_id: requestId };
+      const out = await ok(poster, 'exclude_bank_line', args);
+      expect(out.outcome, JSON.stringify(out).slice(0, 300)).toBe(would);
+      if (would === 'done') return out.result;
+      expect(out.status).toBe('pending');
+      expect((await approveAgentRequest(admin, out.request_id, {}, { atHost: true })).status).toBe('executed');
+      const again = await ok(poster, 'exclude_bank_line', args);
+      expect(again).toMatchObject({ outcome: 'done', repeated: true });
+      return again.result;
+    };
+    expect((await setAside(false, 'recon-excl-1')).excluded).toBe(true);
     expect((await ok(poster, 'get_bank_feed', { bank_account_id: bankAccountId, show: 'excluded' })).count).toBe(1);
-    expect((await ok(poster, 'exclude_bank_line', { bank_transaction_id: supplies.bank_transaction_id, restore: true, request_id: 'recon-excl-2' })).result.excluded).toBe(false);
+    expect((await setAside(true, 'recon-excl-2')).excluded).toBe(false);
     await ok(poster, 'categorize_bank_line', { bank_transaction_id: supplies.bank_transaction_id, account_id: rich.acct['6300'], request_id: 'recon-cat-2' });
     expect((await ok(poster, 'get_bank_feed', { bank_account_id: bankAccountId })).count).toBe(0);
   });
@@ -834,15 +880,26 @@ describe('a bank statement, start to finish', () => {
     const ledgerBefore = (await fingerprint()).journal;
     const statement = { bank_account_id: bank, statement_kind: 'bank', opening_balance: '0.00', closing_balance: '-18.00', lines: [{ date: '2026-06-03', description: 'MONTHLY FEE', amount: '-18.00' }] };
 
-    // Statement lines are bulk work, which this preset asks a person about. KNOWN TO FOLLOW THE
-    // CLASSIFICATION: POST /api/import is class 'bulk' for every file type, the reviewed 'rows' of
-    // a statement included (lib/agent/operations/classes/documents.ts). Should the classification
-    // owner class a rows import as prepare, this answer becomes 'done': update it then.
+    // Statement lines: the tool does what the registry says of a rows import for this preset (a
+    // person is asked while it counts as bulk work; done at once if it is prepare work). What
+    // run_operation says of the very same request is the measure, not a class written down here.
+    const importWould = await doorWould(proposer, 'POST', '/api/import', {
+      body: { bankAccountId: bank, fileType: 'rows', rows: statement.lines, statement: { kind: 'bank', openingBalance: '0.00', closingBalance: '-18.00' }, filename: 'statement lines from an agent' },
+    });
+    expect(['asked', 'done'], importWould).toContain(importWould);
     const imported = await ok(proposer, 'import_statement_lines', { ...statement, request_id: 'prop-import-1' });
-    expect(imported).toMatchObject({ outcome: 'asked', status: 'pending' });
-    expect((await ok(proposer, 'get_bank_feed', { bank_account_id: bank })).count).toBe(0);
-    // An agent allowed bulk work lays them out itself; nothing is posted.
-    expect(await ok(poster, 'import_statement_lines', { ...statement, request_id: 'prop-import-by-poster' })).toMatchObject({ outcome: 'done', result: { added_to_feed: 1 } });
+    expect(imported.outcome).toBe(importWould);
+    if (importWould === 'asked') {
+      expect(imported.status).toBe('pending');
+      expect((await ok(proposer, 'get_bank_feed', { bank_account_id: bank })).count).toBe(0);
+    } else {
+      expect(imported.result).toMatchObject({ added_to_feed: 1 });
+    }
+    // An agent allowed bulk work lays them out itself (or finds them laid out already); nothing is posted.
+    expect(await ok(poster, 'import_statement_lines', { ...statement, request_id: 'prop-import-by-poster' })).toMatchObject({
+      outcome: 'done',
+      result: importWould === 'asked' ? { added_to_feed: 1 } : { added_to_feed: 0, already_there: 1 },
+    });
     const feed = (await ok(proposer, 'get_bank_feed', { bank_account_id: bank })).lines as Out[];
     expect(feed).toHaveLength(1);
     // A reconciliation in progress is prepare work: done directly, nothing posted.
@@ -857,15 +914,21 @@ describe('a bank statement, start to finish', () => {
     expect((await fingerprint()).journal).toEqual(ledgerBefore);
     expect((await ok(proposer, 'get_bank_feed', { bank_account_id: bank })).count).toBe(1);
 
-    // Ticking lines is a change (the same request also finishes a reconciliation): a person
-    // approves it, on someone else's reconciliation as on its own. KNOWN TO FOLLOW THE
-    // CLASSIFICATION: PATCH /api/reconciliations/[id] is class 'change' whatever its body's action
-    // (lib/agent/operations/classes/banking.ts). Should the classification owner class
-    // setClearedMany and updateStatement as prepare, this answer becomes 'done': update it then.
+    // Ticking lines, on someone else's reconciliation as on its own: the same request (PATCH
+    // /api/reconciliations/[id]) also finishes one, and the registry says per body what it is (a
+    // person approves it while it counts as a change; done at once if it is prepare work). Again
+    // the measure is what run_operation says of the very same request.
     const other = await ok(poster, 'start_reconciliation', { bank_account_id: bankAccountId, statement_date: '2026-05-31', statement_balance: '759.00', request_id: 'recon-start-again' });
     const sheet = await ok(proposer, 'get_reconciliation', { reconciliation_id: other.result.reconciliation_id });
+    const markWould = await doorWould(proposer, 'PATCH', '/api/reconciliations/[id]', {
+      params: { id: other.result.reconciliation_id },
+      body: { action: 'setClearedMany', journalEntryLineIds: [sheet.lines[0].line_id], isCleared: true },
+    });
+    expect(['asked', 'done'], markWould).toContain(markWould);
     const theirs = await ok(proposer, 'mark_cleared', { reconciliation_id: other.result.reconciliation_id, line_ids: [sheet.lines[0].line_id], request_id: 'prop-mark-theirs' });
-    expect(theirs).toMatchObject({ outcome: 'asked', status: 'pending' });
+    expect(theirs.outcome).toBe(markWould);
+    if (markWould === 'asked') expect(theirs.status).toBe('pending');
+    else expect(theirs.result).toHaveProperty('cleared_balance');
     // Cancelling one needs the Delete right on Reconcile, which the Bookkeeper role does not have,
     // for an agent as for a person.
     const cancel = await run(proposer, 'cancel_reconciliation', { reconciliation_id: started.result.reconciliation_id, request_id: 'prop-cancel-1' });

@@ -42,8 +42,10 @@
  * entry void), but the bridge counts the voided entry at its total, and an entry deleted outright
  * at the total its audit row kept. With an amountField the amount is the larger of that field and
  * the largest single one of those entries (an amountField it cannot read stays over every limit).
- * With none it is all of them added up (the entries posted, or the entries touched, whichever is
- * larger), "0.00" for a run that posted and touched no entry at all, and unknown when a touched
+ * With none it is all of them added up, except that a document an edit re-posts counts once, at
+ * the larger of its new and its old entry (by source reference), and "0.00" only for a run that
+ * made new records and posted no entry. A run that voided, deleted or changed a record that was
+ * already there and touched no entry stays unknown (over every limit), as does one where a touched
  * entry's total cannot be read. So voiding a $50,000 journal entry is a $50,000 request after its
  * dry run, with or without an amountField: an amountField can only raise that figure. Entering or
  * editing a journal entry sets no amountField: the answer has its lines but no total, and the
@@ -52,11 +54,59 @@
  * judged by every entry they post, added up; they always ask, and the card's ledger preview lists
  * every entry.
  *
+ * One request, two kinds of work: the Reconcile window's PATCH ticks lines and corrects the
+ * statement (prepare work) but also completes the reconciliation and posts its adjustments
+ * (change), by body.action; the bank feed's suggestions stay on this computer unless ai=1 asks
+ * the company's AI model. An operation has one class (types.ts), so each is classed by its
+ * riskiest work, and BANKING_CLASS_BY_INPUT below says how the input would class it. The policy
+ * does not read that table yet: until types.ts has a field for a class that depends on the input,
+ * ticking a line asks like completing, and a local suggestion asks like an AI one (fail closed).
+ *
  * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
  * ".post", with a short verb; the real lists whose records live at another address also get
  * ".list" and ".create" (bank-accounts.list, bank-accounts.create).
  */
-import type { ClassificationMap } from '../types';
+import type { ClassificationMap, OperationKey, RiskClass } from '../types';
+
+/**
+ * How one value of a request would class it, for a route whose one request does different kinds
+ * of work. NOT READ BY THE POLICY: types.ts (OperationClassification) has no such field yet, so the
+ * operation's own class is the strictest class of its table, and classes/banking.test.ts holds that
+ * and that the table names every value the route acts on.
+ */
+export interface ClassByInput {
+  /** Where the value is: a body field, or a query parameter (its first value, as the route reads it). */
+  from: 'body' | 'query';
+  field: string;
+  /** The class for each value the route acts on. */
+  classes: Readonly<Record<string, RiskClass>>;
+  /** Any other value, or none: what the route then does. */
+  otherwise: RiskClass;
+}
+
+export const BANKING_CLASS_BY_INPUT: Readonly<Partial<Record<OperationKey, ClassByInput>>> = {
+  // Ticking lines and correcting the statement never reach the books and are undone by unticking
+  // or cancelling (prepare, like starting the reconciliation). Completing it, with or without the
+  // discrepancy adjustment, and the service charge and interest entries post (change). Any other
+  // action is refused by the route; it is judged as the strictest.
+  'PATCH /api/reconciliations/[id]': {
+    from: 'body',
+    field: 'action',
+    classes: { setClearedMany: 'prepare', toggleCleared: 'prepare', updateStatement: 'prepare', complete: 'change', adjustments: 'change' },
+    otherwise: 'change',
+  },
+  // Only ai=1 sends anything off this computer: the payee, description and amount of unsure lines
+  // to the AI model the company set up, which may be a cloud service, and, when the owner turned
+  // vendor lookup on, the payee name to that web lookup (llmSuggestBankCategory, lookupVendor).
+  // Without it the suggestions come from the rules, the history and the learned model on this
+  // computer: a read.
+  'GET /api/bank-transactions/suggestions': {
+    from: 'query',
+    field: 'ai',
+    classes: { '1': 'outside' },
+    otherwise: 'read',
+  },
+};
 
 export const BANKING_CLASSES: ClassificationMap = {
   // Bank accounts: the link between a real bank or card account and its GL account.
@@ -97,7 +147,11 @@ export const BANKING_CLASSES: ClassificationMap = {
     class: 'outside',
     describe:
       'Suggest accounts for the bank feed lines of bank account {bankAccountId} (ai: {ai}; with ai 1, the payee, description and amount of unsure lines go to the company\'s AI model)',
-    why: 'Not a plain read. Every call refreshes the learned categorizer stored in the company file (ai_categorizer_models), and with ai=1 the low-confidence lines (payee, description, amount) are sent to the AI model the company set up, which may be a cloud service, plus the optional vendor web lookup. No dry run: a preview would send the same lines out.',
+    why:
+      'Classed by its riskiest form. With ai=1 the low-confidence lines (payee, description, amount) are sent to the AI model the company set up, which may be a cloud service, and, when the owner turned vendor lookup on, the payee name to that web lookup, so that form leaves this computer. ' +
+      'Without ai=1 nothing leaves it: the suggestions come from the bank rules, the history and the learned model on this computer, and the only write is the refresh of that learned model (ai_categorizer_models), which an agent\'s read-only run cannot make (its opinion is then left out). ' +
+      'That form would be a read, but an operation has one class, so it asks too until the policy can class a request by its query (BANKING_CLASS_BY_INPUT). ' +
+      'Suggestions from the rules and the history alone are a read: the curated bank_feed_suggestions action. No dry run: a preview would send the same lines out.',
     effects: ['network'],
     dryRun: 'none',
   },
@@ -120,7 +174,10 @@ export const BANKING_CLASSES: ClassificationMap = {
   'POST /api/bank-transactions/exclude': {
     class: 'change',
     describe: 'Exclude bank feed line {bankTransactionId} from review, or restore it',
-    why: 'Nothing reaches the ledger, but an excluded line is never recorded: excluding is a bookkeeping decision about an existing line, and bank line text is untrusted input an agent reads. So it is a change, not prepare. restore: true brings the line back.',
+    why:
+      'Nothing reaches the ledger, but an excluded line is never recorded and leaves the review list; it shows again only under Excluded. A real charge excluded is missing from the books until someone finds it, at the latest when the account is reconciled and the difference shows. ' +
+      'That is a bookkeeping decision about a line whose text outsiders wrote and the agent read, so excluding is a change, not prepare: under "Ask for every change" (the default) a person sees each one, and a policy that lets changes run lets this run too. ' +
+      'Ticking a reconciliation line is different: it would be prepare once the policy can class a request by its body.action (see PATCH /api/reconciliations/[id]), and today it is a change as well. restore: true brings the line back.',
   },
   'POST /api/bank-transactions/bulk': {
     class: 'bulk',
@@ -474,7 +531,9 @@ export const BANKING_CLASSES: ClassificationMap = {
   'PATCH /api/reconciliations/[id]': {
     class: 'change',
     describe: 'Work on reconciliation {id} (action: {action})',
-    why: 'The same request ticks lines and corrects the statement (prepare work), but also completes the reconciliation and posts service charge, interest and discrepancy entries (action complete or adjustments). One class covers every action, so it is the stricter one.',
+    why:
+      'One request for every action. setClearedMany, toggleCleared and updateStatement tick lines and correct the statement: prepare work, nothing reaches the books. complete (with adjust: true, after posting the difference to Reconciliation Discrepancies) marks every ticked line reconciled, and adjustments posts the service charge and interest entries: change. ' +
+      'An operation has one class, so it is the stricter one, and ticking a line asks wherever completing would, until the policy can class a request by its body.action (BANKING_CLASS_BY_INPUT).',
   },
   'DELETE /api/reconciliations/[id]': {
     class: 'remove',

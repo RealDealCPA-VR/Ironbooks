@@ -26,7 +26,19 @@
  *    in the folder that was checked; a dryRun 'none' commit has a 10-minute limit of its own.
  *  - The handler's context is built from the actor, never from base.access.
  *  - The staleness key: two runs over the same books agree; a price the run reads or a record the
- *    input names, changed in between, gives another key.
+ *    input names, changed in between, gives another key. What the run assigns to itself is left
+ *    out (wave 4): the next estimate, purchase order, invoice or journal entry number another
+ *    request took, a posting elsewhere, ids of rows the run made wherever they show (a value, a
+ *    source, a reference cut to 8 hex digits, a second audit kind on one id, a row dated back), so
+ *    none of those makes a waiting request stale; an existing row's id stays as it is.
+ *  - Wave 4 also: a void plus an unrelated posting adds up, an edit re-posting one document counts
+ *    once; editing a record that existed with no entry is an unknown amount; an entry only named by
+ *    an audit row is not shown as changed; a flagged dry run's preview carries the warning the flag
+ *    accepted; expectedUpdatedAt reaches the route as x-expected-updated-at (409 on a person's
+ *    edit in between); the launch pass reaches the handler only for an approval at the host and
+ *    never the scope; ledger lines name who they are for and their class; a wrong closing-date
+ *    password typed on the card is refused before the route runs and counted once, and Set Closing
+ *    Date does not count it again; no agent changes or deletes a role an agent holds.
  *  - Refusals before running, an edited copy of an operation, the gates a scope skips, time limits
  *    (reports longer), preview limits, staged files in and out, allowed folders (a folder still to
  *    be made included), grants, produced secrets, a dry run stopped at a call to another computer
@@ -140,7 +152,7 @@ import { PREVIEW_ROW_LIMIT, type BridgeActor, type OperationInput } from './cont
 import { PRODUCED_SECRET_TEXT, SECRET_HEADERS, encodeSecretParts } from './guards';
 import { allowedFolder, stageFile } from './files';
 import { postJournalEntry } from '@/lib/services/posting';
-import { IRREVERSIBLE_COMMIT_TIME_LIMIT_MS, runOperation } from './bridge';
+import { CLOSING_PASSWORD_WRONG_MESSAGE, IRREVERSIBLE_COMMIT_TIME_LIMIT_MS, runOperation } from './bridge';
 
 type Out = Record<string, any>;
 let db: DB;
@@ -866,10 +878,18 @@ describe('secrets come only from the approving person, on a commit', () => {
     seen.length = 0;
   });
 
-  it('never in a dry run, even when the actor holds the secret; the agent\'s own are taken out', async () => {
+  it('a dry run gets only the closing-date password (so closed-period work is tried on real figures); the agent\'s own are taken out', async () => {
     h.handler = spy;
     const r = await run(closing(), { body: agentBody }, 'dry_run', { ...everything, secrets: { closing_password: 'pw-1' } });
     expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(seen).toEqual([{ request: 'pw-1', scope: 'pw-1', override: true, body: { closingDate: '2025-12-31', currentPassword: 'pw-1' } }]);
+    expect(JSON.stringify(r)).not.toContain('pw-1');
+    expect(JSON.stringify(r)).not.toContain('agent-typed');
+    // With nothing typed, nothing: the agent's own dry run never has a password.
+    seen.length = 0;
+    h.handler = spy;
+    const own = await run(closing(), { body: agentBody }, 'dry_run', everything);
+    expect(own.outcome, JSON.stringify(own.error)).toBe('ok');
     expect(seen).toEqual([{ request: null, scope: null, override: false, body: { closingDate: '2025-12-31' } }]);
   });
 
@@ -954,13 +974,23 @@ describe('secrets come only from the approving person, on a commit', () => {
       expect(JSON.stringify([withLogin, withKey])).not.toMatch(/pä55|dana@books\.test|RK-7Q2M/);
     });
 
-    it('never from the agent alone, never in a dry run, and a commit without them is refused before anything runs', async () => {
-      // A commit with nothing typed: refused, the handler never runs, whatever the agent planted.
+    it('never from the agent alone, never in a dry run; a commit without them runs without any (the route needs none for a backup of this same file)', async () => {
+      // A commit with nothing typed: the sign-in of another file is optional to the route
+      // (ApprovalNeeds.optionalSecrets), so it runs, and with none of what the agent planted.
       h.handler = archiveSpy;
-      const refused = await run(op('backups.restore'), { ...planted, body: { id: 'backup-1' } } as unknown as OperationInput, 'commit', everything);
+      const without = await run(op('backups.restore'), { ...planted, body: { id: 'backup-1' } } as unknown as OperationInput, 'commit', everything);
+      h.handler = null;
+      expect(without.outcome, JSON.stringify(without.error)).toBe('ok');
+      const none = { 'x-ironbooks-login': null, 'x-ironbooks-password': null, 'x-ironbooks-recovery-key': null };
+      expect(got).toEqual([{ request: none, scope: none }]);
+      got.length = 0;
+      // A secret the route always needs is still asked for before anything runs.
+      h.handler = archiveSpy;
+      const staged0 = await stageFile({ companyId: rich.ctx.companyId, agentId }, { name: 'copy.ibk', type: 'application/octet-stream', bytes: new Uint8Array([5]) });
+      const refused = await run(op('portable.restore'), { body: { fileId: staged0.fileId } }, 'commit', everything);
       h.handler = null;
       expect(refused.error!.code).toBe('SECRET_NEEDED');
-      expect(refused.error!.details).toEqual({ secrets: ['archive_credentials'] });
+      expect(refused.error!.details).toEqual({ secrets: ['backup_password'] });
       expect(got).toEqual([]);
       // A dry run that really runs (a copy of the operation that can be rolled back), with the
       // approver's secret in hand: still none of them reaches the handler.
@@ -994,7 +1024,7 @@ describe('secrets come only from the approving person, on a commit', () => {
     });
   });
 
-  it('wrong closing-date passwords are counted by the person\'s own limiter, and a locked one refuses before anything runs', async () => {
+  it('a wrong closing-date password refuses at once, before the route runs, counted once by the person\'s own limiter; a locked one refuses even the right one', async () => {
     const owner = rich.ctx.userId!;
     const [company] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, rich.ctx.companyId));
     const original = company.settings;
@@ -1006,32 +1036,118 @@ describe('secrets come only from the approving person, on a commit', () => {
       .update(companies)
       .set({ settings: { ...((original ?? {}) as Record<string, unknown>), closingDatePasswordHash: await hashPassword('right-pw-1') } })
       .where(eq(companies.id, rich.ctx.companyId));
+    const keys = async () => attemptKeys('closing-password', `${rich.ctx.companyId}:${owner}`, (await getRequestOrigin()).addr).filter((k) => !k.includes(':addr:'));
     try {
-      const guess = (pw: string) => {
+      const guess = (pw: string, mode: 'dry_run' | 'commit' = 'commit') => {
         h.handler = spy;
-        return run(closing(), { body: { closingDate: '2025-12-31' } }, 'commit', { ...everything, userId: owner, secrets: { closing_password: pw } });
+        return run(closing(), { body: { closingDate: '2025-12-31' } }, mode, { ...everything, userId: owner, secrets: { closing_password: pw } });
       };
-      let refusedAt = -1;
-      for (let i = 0; i < 10 && refusedAt < 0; i++) {
-        const r = await guess(`wrong-${i}`);
-        if (r.outcome === 'error') {
-          refusedAt = i;
-          expect(r.error!.code).toBe('FORBIDDEN');
+      let lockedAt = -1;
+      for (let i = 0; i < 10 && lockedAt < 0; i++) {
+        const r = await guess(`wrong-${i}`, i % 2 ? 'dry_run' : 'commit');
+        expect(r.outcome).toBe('error');
+        expect(r.httpStatus).toBe(0);
+        expect(r.error!.code).toBe('FORBIDDEN');
+        expect(JSON.stringify(r)).not.toContain(`wrong-${i}`);
+        if ((r.error!.details as Out)?.rateLimited) {
+          lockedAt = i;
           expect(r.error!.message).toMatch(/Too many wrong closing-date passwords/);
-          expect(r.error!.details).toMatchObject({ rateLimited: true });
-          expect(r.httpStatus).toBe(0);
+        } else {
+          expect(r.error!.message).toMatch(/closing-date password typed on the approval card is not correct, so nothing was done/);
+          expect(r.error!.details).toEqual({ closingPassword: 'wrong' });
         }
       }
-      // Some guesses ran (without the override), then the limiter stopped them.
-      expect(refusedAt).toBeGreaterThan(1);
-      expect(refusedAt).toBeLessThanOrEqual(6);
-      expect(seen.length).toBe(refusedAt);
-      expect(seen.every((s) => s.override === false)).toBe(true);
+      // Each wrong one was refused before the route ran, and counted once: the lock comes after a
+      // few, never on the first.
+      expect(seen).toEqual([]);
+      expect(lockedAt).toBeGreaterThan(1);
+      expect(lockedAt).toBeLessThanOrEqual(6);
       // Locked now, even with the right password, and for the person's own window too.
       const right = await guess('right-pw-1');
       expect(right.error!.details).toMatchObject({ rateLimited: true });
-      const keys = attemptKeys('closing-password', `${rich.ctx.companyId}:${owner}`, (await getRequestOrigin()).addr).filter((k) => !k.includes(':addr:'));
-      expect(loginLimiter().check(keys).allowed).toBe(false);
+      expect(seen).toEqual([]);
+      expect(loginLimiter().check(await keys()).allowed).toBe(false);
+
+      // Unlocked again, the right one runs the route with the override, and counts nothing wrong.
+      resetLimiter();
+      const ok = await guess('right-pw-1');
+      expect(ok.outcome, JSON.stringify(ok.error)).toBe('ok');
+      expect(seen).toEqual([{ request: 'right-pw-1', scope: 'right-pw-1', override: true, body: { closingDate: '2025-12-31', currentPassword: 'right-pw-1' } }]);
+    } finally {
+      await db.update(companies).set({ settings: original }).where(eq(companies.id, rich.ctx.companyId));
+      resetLimiter();
+    }
+  });
+
+  it('a wrong one is refused at once even where the request does not show it is needed (a void sent with only an id): the person is told the true reason', async () => {
+    const owner = rich.ctx.userId!;
+    const [company] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, rich.ctx.companyId));
+    const original = company.settings;
+    (globalThis as unknown as { __bkaLoginLimiter?: unknown }).__bkaLoginLimiter = undefined;
+    await db
+      .update(companies)
+      .set({ settings: { ...((original ?? {}) as Record<string, unknown>), closingDatePasswordHash: await hashPassword('right-pw-3') } })
+      .where(eq(companies.id, rich.ctx.companyId));
+    try {
+      const got: Out[] = [];
+      h.handler = async (req) => {
+        const ctx = await getServerContext();
+        got.push({ request: req.headers.get('x-closing-password') !== null, override: ctx.closingDateOverride });
+        return NextResponse.json({ id: randomUUID(), total: '300.00' }, { status: 201 });
+      };
+      // Nothing in the input is dated: the card asked for the password because the record is.
+      for (const mode of ['dry_run', 'commit'] as const) {
+        const r = await run(op('estimates.create'), { body: estimateBody() }, mode, { ...everything, userId: owner, secrets: { closing_password: 'not-it' } });
+        expect(r.outcome, mode).toBe('error');
+        expect(r.error!.code).toBe('FORBIDDEN');
+        expect(r.error!.message).toBe(CLOSING_PASSWORD_WRONG_MESSAGE);
+        expect(JSON.stringify(r)).not.toContain('not-it');
+      }
+      expect(got).toEqual([]);
+      // The right one goes on, with the override for an access holding the closed-period right.
+      const ok = await run(op('estimates.create'), { body: estimateBody() }, 'commit', { ...everything, userId: owner, secrets: { closing_password: 'right-pw-3' } });
+      expect(ok.outcome, JSON.stringify(ok.error)).toBe('ok');
+      expect(got).toEqual([{ request: true, override: true }]);
+    } finally {
+      await db.update(companies).set({ settings: original }).where(eq(companies.id, rich.ctx.companyId));
+      (globalThis as unknown as { __bkaLoginLimiter?: unknown }).__bkaLoginLimiter = undefined;
+    }
+  });
+
+  it('Set Closing Date takes the password the bridge checked without counting it again, in the scope\'s realm', async () => {
+    // The real route, as a non-Admin with the closing-date right moving the date earlier: it needs
+    // the current password (body.currentPassword), the one the approver typed on the card.
+    const owner = rich.ctx.userId!;
+    const [company] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, rich.ctx.companyId));
+    const original = company.settings;
+    const resetLimiter = () => {
+      (globalThis as unknown as { __bkaLoginLimiter?: unknown }).__bkaLoginLimiter = undefined;
+    };
+    resetLimiter();
+    await db
+      .update(companies)
+      .set({ settings: { ...((original ?? {}) as Record<string, unknown>), closingDate: '2026-01-31', closingDatePasswordHash: await hashPassword('right-pw-2') } })
+      .where(eq(companies.id, rich.ctx.companyId));
+    const notAdmin: EffectiveAccess = { ...fullAccess(), isAdmin: false };
+    try {
+      const limiter = loginLimiter() as unknown as { begin: (...a: unknown[]) => unknown };
+      const counted: string[][] = [];
+      const begin = limiter.begin.bind(limiter);
+      limiter.begin = (keys: unknown, ...rest: unknown[]) => {
+        counted.push([...(keys as string[])]);
+        return begin(keys, ...rest);
+      };
+      try {
+        const r = await run(closing(), { body: { closingDate: '2025-12-31' } }, 'commit', { access: notAdmin, role: 'accountant', userId: owner, secrets: { closing_password: 'right-pw-2' } });
+        expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+      } finally {
+        limiter.begin = begin;
+      }
+      // One guess, under the person's own keys; none under the agent scope's ("this computer, outside Ironbooks").
+      expect(counted).toHaveLength(1);
+      expect(counted[0].some((k) => k.includes('outside'))).toBe(false);
+      const [after] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, rich.ctx.companyId));
+      expect((after.settings as Out).closingDate).toBe('2025-12-31');
     } finally {
       await db.update(companies).set({ settings: original }).where(eq(companies.id, rich.ctx.companyId));
       resetLimiter();
@@ -1877,5 +1993,511 @@ describe('a commit of work that cannot be undone (dryRun none) has a time limit 
     await sleep(300);
     expect(started).toBe(false);
     expect(sender).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wave 4
+// ---------------------------------------------------------------------------
+
+/** A class of the company, inserted as `db` is (the bridge's transaction inside a handler). */
+async function insertClass(on: DB, companyId: string, name: string): Promise<string> {
+  const res = (await on.execute(sql`insert into classes (company_id, name) values (${companyId}, ${name}) returning id::text as id`)) as unknown as {
+    rows: Array<{ id: string }>;
+  };
+  return res.rows[0].id;
+}
+
+describe('the staleness key leaves out what the run assigns to itself, and still moves when the books do', () => {
+  const invoiceBody = () => ({
+    customerId: rich.customerId,
+    date: '2026-03-02',
+    lines: [{ accountId: rich.acct['4000'], description: 'Consulting', quantity: '1', rate: '120.00' }],
+  });
+  const keyOf = async (id: string, body: unknown) => {
+    const r = await run(op(id), { body }, 'dry_run');
+    expect(r.outcome, `${id}: ${JSON.stringify(r.error)}`).toBe('ok');
+    expect(r.stalenessKey, id).toMatch(/^[0-9a-f]{64}$/);
+    return r.stalenessKey!;
+  };
+
+  it('two waiting requests that each take "the next number" do not make each other stale (estimate, purchase order, invoice, check, journal entry)', async () => {
+    const checkBody = {
+      vendorId: rich.vendorId,
+      date: '2026-03-02',
+      method: 'check',
+      paymentAccountId: rich.acct['1000'],
+      lines: [{ accountId: rich.acct['6300'], amount: '45.00' }],
+    };
+    const cases: Array<[string, unknown]> = [
+      ['estimates.create', estimateBody()],
+      ['purchase-orders.create', poBody()],
+      ['invoices.create', invoiceBody()],
+      // A check with no number takes the account's next check number (its `reference`, and its entry's).
+      [operationForRoute('POST', '/api/expenses')!.id, checkBody],
+      ['journal-entries.create', journalBody()],
+    ];
+    for (const [id, body] of cases) {
+      const asked = await keyOf(id, body);
+      // The other request is approved first: it takes the number this one would have taken.
+      const first = await run(op(id), { body }, 'commit');
+      expect(first.outcome, `${id}: ${JSON.stringify(first.error)}`).toBe('ok');
+      expect(await keyOf(id, body), `${id}: the key moved with the next number`).toBe(asked);
+    }
+  });
+
+  it("a posting elsewhere that touches none of the request's records changes nothing", async () => {
+    const asked = await keyOf('journal-entries.create', journalBody());
+    await postJournalEntry(admin, {
+      date: new Date('2026-03-04'),
+      description: 'Petty cash for postage',
+      lines: [
+        { accountId: rich.acct['6400'], debit: '12.00' },
+        { accountId: rich.acct['1010'], credit: '12.00' },
+      ],
+    });
+    expect(await keyOf('journal-entries.create', journalBody())).toBe(asked);
+  });
+
+  it('ids the run makes, wherever they show (a value, a source, a reference cut to 8 digits, a second kind on one id), do not move it', async () => {
+    const probe = async () => {
+      const ctx = await getServerContext();
+      // A row the run inserts with no audit row of its own (an application, a first-use account).
+      const rowId = await insertClass(ctx.db, ctx.companyId, 'Made by the run');
+      const made = randomUUID();
+      await writeAudit(ctx, { action: 'create', entityType: 'bridge_probe', entityId: made, newValues: { note: 'made', refNumber: 'P-0042' } });
+      await writeAudit(ctx, { action: 'create', entityType: 'bridge_probe_billing', entityId: made, newValues: { note: 'a second kind on the same id' } });
+      await writeAudit(ctx, {
+        action: 'update',
+        entityType: 'customer',
+        entityId: rich.customerId,
+        oldValues: { phone: null },
+        newValues: { phone: '555-0100', applicationId: rowId, source: `assembly_build:${randomUUID()}` },
+      });
+      await postJournalEntry(ctx, {
+        date: new Date('2026-03-05'),
+        description: `Probe P-0042 for ${made.slice(0, 8)}`,
+        reference: made.slice(0, 8),
+        sourceRef: `bridge_probe:${made}`,
+        lines: [
+          { accountId: rich.acct['6300'], debit: '40.00', memo: `Line of ${rowId}` },
+          { accountId: rich.acct['1000'], credit: '40.00' },
+        ],
+      });
+      return NextResponse.json({ id: made, rowId }, { status: 201 });
+    };
+    const keyed = async () => {
+      h.handler = probe;
+      const r = await run(op('journal-entries.create'), { body: { customerId: rich.customerId } }, 'dry_run');
+      expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+      return r.stalenessKey;
+    };
+    const a = await keyed();
+    expect(await keyed()).toBe(a);
+
+    // The record the run changes (and its input names), changed by someone else in between: another key.
+    await db.execute(sql`update customers set updated_at = updated_at + interval '1 second' where id = ${rich.customerId}`);
+    expect(await keyed()).not.toBe(a);
+  });
+
+  it('a row the run made that its created_at cannot tell is new (dated back, as FIFO\'s opening layer is) counts as made when an audit "create" names it', async () => {
+    const probe = async () => {
+      const ctx = await getServerContext();
+      const id = await insertClass(ctx.db, ctx.companyId, 'Dated back');
+      await ctx.db.execute(sql`update classes set created_at = created_at - interval '1 millisecond' where id = ${id}`);
+      await writeAudit(ctx, { action: 'create', entityType: 'bridge_layer', entityId: id, newValues: { layers: [{ id, quantity: '1.0000' }] } });
+      return NextResponse.json({ id }, { status: 201 });
+    };
+    const keys: Array<string | null> = [];
+    for (let i = 0; i < 2; i++) {
+      h.handler = probe;
+      const r = await run(op('journal-entries.create'), { body: {} }, 'dry_run');
+      expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+      keys.push(r.stalenessKey);
+    }
+    expect(keys[1]).toBe(keys[0]);
+  });
+
+  /** The key of a dry run whose work is `probe` (a handler of its own). */
+  const probeKey = async (probe: () => Promise<Response>) => {
+    h.handler = probe;
+    const r = await run(op('journal-entries.create'), { body: {} }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    return r.stalenessKey!;
+  };
+  /** A check the run makes (an audit 'create' with its number as `reference`) and its entry. */
+  const checkProbe = (o: { number: string; entryReference: string; accountNumber?: string }) => async () => {
+    const ctx = await getServerContext();
+    const id = randomUUID();
+    await writeAudit(ctx, {
+      action: 'create',
+      entityType: 'bridge_check',
+      entityId: id,
+      newValues: { reference: o.number, accountNumber: o.accountNumber ?? '000123456789', amount: '40.00' },
+    });
+    await postJournalEntry(ctx, {
+      date: new Date('2026-03-05'),
+      description: `Check ${o.number}`,
+      reference: o.entryReference,
+      sourceRef: `bridge_check:${id}`,
+      lines: [
+        { accountId: rich.acct['6300'], debit: '40.00' },
+        { accountId: rich.acct['1000'], credit: '40.00' },
+      ],
+    });
+    return NextResponse.json({ id }, { status: 201 });
+  };
+
+  it("the check number a run takes goes from its entry's reference too; a reference it copies, or a number it does not take, stays", async () => {
+    // The next check number, on the check and its entry: another number, the same key.
+    const took = await probeKey(checkProbe({ number: '1001', entryReference: '1001' }));
+    expect(await probeKey(checkProbe({ number: '1002', entryReference: '1002' }))).toBe(took);
+    // A reference the run copied from somewhere else (a bank line's check number): another one, another key.
+    const copied = await probeKey(checkProbe({ number: '1001', entryReference: 'BANK-501' }));
+    expect(await probeKey(checkProbe({ number: '1001', entryReference: 'BANK-502' }))).not.toBe(copied);
+    // An account number the run copies onto what it makes is not a number it took: it counts.
+    expect(await probeKey(checkProbe({ number: '1001', entryReference: '1001', accountNumber: '000999999999' }))).not.toBe(took);
+  });
+
+  it("times: the run's own time goes everywhere; a date on what it makes counts by its day; a time of a record that was there before counts as it is", async () => {
+    const stamp = (values: { made?: Record<string, unknown>; existing?: Record<string, unknown> }) => async () => {
+      const ctx = await getServerContext();
+      if (values.made) await writeAudit(ctx, { action: 'create', entityType: 'bridge_probe', entityId: randomUUID(), newValues: values.made });
+      if (values.existing) await writeAudit(ctx, { action: 'update', entityType: 'customer', entityId: rich.customerId, oldValues: {}, newValues: values.existing });
+      return NextResponse.json({ ok: true });
+    };
+    const now = () => new Date().toISOString();
+    const inDays = (n: number) => new Date(Date.now() + n * 86_400_000).toISOString();
+    // The moment of the run itself, on a record that was there before (no "…At" key): no difference.
+    const own = await probeKey(stamp({ existing: { lastStatementOn: now() } }));
+    await sleep(15);
+    expect(await probeKey(stamp({ existing: { lastStatementOn: now() } }))).toBe(own);
+    // A time of a record that was there before, from before the run: it counts as it is.
+    const before = await probeKey(stamp({ existing: { lastStatementOn: '2026-01-05T10:00:00.000Z' } }));
+    expect(await probeKey(stamp({ existing: { lastStatementOn: '2026-01-05T10:00:01.000Z' } }))).not.toBe(before);
+    // A due date the run works out from today, on what it makes: by its day, the same all day.
+    const due = await probeKey(stamp({ made: { dueOn: inDays(30) } }));
+    await sleep(15);
+    expect(await probeKey(stamp({ made: { dueOn: inDays(30) } }))).toBe(due);
+    // Another day on what it makes: another key.
+    expect(await probeKey(stamp({ made: { dueOn: '2026-05-02T04:00:00.000Z' } }))).not.toBe(await probeKey(stamp({ made: { dueOn: '2026-05-01T04:00:00.000Z' } })));
+  });
+
+  it('an id of a row that was there before the run stays as it is: pointing at another one gives another key', async () => {
+    const x = await insertClass(db, rich.ctx.companyId, 'Existing X');
+    const y = await insertClass(db, rich.ctx.companyId, 'Existing Y');
+    const linking = (classId: string) => async () => {
+      const ctx = await getServerContext();
+      await writeAudit(ctx, { action: 'update', entityType: 'customer', entityId: rich.customerId, oldValues: { classId: null }, newValues: { classId } });
+      return NextResponse.json({ ok: true });
+    };
+    h.handler = linking(x);
+    const toX = await run(op('customers.update'), { params: { id: rich.customerId }, body: {} }, 'dry_run');
+    h.handler = linking(y);
+    const toY = await run(op('customers.update'), { params: { id: rich.customerId }, body: {} }, 'dry_run');
+    expect(toX.outcome, JSON.stringify(toX.error)).toBe('ok');
+    expect(toY.outcome, JSON.stringify(toY.error)).toBe('ok');
+    expect(toY.stalenessKey).not.toBe(toX.stalenessKey);
+  });
+});
+
+describe('the amount, wave 4 rules', () => {
+  const entry = async (amount: string, sourceRef: string) =>
+    (
+      await postJournalEntry(admin, {
+        date: new Date('2026-03-06'),
+        description: `Document ${sourceRef}`,
+        sourceRef,
+        lines: [
+          { accountId: rich.acct['6300'], debit: amount },
+          { accountId: rich.acct['1000'], credit: amount },
+        ],
+      })
+    ).id;
+
+  it('voiding one entry while posting an unrelated one counts both; an edit that re-posts the same document counts once', async () => {
+    const { voidJournalEntry } = await import('@/lib/services/posting');
+    const source = `probe_doc:${randomUUID()}`;
+    const old = await entry('500.00', source);
+    const voidAndPost = (sourceRef: string) => async () => {
+      const ctx = await getServerContext();
+      await voidJournalEntry(ctx, old);
+      await postJournalEntry(ctx, {
+        date: new Date('2026-03-06'),
+        description: 'Posted by the run',
+        sourceRef,
+        lines: [
+          { accountId: rich.acct['6300'], debit: '300.00' },
+          { accountId: rich.acct['1000'], credit: '300.00' },
+        ],
+      });
+      return NextResponse.json({ ok: true });
+    };
+    h.handler = voidAndPost(`probe_doc:${randomUUID()}`);
+    const mixed = await run(op('journal-entries.update'), { params: { id: old }, body: {} }, 'dry_run');
+    expect(mixed.outcome, JSON.stringify(mixed.error)).toBe('ok');
+    expect(mixed.facts.amount).toBe('800.00');
+    h.handler = voidAndPost(source);
+    const edit = await run(op('journal-entries.update'), { params: { id: old }, body: {} }, 'dry_run');
+    expect(edit.outcome, JSON.stringify(edit.error)).toBe('ok');
+    expect(edit.facts.amount).toBe('500.00');
+  });
+
+  it('with an amount field too: a mixed run counts both sides; an edit of its own document, or a plain posting, the larger of the field and its largest entry', async () => {
+    const { voidJournalEntry } = await import('@/lib/services/posting');
+    const deposit = operationForRoute('PATCH', '/api/deposits/[id]')!;
+    expect(deposit.amountField).toBe('total');
+    const source = `probe_doc:${randomUUID()}`;
+    const work = (o: { void: string | null; sourceRef: string }) => async () => {
+      const ctx = await getServerContext();
+      if (o.void) await voidJournalEntry(ctx, o.void);
+      await postJournalEntry(ctx, {
+        date: new Date('2026-03-06'),
+        description: 'Posted by the run',
+        sourceRef: o.sourceRef,
+        lines: [
+          { accountId: rich.acct['6300'], debit: '300.00' },
+          { accountId: rich.acct['1000'], credit: '300.00' },
+        ],
+      });
+      return NextResponse.json({ total: '100.00' });
+    };
+    const amountOf = async (handler: () => Promise<Response>, id: string) => {
+      h.handler = handler;
+      const r = await run(deposit, { params: { id }, body: { total: '100.00' } }, 'dry_run');
+      expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+      return r.facts.amount;
+    };
+    const old = await entry('500.00', source);
+    // Voids $500 of one document and posts $300 for another: $800.
+    expect(await amountOf(work({ void: old, sourceRef: `probe_doc:${randomUUID()}` }), old)).toBe('800.00');
+    // Voids its own document's $500 entry and re-posts it at $300: counted once, $500.
+    expect(await amountOf(work({ void: old, sourceRef: source }), old)).toBe('500.00');
+    // Posts $300 and voids nothing: the larger of the field ($100) and the entry, $300.
+    expect(await amountOf(work({ void: null, sourceRef: `probe_doc:${randomUUID()}` }), old)).toBe('300.00');
+  });
+
+  it('a run that edits a record that existed and touches no entry has an unknown amount; one that only makes records has 0.00', async () => {
+    const changed = await run(op('customers.update'), { params: { id: rich.customerId }, body: { phone: '555-0142' } }, 'dry_run');
+    expect(changed.outcome, JSON.stringify(changed.error)).toBe('ok');
+    expect(changed.preview!.ledger!.entries).toEqual([]);
+    expect(changed.facts.amount).toBeNull();
+    const madeOnly = await run(op('time-entries.create'), { body: timeBody() }, 'dry_run');
+    expect(madeOnly.facts.amount).toBe('0.00');
+  });
+
+  it('an entry only named by an audit row of the run, and not written, is not shown as changed (an applied credit)', async () => {
+    const id = await entry('75.00', `probe_doc:${randomUUID()}`);
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      const applicationId = await insertClass(ctx.db, ctx.companyId, 'An application');
+      await writeAudit(ctx, { action: 'update', entityType: 'journal_entry', entityId: id, newValues: { action: 'apply_credit', applicationId } });
+      return NextResponse.json({ ok: true });
+    };
+    const r = await run(op('journal-entries.update'), { params: { id }, body: {} }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(r.preview!.ledger!.entries).toEqual([]);
+    // It changed what the entry's credit is applied to, with no entry to show its money: unknown.
+    expect(r.facts.amount).toBeNull();
+  });
+});
+
+describe("the preview carries the warnings the agent's flags accepted (plan §5.6)", () => {
+  it('a dry run sent with a flag shows the warning the route gives without it, and keeps nothing', async () => {
+    const ref = `W-${Date.now()}`;
+    const first = await run(op('estimates.create'), { body: estimateBody(ref) }, 'commit');
+    expect(first.outcome, JSON.stringify(first.error)).toBe('ok');
+    const before = await fingerprint();
+    const dry = await run(op('estimates.create'), { body: estimateBody(ref), confirm: ['allowDuplicateNumber'] }, 'dry_run');
+    expect(dry.outcome, JSON.stringify(dry.error)).toBe('ok');
+    expect(dry.preview!.warnings).toEqual([{ flag: 'allowDuplicateNumber', message: expect.stringMatching(/already used/i) }]);
+    // The flag written into the body by the agent is the same yes.
+    const inBody = await run(op('estimates.create'), { body: { ...estimateBody(ref), allowDuplicateNumber: true } }, 'dry_run');
+    expect(inBody.outcome, JSON.stringify(inBody.error)).toBe('ok');
+    expect(inBody.preview!.warnings.map((w) => w.flag)).toEqual(['allowDuplicateNumber']);
+    expect(await fingerprint()).toEqual(before);
+    // A flag the route did not need: no warning.
+    const unneeded = await run(op('estimates.create'), { body: estimateBody(`W2-${Date.now()}`), confirm: ['allowDuplicateNumber'] }, 'dry_run');
+    expect(unneeded.outcome, JSON.stringify(unneeded.error)).toBe('ok');
+    expect(unneeded.preview!.warnings).toEqual([]);
+  });
+});
+
+describe('the version the agent last read goes to the route (OperationInput.expectedUpdatedAt)', () => {
+  const versionOf = async () => {
+    const [c] = await db.select({ updatedAt: customers.updatedAt }).from(customers).where(eq(customers.id, rich.customerId));
+    return c.updatedAt.toISOString();
+  };
+
+  it("as x-expected-updated-at on the handler's request and in the scope; an unreadable one is refused before anything runs", async () => {
+    const seen: Out[] = [];
+    h.handler = async (req) => {
+      seen.push({ request: req.headers.get('x-expected-updated-at'), scope: (await requestHeaders()).get('x-expected-updated-at') });
+      return NextResponse.json({ ok: true });
+    };
+    const v = '2026-11-22T14:05:09.123Z';
+    const r = await run(op('customers.update'), { params: { id: rich.customerId }, body: { phone: '555-0150' }, expectedUpdatedAt: v }, 'dry_run');
+    expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+    expect(seen).toEqual([{ request: v, scope: v }]);
+    for (const bad of ['yesterday', '2026-11-22T14:05:09.123Z\r\nx-closing-password: 1', 42]) {
+      h.handler = async () => NextResponse.json({ ok: true });
+      const refused = await run(op('customers.update'), { params: { id: rich.customerId }, body: {}, expectedUpdatedAt: bad } as unknown as OperationInput, 'dry_run');
+      expect(refused.outcome).toBe('error');
+      expect(refused.error!.code).toBe('VALIDATION');
+      expect(refused.httpStatus).toBe(0);
+    }
+    expect(seen).toHaveLength(1);
+  });
+
+  it("the route compares it inside the committing transaction: a person's edit in between answers 409, never an overwrite", async () => {
+    const read = await versionOf();
+    // A person edits the customer after the agent read it.
+    await db.execute(sql`update customers set phone = '555-0177', updated_at = updated_at + interval '2 seconds' where id = ${rich.customerId}`);
+    const stale = await run(op('customers.update'), { params: { id: rich.customerId }, body: { phone: '555-0199' }, expectedUpdatedAt: read }, 'commit');
+    expect(stale.outcome).toBe('error');
+    expect(stale.httpStatus).toBe(409);
+    expect(stale.error!.code).toBe('CONFLICT');
+    const [c] = await db.select({ phone: customers.phone }).from(customers).where(eq(customers.id, rich.customerId));
+    expect(c.phone).toBe('555-0177');
+    const fresh = await run(op('customers.update'), { params: { id: rich.customerId }, body: { phone: '555-0199' }, expectedUpdatedAt: await versionOf() }, 'commit');
+    expect(fresh.outcome, JSON.stringify(fresh.error)).toBe('ok');
+  });
+});
+
+describe("a run a person approved at the host computer counts as this computer's own for the route (the launch pass)", () => {
+  const PASS = 'launch-pass-of-this-run-0123456789abcdef';
+
+  it("only with an approval given at the host: the handler's request carries the pass, the scope never does, and nothing answered holds it", async () => {
+    const { isRemoteRequest } = await import('@/lib/net/hostOnly');
+    const owner = rich.ctx.userId!;
+    const seen: Out[] = [];
+    const spy = async (req: Request) => {
+      seen.push({
+        remote: isRemoteRequest(req as NextRequest),
+        pass: req.headers.get('x-bka-launch'),
+        scope: [...(await requestHeaders()).keys()],
+        scopeRemote: (await getRequestOrigin()).remote,
+      });
+      return NextResponse.json({ ok: true });
+    };
+    process.env.BKA_LAUNCH_PASS = PASS;
+    try {
+      const approved = { userId: owner, approval: { approvedBy: owner, requestId: randomUUID(), grantId: null } };
+      const cases: Array<Partial<BridgeActor>> = [{ ...approved, atHost: true }, { ...approved, atHost: false }, { atHost: true }];
+      for (const over of cases) {
+        h.handler = spy;
+        const r = await run(op('customers.update'), { params: { id: rich.customerId }, body: {} }, 'dry_run', over);
+        expect(r.outcome, JSON.stringify(r.error)).toBe('ok');
+        expect(JSON.stringify(r)).not.toContain(PASS);
+      }
+    } finally {
+      delete process.env.BKA_LAUNCH_PASS;
+    }
+    expect(seen.map((s) => [s.remote, s.pass])).toEqual([
+      [false, PASS],
+      [true, null],
+      [true, null],
+    ]);
+    for (const s of seen) {
+      expect(s.scope).not.toContain('x-bka-launch');
+      expect(s.scopeRemote).toBe(true);
+    }
+  });
+});
+
+describe('ledger lines name who they are for and their class', () => {
+  it('on the entries a run makes and on the ones it voids', async () => {
+    const [cust] = await db.select({ name: customers.displayName }).from(customers).where(eq(customers.id, rich.customerId));
+    const classId = await insertClass(db, rich.ctx.companyId, 'East Office');
+    const lines = [
+      { accountId: rich.acct['6300'], debit: '64.00', entityType: 'customer' as const, entityId: rich.customerId, classId },
+      { accountId: rich.acct['1000'], credit: '64.00' },
+    ];
+    h.handler = async () => {
+      const ctx = await getServerContext();
+      const e = await postJournalEntry(ctx, { date: new Date('2026-03-07'), description: 'Named lines', lines });
+      return NextResponse.json({ id: e.id }, { status: 201 });
+    };
+    const made = await run(op('journal-entries.create'), { body: {} }, 'dry_run');
+    expect(made.outcome, JSON.stringify(made.error)).toBe('ok');
+    expect(made.preview!.ledger!.entries[0].lines).toEqual([
+      expect.objectContaining({ debit: '64.00', entityName: cust.name, entityType: 'customer', className: 'East Office' }),
+      expect.objectContaining({ credit: '64.00', entityName: null, className: null }),
+    ]);
+
+    const existing = await postJournalEntry(admin, { date: new Date('2026-03-07'), description: 'Named lines to void', lines });
+    const voided = await run(op('journal-entries.delete'), { params: { id: existing.id } }, 'dry_run');
+    expect(voided.outcome, JSON.stringify(voided.error)).toBe('ok');
+    const touched = voided.preview!.ledger!.entries.find((e) => e.journalEntryId === existing.id)!;
+    expect(touched.lines).toEqual(
+      expect.arrayContaining([expect.objectContaining({ debit: '64.00', entityName: cust.name, entityType: 'customer', className: 'East Office' })]),
+    );
+  });
+});
+
+describe('no agent may change or delete a role an agent holds (plan §4.6, D9)', () => {
+  it('refused on a dry run and a commit, approved or not; a role no agent holds goes on', async () => {
+    const everything = { access: fullAccess(), role: 'admin' as const };
+    const owner = rich.ctx.userId!;
+    const make = async (name: string) =>
+      (
+        (await db.execute(
+          sql`insert into company_roles (company_id, name, permissions, flags) values (${rich.ctx.companyId}, ${name}, '{}'::jsonb, '{}'::jsonb) returning id::text as id`,
+        )) as unknown as { rows: Array<{ id: string }> }
+      ).rows[0].id;
+    const held = await make('Held by an agent');
+    const free = await make('Held by nobody');
+    const holder = await createAgent(admin, { name: 'Role Holder', roleKeys: ['full_access'], preset: 'read_only' });
+    await db.update(agents).set({ roleKeys: ['full_access', held] }).where(eq(agents.id, holder.agent.id));
+    let ran = 0;
+    const spy = async () => {
+      ran++;
+      return NextResponse.json({ ok: true });
+    };
+    const approved = { ...everything, userId: owner, approval: { approvedBy: owner, requestId: randomUUID(), grantId: null } };
+    const ways: Array<['dry_run' | 'commit', Partial<BridgeActor>]> = [
+      ['dry_run', everything],
+      ['commit', everything],
+      ['commit', approved],
+    ];
+    const asks: Array<[string, OperationInput]> = [
+      ['roles.update', { params: { id: held }, body: { name: 'Wider' } }],
+      ['roles.delete', { params: { id: held } }],
+    ];
+    for (const [id, input] of asks) {
+      for (const [mode, over] of ways) {
+        h.handler = spy;
+        const r = await run(op(id), input, mode, over);
+        expect(r.outcome, `${id} ${mode}`).toBe('error');
+        expect(r.error!.code).toBe('FORBIDDEN');
+        expect(r.error!.message).toMatch(/No agent may change or delete the role "Held by an agent": an agent holds it/);
+        expect(r.error!.details).toMatchObject({ hardFloor: true });
+      }
+    }
+    expect(ran).toBe(0);
+
+    // The role route reads the id as a uuid, which takes upper case, braces and no hyphens alike:
+    // each of them names the same held role, and is refused the same way.
+    for (const written of [held.toUpperCase(), `{${held}}`, held.replace(/-/g, ''), `{${held.replace(/-/g, '').toUpperCase()}}`]) {
+      for (const id of ['roles.update', 'roles.delete']) {
+        h.handler = spy;
+        const r = await run(op(id), { params: { id: written }, ...(id === 'roles.update' ? { body: { name: 'Wider' } } : {}) }, 'commit', approved);
+        expect(r.outcome, `${id} ${written}`).toBe('error');
+        expect(r.error!.code, `${id} ${written}`).toBe('FORBIDDEN');
+        expect(r.error!.message).toMatch(/No agent may change or delete the role "Held by an agent": an agent holds it/);
+        expect(r.error!.details).toMatchObject({ hardFloor: true, roleHeldByAgent: held.toLowerCase() });
+      }
+    }
+    // A key stored in another case is the same role too.
+    await db.update(agents).set({ roleKeys: ['full_access', held.toUpperCase()] }).where(eq(agents.id, holder.agent.id));
+    h.handler = spy;
+    const stored = await run(op('roles.delete'), { params: { id: held } }, 'commit', approved);
+    expect(stored.error?.details).toMatchObject({ hardFloor: true });
+    expect(ran).toBe(0);
+
+    h.handler = spy;
+    const other = await run(op('roles.update'), { params: { id: free }, body: { name: 'Fine' } }, 'commit', everything);
+    expect(other.outcome, JSON.stringify(other.error)).toBe('ok');
+    expect(ran).toBe(1);
   });
 });

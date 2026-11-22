@@ -29,7 +29,10 @@
  * is still an active member allowed to add documents.
  *
  * Permissions: the inbox needs Lists (like the Doc Center inbox); saving needs Banking (expense,
- * check, card charge) or Vendors (bill) create, plus Vendors create for a new vendor.
+ * check, card charge) or Vendors (bill) create, plus Vendors create for a new vendor. The text read
+ * off a file is left out of the inbox list, and one receipt answers it masked for a caller without
+ * the View rights for full SSNs and account numbers; an agent gets it only on an approved reveal
+ * (receiptTextFor).
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { and, desc, eq, gt, ilike, inArray, isNull, lt, or, sql } from 'drizzle-orm';
@@ -51,6 +54,8 @@ import { AiRouter } from '@/lib/ai/router';
 import type { ChatMessage, StoredProviderConfig } from '@/lib/ai/types';
 import { localityOf } from '@/lib/ai/providers';
 import { canActivity, legacyRoleFor } from '@/lib/permissions/model';
+import { maskSsn } from '@/lib/permissions/mask';
+import { maskAccountsInText } from '@/lib/agent/guards';
 import {
   checkReceiptFile,
   isReadableKind,
@@ -72,7 +77,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertWrite } from './rbac';
-import { requirePermission, resolveAccess } from './access';
+import { hasFlag, requirePermission, resolveAccess } from './access';
 import { getAttachmentFile, saveAttachment, updateAttachment, deleteAttachment } from './attachments';
 import { createExpense, type ExpenseMethod } from './expenses';
 import { createBill } from './bills';
@@ -240,6 +245,86 @@ export function effectiveReceiptStatus(
   return startedAt.getTime() < now.getTime() - STALE_PROCESSING_MS ? 'pending' : 'processing';
 }
 
+// ---------------------------------------------------------------------------
+// The text read off the file, as the caller may see it (plan 5.9, decision D6)
+// ---------------------------------------------------------------------------
+
+/** A dash of any kind, a slash or an underscore between the groups of a number ("123–45–6789"). */
+const GROUP_MARK = '[\\-/_\\u2010-\\u2015\\u2212]';
+
+/**
+ * What may stand between two digits of a labelled number: one space, or a dash, slash, underscore
+ * or dot with at most one space on each side ("1234 5678 9", "123 - 45 - 6789"). Each form has one
+ * reading only, so a long run of gaps is still read in linear time.
+ */
+const DIGIT_GAP = `(?: ?(?:${GROUP_MARK}|\\.) ?| )`;
+
+/**
+ * A labelled SSN, ITIN or EIN: "SSN 123-45-6789", "EIN: 12-3456789", "Tax ID #123456789",
+ * "Social Security Number 123 45 6789". The number (group 1) is 9 digits: first the usual 3-2-4
+ * and 2-7 groupings, then any other grouping of exactly 9 digits after the label, as OCR splits
+ * them ("SSN: 1234-56789", "Tax ID 12 345 6789", "Social Security Number 123 - 45 - 6789"), which
+ * is the loose form of lib/ai/redact.ts TAXID ("\d[\d .-]{7,12}\d" holding 9 digits). A tenth digit
+ * in the same run means it is some other number and is left alone; a run that ends like a money
+ * amount ("EIN 1234567.89") is left alone too (isMoneyLike). Each optional token takes its own
+ * leading space, so a long run of spaces is read one way only (linear time).
+ */
+const LABELLED_TAX_ID = new RegExp(
+  String.raw`\b(?:SSN|ITIN|TIN|EIN|FEIN|tax[\s-]*id|social\s+security(?:\s+(?:no\.?|number|#))?)\b(?:\s*(?:#|no\.?|number))?(?:\s*[:#])?\s*` +
+    `((?:\\d{3}(?:${GROUP_MARK}|[ .])?\\d{2}(?:${GROUP_MARK}|[ .])?\\d{4}|\\d{2}(?:${GROUP_MARK}|[ .])?\\d{7})(?!\\d|[.,]\\d)` +
+    `|\\d(?:${DIGIT_GAP}?\\d){8}(?!\\d|[.,]\\d|${DIGIT_GAP}\\d))`,
+  'gi',
+);
+
+/** "1234567.89": a loosely grouped run that ends in cents is an amount, not a tax ID (redact.ts TAXID accept). */
+const isMoneyLike = (number: string) => /[.,]\d{1,2}$/.test(number);
+
+/** SSNs and EINs written without a label (lib/ai/redact.ts SSN and EIN): not part of a longer number. */
+const UNLABELLED_TAX_IDS: readonly RegExp[] = [
+  new RegExp(`(?<![\\d\\-/_\\u2010-\\u2015\\u2212])\\d{3}${GROUP_MARK}\\d{2}${GROUP_MARK}\\d{4}(?![\\d\\-/_\\u2010-\\u2015\\u2212])`, 'g'),
+  /(?<![\d.,]|\d )\d{3} \d{2} \d{4}(?!\d|[.,]\d| \d)/g,
+  /(?<![\d.,])\d{3}\.\d{2}\.\d{4}(?!\d|[.,]\d)/g,
+  new RegExp(`(?<![\\d\\-/_\\u2010-\\u2015\\u2212])\\d{2}${GROUP_MARK}\\d{7}(?![\\d\\-/_\\u2010-\\u2015\\u2212])`, 'g'),
+];
+
+/** SSNs and tax IDs in text shown as "***-**-6789" (lib/permissions/mask.ts maskSsn). */
+function maskTaxIdsInText(text: string): string {
+  let out = text.replace(LABELLED_TAX_ID, (whole: string, number: string) =>
+    isMoneyLike(number) ? whole : `${whole.slice(0, whole.length - number.length)}${maskSsn(number) ?? number}`,
+  );
+  for (const re of UNLABELLED_TAX_IDS) out = out.replace(re, (number) => maskSsn(number) ?? number);
+  return out;
+}
+
+/**
+ * The text read off a receipt (rawText) as this caller may see it. The inbox takes any file, and a
+ * phone upload link takes it from anyone holding the link: a W-9 or a bank statement dropped in
+ * shows its full SSN or account numbers in that text, which masking by field name never reaches.
+ *  - Without "View full bank / account numbers", an account number after its label reads masked
+ *    ("Acct # ••••6789", lib/agent/guards.ts maskAccountsInText), one line at a time: a label with
+ *    "#" masks to the end of its text, and the end of an OCR line is where a number on a receipt
+ *    ends, so the lines after it stay readable.
+ *  - Without "View sensitive payroll data", an SSN or EIN reads "***-**-6789" (maskTaxIdsInText).
+ *  - An agent gets no text at all unless a person approved a reveal for its run (its access then
+ *    has the View right of the kind revealed, lib/agent/bridge.ts runAccess): the patterns above
+ *    catch labelled and well-formed numbers only.
+ * A trusted context (no `access`) and a caller with both rights read the text as stored. Only
+ * answers go through this; the stored text is what the vendor match and the suggestions read.
+ */
+export function receiptTextFor(ctx: Pick<ServiceContext, 'access' | 'agent'>, text: string | null): string | null {
+  if (!text) return text;
+  if (ctx.agent && !(ctx.access?.flags.sensitivePayroll || ctx.access?.flags.fullAccountNumbers)) return null;
+  let out = text;
+  if (!hasFlag(ctx, 'fullAccountNumbers')) out = out.split('\n').map(maskAccountsInText).join('\n');
+  if (!hasFlag(ctx, 'sensitivePayroll')) out = maskTaxIdsInText(out);
+  return out;
+}
+
+/** A receipt as an answer to this caller: its text through receiptTextFor. */
+function shownView(ctx: Pick<ServiceContext, 'access' | 'agent'>, view: ReceiptView): ReceiptView {
+  return { ...view, rawText: receiptTextFor(ctx, view.rawText) };
+}
+
 function toView(r: { scan: typeof receiptScans.$inferSelect; filename: string; mimeType: string | null; sizeBytes: number | null }): ReceiptView {
   const s = r.scan;
   return {
@@ -283,7 +368,12 @@ async function loadView(ctx: Pick<ServiceContext, 'db' | 'companyId'>, id: strin
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Receipts in the inbox (not yet saved) first, then recently saved ones. */
+/**
+ * Receipts in the inbox (not yet saved) first, then recently saved ones. The text read off each
+ * file (rawText) is left out: the inbox does not show it, and up to 20,000 characters of every
+ * file's text in one answer is what a W-9 or a bank statement in the inbox would leak. One receipt
+ * (getReceipt) answers it, as the caller may see it (receiptTextFor).
+ */
 export async function listReceipts(
   ctx: ServiceContext,
   opts: { status?: 'open' | 'saved' | 'all'; limit?: number } = {},
@@ -304,12 +394,13 @@ export async function listReceipts(
     .where(and(...conds))
     .orderBy(desc(receiptScans.createdAt))
     .limit(Math.min(Math.max(opts.limit ?? 200, 1), 500));
-  return rows.map(toView);
+  return rows.map((r) => ({ ...toView(r), rawText: null }));
 }
 
+/** One receipt, its text as this caller may see it (receiptTextFor). */
 export async function getReceipt(ctx: ServiceContext, id: string): Promise<ReceiptView> {
   requirePermission(ctx, 'lists.doc_center', 'view');
-  return loadView(ctx, id);
+  return shownView(ctx, await loadView(ctx, id));
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +600,7 @@ export async function extractReceipt(
 ): Promise<ReceiptView> {
   requirePermission(ctx, 'lists.doc_center', 'create');
   const current = await loadView(ctx, id);
-  if (current.status === 'saved') return current;
+  if (current.status === 'saved') return shownView(ctx, current);
   if (opts.force && opts.version !== undefined && opts.version !== current.version) {
     throw new ServiceError('CONFLICT', 'This receipt was changed by someone else. Reload it and try again.', { stale: true });
   }
@@ -529,7 +620,7 @@ export async function extractReceipt(
     .set({ status: 'processing', processingStartedAt: new Date(), updatedAt: new Date() })
     .where(and(eq(receiptScans.id, id), eq(receiptScans.companyId, ctx.companyId), claimable))
     .returning({ id: receiptScans.id, attachmentId: receiptScans.attachmentId });
-  if (!claimed) return loadView(ctx, id);
+  if (!claimed) return shownView(ctx, await loadView(ctx, id));
 
   let result: ReadResult;
   let parsed: ParsedReceipt | null = null;
@@ -580,7 +671,7 @@ export async function extractReceipt(
       updatedAt: new Date(),
     })
     .where(and(eq(receiptScans.id, id), eq(receiptScans.companyId, ctx.companyId), eq(receiptScans.status, 'processing')));
-  return loadView(ctx, id);
+  return shownView(ctx, await loadView(ctx, id));
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +832,9 @@ async function matchPaymentAccount(
 }
 
 export async function receiptSuggestions(ctx: ServiceContext, id: string): Promise<ReceiptSuggestions> {
-  const view = await getReceipt(ctx, id);
+  // The stored text: the match reads it, and nothing of it is in the answer.
+  requirePermission(ctx, 'lists.doc_center', 'view');
+  const view = await loadView(ctx, id);
   const vendor = await matchVendor(ctx, view.vendorName, view.rawText);
   let accountId: string | null = null;
   let accountSource: ReceiptSuggestions['accountSource'] = 'none';
@@ -925,7 +1018,7 @@ export async function saveReceipt(ctx: ServiceContext, id: string, raw: unknown)
     });
     return { txnType, txnId };
   });
-  return { receipt: await loadView(ctx, id), ...result };
+  return { receipt: shownView(ctx, await loadView(ctx, id)), ...result };
 }
 
 // ---------------------------------------------------------------------------

@@ -54,7 +54,7 @@ import { listUndepositedPayments } from './deposits';
 import { canSeeTodoLink } from './todos';
 import { requireFileAdmin, requirePermission } from './access';
 import { isConfigured as emailIsConfigured, sendMail } from './email';
-import { EMAIL_NOT_SET_UP_MESSAGE, senderMergeFields } from './emailSettings';
+import { EMAIL_NOT_SET_UP_MESSAGE, recipientProblem, senderMergeFields } from './emailSettings';
 import { backupFolderIgnoredHere, lastFullBackup, readBackupHistory, readBackupSettings } from './backupHistory';
 import { runVersionedBackup } from './backupSchedule';
 import { buildInvoicePdf } from '@/lib/pdf/forms';
@@ -1160,7 +1160,14 @@ export async function sendPaymentReminder(
   if (!recipient) {
     throw validation(`There is no email address for ${inv.customerName}. Type one in, or add it to the customer record.`);
   }
-  if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(recipient)) throw validation('That email address does not look right.');
+  // One recipient (lib/services/emailSettings.ts recipientProblem): no comma or semicolon, and none
+  // of the characters the mailer reads as a name, a comment or another address, which could send
+  // the reminder somewhere other than where it reads. An agent's must be a plain address.
+  const problem = recipientProblem(ctx, recipient, 'one');
+  if (problem) {
+    const typed = typeof to === 'string' && to.trim() !== '';
+    throw validation(typed ? problem : `The email address on ${inv.customerName}'s record cannot be used: ${problem}`);
+  }
   if (!(await emailIsConfigured(ctx))) {
     throw validation(EMAIL_NOT_SET_UP, undefined, [
       { id: 'email.setup', label: 'Set up email', kind: 'navigate', href: '/settings?tab=sendForms' },

@@ -12,9 +12,16 @@
  *
  * Letting an agent do more by itself is for an Admin (plan 4.4). For anyone else who manages
  * agents, every control that would loosen it (a looser preset, a cell, "follow again" buttons that
- * would loosen a cell, another folder, the email notice) is off and says why, and a raised limit
- * typed in is held at Save with the reason (policyDraft.ts looseningsOf); tightening and pausing
- * stay open. A refusal from the server is shown in its own words, beside Save.
+ * would loosen a cell, a folder outside the ones it has, the email notice) is off and says why, and
+ * a raised limit typed in is held at Save with the reason (policyDraft.ts looseningsOf); tightening,
+ * pausing and a folder inside one it has stay open. A refusal from the server is shown in its own
+ * words, beside Save: the folder checks only the server can make (a folder that is not there, a
+ * share of this computer, one of Ironbooks' own places, a stored folder that does not really reach
+ * the new one) come back that way.
+ *
+ * Tightening, pausing and taking back a standing permission need the right to change Users & Roles
+ * > Users (viewerMayManage; an Admin always has it). Someone who may only see that list sees this
+ * page as it is, with no control the server would refuse, and is told what they would need.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Pause, Play, Trash2 } from 'lucide-react';
@@ -35,6 +42,7 @@ import {
   clearLooser,
   clearScope,
   clearSetting,
+  differingCount,
   draftFrom,
   isChanged,
   keptAsChosen,
@@ -51,6 +59,7 @@ import {
 import {
   ADMIN_ROLE_WARNING,
   ADMIN_TO_LOOSEN,
+  ADMIN_TO_PAUSE_ALL,
   ADMIN_TO_RESUME_ADMIN_AGENT,
   AGENT_PRESET_LABELS,
   ALL_PAUSED_NOTE,
@@ -60,11 +69,13 @@ import {
   POLICY_INTRO,
   REMOVED_NOTE,
   ROLE_AND_PRESET_NOTE,
+  VIEW_ONLY_NOTE,
   adjustedPresetNote,
   adjustedTitle,
   adminOnlyNote,
   looserNote,
   presetSummary,
+  storedFolderGone,
   when,
 } from './words';
 
@@ -122,6 +133,8 @@ export default function AgentDetailView({
   onBack,
   onRemove,
   viewerIsAdmin = false,
+  viewerMayManage = false,
+  pauseAllOffered = null,
 }: {
   agentId: string;
   /** This window is not at the computer that holds the company file: the policy can only be looked at. */
@@ -134,6 +147,17 @@ export default function AgentDetailView({
    * Unknown counts as not: the controls that would loosen stay off, and the server decides anyway.
    */
   viewerIsAdmin?: boolean;
+  /**
+   * The person may change Users & Roles > Users, which tightening, pausing and taking back a
+   * standing permission need (lib/services/agentPolicies.ts personWhoManagesAgents). An Admin
+   * always may. Unknown counts as not: the page is shown to look at only.
+   */
+  viewerMayManage?: boolean;
+  /**
+   * Pause all agents is offered to this person (AgentRequestCount.canPauseAll), false when it is
+   * not, null while that is not known. Only used to say who can turn every agent back on.
+   */
+  pauseAllOffered?: boolean | null;
 }) {
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [error, setError] = useState('');
@@ -191,7 +215,10 @@ export default function AgentDetailView({
   }
 
   const removed = Boolean(detail.revokedAt);
-  const readOnly = hostOnly || removed;
+  // Tightening, pausing and Revoke all need Users & Roles > Users, Modify; without it the page is
+  // there to look at, and offers nothing the server would refuse.
+  const mayManage = viewerIsAdmin || viewerMayManage;
+  const readOnly = hostOnly || removed || !mayManage;
   const counts = areaCounts(draft);
   const everywhereCount = draft.overrides.filter((o) => o.area === null).length;
   const isAdminAgent = detail.roleKeys.includes(ADMIN_ROLE_KEY);
@@ -227,6 +254,9 @@ export default function AgentDetailView({
   const typed = withTypedFolder(draft, folderText);
   const loosenings = mayLoosen || readOnly ? [] : looseningsOf(initial, typed.draft ?? draft);
   const saveError = refusal && refusal.draft === draft && refusal.folder === folderText ? refusal.message : '';
+  // The server could not find a folder the agent already has (moved or deleted since): say how to
+  // get past it. Read from its own words; if they ever change, only this hint is left out.
+  const goneFolder = saveError ? (initial.folders.find((f) => saveError.includes(`"${f}" was not found`)) ?? null) : null;
 
   function choose(areaKey: Area | null, cls: RiskClass, setting: PolicySetting) {
     setDraft((d) => (d && detail ? chooseSetting(d, detail.policy.locked, areaKey, cls, setting) : d));
@@ -315,8 +345,10 @@ export default function AgentDetailView({
             </h2>
             <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-navy/60">
               {detail.roleNames.length ? detail.roleNames.map((r) => <Badge key={r}>{r}</Badge>) : <span>Role removed</span>}
-              <span className="ml-1" data-preset-summary="" title={adjustedTitle(initial.overrides.length, keptAsChosen(initial).length)}>
-                {presetSummary(AGENT_PRESET_LABELS[detail.policy.preset], detail.policy.overrides.length)}
+              {/* "(adjusted: N)": the settings that differ from the preset, worked out from the saved
+                  settings themselves, so it holds whatever the list's count means. */}
+              <span className="ml-1" data-preset-summary="" title={adjustedTitle(differingCount(initial), keptAsChosen(initial).length)}>
+                {presetSummary(AGENT_PRESET_LABELS[initial.preset], differingCount(initial))}
               </span>
               {detail.unattended && <span className="ml-1">· Also while nobody is signed in</span>}
             </div>
@@ -324,7 +356,7 @@ export default function AgentDetailView({
               Made {when(detail.createdAt)} · Last used {when(detail.lastUsedAt)}
             </p>
           </div>
-          {!removed && (
+          {!removed && mayManage && (
             <div className="flex flex-wrap gap-2">
               {detail.paused ? (
                 <Button
@@ -351,11 +383,17 @@ export default function AgentDetailView({
         </div>
         <div className="mt-3 space-y-2">
           {removed && <p className="text-sm text-navy/60">{REMOVED_NOTE}</p>}
-          {!removed && detail.allPaused && <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">{ALL_PAUSED_NOTE}</p>}
+          {!removed && detail.allPaused && (
+            <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900" data-all-paused="">
+              {ALL_PAUSED_NOTE}
+              {/* Only whoever may use the switch can turn it back on (canPauseAll): say so to anyone else. */}
+              {pauseAllOffered === false && <span className="mt-1 block">{ADMIN_TO_PAUSE_ALL}</span>}
+            </p>
+          )}
           {!removed && detail.paused && (
             <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">
               {PAUSED_NOTE}
-              {resumeBlocked && (
+              {resumeBlocked && mayManage && (
                 <span className="mt-1 block" data-resume-blocked="">
                   {ADMIN_TO_RESUME_ADMIN_AGENT}
                 </span>
@@ -363,7 +401,17 @@ export default function AgentDetailView({
             </p>
           )}
           {isAdminAgent && !removed && <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-900">{ADMIN_ROLE_WARNING}</p>}
-          {hostOnly && !removed && <p className="text-sm text-amber-700">{HOST_ONLY_MESSAGE} Pausing and taking back standing permission work from here.</p>}
+          {hostOnly && !removed && (
+            <p className="text-sm text-amber-700">
+              {HOST_ONLY_MESSAGE}
+              {mayManage && ' Pausing and taking back standing permission work from here.'}
+            </p>
+          )}
+          {!mayManage && !removed && (
+            <p className="rounded-lg bg-slate-50 p-3 text-xs text-navy/70" data-view-only="">
+              {VIEW_ONLY_NOTE}
+            </p>
+          )}
           {!mayLoosen && !readOnly && (
             <p id={ADMIN_ONLY_NOTE_ID} className="rounded-lg bg-slate-50 p-3 text-xs text-navy/70" data-not-admin="">
               {NOT_ADMIN_NOTE}
@@ -519,6 +567,11 @@ export default function AgentDetailView({
               {saveError}
             </p>
           )}
+          {goneFolder && (
+            <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-900" role="note" data-folder-gone="">
+              {storedFolderGone(goneFolder)}
+            </p>
+          )}
           <div className="flex flex-wrap items-center justify-end gap-2">
             {changed && <span className="mr-auto text-sm text-navy/60">Not saved yet.</span>}
             <Button
@@ -545,6 +598,7 @@ export default function AgentDetailView({
             agentId={detail.id}
             agentName={detail.name}
             paused={removed ? null : detail.paused ? 'agent' : detail.allPaused ? 'all' : null}
+            mayRevoke={mayManage}
           />
         </Card>
       )}

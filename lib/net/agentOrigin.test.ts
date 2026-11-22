@@ -186,7 +186,20 @@ describe('what an agent may reach', () => {
       for (const m of ['POST', 'PUT', 'PATCH', 'DELETE']) expect(agentRouteAllowed(p, m, registry), `${m} ${p}`).toBe(false);
     }
     // Not a plain read, or not for agents: through the door, or not at all.
-    for (const p of ['/api/backup', '/api/network-policy', '/api/reports/1099-xml', `/api/attachments/${ID}`, '/api/auth/me', '/api/agents', '/api/agent-requests']) {
+    for (const p of [
+      '/api/backup',
+      '/api/network-policy',
+      '/api/reports/1099-xml',
+      `/api/attachments/${ID}`,
+      '/api/auth/me',
+      '/api/agents',
+      '/api/agent-requests',
+      // A person's own account, the company file's name, and the raw transaction log.
+      '/api/companies',
+      '/api/file-protection',
+      '/api/company-file/info',
+      '/api/transaction-log/download',
+    ]) {
       expect(agentRouteAllowed(p, 'GET', registry), p).toBe(false);
     }
   });

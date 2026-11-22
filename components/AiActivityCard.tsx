@@ -1,7 +1,10 @@
 /**
  * Home page "AI" card (server component): what the AI did and what it needs from you, each count
  * linking to the screen that finishes the job (lib/services/aiActivity.ts). With no AI connected
- * it is a one-line invitation to connect one.
+ * and nothing to report it is a one-line invitation to connect one.
+ *
+ * The assistant's proposals link to Ask AI, where they are approved; agents' requests link to
+ * Agent requests, the one place where an agent's work is approved or denied.
  */
 import Link from 'next/link';
 import { Sparkles } from 'lucide-react';
@@ -22,7 +25,8 @@ function Row({ href, n, text, tone = 'navy' }: { href: string; n: number; text: 
 export default function AiActivityCard({ a }: { a: AiActivity }) {
   // Auto-posting runs on the learned categorizer, with or without an AI connected: what it did
   // is always shown; the invitation alone only when there is nothing to report.
-  const activity = a.autoPostedLast7Days + a.bankLinesToReview + a.pendingProposals + a.ruleOffers;
+  // Agents work without the app's own AI, so their requests count as activity too.
+  const activity = a.autoPostedLast7Days + a.bankLinesToReview + a.pendingProposals + a.agentRequestsWaiting + a.ruleOffers;
   if (a.connected === 'none' && activity === 0) {
     return (
       <Card className="mt-8 flex max-w-3xl flex-wrap items-center justify-between gap-3 p-5">
@@ -40,19 +44,44 @@ export default function AiActivityCard({ a }: { a: AiActivity }) {
     );
   }
   const rows: Array<{ href: string; n: number; text: string; tone?: 'navy' | 'electric' }> = [];
+  // Each count reads as a sentence: "1 bank line", "2 bank lines".
+  const one = (n: number, single: string, many: string) => (n === 1 ? single : many);
   if (a.autoPostedLast7Days > 0) {
-    rows.push({ href: '/ai-posts', n: a.autoPostedLast7Days, text: 'bank lines the AI posted this week (see them and undo any in one click)' });
+    rows.push({
+      href: '/ai-posts',
+      n: a.autoPostedLast7Days,
+      text: `${one(a.autoPostedLast7Days, 'bank line', 'bank lines')} the AI posted this week (see them and undo any in one click)`,
+    });
   }
   if (a.bankLinesToReview > 0) {
+    const suggested = a.bankLinesWithSuggestion;
     rows.push({
       href: '/bank-review',
       n: a.bankLinesToReview,
-      text: `bank lines to review${a.bankLinesWithSuggestion ? ` — ${a.bankLinesWithSuggestion} already have a suggested account` : ''}`,
+      text: `${one(a.bankLinesToReview, 'bank line', 'bank lines')} to review${suggested ? ` — ${suggested} already ${one(suggested, 'has', 'have')} a suggested account` : ''}`,
       tone: 'electric',
     });
   }
-  if (a.pendingProposals > 0) rows.push({ href: '/dashboard?assistant=1', n: a.pendingProposals, text: 'entries the assistant or an agent drafted, waiting for your approval (Ask AI)', tone: 'electric' });
-  if (a.ruleOffers > 0) rows.push({ href: '/bank-rules', n: a.ruleOffers, text: 'learned payee rules ready to turn on', tone: 'electric' });
+  if (a.pendingProposals > 0) {
+    rows.push({
+      href: '/dashboard?assistant=1',
+      n: a.pendingProposals,
+      text: `${one(a.pendingProposals, 'entry', 'entries')} the assistant drafted, waiting for your approval (Ask AI)`,
+      tone: 'electric',
+    });
+  }
+  // What an agent asks for is decided in Agent requests, where you see what it would change first.
+  if (a.agentRequestsWaiting > 0) {
+    rows.push({
+      href: '/agent-requests',
+      n: a.agentRequestsWaiting,
+      text: `${one(a.agentRequestsWaiting, 'request from an agent', 'requests from agents')} waiting for your decision (Agent requests)`,
+      tone: 'electric',
+    });
+  }
+  if (a.ruleOffers > 0) {
+    rows.push({ href: '/bank-rules', n: a.ruleOffers, text: `${one(a.ruleOffers, 'learned payee rule', 'learned payee rules')} ready to turn on`, tone: 'electric' });
+  }
   return (
     <Card className="mt-8 max-w-3xl p-6">
       <div className="mb-2 flex items-center justify-between">

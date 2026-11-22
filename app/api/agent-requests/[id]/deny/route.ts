@@ -7,15 +7,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { denyAgentRequest } from '@/lib/services/agentRequests';
-import { routeError, requireJsonObject } from '@/lib/routeErrors';
+import { requireJsonObject } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { denyRequestSchema } from '@/lib/validation/agentAccess';
-import { NO_STORE, badId, refuseAgent, refuseOutsideWindow } from '@/app/api/agent-requests/_guards';
+import { NO_STORE, badId, refuseAgent, refuseAgentRequest, refuseOutsideWindow, routeErrorPlain } from '@/app/api/agent-requests/_guards';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const early = refuseAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
     const refused = refuseAgent(ctx, req) ?? refuseOutsideWindow(req);
     if (refused) return refused;
@@ -26,6 +28,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400, headers: NO_STORE });
     return NextResponse.json({ request: await denyAgentRequest(ctx, id, parsed.data.note) }, { headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agent-requests/[id]/deny/route');
+    return routeErrorPlain(err, 'agent-requests/[id]/deny/route');
   }
 }

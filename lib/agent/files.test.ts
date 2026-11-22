@@ -10,7 +10,18 @@
  *  - File ids and names cannot be paths, device names, hidden-direction tricks or broken characters;
  *    an id of the wrong shape never reaches the disk.
  *  - One agent keeps at most 500 MB or 1000 files at once (the exported constants), refused with
- *    words that say to wait or ask a person; other agents are not affected.
+ *    words that say how much room is left when only the new file does not fit, and to remove files
+ *    (remove_file, once the door has that verb), to wait and how long, or to ask a person; other
+ *    agents are not affected; removing a file, or expiry as a read judges it, frees the room at
+ *    once; only what a read would return holds room; and what expired, was left half written or
+ *    can never be read is removed when the agent next adds a file.
+ *  - As an attacker: a .bin, .json or .part swapped for another file, a second name, a link or (on
+ *    macOS and Linux) a pipe between the check and the use; a .bin or .json that grows while it is
+ *    read; the agent's or company's folder swapped for a link; a staged file copied into another
+ *    owner's folder; ids guessed from another agent or company; device names, streams, trailing
+ *    dots and spaces; long paths; a link swapped in after the walk that leads to a share. Each
+ *    refused, nothing of anyone else's touched, nothing waited on, nothing read past its size.
+ *  - The table of this-computer-share cases (thisComputerShares.json) the ports are held to.
  *  - Old files and uploads are cleared (by age, or all), also lazily (when adding and when reading);
  *    clearing a missing folder is fine; a full clear at the same time as writes never fails them,
  *    waits for a write already going, and never takes a file staged after it began (one gate).
@@ -22,7 +33,8 @@
  *  - overlapsAppData: the staging folders, the books and the copies beside them, Ironbooks' own
  *    local folder, the desktop app's settings folder under every name it has had (company-folder
  *    mode's companies included), the backup, sandbox and connection-file folders the shell names,
- *    inside or holding them, through links and in other spellings; fail closed for what is no full
+ *    the browser version's sandbox folder and, while a sandbox is open there, the real books beside
+ *    it, inside or holding them, through links and in other spellings; fail closed for what is no full
  *    path and for a share on this very computer in any spelling (by the words, nothing looked at,
  *    or as the disk answers).
  *  - allowedFolder: the folder itself or below, never beside or above (".."), case on Windows, a
@@ -37,7 +49,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { STAGED_FILE_HOURS, UPLOAD_CHUNK_BYTES, UPLOAD_MAX_BYTES, type FileOwner } from './contract';
+import { AGENT_VERBS, STAGED_FILE_HOURS, UPLOAD_CHUNK_BYTES, UPLOAD_MAX_BYTES, type FileOwner } from './contract';
 import {
   AGENT_FILES_DIR_ENV,
   AGENT_MAX_BYTES,
@@ -48,11 +60,14 @@ import {
   isThisComputerShare,
   overlapsAppData,
   readStagedFile,
+  REMOVE_FILE_VERB,
+  removeStagedFile,
   stagedFileInfo,
   stagedFilesRoot,
   stageFile,
   uploadChunk,
 } from './files';
+import thisComputerShares from './thisComputerShares.json';
 import { ServiceError } from '@/lib/services/errors';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ib-agent-files-'));
@@ -105,6 +120,111 @@ function restoreEnv(...keys: Array<(typeof ENV_KEYS)[number]>): void {
 
 function ownerFolder(o: FileOwner): string {
   return path.join(ROOT, o.companyId, o.agentId);
+}
+
+/** As much of a FileHandle as the tests that watch its reads need. */
+interface FileHandleLike {
+  read: (...a: unknown[]) => Promise<{ bytesRead: number }>;
+}
+
+/** One case of lib/agent/thisComputerShares.json. */
+interface ShareCase {
+  path: string;
+  want: boolean;
+  env?: Record<string, string>;
+  since?: string;
+  why?: string;
+}
+
+/**
+ * The table's cases with its templates filled in for this computer (lib/agent/thisComputerShares.json
+ * says what each stands for); a case whose template cannot be filled here is left out.
+ */
+function shareCases(): ShareCase[] {
+  let ownIPv4: string | null = null;
+  let ownIPv6: string | null = null;
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list ?? []) {
+      // Node names the family 'IPv4' or 'IPv6' (a number in some older versions).
+      const family = String(a.family);
+      if (!ownIPv4 && (family === 'IPv4' || family === '4') && !a.internal) ownIPv4 = a.address;
+      if (!ownIPv6 && (family === 'IPv6' || family === '6') && !a.internal) ownIPv6 = a.address.replace(/%.*$/, '');
+    }
+  }
+  const v4Number = ownIPv4 === null ? null : ownIPv4.split('.').reduce((n, part) => n * 256 + Number(part), 0);
+  const host = os.hostname();
+  const fill: Record<string, string | null> = {
+    '{hostname}': host,
+    '{hostname:lower}': host.toLowerCase(),
+    '{hostname:upper}': host.toUpperCase(),
+    '{COMPUTERNAME}': process.env.COMPUTERNAME?.trim() || null,
+    '{ownIPv4}': ownIPv4,
+    '{ownIPv4:number}': v4Number === null ? null : String(v4Number),
+    '{ownIPv4:hex}': v4Number === null ? null : `0x${v4Number.toString(16)}`,
+    '{ownIPv6}': ownIPv6,
+    '{ownIPv6:literal}': ownIPv6 === null ? null : `${ownIPv6.replace(/:/g, '-')}.ipv6-literal.net`,
+  };
+  const out: ShareCase[] = [];
+  for (const c of thisComputerShares.cases as ShareCase[]) {
+    let p: string | null = c.path;
+    for (const [t, v] of Object.entries(fill)) if (p?.includes(t)) p = v === null ? null : p.split(t).join(v);
+    if (p !== null) out.push({ ...c, path: p });
+  }
+  return out;
+}
+
+/** Run `fn` as if remove_file were one of the door's verbs (contract AGENT_VERBS), then put the list back. */
+async function withRemoveVerb(fn: () => Promise<void>): Promise<void> {
+  const verbs = AGENT_VERBS as unknown as string[];
+  const had = verbs.includes(REMOVE_FILE_VERB);
+  if (!had) verbs.push(REMOVE_FILE_VERB);
+  try {
+    await fn();
+  } finally {
+    if (!had) verbs.splice(verbs.indexOf(REMOVE_FILE_VERB), 1);
+  }
+}
+
+/** Run `fn` with these environment values in place, then put back what was there. */
+function withEnv(values: Record<string, string> | undefined, fn: () => void): void {
+  const before = Object.fromEntries(Object.keys(values ?? {}).map((k) => [k, env[k]]));
+  Object.assign(env, values ?? {});
+  try {
+    fn();
+  } finally {
+    for (const [k, v] of Object.entries(before)) {
+      if (v === undefined) delete env[k];
+      else env[k] = v;
+    }
+  }
+}
+
+/** `count` more staged files of one byte in the owner's folder `dir`, as stageFile keeps them (each with its .json). */
+function plantStaged(dir: string, o: FileOwner, count: number): void {
+  const created = new Date().toISOString();
+  for (let i = 1; i <= count; i++) {
+    const id = i.toString(16).padStart(32, '0');
+    fs.writeFileSync(path.join(dir, `${id}.bin`), 'p');
+    fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ name: `p${i}.txt`, type: 'text/plain', size: 1, created, company: o.companyId, agent: o.agentId }));
+  }
+}
+
+/**
+ * Staged files of these sizes in the owner's folder `dir`, each whole as stageFile keeps it (its
+ * .json names the owner and the very size of its .bin, so a read would return it); the bytes are
+ * made by setting the size, never written. Their ids start with "5", away from plantStaged's.
+ * Answers the .bin of each.
+ */
+function plantSized(dir: string, o: FileOwner, sizes: readonly number[]): string[] {
+  const created = new Date().toISOString();
+  return sizes.map((size, i) => {
+    const id = `5${(i + 1).toString(16).padStart(31, '0')}`;
+    const bin = path.join(dir, `${id}.bin`);
+    fs.writeFileSync(bin, '');
+    fs.truncateSync(bin, size);
+    fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ name: `s${i}.bin`, type: 'application/octet-stream', size, created, company: o.companyId, agent: o.agentId }));
+    return bin;
+  });
 }
 
 /** Make a staged file or upload look `hours` old on the disk. */
@@ -210,7 +330,8 @@ describe('staging a file', () => {
     const dir = ownerFolder(me);
     expect(fs.readFileSync(path.join(dir, `${file.fileId}.bin`)).equals(bytes)).toBe(true);
     const meta = JSON.parse(fs.readFileSync(path.join(dir, `${file.fileId}.json`), 'utf8'));
-    expect(meta).toEqual({ name: 'November.csv', type: 'text/csv', size: bytes.length, created: expect.any(String) });
+    // The .json names its owner too.
+    expect(meta).toEqual({ name: 'November.csv', type: 'text/csv', size: bytes.length, created: expect.any(String), company: COMPANY, agent: AGENT });
     expect(Number.isNaN(Date.parse(meta.created))).toBe(false);
     // Nothing else left behind (no temporary files).
     expect(fs.readdirSync(dir).filter((n) => n.startsWith(file.fileId)).sort()).toEqual([`${file.fileId}.bin`, `${file.fileId}.json`]);
@@ -528,42 +649,98 @@ describe('limits per agent', () => {
     process.env[AGENT_FILES_DIR_ENV] = limitsRoot;
   });
 
-  it('the limits are the constants: 500 MB and 1000 files per agent', () => {
+  it('the limits are the constants: 500 MB and 1000 files per agent; room is made with remove_file', () => {
     expect(AGENT_MAX_BYTES).toBe(MAX_BYTES);
     expect(AGENT_MAX_FILES).toBe(MAX_FILES);
+    expect(REMOVE_FILE_VERB).toBe('remove_file');
   });
 
   it('one agent keeps at most 500 MB at once, uploads included; other agents are not affected; expired files stop counting', async () => {
     const owner: FileOwner = { companyId: COMPANY, agentId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' };
     const dir = path.join(limitsRoot, owner.companyId, owner.agentId);
     const up = await uploadChunk(owner, { name: 'u.bin', type: 'application/octet-stream', chunkBase64: b64('u'), last: false });
-    const big = await stageFile(owner, { name: 'big.bin', type: 'application/octet-stream', bytes: Buffer.from('b') });
-    const bigBin = path.join(dir, `${big.fileId}.bin`);
     try {
-      // As if the agent kept almost 500 MB: 1 byte of upload, the rest in one file; 5 bytes still fit.
-      fs.truncateSync(bigBin, MAX_BYTES - 6);
+      // As if the agent kept almost 500 MB: 1 byte of upload, the rest in ten files of at most
+      // 50 MB each, every one a file a read would return; 5 bytes still fit.
+      const bins = plantSized(dir, owner, [...Array<number>(9).fill(UPLOAD_MAX_BYTES), UPLOAD_MAX_BYTES - 6]);
+      expect(10 * UPLOAD_MAX_BYTES).toBe(MAX_BYTES);
+      expect((await stagedFileInfo(owner, path.basename(bins[9], '.bin')))?.size).toBe(UPLOAD_MAX_BYTES - 6);
       const err = await refusal(uploadChunk(owner, { uploadId: up.uploadId, name: 'u.bin', type: 'application/octet-stream', chunkBase64: b64('123456'), last: false }));
       expect(err.code).toBe('VALIDATION');
       expect(err.message).toMatch(/500 MB/);
-      // Plain words that say what to do next: wait, or ask a person.
-      expect(err.message).toMatch(/wait for older ones to be cleared/);
+      // Not full yet: it says how much room is left, and how much this needs.
+      expect(err.message).toMatch(/There is not room for this here\. This agent keeps 499 MB of the 500 MB one agent may keep at once, which leaves room for 5 bytes, and this needs 6 bytes\./);
+      expect(err.message).not.toMatch(/already keeps/);
+      // Plain words that say what to do next: wait (and how long), or ask a person. Never a verb
+      // the door does not have (remove_file, until it is one of AGENT_VERBS).
+      expect(err.message).toMatch(/To make room, wait for older ones to be cleared/);
+      expect(err.message).toMatch(/the oldest in about 24 hours/);
       expect(err.message).toMatch(/ask a person/);
+      expect(err.message).not.toMatch(/remove_file/);
       // The upload is not stopped by that: a smaller part still fits.
       expect(fs.existsSync(path.join(dir, `${up.uploadId}.part`))).toBe(true);
       const done = await uploadChunk(owner, { uploadId: up.uploadId, name: 'u.bin', type: 'application/octet-stream', chunkBase64: b64('12345'), last: true });
       expect(done.file?.size).toBe(6);
 
-      // Full now: nothing more, in any way.
-      await refusal(stageFile(owner, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') }));
+      // Full now: nothing more, in any way, and it says it is full.
+      const full = await refusal(stageFile(owner, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') }));
+      expect(full.message).toMatch(/^This agent already keeps as much here as one agent may at once \(500 MB\)\. To make room, /);
       await refusal(uploadChunk(owner, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: true }));
       await refusal(uploadChunk(owner, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: false }));
       // Another agent is not affected.
       expect((await stageFile(otherAgent, { name: 'y.txt', type: 'text/plain', bytes: Buffer.from('y') })).size).toBe(1);
-      // A file older than a day no longer counts.
-      age(bigBin, STAGED_FILE_HOURS + 1);
+      // A file older than a day no longer counts, and is gone once the agent adds one.
+      age(bins[0], STAGED_FILE_HOURS + 1);
       expect((await stageFile(owner, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') })).size).toBe(1);
+      expect(fs.existsSync(bins[0])).toBe(false);
     } finally {
-      fs.rmSync(bigBin, { force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('only what a read would return holds room: an entry no read returns is not counted, and is removed (only its name, for a second name)', async () => {
+    const owner: FileOwner = { companyId: COMPANY, agentId: '9a9a9a9a-9a9a-49a9-89a9-9a9a9a9a9a9a' };
+    const dir = path.join(limitsRoot, owner.companyId, owner.agentId);
+    const outside = path.join(TMP, 'limits-outside.txt');
+    fs.writeFileSync(outside, 'p');
+    try {
+      await stageFile(owner, { name: 'first.txt', type: 'text/plain', bytes: Buffer.from('1') });
+      plantStaged(dir, owner, MAX_FILES - 1);
+      await refusal(stageFile(owner, { name: 'full.txt', type: 'text/plain', bytes: Buffer.from('f') }));
+      // Four of the planted files spoiled, each in a way a read refuses (findStaged).
+      const at = (i: number, ext: string) => path.join(dir, `${i.toString(16).padStart(32, '0')}.${ext}`);
+      const meta = (i: number) => JSON.parse(fs.readFileSync(at(i, 'json'), 'utf8')) as Record<string, unknown>;
+      // 1: a .json that names no owner (as an older Ironbooks wrote it).
+      const { company: _c, agent: _a, ...ownerless } = meta(1);
+      fs.writeFileSync(at(1, 'json'), JSON.stringify(ownerless));
+      // 2: copied from another agent's folder (its .json names that agent).
+      fs.writeFileSync(at(2, 'json'), JSON.stringify({ ...meta(2), agent: OTHER_AGENT }));
+      // 3: a .bin that is not the size its .json says.
+      fs.writeFileSync(at(3, 'bin'), 'longer than one byte');
+      // 4: a second name (a hard link) for a file kept elsewhere.
+      fs.rmSync(at(4, 'bin'));
+      fs.linkSync(outside, at(4, 'bin'));
+      for (const i of [1, 2, 3, 4]) expect(await stagedFileInfo(owner, i.toString(16).padStart(32, '0')), String(i)).toBeNull();
+      // Their room is free: four more fit, and a fifth does not.
+      for (let n = 0; n < 4; n++) expect((await stageFile(owner, { name: `more${n}.txt`, type: 'text/plain', bytes: Buffer.from('m') })).size).toBe(1);
+      expect((await refusal(stageFile(owner, { name: 'fifth.txt', type: 'text/plain', bytes: Buffer.from('m') }))).message).toMatch(/1000 files/);
+      // And they are gone from the disk; the file the second name led to is untouched.
+      for (const i of [1, 2, 3, 4]) for (const ext of ['bin', 'json']) expect(fs.existsSync(at(i, ext)), `${i}.${ext}`).toBe(false);
+      expect(fs.readFileSync(outside, 'utf8')).toBe('p');
+      expect(fs.statSync(outside).nlink).toBe(1);
+      // An upload that is a second name for another file can never be finished: it holds no place.
+      fs.rmSync(dir, { recursive: true, force: true });
+      const ups: string[] = [];
+      for (let i = 0; i < 5; i++) ups.push((await uploadChunk(owner, { name: `u${i}`, type: 'text/plain', chunkBase64: b64('u'), last: false })).uploadId);
+      const part = path.join(dir, `${ups[0]}.part`);
+      fs.rmSync(part);
+      fs.linkSync(outside, part);
+      expect((await uploadChunk(owner, { name: 'u5', type: 'text/plain', chunkBase64: b64('u'), last: false })).file).toBeNull();
+      expect(fs.existsSync(part)).toBe(false);
+      expect(fs.readFileSync(outside, 'utf8')).toBe('p');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(outside, { force: true });
     }
   });
 
@@ -572,13 +749,104 @@ describe('limits per agent', () => {
     const dir = path.join(limitsRoot, owner.companyId, owner.agentId);
     const first = await stageFile(owner, { name: 'first.txt', type: 'text/plain', bytes: Buffer.from('1') });
     // As if it had staged 999 more.
-    for (let i = 1; i < MAX_FILES; i++) fs.writeFileSync(path.join(dir, `${i.toString(16).padStart(32, '0')}.bin`), '');
+    plantStaged(dir, owner, MAX_FILES - 1);
     const err = await refusal(stageFile(owner, { name: 'one-more.txt', type: 'text/plain', bytes: Buffer.from('x') }));
     expect(err.message).toMatch(/1000 files/);
-    expect(err.message).toMatch(/wait .*or ask a person/);
+    expect(err.message).toMatch(/If it cannot wait, ask a person for help\./);
+    // Once the door has the verb to remove files, the refusal says to use it.
+    await withRemoveVerb(async () => {
+      const said = (await refusal(stageFile(owner, { name: 'one-more.txt', type: 'text/plain', bytes: Buffer.from('x') }))).message;
+      expect(said).toMatch(/To make room, remove the files it no longer needs \(remove_file with their file id\), or wait for older ones to be cleared/);
+    });
     await refusal(uploadChunk(owner, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: true }));
     age(path.join(dir, `${first.fileId}.bin`), STAGED_FILE_HOURS + 1);
     expect((await stageFile(owner, { name: 'one-more.txt', type: 'text/plain', bytes: Buffer.from('x') })).size).toBe(1);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('removing a file frees its room at once; an id of another shape or another agent’s removes nothing', async () => {
+    const owner: FileOwner = { companyId: COMPANY, agentId: '12121212-1212-4121-8121-121212121212' };
+    const dir = path.join(limitsRoot, owner.companyId, owner.agentId);
+    const mine = await stageFile(owner, { name: 'keep-or-go.txt', type: 'text/plain', bytes: Buffer.from('k') });
+    plantStaged(dir, owner, MAX_FILES - 1);
+    await refusal(stageFile(owner, { name: 'more.txt', type: 'text/plain', bytes: Buffer.from('m') }));
+    // Another agent's file with the same shape of id is never reached, and stays.
+    const theirs = await stageFile(otherAgent, { name: 'theirs.txt', type: 'text/plain', bytes: Buffer.from('t') });
+    expect(await removeStagedFile(owner, theirs.fileId)).toBe(false);
+    expect(await readStagedFile(otherAgent, theirs.fileId)).not.toBeNull();
+    // A malformed id is answered before the disk is looked at.
+    const disk = watchDisk();
+    try {
+      for (const bad of ['', '../x', mine.fileId.toUpperCase(), `${mine.fileId}.bin`, 42, null]) expect(await removeStagedFile(owner, bad as unknown as string)).toBe(false);
+      expect(await removeStagedFile({ companyId: '..', agentId: owner.agentId }, mine.fileId)).toBe(false);
+      expect(disk.paths()).toEqual([]);
+    } finally {
+      disk.restore();
+    }
+    expect(await removeStagedFile(owner, mine.fileId)).toBe(true);
+    expect(await readStagedFile(owner, mine.fileId)).toBeNull();
+    expect(fs.existsSync(path.join(dir, `${mine.fileId}.bin`))).toBe(false);
+    expect(fs.existsSync(path.join(dir, `${mine.fileId}.json`))).toBe(false);
+    expect(await removeStagedFile(owner, mine.fileId)).toBe(false);
+    // The room is there again at once.
+    expect((await stageFile(owner, { name: 'more.txt', type: 'text/plain', bytes: Buffer.from('m') })).size).toBe(1);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('stopping an unfinished upload frees its place, and the refusal for too many says how', async () => {
+    const owner: FileOwner = { companyId: COMPANY, agentId: '34343434-3434-4343-8343-343434343434' };
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) ids.push((await uploadChunk(owner, { name: `p${i}`, type: 'text/plain', chunkBase64: b64(`part ${i}`), last: false })).uploadId);
+    const err = await refusal(uploadChunk(owner, { name: 'p6', type: 'text/plain', chunkBase64: b64('six'), last: false }));
+    expect(err.message).toMatch(/Finish one of them \(send its last part\), then start again\./);
+    expect(err.message).toMatch(/24 hours after its last part/);
+    expect(err.message).not.toMatch(/remove_file/);
+    await withRemoveVerb(async () => {
+      const said = (await refusal(uploadChunk(owner, { name: 'p6', type: 'text/plain', chunkBase64: b64('six'), last: false }))).message;
+      expect(said).toMatch(/Finish one of them \(send its last part\), or stop one it no longer needs \(remove_file with its upload id\), then start again\./);
+    });
+    expect(await removeStagedFile(owner, ids[2])).toBe(true);
+    expect((await uploadChunk(owner, { name: 'p6', type: 'text/plain', chunkBase64: b64('six'), last: false })).file).toBeNull();
+    // A stopped upload cannot be carried on.
+    await refusal(uploadChunk(owner, { uploadId: ids[2], name: 'p2', type: 'text/plain', chunkBase64: b64('late'), last: true }));
+  });
+
+  it('expiry frees the room as a read judges it (the .json’s own time too), and what expired is removed when the agent next adds a file', async () => {
+    const owner: FileOwner = { companyId: COMPANY, agentId: '56565656-5656-4565-8565-565656565656' };
+    const dir = path.join(limitsRoot, owner.companyId, owner.agentId);
+    const old = await stageFile(owner, { name: 'old.txt', type: 'text/plain', bytes: Buffer.from('o') });
+    plantStaged(dir, owner, MAX_FILES - 1);
+    await refusal(stageFile(owner, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') }));
+    // Its .json says it was made more than a day ago (the disk's times say now): a read finds no
+    // file, so it holds no room either.
+    const json = path.join(dir, `${old.fileId}.json`);
+    fs.writeFileSync(json, JSON.stringify({ ...JSON.parse(fs.readFileSync(json, 'utf8')), created: new Date(Date.now() - (STAGED_FILE_HOURS + 1) * 3600_000).toISOString() }));
+    expect(await readStagedFile(owner, old.fileId)).toBeNull();
+    const fresh = await stageFile(owner, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') });
+    expect(fresh.size).toBe(1);
+    // And it is gone from the disk, not merely no longer counted.
+    expect(fs.existsSync(path.join(dir, `${old.fileId}.bin`))).toBe(false);
+    expect(fs.existsSync(json)).toBe(false);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('half a staged file (a crash between its two halves) holds no room and is removed', async () => {
+    const owner: FileOwner = { companyId: COMPANY, agentId: '78787878-7878-4787-8787-787878787878' };
+    const dir = path.join(limitsRoot, owner.companyId, owner.agentId);
+    const first = await stageFile(owner, { name: 'whole.txt', type: 'text/plain', bytes: Buffer.from('w') });
+    // 999 .bin files without their .json, as if each write had stopped half way.
+    for (let i = 1; i < MAX_FILES; i++) fs.writeFileSync(path.join(dir, `${i.toString(16).padStart(32, '0')}.bin`), 'half');
+    const lonelyJson = path.join(dir, `${'e'.repeat(32)}.json`);
+    fs.writeFileSync(lonelyJson, fs.readFileSync(path.join(dir, `${first.fileId}.json`)));
+    // Not ours at all (a folder, a name of another shape): left alone.
+    const strangers = [path.join(dir, `${'d'.repeat(32)}.bin`), path.join(dir, 'notes.txt')];
+    fs.mkdirSync(strangers[0]);
+    fs.writeFileSync(strangers[1], 'not ours');
+    expect((await stageFile(owner, { name: 'more.txt', type: 'text/plain', bytes: Buffer.from('m') })).size).toBe(1);
+    expect(fs.readdirSync(dir).filter((n) => n.endsWith('.bin') && n !== `${'d'.repeat(32)}.bin`)).toHaveLength(2);
+    expect(fs.existsSync(lonelyJson)).toBe(false);
+    for (const s of strangers) expect(fs.existsSync(s), s).toBe(true);
+    expect((await readStagedFile(owner, first.fileId))?.file.name).toBe('whole.txt');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
@@ -675,6 +943,16 @@ describe('clearing', () => {
       expect(await look(otherAgent, fresh.fileId)).not.toBeNull();
       expect(fs.existsSync(bin)).toBe(false);
     }
+  });
+
+  it('removing a file clears old files too, as every call that takes an id does', async () => {
+    const old = await stageFile(me, { name: 'stale.txt', type: 'text/plain', bytes: Buffer.from('stale') });
+    const bin = path.join(clearRoot, COMPANY, AGENT, `${old.fileId}.bin`);
+    age(bin, STAGED_FILE_HOURS + 1);
+    const goes = await stageFile(otherAgent, { name: 'goes.txt', type: 'text/plain', bytes: Buffer.from('goes') });
+    lazyClearDue();
+    expect(await removeStagedFile(otherAgent, goes.fileId)).toBe(true);
+    expect(fs.existsSync(bin)).toBe(false);
   });
 
   it('a full clear at the same time as staging and uploads never makes them fail', async () => {
@@ -819,6 +1097,514 @@ describe('clearing', () => {
     expect(fs.existsSync(path.join(empty, MARKER))).toBe(true);
     expect(await clearStagedFiles({ all: true })).toBe(1);
     expect(fs.existsSync(empty)).toBe(false);
+  });
+});
+
+describe('as an attacker: attach, get and save', () => {
+  const attackRoot = path.join(TMP, 'attack');
+  const dirOf = (o: FileOwner) => path.join(attackRoot, o.companyId, o.agentId);
+
+  beforeEach(() => {
+    process.env[AGENT_FILES_DIR_ENV] = attackRoot;
+  });
+
+  /** Run `swap` once, just before lib/agent/files.ts opens `target`, then let the open go on. */
+  function beforeOpen(target: string, swap: () => void): { mockRestore: () => void } {
+    const open = fsp.open.bind(fsp) as (...a: unknown[]) => Promise<unknown>;
+    let done = false;
+    return vi.spyOn(fsp, 'open').mockImplementation((async (p: unknown, ...a: unknown[]) => {
+      if (!done && String(p) === target) {
+        done = true;
+        swap();
+      }
+      return open(p, ...a);
+    }) as never);
+  }
+
+  /** Remove a directory link (a junction on Windows) without touching what it leads to. */
+  function unlinkDir(p: string): void {
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      fs.rmdirSync(p);
+    }
+  }
+
+  it('a .bin swapped for another file between the check and the read is refused: another file, or a second name for one', async () => {
+    const secret = path.join(TMP, 'attack-secret.txt');
+    fs.writeFileSync(secret, 'SECRET');
+    for (const how of ['another file', 'a second name'] as const) {
+      // The same size as the secret, so only the file itself can tell them apart.
+      const f = await stageFile(me, { name: 'mine.txt', type: 'text/plain', bytes: Buffer.from('mine!!') });
+      const bin = path.join(dirOf(me), `${f.fileId}.bin`);
+      const spy = beforeOpen(bin, () => {
+        fs.rmSync(bin);
+        if (how === 'a second name') fs.linkSync(secret, bin);
+        else fs.writeFileSync(bin, 'SECRET');
+      });
+      try {
+        expect(await readStagedFile(me, f.fileId), how).toBeNull();
+      } finally {
+        spy.mockRestore();
+      }
+    }
+    expect(fs.readFileSync(secret, 'utf8')).toBe('SECRET');
+  });
+
+  it('a second name (a hard link) or a link planted at a .bin is no file, for the bytes or the facts', async () => {
+    const secret = path.join(TMP, 'attack-secret-2.txt');
+    fs.writeFileSync(secret, 'SECRET');
+    const f = await stageFile(me, { name: 'mine.txt', type: 'text/plain', bytes: Buffer.from('mine!!') });
+    const bin = path.join(dirOf(me), `${f.fileId}.bin`);
+    fs.rmSync(bin);
+    fs.linkSync(secret, bin);
+    expect(await stagedFileInfo(me, f.fileId)).toBeNull();
+    expect(await readStagedFile(me, f.fileId)).toBeNull();
+    fs.rmSync(bin);
+    let symlinked = true;
+    try {
+      fs.symlinkSync(secret, bin, 'file');
+    } catch {
+      symlinked = false; // this computer lets no one make one: nothing more to prove
+    }
+    if (symlinked) {
+      expect(await stagedFileInfo(me, f.fileId)).toBeNull();
+      expect(await readStagedFile(me, f.fileId)).toBeNull();
+    }
+    expect(fs.readFileSync(secret, 'utf8')).toBe('SECRET');
+  });
+
+  it('a file that grows while it is read is refused, and is never read past its size', async () => {
+    // Grown by the time it is opened.
+    const f = await stageFile(me, { name: 'grows.bin', type: 'application/octet-stream', bytes: Buffer.from('abc') });
+    const bin = path.join(dirOf(me), `${f.fileId}.bin`);
+    const open = fsp.open.bind(fsp) as (...a: unknown[]) => Promise<FileHandleLike>;
+    let spy = vi.spyOn(fsp, 'open').mockImplementation((async (p: unknown, ...a: unknown[]) => {
+      const h = await open(p, ...a);
+      if (String(p) === bin) fs.appendFileSync(bin, Buffer.alloc(5 * MB));
+      return h;
+    }) as never);
+    try {
+      expect(await readStagedFile(me, f.fileId)).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+    // Growing while it is read: past UPLOAD_MAX_BYTES, and still never read on.
+    const g = await stageFile(me, { name: 'grows-later.bin', type: 'application/octet-stream', bytes: Buffer.from('abcdef') });
+    const gBin = path.join(dirOf(me), `${g.fileId}.bin`);
+    let read = 0;
+    spy = vi.spyOn(fsp, 'open').mockImplementation((async (p: unknown, ...a: unknown[]) => {
+      const h = await open(p, ...a);
+      if (String(p) !== gBin) return h;
+      const real = h.read.bind(h);
+      let first = true;
+      h.read = async (...args: unknown[]) => {
+        if (first) {
+          first = false;
+          fs.truncateSync(gBin, UPLOAD_MAX_BYTES + MB);
+        }
+        const r = await real(...args);
+        read += r.bytesRead;
+        return r;
+      };
+      return h;
+    }) as never);
+    try {
+      expect(await readStagedFile(me, g.fileId)).toBeNull();
+      // Read through the handle that was checked, and never more than one byte past the size.
+      expect(read).toBeGreaterThan(0);
+      expect(read).toBeLessThanOrEqual(g.size + 1);
+    } finally {
+      spy.mockRestore();
+      fs.rmSync(gBin, { force: true });
+    }
+  });
+
+  it('a .json swapped for a larger file or a link between the check and the read, or growing while it is read, is no file, and is never read into memory', async () => {
+    const META_MAX = 64 * 1024; // lib/agent/files.ts META_MAX
+    const open = fsp.open.bind(fsp) as (...a: unknown[]) => Promise<FileHandleLike>;
+    /**
+     * Run `change` once when lib/agent/files.ts opens `target`: just before the open, just after
+     * it, or at the first read through the handle. Counts every byte read through that handle.
+     */
+    const watchReads = (target: string, change: () => void, when: 'before the open' | 'after the open' | 'at the first read') => {
+      let read = 0;
+      const spy = vi.spyOn(fsp, 'open').mockImplementation((async (p: unknown, ...a: unknown[]) => {
+        if (String(p) !== target) return open(p, ...a);
+        if (when === 'before the open') change();
+        const h = await open(p, ...a);
+        if (when === 'after the open') change();
+        const real = h.read.bind(h);
+        let first = true;
+        h.read = async (...args: unknown[]) => {
+          if (first && when === 'at the first read') change();
+          first = false;
+          const r = await real(...args);
+          read += r.bytesRead;
+          return r;
+        };
+        return h;
+      }) as never);
+      return { read: () => read, restore: () => spy.mockRestore() };
+    };
+    const big = JSON.stringify({ name: 'big.txt', type: 'text/plain', size: 4, created: new Date().toISOString(), company: COMPANY, agent: AGENT, pad: 'x'.repeat(4 * META_MAX) });
+    const readFiles = vi.spyOn(fsp, 'readFile');
+    try {
+      for (const how of ['a larger file', 'a link', 'grown after the open', 'grown while read'] as const) {
+        const f = await stageFile(me, { name: 'meta.txt', type: 'text/plain', bytes: Buffer.from('meta') });
+        const json = path.join(dirOf(me), `${f.fileId}.json`);
+        const before = fs.readFileSync(json, 'utf8');
+        const elsewhere = path.join(TMP, `attack-meta-${f.fileId}.json`);
+        fs.writeFileSync(elsewhere, big);
+        let made = true;
+        const w = watchReads(
+          json,
+          () => {
+            // The checked .json is replaced (a new file, or a link), or grows where it is.
+            if (how === 'a larger file') {
+              fs.rmSync(json);
+              fs.writeFileSync(json, big);
+            } else if (how === 'a link') {
+              fs.rmSync(json);
+              try {
+                fs.symlinkSync(elsewhere, json, 'file');
+              } catch {
+                made = false; // this computer lets no one make one
+                fs.writeFileSync(json, before);
+              }
+            } else {
+              fs.appendFileSync(json, 'x'.repeat(4 * META_MAX));
+            }
+          },
+          how === 'grown after the open' ? 'after the open' : how === 'grown while read' ? 'at the first read' : 'before the open',
+        );
+        try {
+          if (made) expect(await stagedFileInfo(me, f.fileId), how).toBeNull();
+          // At most one byte past what it was when it was checked, never the larger file.
+          expect(w.read(), how).toBeLessThanOrEqual(Buffer.byteLength(before) + 1);
+        } finally {
+          w.restore();
+          fs.rmSync(json, { force: true });
+          fs.rmSync(elsewhere, { force: true });
+        }
+      }
+      // A .json is only ever read through a handle, never by its name alone.
+      const f = await stageFile(me, { name: 'read.txt', type: 'text/plain', bytes: Buffer.from('read') });
+      expect((await readStagedFile(me, f.fileId))?.file.name).toBe('read.txt');
+      await clearStagedFiles();
+      expect(readFiles.mock.calls.map((c) => String(c[0])).filter((p) => p.endsWith('.json'))).toEqual([]);
+    } finally {
+      readFiles.mockRestore();
+    }
+  });
+
+  it.runIf(process.platform !== 'win32')('a pipe put at a .bin’s, a .json’s or a .part’s name after the check is never waited on', async (ctx) => {
+    const { execFileSync } = await import('node:child_process');
+    const pipeAt = (p: string) => {
+      fs.rmSync(p, { force: true });
+      execFileSync('mkfifo', [p]);
+    };
+    try {
+      pipeAt(path.join(TMP, 'attack-fifo-probe'));
+    } catch {
+      ctx.skip(); // no mkfifo here
+    }
+    /** `p` settled within two seconds; else the pipe is opened for writing once, so the waiting open ends. */
+    const soon = async <T>(p: Promise<T>, pipe: string): Promise<T | 'waited'> => {
+      let timer: NodeJS.Timeout | undefined;
+      const late = new Promise<'waited'>((r) => (timer = setTimeout(() => r('waited'), 2000)));
+      const out = await Promise.race([p, late]);
+      clearTimeout(timer);
+      if (out === 'waited') {
+        try {
+          fs.closeSync(fs.openSync(pipe, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK));
+        } catch {
+          /* nothing waits on it any more */
+        }
+      }
+      return out;
+    };
+    for (const ext of ['bin', 'json'] as const) {
+      const f = await stageFile(me, { name: 'pipe.txt', type: 'text/plain', bytes: Buffer.from('pipe') });
+      const target = path.join(dirOf(me), `${f.fileId}.${ext}`);
+      const spy = beforeOpen(target, () => pipeAt(target));
+      try {
+        expect(await soon(readStagedFile(me, f.fileId), target), ext).toBeNull();
+      } finally {
+        spy.mockRestore();
+        fs.rmSync(target, { force: true });
+      }
+    }
+    const up = await uploadChunk(me, { name: 'u.txt', type: 'text/plain', chunkBase64: b64('u'), last: false });
+    const part = path.join(dirOf(me), `${up.uploadId}.part`);
+    const spy = beforeOpen(part, () => pipeAt(part));
+    try {
+      const sent = uploadChunk(me, { uploadId: up.uploadId, name: 'u.txt', type: 'text/plain', chunkBase64: b64('x'), last: false }).then(
+        () => 'kept',
+        () => 'refused',
+      );
+      expect(await soon(sent, part)).toBe('refused');
+    } finally {
+      spy.mockRestore();
+      fs.rmSync(part, { force: true });
+    }
+  });
+
+  it('the agent’s folder, or its company’s, swapped for a link to another agent’s: nothing is read from it, kept in it or removed from it', async (ctx) => {
+    const mine = await stageFile(me, { name: 'mine.txt', type: 'text/plain', bytes: Buffer.from('mine') });
+    const theirs = await stageFile(otherAgent, { name: 'theirs.txt', type: 'text/plain', bytes: Buffer.from('their secret') });
+    const myDir = dirOf(me);
+    const theirDir = dirOf(otherAgent);
+    const moved = `${myDir}-moved`;
+    fs.renameSync(myDir, moved);
+    try {
+      fs.symlinkSync(theirDir, myDir, WIN ? 'junction' : 'dir');
+    } catch {
+      fs.renameSync(moved, myDir);
+      ctx.skip();
+    }
+    const before = fs.readdirSync(theirDir).sort();
+    try {
+      expect(await readStagedFile(me, theirs.fileId)).toBeNull();
+      expect(await stagedFileInfo(me, theirs.fileId)).toBeNull();
+      expect((await refusal(stageFile(me, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') }))).code).toBe('INTERNAL');
+      await refusal(uploadChunk(me, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: false }));
+      await refusal(uploadChunk(me, { name: 'x', type: 'text/plain', chunkBase64: b64('x'), last: true }));
+      await refusal(removeStagedFile(me, theirs.fileId));
+      expect(fs.readdirSync(theirDir).sort()).toEqual(before);
+    } finally {
+      unlinkDir(myDir);
+      fs.renameSync(moved, myDir);
+    }
+    expect(Buffer.from((await readStagedFile(otherAgent, theirs.fileId))!.bytes).toString()).toBe('their secret');
+    expect((await readStagedFile(me, mine.fileId))?.file.name).toBe('mine.txt');
+
+    // The company's folder: another company's (same agent id) made a link to this one's.
+    const otherCompanyDir = path.join(attackRoot, OTHER_COMPANY);
+    fs.rmSync(otherCompanyDir, { recursive: true, force: true });
+    fs.symlinkSync(path.join(attackRoot, COMPANY), otherCompanyDir, WIN ? 'junction' : 'dir');
+    try {
+      expect(await readStagedFile(otherCompany, mine.fileId)).toBeNull();
+      expect(await stagedFileInfo(otherCompany, mine.fileId)).toBeNull();
+      await refusal(stageFile(otherCompany, { name: 'x.txt', type: 'text/plain', bytes: Buffer.from('x') }));
+    } finally {
+      unlinkDir(otherCompanyDir);
+    }
+    expect((await readStagedFile(me, mine.fileId))?.file.name).toBe('mine.txt');
+  });
+
+  it('a staged file copied into another agent’s or company’s folder is no file there: its .json names its owner', async () => {
+    const f = await stageFile(me, { name: 'mine.txt', type: 'text/plain', bytes: Buffer.from('mine') });
+    for (const o of [otherAgent, otherCompany]) {
+      await stageFile(o, { name: 'own.txt', type: 'text/plain', bytes: Buffer.from('own') });
+      for (const ext of ['bin', 'json']) fs.copyFileSync(path.join(dirOf(me), `${f.fileId}.${ext}`), path.join(dirOf(o), `${f.fileId}.${ext}`));
+      expect(await readStagedFile(o, f.fileId)).toBeNull();
+      expect(await stagedFileInfo(o, f.fileId)).toBeNull();
+    }
+    expect((await readStagedFile(me, f.fileId))?.file.name).toBe('mine.txt');
+    // A .json that names no owner at all is no file either.
+    const json = path.join(dirOf(me), `${f.fileId}.json`);
+    const { company: _company, agent: _agent, ...rest } = JSON.parse(fs.readFileSync(json, 'utf8'));
+    fs.writeFileSync(json, JSON.stringify(rest));
+    expect(await stagedFileInfo(me, f.fileId)).toBeNull();
+  });
+
+  it('an id guessed from another agent or another company reaches nothing of theirs, in any call', async () => {
+    const theirs = await stageFile(otherAgent, { name: 'theirs.txt', type: 'text/plain', bytes: Buffer.from('theirs') });
+    const elsewhere = await stageFile(otherCompany, { name: 'elsewhere.txt', type: 'text/plain', bytes: Buffer.from('elsewhere') });
+    const theirUpload = await uploadChunk(otherAgent, { name: 'u.txt', type: 'text/plain', chunkBase64: b64('their '), last: false });
+    for (const id of [theirs.fileId, elsewhere.fileId, theirUpload.uploadId]) {
+      expect(await readStagedFile(me, id)).toBeNull();
+      expect(await stagedFileInfo(me, id)).toBeNull();
+      expect(await removeStagedFile(me, id)).toBe(false);
+    }
+    await refusal(uploadChunk(me, { uploadId: theirUpload.uploadId, name: 'x', type: 'text/plain', chunkBase64: b64('evil'), last: true }));
+    // Theirs, untouched.
+    expect(Buffer.from((await readStagedFile(otherAgent, theirs.fileId))!.bytes).toString()).toBe('theirs');
+    expect(Buffer.from((await readStagedFile(otherCompany, elsewhere.fileId))!.bytes).toString()).toBe('elsewhere');
+    const done = await uploadChunk(otherAgent, { uploadId: theirUpload.uploadId, name: 'u.txt', type: 'text/plain', chunkBase64: b64('upload'), last: true });
+    expect(Buffer.from((await readStagedFile(otherAgent, done.file!.fileId))!.bytes).toString()).toBe('their upload');
+  });
+
+  it('an upload’s part that is a link, or a second name for another file, is never written through: planted, or swapped in before it is opened', async () => {
+    const victim = path.join(TMP, 'attack-victim.txt');
+    fs.writeFileSync(victim, 'VICTIM');
+    const start = async () => {
+      const up = await uploadChunk(me, { name: 'u.txt', type: 'text/plain', chunkBase64: b64('u'), last: false });
+      return { id: up.uploadId, part: path.join(dirOf(me), `${up.uploadId}.part`) };
+    };
+    // Planted: a second name for the victim at the part's name.
+    const a = await start();
+    fs.rmSync(a.part);
+    fs.linkSync(victim, a.part);
+    expect((await refusal(uploadChunk(me, { uploadId: a.id, name: 'u.txt', type: 'text/plain', chunkBase64: b64('EVIL'), last: false }))).message).toMatch(/no unfinished upload/);
+    fs.rmSync(a.part);
+    // Swapped in between the check and the open.
+    const b = await start();
+    const spy = beforeOpen(b.part, () => {
+      fs.rmSync(b.part);
+      fs.linkSync(victim, b.part);
+    });
+    try {
+      await refusal(uploadChunk(me, { uploadId: b.id, name: 'u.txt', type: 'text/plain', chunkBase64: b64('EVIL'), last: true }));
+    } finally {
+      spy.mockRestore();
+      fs.rmSync(b.part, { force: true });
+    }
+    // A symbolic link, where this computer lets one be made.
+    const c = await start();
+    fs.rmSync(c.part);
+    let symlinked = true;
+    try {
+      fs.symlinkSync(victim, c.part, 'file');
+    } catch {
+      symlinked = false;
+    }
+    if (symlinked) await refusal(uploadChunk(me, { uploadId: c.id, name: 'u.txt', type: 'text/plain', chunkBase64: b64('EVIL'), last: false }));
+    fs.rmSync(c.part, { force: true });
+    expect(fs.readFileSync(victim, 'utf8')).toBe('VICTIM');
+  });
+
+  it('a part changed between its last write and being kept is not kept', async () => {
+    const up = await uploadChunk(me, { name: 'u.txt', type: 'text/plain', chunkBase64: b64('first '), last: false });
+    const part = path.join(dirOf(me), `${up.uploadId}.part`);
+    const binsBefore = fs.readdirSync(dirOf(me)).filter((n) => n.endsWith('.bin'));
+    const rename = fsp.rename.bind(fsp) as (...a: unknown[]) => Promise<void>;
+    const spy = vi.spyOn(fsp, 'rename').mockImplementation((async (from: unknown, to: unknown) => {
+      if (String(from) === part) {
+        // Another file of the very size the upload came to.
+        fs.rmSync(part);
+        fs.writeFileSync(part, 'EVIL-EVIL!');
+      }
+      return rename(from, to);
+    }) as never);
+    try {
+      const err = await refusal(uploadChunk(me, { uploadId: up.uploadId, name: 'u.txt', type: 'text/plain', chunkBase64: b64('last'), last: true }));
+      expect(err.message).toMatch(/changed on this computer while it was being sent/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readdirSync(dirOf(me)).filter((n) => n.endsWith('.bin'))).toEqual(binsBefore);
+  });
+
+  it('names with trailing dots or spaces, device names (CON, NUL, COM1 and the rest) and streams are kept plain', async () => {
+    const cases: Array<[string, string]> = [
+      ['CON.', '_CON'],
+      ['nul.txt.', '_nul.txt'],
+      ['COM1 ', '_COM1'],
+      ['com¹.txt', '_com¹.txt'],
+      ['Lpt3.log', '_Lpt3.log'],
+      ['conin$', '_conin$'],
+      ['CONOUT$.log', '_CONOUT$.log'],
+      ['clock$', '_clock$'],
+      ['PRN . .', '_PRN'],
+      ['aux .txt', '_aux .txt'],
+      ['CON​.txt', '_CON.txt'],
+      ['report.pdf:hidden', 'report.pdf-hidden'],
+      ['report.pdf::$DATA', 'report.pdf--$DATA'],
+      ['file.txt:Zone.Identifier:$DATA', 'file.txt-Zone.Identifier-$DATA'],
+      ['name . . .', 'name'],
+      ['ends-in-space ', 'ends-in-space'],
+      ['dots...', 'dots'],
+    ];
+    for (const [raw, want] of cases) {
+      const file = await stageFile(me, { name: raw, type: 'text/plain', bytes: Buffer.from('x') });
+      expect(file.name, JSON.stringify(raw)).toBe(want);
+      expect(fs.existsSync(path.join(dirOf(me), `${file.fileId}.bin`))).toBe(true);
+    }
+    // Nothing but this module's own names in the agent's folder.
+    for (const n of fs.readdirSync(dirOf(me))) expect(n, n).toMatch(/^([0-9a-f]{32}\.(bin|json|part)|\.ironbooks-agent-files)$/);
+  });
+
+  it('a long path: refused when longer than a plain path may be; a real folder deep inside an allowed one still works', async () => {
+    const allowed = path.join(TMP, 'long-allowed');
+    let deep = allowed;
+    for (let i = 0; i < 7; i++) deep = path.join(deep, `${'d'.repeat(60)}${i}`);
+    fs.mkdirSync(deep, { recursive: true });
+    expect(deep.length).toBeGreaterThan(400);
+    expect(await allowedFolder([allowed], deep)).toBe(fs.realpathSync.native(deep));
+    const tooLong = path.join(deep, 'x'.repeat(700));
+    expect(tooLong.length).toBeGreaterThan(1024);
+    expect(await allowedFolder([allowed], tooLong)).toBeNull();
+    expect(await allowedFolder([tooLong], deep)).toBeNull();
+    expect(overlapsAppData(tooLong)).toBe(true);
+  });
+
+  it('a folder named with a trailing dot or space is the same folder to Windows: overlapsAppData refuses it too', () => {
+    const shellBackups = path.join(TMP, 'trim', 'backups-here');
+    process.env.BKA_BACKUP_DIR = shellBackups;
+    try {
+      // As written, as inside it, and as the folder that holds it.
+      for (const folder of [`${shellBackups}.`, `${shellBackups} `, `${shellBackups}. .`, path.join(`${shellBackups}.`, 'Acme'), path.join(TMP, 'trim.'), path.join(TMP, 'trim. ')]) {
+        expect(overlapsAppData(folder), folder).toBe(true);
+      }
+      expect(overlapsAppData(`${shellBackups}2`)).toBe(false);
+    } finally {
+      restoreEnv('BKA_BACKUP_DIR');
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('a folder with a trailing dot or space, a device name or a stream along the way is refused', async () => {
+    const allowed = path.join(TMP, 'odd-allowed');
+    const sub = path.join(allowed, 'sub', 'deeper');
+    fs.mkdirSync(sub, { recursive: true });
+    expect(await allowedFolder([allowed], sub)).toBe(fs.realpathSync.native(sub));
+    for (const folder of [
+      path.join(allowed, 'sub.'),
+      path.join(allowed, 'sub.', 'deeper'),
+      `${path.join(allowed, 'sub ')}\\deeper`,
+      path.join(allowed, 'sub', 'deeper..'),
+      path.join(allowed, 'CON'),
+      path.join(allowed, 'nul.txt'),
+      path.join(allowed, 'COM1.'),
+      path.join(allowed, 'sub', 'conout$'),
+      `${sub}::$INDEX_ALLOCATION`,
+      `${path.join(allowed, 'sub')}:stream\\deeper`,
+    ]) {
+      expect(await allowedFolder([allowed], folder), folder).toBeNull();
+    }
+    // An allowed folder written that way allows nothing.
+    expect(await allowedFolder([`${allowed}.`], sub)).toBeNull();
+    expect(await allowedFolder([`${allowed}\\.\\sub.`], sub)).toBeNull();
+  });
+
+  it.runIf(process.platform === 'win32')('a link swapped in after the walk, leading to a share no allowed folder names, is refused before the share is looked at again; a drive mapped to it still works', async () => {
+    const SHARE = '\\\\ironbooks-test.invalid\\share';
+    const local = path.join(TMP, 'swap-share');
+    const allowed = path.join(local, 'allowed');
+    const sub = path.join(allowed, 'sub');
+    fs.mkdirSync(sub, { recursive: true });
+    const localReal = fs.realpathSync.native(local);
+    const driveRoot = path.parse(localReal).root;
+    let mapped = false;
+    const statted: string[] = [];
+    const toShare = (p: string) => (p === localReal || p.startsWith(localReal + path.sep) ? SHARE + p.slice(localReal.length) : p);
+    const toLocal = (p: string) => (p.toUpperCase().startsWith(SHARE.toUpperCase()) ? localReal + p.slice(SHARE.length) : p);
+    const nativeOrig = fs.realpath.native;
+    const stat = fsp.stat.bind(fsp) as (...a: unknown[]) => Promise<unknown>;
+    const spies = [
+      vi.spyOn(fs.realpath, 'native').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+        const cb = rest[rest.length - 1] as (err: Error | null, out?: string) => void;
+        if (/^[\\/]{2}/.test(String(p))) return cb(Object.assign(new Error('not there'), { code: 'ENOENT' }));
+        // The drive this test's folders are on, mapped to the share, or not.
+        if (String(p) === driveRoot) return cb(null, mapped ? `${SHARE}\\` : driveRoot);
+        nativeOrig(p, (err, out) => (err ? cb(err) : cb(null, toShare(out))));
+      }) as never),
+      vi.spyOn(fsp, 'stat').mockImplementation((async (p: unknown, ...a: unknown[]) => {
+        if (/^[\\/]{2}/.test(String(p))) statted.push(String(p));
+        return stat(toLocal(String(p)), ...a);
+      }) as never),
+    ];
+    try {
+      // As if a link had been put in place after the walk: the folder answers as on the share.
+      expect(await allowedFolder([allowed], sub)).toBeNull();
+      expect(statted).toEqual([]);
+      // A drive mapped to that very share is the person's own way there: as before.
+      mapped = true;
+      expect(await allowedFolder([allowed], sub)).toBe(toShare(fs.realpathSync.native(sub)));
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
   });
 });
 
@@ -1197,73 +1983,112 @@ describe('overlapsAppData (for the folder rules of other units)', () => {
         expect(overlapsAppData(folder), folder).toBe(false);
       }
     });
+
+    it('with no sandbox folder named (the browser version): "Ironbooks Sandboxes" beside the books, real or sandboxed, as lib/services/sandbox.ts keeps them', () => {
+      const web = path.join(TMP, 'overlaps-web2', '.bookkeeper-data', 'default');
+      const sandboxes = path.join(path.dirname(web), 'Ironbooks Sandboxes');
+      process.env.BKA_DATA_DIR = web;
+      expect(appDataPlaces()).toContain(sandboxes);
+      for (const folder of [sandboxes, path.join(sandboxes, 'sbx-1', 'data'), path.dirname(web)]) expect(overlapsAppData(folder), folder).toBe(true);
+      for (const folder of [`${sandboxes} old`, path.join(TMP, 'overlaps-web2', 'Receipts')]) expect(overlapsAppData(folder), folder).toBe(false);
+      // The default data folder, as the reviewer found it: <cwd>/.bookkeeper-data/Ironbooks Sandboxes.
+      delete process.env.BKA_DATA_DIR;
+      expect(overlapsAppData(path.resolve(process.cwd(), '.bookkeeper-data', 'Ironbooks Sandboxes', 'sbx-2'))).toBe(true);
+      // While a sandbox is open the books in use are the copy; the real books' sandboxes count too.
+      process.env.BKA_DATA_DIR = path.join(sandboxes, 'sbx-1', 'data');
+      process.env.BKA_SANDBOX_REAL_DIR = realBooks;
+      expect(overlapsAppData(path.join(path.dirname(realBooks), 'Ironbooks Sandboxes', 'sbx-3'))).toBe(true);
+      // The shell names the folder: that one, not the default (which is then never used).
+      process.env.BKA_SANDBOX_ROOT = shellNamed.BKA_SANDBOX_ROOT;
+      process.env.BKA_DATA_DIR = web;
+      expect(appDataPlaces()).toContain(shellNamed.BKA_SANDBOX_ROOT);
+      expect(appDataPlaces()).not.toContain(sandboxes);
+      restoreEnv('BKA_DATA_DIR');
+    });
+
+    it('a sandbox open in the browser version (only BKA_DATA_DIR changes): the sandbox folder, the real books beside it and the copies beside them', () => {
+      const beside = path.join(TMP, 'overlaps-web3', '.bookkeeper-data');
+      const real = path.join(beside, 'default');
+      const sandboxes = path.join(beside, 'Ironbooks Sandboxes');
+      const copy = path.join(sandboxes, 'Acme sandbox 2026-11-22 101500 ab12', 'default');
+      const copies = ['backups', 'pre-op-backups', 'archives'].map((n) => path.join(beside, n));
+      // As lib/services/sandbox.ts switchActiveDataDir leaves it: the shell names nothing at all.
+      process.env.BKA_DATA_DIR = copy;
+      expect(process.env.BKA_SANDBOX_ROOT).toBeUndefined();
+      expect(process.env.BKA_SANDBOX_REAL_DIR).toBeUndefined();
+      expect(appDataPlaces()).toEqual(expect.arrayContaining([sandboxes, real, ...copies]));
+      const refused = [
+        real,
+        path.join(real, 'base'),
+        ...copies,
+        path.join(copies[0], 'Acme 2026-11-21.bka'),
+        sandboxes,
+        path.join(sandboxes, 'Acme sandbox 2026-11-20 090000 cd34', 'default'), // another sandbox
+        copy,
+        beside, // holds them all
+      ];
+      for (const folder of refused) expect(overlapsAppData(folder), folder).toBe(true);
+      for (const folder of [path.join(beside, 'Receipts'), path.join(TMP, 'overlaps-web3', 'Receipts'), `${sandboxes} old`]) {
+        expect(overlapsAppData(folder), folder).toBe(false);
+      }
+      // The folder's name in another case: the same folder to Windows and macOS, refused too.
+      process.env.BKA_DATA_DIR = path.join(beside, 'ironbooks sandboxes', 'x', 'default');
+      expect(overlapsAppData(real)).toBe(true);
+      // Two levels under a folder of any other name: no sandbox, nothing more is listed.
+      process.env.BKA_DATA_DIR = path.join(TMP, 'overlaps-web3', 'Projects', 'x', 'default');
+      expect(overlapsAppData(path.join(TMP, 'overlaps-web3', 'default'))).toBe(false);
+      // The shell names the sandbox folder (the desktop, which names the real books too): the words are not taken.
+      process.env.BKA_SANDBOX_ROOT = shellNamed.BKA_SANDBOX_ROOT;
+      process.env.BKA_DATA_DIR = copy;
+      expect(appDataPlaces()).not.toContain(real);
+      restoreEnv('BKA_DATA_DIR');
+    });
+  });
+
+  describe('the table of this-computer-share cases every port is held to (lib/agent/thisComputerShares.json)', () => {
+    it('is plain data: every case a path and an answer, every template one the table explains', () => {
+      expect(Array.isArray(thisComputerShares.cases)).toBe(true);
+      expect(thisComputerShares.cases.length).toBeGreaterThan(50);
+      const known = Object.keys(thisComputerShares.templates);
+      for (const c of thisComputerShares.cases as ShareCase[]) {
+        expect(typeof c.path, JSON.stringify(c)).toBe('string');
+        expect(typeof c.want, JSON.stringify(c)).toBe('boolean');
+        for (const t of c.path.match(/\{[^}]+\}/g) ?? []) expect(known, c.path).toContain(t);
+      }
+      // This test fills every template the table names: no case is judged by a template's own words.
+      for (const c of shareCases()) expect(c.path, c.path).not.toMatch(/\{[^}]+\}/);
+      // Both answers, and the machine-specific ones, are there.
+      expect(shareCases().some((c) => c.want)).toBe(true);
+      expect(shareCases().some((c) => !c.want)).toBe(true);
+      expect(shareCases().some((c) => c.path.includes(os.hostname()))).toBe(true);
+    });
+
+    it('lib/agent/files.ts answers every case as the table says (on other systems: never a share)', () => {
+      const cases = shareCases();
+      for (const c of cases) {
+        withEnv(c.env, () => expect(isThisComputerShare(c.path), JSON.stringify(c.path)).toBe(WIN ? c.want : false));
+      }
+      expect(isThisComputerShare(5 as unknown as string)).toBe(false);
+    });
   });
 
   describe.runIf(process.platform === 'win32')('a share on this very computer', () => {
-    const own = (): string | null => {
-      for (const list of Object.values(os.networkInterfaces())) {
-        for (const a of list ?? []) if (a.family === 'IPv4' && !a.internal) return a.address;
-      }
-      return null;
-    };
-    const hostName = os.hostname();
-    const here = [
-      '\\\\localhost\\c$\\Users\\someone\\AppData\\Local\\Ironbooks',
-      '//LOCALHOST/c$/Users/someone/AppData/Local',
-      '\\\\LocalHost.\\c$\\x',
-      '\\\\localhost',
-      '\\\\localhost@SSL\\DavWWWRoot\\x',
-      '\\\\wsl.localhost\\Ubuntu\\mnt\\c\\Users',
-      '\\\\wsl$\\Ubuntu\\mnt\\c\\Users',
-      '\\\\anything.localhost\\c$',
-      '\\\\\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54\\c$', // full-width letters
-      '\\\\127.0.0.1\\c$\\Users',
-      '\\\\127.1\\c$',
-      '\\\\127.255.10.3\\c$',
-      '\\\\0x7f.0.0.1\\c$',
-      '\\\\0177.0.0.1\\c$',
-      '\\\\2130706433\\c$',
-      '\\\\0x7f000001\\c$',
-      '\\\\0.0.0.0\\c$',
-      '\\\\::1\\c$',
-      '\\\\[::1]\\c$',
-      '\\\\0:0:0:0:0:0:0:1\\c$',
-      '\\\\0000::0001\\c$',
-      '\\\\0--1.ipv6-literal.net\\c$',
-      '\\\\--1.IPV6-LITERAL.NET\\c$',
-      '\\\\::ffff:127.0.0.1\\c$',
-      '\\\\[::ffff:7f00:1]\\c$',
-      `\\\\${hostName}\\c$\\Users`,
-      `\\\\${hostName.toLowerCase()}\\Shared`,
-      `\\\\${hostName.toUpperCase()}.corp.example\\Shared`,
-      ...(process.env.COMPUTERNAME ? [`\\\\${process.env.COMPUTERNAME}\\c$`] : []),
-      ...(own() ? [`\\\\${own()}\\c$`] : []),
-      '\\\\',
-    ];
-    const elsewhereShares = [
-      '\\\\ironbooks-test.invalid\\share\\Receipts',
-      '\\\\fileserver\\books',
-      '\\\\localhostx\\share',
-      '\\\\128.0.0.1\\share',
-      '\\\\203.0.113.7\\share', // a documentation address, never this computer's
-      '\\\\[2001:db8::1]\\share',
-      `\\\\${hostName}x-ironbooks-test\\share`,
-    ];
-
-    it('is refused in every spelling, by the words alone: nothing at all is looked at', () => {
+    it('is refused in every spelling, by the words alone: nothing at all is looked at', async () => {
+      const here = shareCases().filter((c) => c.want && !c.env).map((c) => c.path);
       const disk = watchDisk();
       try {
         for (const p of here) {
           expect(isThisComputerShare(p), p).toBe(true);
           expect(overlapsAppData(p), p).toBe(true);
+          // Never a folder an agent may use, nor one that allows any.
+          expect(await allowedFolder([p], p), p).toBeNull();
         }
         expect(disk.paths(() => true)).toEqual([]);
       } finally {
         disk.restore();
       }
-      for (const p of elsewhereShares) expect(isThisComputerShare(p), p).toBe(false);
       // Not a share at all.
-      for (const p of [elsewhere, '\\\\?\\C:\\x', 'C:\\localhost\\c$', '/localhost/c$']) expect(isThisComputerShare(p), p).toBe(false);
+      expect(isThisComputerShare(elsewhere)).toBe(false);
     });
 
     it('a folder the disk answers as one (a drive mapped to this computer’s own share) is refused', () => {

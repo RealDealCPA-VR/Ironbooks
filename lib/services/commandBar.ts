@@ -70,6 +70,7 @@ import { pickName, type NameCandidate } from '@/lib/commands/match';
 import { PREFILL_PATHS, formPrefillSchema, type FormPrefill, type PrefillLine } from '@/lib/commands/prefill';
 import { ACTION_HREFS, ACTION_NEEDS, COMMAND_ACTIONS, canDoAction, canOpenHref } from '@/lib/commands/actions';
 import { type ServiceContext, validation } from './_base';
+import { agentCount } from './agents';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { companyToday } from './preferences';
 import { notFiscalCloseEntry, profitAndLoss } from './reports';
@@ -1089,13 +1090,27 @@ async function nameActivity(
 // navigate / action
 // ---------------------------------------------------------------------------
 
-function executeNavigate(ctx: ServiceContext, intent: NavigateIntent): CommandOutcome {
+/**
+ * Whether the company has an agent (paused ones count), as the title bar counts them: the agent
+ * pages (Agent requests) are found only then, the same as in the menu and the command palette. A
+ * count that cannot be read finds them not, and every other page as before.
+ */
+async function companyHasAgents(ctx: ServiceContext): Promise<boolean> {
+  try {
+    return (await agentCount(ctx.db, ctx.companyId)) > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function executeNavigate(ctx: ServiceContext, intent: NavigateIntent): Promise<CommandOutcome> {
   // prefsperms: area and activity rights in one map (pages and actions check their activity).
   const permissions = ctx.access ? { ...ctx.access.activities, ...ctx.access.permissions } : null;
   // Only a page that really answers to the words typed — every word in its name, QuickBooks name
   // or keywords, or a whole plain-language phrase. A loose partial hit ("go to nowhere-page" →
   // Home) is not a match: the user is told the page wasn't found instead.
-  const [page] = searchPages(intent.target, { permissions, limit: 1, strict: true });
+  const hasAgents = await companyHasAgents(ctx);
+  const [page] = searchPages(intent.target, { permissions, hasAgents, limit: 1, strict: true });
   if (page) return { type: 'navigate', href: page.href, title: page.label, summary: page.description };
   const q = intent.target.toLowerCase();
   const act = COMMAND_ACTIONS.find(

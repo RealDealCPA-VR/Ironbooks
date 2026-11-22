@@ -8,6 +8,8 @@ import { getServerContext } from '@/lib/context';
 import { getInventoryTransfer, voidInventoryTransfer } from '@/lib/services/inventoryTransfers';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { voidInventoryTransferSchema } from '@/lib/validation/inventorySites';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -43,6 +45,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     if (body.action !== 'void') {
       return NextResponse.json({ error: 'action must be "void"', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/inventorySites.ts); the check above answers first.
+    const checked = voidInventoryTransferSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     return NextResponse.json(await voidInventoryTransfer(ctx, id));
   } catch (err) {
     return errorResponse(err);

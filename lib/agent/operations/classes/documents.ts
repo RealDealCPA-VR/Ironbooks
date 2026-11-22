@@ -28,8 +28,6 @@
  * run either, for the same reason: saving the AI settings and the receipt settings loads the AI
  * settings before and after, and saving the mail server checks whether its name is on this
  * network. The approval card then shows the request itself instead of a before-and-after preview.
- * One write keeps its dry run although it looks names up: POST /api/import, whose lookups are only
- * of the AI addresses already saved (its "why" says so).
  *
  * A GET classed above 'read' (a document download, a File Utilities read, one that saves derived
  * data) is dryRun 'none' too: a dry run hands the route's answer back to the agent
@@ -74,7 +72,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     class: 'read',
     describe: 'List receipts in the receipt inbox',
     sensitiveFields: ['receipts.*.rawText'],
-    why: "Everyday agent work, so a plain read. Each receipt carries rawText, up to 20,000 characters of the text read off the file, and a phone upload link takes any file: a bank statement or a W-9 dropped into the inbox would show its full numbers there, which masking by field name never reaches and the masking of labelled account numbers in text only partly does. So rawText is listed here and hidden in every answer that goes through the door (shown only on a reveal, which an Admin approves since it cannot be told what the text holds). A direct read of this list is not masked by the registry: leaving rawText out of an agent's answer is for the receipts service.",
+    why: "Everyday agent work, so a plain read. The list never carries the text read off each file (rawText is null in every row, lib/services/receipts.ts listReceipts): up to 20,000 characters of every file's text in one answer is what a W-9 or a bank statement dropped into the inbox through a phone upload link would leak. So no reveal is offered here: there is nothing to reveal. An agent that needs one receipt's text reads it with GET /api/receipts/[id] (receipts.get) and reveal: true, which a person approves. sensitiveFields stays as a backstop: should the list ever carry the text again, the door hides it in every answer that goes through it.",
   },
   'POST /api/receipts': {
     class: 'outside',
@@ -87,9 +85,10 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'GET /api/receipts/[id]': {
     class: 'prepare',
     describe: 'Show receipt {id} with suggestions',
-    why: 'Suggesting the expense account brings the learned categorizer up to date, which saves its model (derived data, never the ledger). A read must not write at all. Described only, never dry run: a dry run would hand the agent the receipt before anyone approved it, where the policy asks. rawText, the text read off the file, is hidden in the answer for the reason given at GET /api/receipts; vendor, date, amounts and the card\'s last 4 still show.',
+    why: 'Suggesting the expense account brings the learned categorizer up to date, which saves its model (derived data, never the ledger). A read must not write at all. Described only, never dry run: a dry run would hand the agent the receipt before anyone approved it, where the policy asks. The answer carries rawText, up to 20,000 characters of the text read off the file, and a phone upload link takes any file: a W-9 or a bank statement dropped into the inbox shows its numbers there, which masking by field name never reaches. So rawText is hidden in every answer to an agent (the receipts service gives an agent no text, lib/services/receipts.ts receiptTextFor, and the door hides the field too); vendor, date, amounts and the card\'s last 4 still show. An agent that needs the text asks again with reveal: true: that always asks a person, one request at a time, and whoever approves must hold "View sensitive payroll data", as the text can hold a full SSN or EIN. The approved answer shows the text as that person would see it in Ironbooks: SSNs and EINs in full, account numbers after a label ("Acct #", "Account Number:") still masked. A number with no label (a statement line such as "Checking 000123456789") is not caught by that masking, so it shows to the agent, though the approver is not asked to hold "View full bank / account numbers" (a reveal names one kind). The agent still sees no more than that approver sees of the same receipt in Ironbooks.',
     dryRun: 'none',
     sensitiveFields: ['receipt.rawText'],
+    reveal: 'ssn',
   },
   'DELETE /api/receipts/[id]': {
     class: 'remove',
@@ -326,7 +325,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     class: 'change',
     describe: 'Approve or reject proposal {id}',
     availability: 'hard_floor',
-    why: 'Approving or rejecting proposals is how a person decides what the AI assistant and agents asked for (agent proposals live here too). An agent approving its own requests would defeat the approval.',
+    why: "Approving or rejecting what the app's own AI assistant proposed is a person's decision, in their own window; an agent that could approve would defeat the approval. What an agent asks for is not decided here: it is approved or denied in Agent requests (app/agent-requests), and this route refuses to approve or reject an agent's proposal (lib/services/aiAssistant.ts refuseIfAgentProposal). The only exception is a leftover agent proposal with no request, which a person can decline to clear it; that enters nothing.",
   },
   'POST /api/ai/pull': {
     class: 'outside',
@@ -422,11 +421,11 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
 
   // import: bank file import, statement reading, QuickBooks list import, Rebuild Data
   'POST /api/import': {
-    class: 'bulk',
+    class: 'prepare',
     describe: 'Import bank lines ({fileType}) into the feed of {bankAccountId}',
     countField: 'rows',
     confirmFlags: ['statement.acknowledgeDifference'],
-    why: 'Stages every line of the file in the bank feed, and when AI auto-apply is on (the default for new companies) also posts each line the learned model is sure of. countField counts reviewed statement rows (fileType "rows"); for an OFX, QBO or CSV file the number of lines is known only after reading it. The confirm flag is the nested field statement.acknowledgeDifference, and a statement that does not tie out answers 400 VALIDATION with details.tieOut, not a 409 warning; it is listed so a request that sends it counts as confirmed and cannot ride on a standing grant. The dry run is kept although it makes name lookups (the exception to the rule in this file\'s header): when lines come in, the import service loads the AI settings to see whether auto-apply is on (lib/services/import.ts, unless skipAutoPost, which this route never sets), and that looks up only the *.ts.net AI addresses already saved in the company, never a name the agent typed. A preview of what the file brings in and posts is worth more here than avoiding those lookups.',
+    why: 'Classed by what it brings in, and for an agent every body only brings statement lines into the bank feed, where they wait for review: prepare work (plan 4.2), whatever the file type, reviewed statement rows (fileType "rows") included. The import service stages the lines (rules only fill in a suggested account and payee) and posts nothing for an agent: its auto-posting after an import, which posts each line the learned model is sure of when AI auto-apply is on, is skipped when the run is an agent\'s (ctx.agent, which the bridge always sets) and in any rolled-back preview (lib/services/import.ts importTransactions, autoPostHere). Posting those lines is its own operation, ai.bank-suggestions.run (action "auto-apply"), asked about on its own. A person\'s own import works as before. countField counts reviewed statement rows (fileType "rows"), so the record limit holds for them; for an OFX, QBO or CSV file the number of lines is known only after reading it. The confirm flag is the nested field statement.acknowledgeDifference: a statement that does not tie out answers 400 VALIDATION with details.tieOut, not a 409 warning. It is listed so a request that sends it counts as confirmed: one class higher (enter), and never under a standing grant. The dry run stages the lines in a transaction that is rolled back and looks no name up (the AI settings are not loaded for it).',
   },
   'POST /api/import/csv-preview': {
     class: 'read',

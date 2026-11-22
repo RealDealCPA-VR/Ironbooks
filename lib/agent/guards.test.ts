@@ -16,6 +16,8 @@ import { allOperations, operationForRoute } from './operations/registry';
 import type { Operation, SecretKind } from './operations/types';
 import type { OperationInput } from './contract';
 import {
+  ADDRESS_DOMAIN_MAX,
+  ADDRESS_LOCAL_MAX,
   ARCHIVE_LOGIN_HEADER,
   ARCHIVE_PASSWORD_HEADER,
   ARCHIVE_RECOVERY_KEY_HEADER,
@@ -24,6 +26,7 @@ import {
   MASKED_TEXT,
   PRODUCED_SECRET_TABLE,
   PRODUCED_SECRET_TEXT,
+  RECIPIENT_FIELDS,
   SECRET_HEADERS,
   SECRET_PARTS_MARKER,
   SECRET_ROUTE_TABLE,
@@ -36,6 +39,7 @@ import {
   maskAccountsInText,
   maskInput,
   maskSensitiveFields,
+  plainAddress,
   redactAnswer,
 } from './guards';
 
@@ -495,6 +499,263 @@ describe('the mail server a typed mail password goes to', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Email recipients an agent sends
+// ---------------------------------------------------------------------------
+
+/**
+ * Operations whose effects say they send email but that take no recipient from the agent: what
+ * they send goes to recipients a person saved (a schedule's, held until a person saves them) or to
+ * the addresses on file. Every other email operation is in RECIPIENT_FIELDS.
+ */
+const EMAIL_WITHOUT_RECIPIENTS: Readonly<Record<string, string>> = {
+  'POST /api/memorized-reports': "a group's schedules, to their own recipients",
+  'PATCH /api/memorized-reports/[id]': "a group's schedules, to their own recipients",
+  'POST /api/report-schedules/run-due': "each schedule's recipients, saved by a person",
+  'POST /api/reports/schedules/run-due': "each schedule's recipients, saved by a person",
+  'POST /api/income-tracker/actions': "each customer's address on file",
+};
+
+/** The body that puts `value` in the recipient field of `key`. */
+function recipientBody(key: string, value: unknown): Record<string, unknown> {
+  const field = RECIPIENT_FIELDS[key][0];
+  if (field.path === 'items.*.to') return { action: 'send_emails', items: [{ kind: 'invoice', id: 'i1', to: value }] };
+  // The mail set-up names its server (refused first without one).
+  const setup = key === 'PUT /api/email/settings' ? { host: 'smtp.acme.com', port: 587, security: 'starttls', fromEmail: 'books@acme.com' } : {};
+  return { ...setup, [field.path]: value, ...(key.includes('statement') ? { customerId: 'c1' } : {}), ...(key.includes('reminder') ? { invoiceId: 'i1' } : {}) };
+}
+
+function recipientInput(key: string, value: unknown): OperationInput {
+  const o = reg(key);
+  return { params: Object.fromEntries(o.params.map((p) => [p, 'p1'])), body: recipientBody(key, value) };
+}
+
+/** A domain exactly `length` long, of labels of at most 63 characters. */
+const domainOf = (length: number) => {
+  const labels: string[] = [];
+  // What the labels and the dots between them take.
+  let left = length - '.example'.length;
+  while (left > 0) {
+    let n = Math.min(63, left);
+    // Never leave one character: it would be a dot with no label after it.
+    if (left - n === 1) n -= 1;
+    labels.push('d'.repeat(n));
+    left -= n + 1;
+  }
+  return `${labels.join('.')}.example`;
+};
+
+/** The reviewer's probes (WAVE3 guards section) and the other ways a mailer can read past what shows. */
+const NOT_PLAIN: readonly string[] = [
+  "billing.acme.com.acct#7'x@evil.com",
+  'billing.acme.com.acct#7(x)@evil.com',
+  'billing.acme.com.acct#7"@evil.com',
+  'billing.acme.com.acct#7[x]@evil.com',
+  'Name.acct#7<x@evil.example>',
+  'Name<x@evil.example>',
+  "accounts.payable.department.of.acme.com.billing.team.o'brien@evil.example",
+  'x@(acme.com)evil.com',
+  'a@b.c<x',
+  'ap@acme.com (x@evil.example)',
+  '"x@evil.example" <ap@acme.com>',
+  'Accounts Payable <ap@acme.com>',
+  'ap@acme.com.',
+  '.ap@acme.com',
+  'ap..x@acme.com',
+  'ap@acme..com',
+  'ap@-acme.com',
+  'ap@acme',
+  'a b@acme.com',
+  'x%evil.com@acme.com',
+  'evil.com!x@acme.com',
+  'x:y@acme.com',
+  'a\\b@acme.com',
+  'a`b@acme.com',
+  `ap@acme.com${String.fromCharCode(0x200b)}`,
+  `ap@ac${String.fromCharCode(0x0456)}me.com`,
+  'ap@münchen.de',
+  'ap@@acme.com',
+  'ap@x@acme.com',
+  'billing.acme.com',
+  'acct#1',
+];
+
+describe('guardInput: email recipients an agent sends', () => {
+  it('names only email operations of the registry, and every email operation takes plain addresses or none', () => {
+    // The mail set-up sends nothing itself: its copies and reply address go on every later email.
+    for (const key of Object.keys(RECIPIENT_FIELDS)) if (key !== 'PUT /api/email/settings') expect(reg(key).effects, key).toContain('email');
+    const email = allOperations().filter((o) => o.kind === 'route' && o.effects.includes('email') && o.availability === 'agent').map((o) => `${o.method} ${o.route}`);
+    for (const key of email) expect(key in RECIPIENT_FIELDS || key in EMAIL_WITHOUT_RECIPIENTS, key).toBe(true);
+    for (const key of Object.keys(EMAIL_WITHOUT_RECIPIENTS)) expect(email, key).toContain(key);
+  });
+
+  it.each(NOT_PLAIN)('%j is refused for every recipient field, before a person is asked', (to) => {
+    for (const key of Object.keys(RECIPIENT_FIELDS)) {
+      const refused = guardInput(reg(key), recipientInput(key, to)).refused;
+      expect(refused, key).toMatch(/plain email address|takes one email address|email addresses parted by commas/);
+      expect(refused, key).toMatch(/billing@acme\.com/);
+    }
+    // In a field that takes several, one odd item among plain ones is enough.
+    const schedule = reg('POST /api/report-schedules');
+    expect(guardInput(schedule, { body: { emailTo: `ok@acme.com, ${to}` } }).refused).toMatch(/plain email address|parted by commas/);
+  });
+
+  it.each([
+    ['billing@acme.com'],
+    ['  billing@acme.com  '],
+    ['Billing.Dept@ACME.Com'],
+    ['a+tag@sub.acme.co.uk'],
+    ['x@xn--mnchen-3ya.de'],
+    ['billing.acme.com.acct#7@evil.com'],
+    [`ap@${domainOf(200)}`],
+    [''],
+    [null],
+  ])('%j is a plain address (or none), so the request goes on', (to) => {
+    for (const key of Object.keys(RECIPIENT_FIELDS)) expect(guardInput(reg(key), recipientInput(key, to)).refused, key).toBeNull();
+  });
+
+  it('a 200-character domain is plain; past the mail limits, an address is refused', () => {
+    expect(domainOf(200)).toHaveLength(200);
+    expect(plainAddress(`ap@${domainOf(200)}`)).toEqual({ local: 'ap', domain: domainOf(200) });
+    const invoice = reg('POST /api/invoices/[id]/email');
+    const refused = (to: string) => guardInput(invoice, { params: { id: 'i1' }, body: { to } }).refused;
+    expect(refused(`${'a'.repeat(ADDRESS_LOCAL_MAX)}@acme.com`)).toBeNull();
+    expect(refused(`${'a'.repeat(ADDRESS_LOCAL_MAX + 1)}@acme.com`)).toMatch(/too long for an email address/);
+    expect(refused(`ap@${domainOf(ADDRESS_DOMAIN_MAX)}`)).toBeNull();
+    expect(refused(`ap@${'d'.repeat(250)}.example`)).toMatch(/too long/);
+    expect(refused(`ap@${'d'.repeat(64)}.example`)).toMatch(/63 between two dots/);
+  });
+
+  it('a field that takes one recipient takes no "," or ";"; one that takes several takes thirty', () => {
+    const thirty = Array.from({ length: 30 }, (_, i) => `r${i}@client${i}.example`);
+    for (const key of Object.keys(RECIPIENT_FIELDS)) {
+      const many = RECIPIENT_FIELDS[key][0].many;
+      for (const sep of [', ', ';', ',']) {
+        const refused = guardInput(reg(key), recipientInput(key, thirty.join(sep))).refused;
+        if (many) expect(refused, key).toBeNull();
+        else expect(refused, key).toMatch(/takes one email address/);
+      }
+      // The reviewer's probe: a first "recipient" with no "@", the mailer delivering only the second.
+      const probe = 'billing.department.of.acme-corporation-holdings.payables.acme.com,x@evil.example';
+      expect(guardInput(reg(key), recipientInput(key, probe)).refused, key).toMatch(many ? /plain email address/ : /takes one email address/);
+    }
+  });
+
+  it('a recipient must be text: a list or an object is refused (the route would ignore it and use the address on file)', () => {
+    for (const key of Object.keys(RECIPIENT_FIELDS)) {
+      for (const v of [['a@acme.com'], { to: 'a@acme.com' }, 42, true]) {
+        expect(guardInput(reg(key), recipientInput(key, v)).refused, `${key} ${JSON.stringify(v)}`).toMatch(/as text|must be text/);
+      }
+    }
+  });
+
+  it('the mail set-up: the copies sent of every email and the reply address are recipients too', () => {
+    const settings = reg('PUT /api/email/settings');
+    const setup = { host: 'smtp.acme.com', port: 587, security: 'starttls', fromEmail: 'books@acme.com' };
+    expect(guardInput(settings, { body: { ...setup, bcc: 'files@acme.com; cpa@firm.example', replyTo: 'ap@acme.com' } }).refused).toBeNull();
+    expect(guardInput(settings, { body: { ...setup, bcc: 'files@acme.com, Name<x@evil.example>' } }).refused).toMatch(/plain email address/);
+    expect(guardInput(settings, { body: { ...setup, replyTo: 'ap@acme.com, x@evil.example' } }).refused).toMatch(/takes one email address/);
+  });
+
+  it('any field named like recipients, at any depth of an email operation, is checked too; a statement\'s "to" date is not', () => {
+    const test = reg('POST /api/email/test');
+    expect(guardInput(test, { body: { to: 'me@acme.com', cc: 'Name<x@evil.example>' } }).refused).toMatch(/body\.cc/);
+    expect(guardInput(test, { body: { to: 'me@acme.com', draft: { host: 'smtp.acme.com', bcc: ['ok@acme.com', 'a@b.c<x'] } } }).refused).toMatch(/body\.draft\.bcc/);
+    expect(guardInput(test, { body: { to: 'me@acme.com', cc: ['ok@acme.com', 'cfo@acme.com'] } }).refused).toBeNull();
+    const statement = reg('POST /api/sales-forms/statement-email');
+    expect(guardInput(statement, { body: { customerId: 'c1', from: '2026-01-01', to: '2026-10-31', email: 'ap@acme.com' } }).refused).toBeNull();
+    // An operation that sends no email is not judged on a field of that name.
+    expect(guardInput(reg('POST /api/customers'), { body: { displayName: 'Acme', cc: 'Name <a@b.c>' } }).refused).toBeNull();
+  });
+
+  it('the refusal shows the address cleaned and cut, and says what to send instead', () => {
+    const RLO = String.fromCharCode(0x202e);
+    const refused = guardInput(reg('POST /api/invoices/[id]/email'), { params: { id: 'i1' }, body: { to: `Name${RLO}<x@evil.example>${'z'.repeat(200)}` } }).refused ?? '';
+    expect(refused).not.toContain(RLO);
+    expect(refused).toMatch(/Send just the address, such as billing@acme\.com/);
+    expect(refused.length).toBeLessThan(400);
+  });
+});
+
+describe('guardInput: file paths an agent sends', () => {
+  const shellOp = (id: string) => {
+    const found = allOperations().find((o) => o.id === id);
+    if (!found) throw new Error(`No registry operation ${id}`);
+    return found;
+  };
+  const saveCopy = () => shellOp('shell.company.saveCopyAs');
+  const backups = () => reg('PUT /api/backups');
+  const refused = (o: Operation, body: Record<string, unknown>) => guardInput(o, { body }).refused;
+
+  it('both operations the reviewer probed are an agent\'s, so guardInput judges them', () => {
+    expect(saveCopy().availability).toBe('agent');
+    expect(backups().availability).toBe('agent');
+  });
+
+  it.each([
+    // The reviewer's probes (wave 4): ".." in the part the line cuts out, and a share written as a device path.
+    [`C:\\Users\\VR\\Documents\\Backups\\${'a'.repeat(81)}\\..\\..\\..\\..\\Public\\${'p'.repeat(68)}\\Backups\\Books backup.ironbooks`, /"\." or "\.\." as a folder/],
+    [`\\\\?\\UNC\\files-${'x'.repeat(60)}.offsite-storage-for-ironbooks.example\\drop\\Ironbooks Backups`, /device path/],
+    [`\\\\.\\UNC\\files-${'x'.repeat(60)}.example\\drop\\Ironbooks Backups`, /device path/],
+    [`//?/UNC/files.example/drop/Ironbooks Backups`, /device path/],
+    ['//./UNC/files.example/drop/Ironbooks Backups', /device path/],
+    ['\\??\\UNC\\files.example\\drop\\x', /device path/],
+    ['\\\\?\\C:\\Users\\Pat\\x.ironbooks', /device path/],
+    ['\\\\.\\pipe\\x', /device path/],
+    ['C:\\Users\\Pat\\.\\x.ironbooks', /"\." or "\.\." as a folder/],
+    ['/home/pat/../../etc/x.ironbooks', /"\." or "\.\." as a folder/],
+    ['C:\\Users\\Pat\\...\\x.ironbooks', /"\." or "\.\." as a folder/],
+    ['C:\\Users\\Pat\\.. \\x.ironbooks', /"\." or "\.\." as a folder/],
+    ['..\\x.ironbooks', /"\." or "\.\." as a folder/],
+    ['\\\\\\server\\share\\x.ironbooks', /three slashes or more/],
+    [`C:\\Users\\Pat\\.${String.fromCharCode(0x200b)}.\\x.ironbooks`, /invisible mark/],
+    [`C:\\Users\\Pat${String.fromCharCode(0x202e)}\\x.ironbooks`, /invisible mark/],
+    ['C:\\Users\\Pat\nD:\\x.ironbooks', /line break/],
+  ])('%j is not a plain path: refused for the file and for the folder, before a person is asked', (value, why) => {
+    for (const [o, body] of [
+      [saveCopy(), { file: value }],
+      [backups(), { schedule: 'daily', keep: 14, folder: value }],
+    ] as const) {
+      const r = refused(o, body);
+      expect(r, o.id).toMatch(/is not a plain path/);
+      expect(r, o.id).toMatch(why);
+      expect(r, o.id).toMatch(/Send the full path written the plain way, such as C:\\Users\\Pat\\Documents\\Ironbooks Backups/);
+    }
+  });
+
+  it.each([
+    ['C:\\Users\\Pat\\Documents\\Ironbooks Backups\\Books backup.ironbooks'],
+    ['\\\\nas\\books\\Ironbooks Backups'],
+    ['//nas/books/Ironbooks Backups'],
+    ['/Users/pat/Documents/Ironbooks Backups/'],
+    ['C:\\Users\\Pat\\Books v1.2\\x.ironbooks'],
+    ['C:\\Users\\Pat\\.hidden\\x.ironbooks'],
+    ['C:\\Users\\Pat\\x..ironbooks'],
+    [null],
+  ])('%j is a plain path (or none), so the request goes on', (value) => {
+    expect(refused(saveCopy(), { file: value })).toBeNull();
+    expect(refused(backups(), { schedule: 'daily', keep: 14, folder: value })).toBeNull();
+  });
+
+  it('any field named like a path, at any depth of the body or in the query, for every operation; other fields are not judged', () => {
+    const o = op({ id: 'x.export', route: '/api/x/export', describe: 'Export to {folder}' });
+    expect(guardInput(o, { body: { options: { exportFolder: 'C:\\Out\\..\\Windows' } } }).refused).toMatch(/body\.options\.exportFolder is not a plain path/);
+    expect(guardInput(o, { body: { files: [{ targetPath: '/srv/../etc' }] } }).refused).toMatch(/body\.files\.0\.targetPath/);
+    expect(guardInput(o, { body: { folder: ['C:\\Out', 'C:\\Out\\..\\Windows'] } }).refused).toMatch(/body\.folder/);
+    expect(guardInput(o, { query: { target: 'C:\\Out\\..\\Windows\\x' } }).refused).toMatch(/query\.target is not a plain path/);
+    // A memo is a memo, and a value with no slash is not a path (a staged file's id, a group's name).
+    expect(guardInput(o, { body: { memo: 'C:\\Out\\..\\Windows', file: '..', folder: 'Monthly', fileId: 'f_1' } }).refused).toBeNull();
+    // A memorized report's group may hold a "/", and is judged only on its dots.
+    expect(guardInput(o, { body: { folder: 'Banking/Monthly' } }).refused).toBeNull();
+  });
+
+  it('the refusal is plain and shows no part of the path', () => {
+    const r = refused(saveCopy(), { file: `C:\\${'secret-folder\\'.repeat(20)}..\\x` }) ?? '';
+    expect(r).not.toMatch(/secret-folder/);
+    expect(r.length).toBeLessThan(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // redactAnswer
 // ---------------------------------------------------------------------------
 
@@ -676,8 +937,22 @@ describe('text helpers', () => {
     // Chart-of-accounts numbers are not protected: the app's own sentences about them stay as they are.
     ['Account number 1000 is already used, so "Checking" was created as 1000-2.', 'Account number 1000 is already used, so "Checking" was created as 1000-2.'],
     ['account number 6100.10', 'account number 6100.10'],
-    ['Account number 1000-2 was created', 'Account number 1000-2 was created'],
-    ['Account number 1000 is used; Account No. 33334444 is the bank', 'Account number 1000 is used; Account No. ••••4444 is the bank'],
+    // Only the app's own sentence in its full wording: these are words someone typed.
+    ['Account number 1000-2 was created', 'Account number ••••00-2 was created'],
+    ['Account number 1000 is used; Account No. 33334444 is the bank', 'Account number •••• is used; Account No. ••••4444 is the bank'],
+    // The reviewer's probes: typed memos that start like the app's sentence.
+    ['Electric: Account number 4471234 is used for autopay', 'Electric: Account number ••••1234 is used for autopay'],
+    ['Account number 4471234 is used for autopay', 'Account number ••••1234 is used for autopay'],
+    ['Gas. Account number 1234567 is used on the bill', 'Gas. Account number ••••4567 is used on the bill'],
+    ['Account number 4471234 was created by the utility', 'Account number ••••1234 was created by the utility'],
+    ['Account number 4471234 is already used', 'Account number ••••1234 is already used'],
+    ['Account number 4471234 is already used, so the bill', 'Account number ••••1234 is already used, so the bill'],
+    // Its full wording: the code it got, a full stop, then the end of the text or more words.
+    ['Account number 6100 is already used, so "Utilities:Gas" was created as 6100-QB.', 'Account number 6100 is already used, so "Utilities:Gas" was created as 6100-QB.'],
+    ['Imported. Account number 1000 is already used, so "Checking" was created as 1000-2. Done', 'Imported. Account number 1000 is already used, so "Checking" was created as 1000-2. Done'],
+    // In small letters, or not at the start of a clause, it is not the app's.
+    ['account number 1000 is already used, so "Checking" was created as 1000-2.', 'account number •••• is already used, so "Checking" was created as 1000-2.'],
+    ['Paid Account number 1000 is already used, so "A" was created as 1000-2.', 'Paid Account number •••• is already used, so "A" was created as 1000-2.'],
     // A bank or vendor number: labelled as one ("No", "Acct", a colon), or too long for a chart of accounts.
     ['Account No. 1000', 'Account No. ••••'],
     ['Acct no 1000', 'Acct no ••••'],
@@ -694,8 +969,9 @@ describe('text helpers', () => {
     ['Acct # SMITHJ-AP', 'Acct # ••••J-AP'],
     ['Account number missing; Acct # SMITHJ', 'Account number missing; Acct # ••••ITHJ'],
     // Only the app's own sentences about a chart-of-accounts number are left: they start the text or
-    // a clause, and go on "is already used", "is used", "was created", or end there.
-    ['Note: Account number 1000 is already used', 'Note: Account number 1000 is already used'],
+    // a clause, and go on word for word as lib/services/qbGlImport.ts writes them.
+    ['Note: Account number 1000 is already used', 'Note: Account number •••• is already used'],
+    ['Note: Account number 1000 is already used, so "A" was created as 1000-2.', 'Note: Account number 1000 is already used, so "A" was created as 1000-2.'],
     [
       'Account number 1000 is already used, so "A" was created as 1000-2. Account number 2000 is already used, so "B" was created as 2000-2.',
       'Account number 1000 is already used, so "A" was created as 1000-2. Account number 2000 is already used, so "B" was created as 2000-2.',

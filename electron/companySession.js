@@ -795,9 +795,9 @@ function discardProtectedWorkingData(workDir, companyFile) {
  * Remove the files agents staged in a working copy (lib/agent/files.ts keeps them in
  * <workDir>/agent-files): bank statements and report PDFs, in plain text even for a company file
  * protected with passwords. They never outlive the session that staged them: removed when the
- * company file closes (electron/main.js, on quit) and when it opens (prepareWorkingCopy: what a
- * crash left). A link or file in that place is removed itself, never followed. Best effort, never
- * throws: true when nothing is left there.
+ * company file closes (electron/main.js clearStagedAgentFiles: once it is saved and released, and
+ * again on quit) and when it opens (prepareWorkingCopy: what a crash left). A link or file in that
+ * place is removed itself, never followed. Best effort, never throws: true when nothing is left there.
  */
 function clearAgentFiles(workDir) {
   if (typeof workDir !== 'string' || !workDir) return true;

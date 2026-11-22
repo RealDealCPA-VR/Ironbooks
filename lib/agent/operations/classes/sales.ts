@@ -31,8 +31,9 @@
  *    run's whole ledger: the entries it posted, and the entries already in the books that it
  *    voided, deleted or changed in place (a void posts nothing new, but its entry counts at its
  *    total). With an amountField the amount is the larger of that field and the largest SINGLE one
- *    of those entries; with none it is all of them added up, and "0.00" for a run that posted and
- *    touched no entry.
+ *    of those entries; with none it is all of them added up, and "0.00" only for a run that made
+ *    new records and posted no entry (one that voided, deleted or changed a record already there
+ *    and touched no entry stays unknown).
  *  - Confirmation flags: the sales receipt and payment body schemas carry allowReconciledEdit (and
  *    the payment one removeFromDeposit) because one schema serves the new record and the edit, but
  *    only the edit asks for them (updateSalesReceipt, updatePayment; a new record has no reconciled
@@ -77,9 +78,8 @@ export const SALES_CLASSES: ClassificationMap = {
     class: 'bulk',
     id: 'customers.bulk.save',
     describe: 'Add or edit several customers at once',
-    why: 'One request saves every row (new customers, and edits of existing ones when a row has an id).',
+    why: 'Add/Edit Multiple: one request saves every row (new customers, and edits of existing ones when a row has an id), all or nothing. Its preview option is dryRun: true in the body: every row is checked and the whole batch rolled back, so nothing is saved.',
     countField: 'rows',
-    // The route checks every row and rolls back with { dryRun: true }.
     dryRun: 'preview',
     bodySchema: '@/lib/validation/lists#bulkSchema',
   },
@@ -331,8 +331,10 @@ export const SALES_CLASSES: ClassificationMap = {
   'POST /api/payments': {
     class: 'enter',
     describe: 'Receive a payment of {amount} from customer {customerId}',
-    why: "The amount is the cash received (the body's amount, which the route saves; the answer is { payment, entry }). Credits applied in the same save (credit memos, earlier payments, General Journal credits) are not counted: the answer holds no total of them and applying them posts no new entry, so a $1 payment that applies a $50,000 credit is judged at $1 by the two-person rule and a grant's maxAmount. Closing that needs a total of the credits in the answer, as Pay Bills answers creditsApplied.",
-    amountField: 'amount',
+    why:
+      "The amount is the larger of the cash received and the credits applied, as for Pay Bills. The answer is { payment, entry, creditsApplied }: creditsApplied is one total of every credit the save used (credit memos, earlier payments, General Journal credits and offsets), and applying them posts no new entry, so amountField names it. The cash posts its own new entry, which the bridge takes when it is larger. " +
+      'So a $1 payment that applies a $50,000 credit is judged at $50,000 by the two-person rule and a grant\'s maxAmount. A save that both receives cash and applies credits is judged by the larger of the two, not their sum. Until the dry run has answered, the amount is unknown and counts as over every amount limit.',
+    amountField: 'creditsApplied',
   },
   'GET /api/payments/[id]': { class: 'read', describe: 'Show payment {id}' },
   'POST /api/payments/[id]': {

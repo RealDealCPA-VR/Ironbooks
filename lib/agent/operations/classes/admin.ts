@@ -9,17 +9,25 @@
  *  - Reading Users & Roles is 'admin' too (plan 4.2): who may sign in, what each role allows and
  *    the password rules are what an attacker would read first, and the door asks by class, not by
  *    area, so a 'read' here would run for an Admin-role agent with nobody asked.
- *  - Backups, restores, portable files, the company list and saving the file are 'file'. A restore
- *    is 'file' (Admin, never Allow) rather than 'remove': it replaces every company in the file.
- *    File Utilities reads that show file names, folders or backups, or produce a file, are 'file'
- *    as well (plan 4.2). Pure checks of the books (integrity, books in balance) stay 'read': they
- *    answer pass or fail per check and show nothing of the files on disk.
+ *  - Backups, restores, portable files, making, renaming or archiving a company and saving the file
+ *    are 'file'. A restore is 'file' (Admin, never Allow) rather than 'remove': it replaces every
+ *    company in the file. File Utilities reads that show file names, folders or backups, or produce
+ *    a file, are 'file' as well (plan 4.2), and so is the sign-in screen's read of the company
+ *    file's name. Pure checks of the books (integrity, books in balance) stay 'read': they answer
+ *    pass or fail per check and show nothing of the files on disk.
  *  - A GET classed above 'read' is dryRun 'none'. A dry run hands the route's answer back to the
  *    agent (lib/agent/operate.ts tryOnly), and for a read the answer is the very thing a person is
  *    asked about, so it is described only and runs once someone approves.
  *  - Signing in, unlocking the file and a person's own two-step sign-in are 'person_only': they ARE
  *    a person acting as themselves. The desktop shell's own calls (internal token) are marked the
- *    same way: an agent cannot ask for them; its way is the shell operation (plan 5.5).
+ *    same way: an agent cannot ask for them; its way is the shell operation (plan 5.5). So are the
+ *    reads of a person's own account ('self' in lib/permissions/routes.ts) that answer from the
+ *    signed-in user's session alone (getSessionGate): the company files a person belongs to and who
+ *    can open the protected file. An agent has no session, so the route refuses every agent; the
+ *    registry says so instead of offering them as reads.
+ *  - A restore that replaces the company file (and so takes every agent's access away) or writes a
+ *    whole company or company file on disk is 'file', needs the file Admin and is host-only: the
+ *    person approving it does so at the computer that holds the company file.
  *  - Making, changing, pausing or removing agents, their policies and standing permissions, answering
  *    permission requests (the approval center) and working in a practice copy are on the hard floor
  *    (plan 4.6, D9): even looking is a person's, in their own window. An agent reads its OWN requests
@@ -63,7 +71,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'POST /api/users': {
     class: 'admin',
     describe: 'Add user {name} (login: {login})',
-    why: "Adds a person who can sign in to the books. A new login needs a password (body field password), which the approving Admin types; the agent never sees it and must never supply it, or it could sign in as that person. A login that already exists in the file is added as it is, without a password.",
+    why: "Adds a person who can sign in to the books. A new login needs a password (body field password), which the approving Admin types on the card (plan 5.8, inputs); the agent never sees it and must never supply it, or it could sign in as that person. Nothing is produced for this request: the Admin already knows the password they typed, so the answer holds no secret. A login that already exists in the file is added as it is, without a password.",
     needsSecret: ['new_user_password'],
     sensitiveFields: ['password'],
   },
@@ -109,13 +117,16 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'GET /api/roles/[id]': { class: 'admin', describe: 'Show role {id} and what it allows', why: USERS_READ_WHY, dryRun: 'none' },
   'PATCH /api/roles/[id]': {
     class: 'admin',
-    describe: 'Change what role {id} allows',
-    why: "Changes what everyone holding the role may do. Agents can hold custom roles (agents.ts checks an agent's roles against the same list), so editing a role an agent holds changes that agent: the bridge must refuse it when ANY agent holds the role, not only the agent asking (plan 4.6, D9).",
+    // The door names {id} by the role's name as it is now (lib/agent/operate.ts summaryNames), and
+    // {name} is the name in the route's answer, the role as it will be. Worded so the line reads
+    // naturally both ways: the same name twice when the role keeps its name, the new one on a rename.
+    describe: 'Change what role {id} allows (called {name} after the change)',
+    why: "Changes what everyone holding the role may do. Agents can hold custom roles (agents.ts checks an agent's roles against the same list), and agentAccess reads a role live, so editing a role an agent holds would change that agent at once. So no agent may change a role that ANY agent holds (agents.roleKeys), not only the agent asking: that is the hard floor (plan 4.6, D9). The door refuses it on every path (dry run, run, ask, asking for standing permission, a run under it) and checks again when a person approves, with a note that names the role and says an agent holds it. The service refuses it again as a backstop whenever the caller is an agent (lib/services/users.ts updateRole, refuseAgentOnAgentRole). Built-in roles cannot be edited at all.",
   },
   'DELETE /api/roles/[id]': {
     class: 'admin',
     describe: 'Delete role {id}',
-    why: "A Users & Roles change, Admin-approved like the rest of them. The service refuses it while a PERSON holds the role, but never looks at agents (users.ts deleteRole checks people's role assignments only), so deleting a role an agent holds quietly changes that agent's access: the bridge must refuse it when any agent holds the role (plan 4.6, D9).",
+    why: "A Users & Roles change, Admin-approved like the rest of them. The service refuses it while a person holds the role. No agent may delete a role that ANY agent holds (agents.roleKeys) either: the hard floor (plan 4.6, D9). The door refuses it on every path (dry run, run, ask, asking for standing permission, a run under it) and checks again when a person approves, with a note that names the role and says an agent holds it. The service refuses it again as a backstop whenever the caller is an agent (lib/services/users.ts deleteRole, refuseAgentOnAgentRole). Built-in roles cannot be deleted at all.",
   },
 
   // ---- Company file password ----
@@ -131,7 +142,13 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
 
   // ---- File protection (encrypted company file) ----
-  'GET /api/file-protection': { class: 'read', describe: 'Show who can open the protected company file', id: 'file-protection.status' },
+  'GET /api/file-protection': {
+    class: 'read',
+    describe: 'Show who can open the protected company file',
+    id: 'file-protection.status',
+    availability: 'person_only',
+    why: "A person's own route ('self' in lib/permissions/routes.ts): it answers from the signed-in user's session (getSessionGate) and refuses a caller without one, so it answers every agent \"This is not available to agents.\" Not offered to agents at all. Who can open the file is a person's to look up, in Company > Security.",
+  },
   'POST /api/file-protection': {
     class: 'secret',
     describe: 'Protect the company file with passwords',
@@ -495,10 +512,11 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
   'POST /api/backup': {
     class: 'file',
-    describe: 'Restore the whole company file from an uploaded backup',
+    describe: "Restore the whole company file from an uploaded backup (ends every agent's access, this one's included)",
     id: 'backup.restore',
-    why: 'Replaces every company in the file (and revokes every agent). Closes the database and swaps the folder, so no dry run. A backup from another protected file needs its user name and password or recovery key, typed by the approver.',
+    why: 'Replaces every company in the file. It takes away every agent\'s access, this one\'s too: the restored books start with no agent access, and the requests and standing permissions in them are ended (lib/services/backup.ts restoreBackup, revokeAllAgents). Closes the database and swaps the folder, so no dry run. Needs the file Admin, approving at the computer that holds the company file (host-only). A backup from another protected file needs its user name and password or recovery key, typed by the approver.',
     fileAdmin: true,
+    hostOnly: true,
     body: 'bytes',
     dryRun: 'none',
     needsSecret: ['archive_credentials'],
@@ -518,7 +536,9 @@ export const ADMIN_CLASSES: ClassificationMap = {
     class: 'file',
     describe: 'Restore a company backup as a new company {name}',
     id: 'backup.company.restore',
-    why: 'Adds a whole new company to the file. Makes a safety copy and copies attachment files on disk first, so no dry run. A backup from another protected file needs its credentials, typed by the approver.',
+    why: "Adds a whole new company to the file, owned by the user id the request runs as (so it runs as the approver). It leaves the open company and its agents as they are; the new company starts with no agent access (a company backup never carries agents). Makes a safety copy and copies attachment files on disk first, so no dry run. The route needs the Restore right; the approval asks more, the file Admin at the computer that holds the company file (host-only), as for every restore. A backup from another protected file needs its credentials, typed by the approver.",
+    fileAdmin: true,
+    hostOnly: true,
     body: 'bytes',
     dryRun: 'none',
     needsSecret: ['archive_credentials'],
@@ -561,9 +581,10 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
   'POST /api/backups/restore': {
     class: 'file',
-    describe: 'Restore the whole company file from backup {id}',
-    why: 'Replaces every company in the file with a version from the backup history (and revokes every agent). Swaps the folder on disk, so no dry run; POST /api/backups/preview is its preview.',
+    describe: "Restore the whole company file from backup {id} (ends every agent's access, this one's included)",
+    why: "Replaces every company in the file with a version from the backup history. It takes away every agent's access, this one's too: the restored books start with no agent access, and the requests and standing permissions in them are ended (lib/services/backup.ts restoreBackup, revokeAllAgents). Swaps the folder on disk, so no dry run; POST /api/backups/preview is its preview. Needs the file Admin, approving at the computer that holds the company file (host-only).",
     fileAdmin: true,
+    hostOnly: true,
     dryRun: 'none',
     needsSecret: ['archive_credentials'],
     effects: ['file'],
@@ -594,9 +615,12 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
   'POST /api/condense/archives': {
     class: 'file',
-    describe: 'Restore the whole company file from the pre-condense copy {id}',
-    why: 'Replaces every company in the file with the copy saved before a condense. Swaps the folder on disk, so no dry run.',
+    describe: "Restore the whole company file from the pre-condense copy {id} (ends every agent's access, this one's included)",
+    // The id rule gives the neutral "condense.archives.post". It is kept: stored requests name
+    // operations by id (operation-ids.txt), and the describe line says it restores.
+    why: "Replaces every company in the file with the copy saved before a condense. It takes away every agent's access, this one's too, as every restore of the whole file does (lib/services/condense.ts restoreCondenseArchive goes through backup.ts restoreBackup, revokeAllAgents). Swaps the folder on disk, so no dry run. Needs the file Admin, approving at the computer that holds the company file (host-only).",
     fileAdmin: true,
+    hostOnly: true,
     dryRun: 'none',
     needsSecret: ['archive_credentials'],
     effects: ['file'],
@@ -628,20 +652,23 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'POST /api/portable/restore': {
     class: 'file',
     describe: 'Open a portable company file as a new company file',
-    why: 'Writes a whole new company file on disk next to the open one. ?inspect=1 is its own read-only preview. A protected portable file needs its password, typed by the approver.',
+    why: "Writes a whole new company file on disk next to the open one. It leaves the open file and its agents as they are; the new file starts with no agent access, and nothing the agents were waiting on runs in it (lib/services/portableFile.ts endAgentAccessInRestoredBooks). ?inspect=1 is its own read-only preview. The route needs the owner or an Admin; the approval asks more, the file Admin at the computer that holds the company file (host-only), as for every restore. A protected portable file needs its password, typed by the approver.",
+    fileAdmin: true,
+    hostOnly: true,
     body: 'bytes',
     dryRun: 'preview',
     needsSecret: ['backup_password'],
     effects: ['file'],
   },
-  // An export of the books, nothing masked to hide (no tax IDs or account numbers in it): an Excel
-  // workbook, or with ?format=pdf a PDF summary. The route map asks for File Utilities' Print right.
+  // An export of the books: an Excel workbook, or with ?format=pdf a PDF summary. The route map asks
+  // for File Utilities' Print right. Vendor tax IDs are left out of it.
   'GET /api/portable/shareable': {
     class: 'file',
     describe: 'Download a shareable ledger (an Excel workbook, or a PDF summary when format is pdf)',
-    why: `${FILE_READ_WHY} The answer is a file of the whole ledger, made to be shared outside the company.`,
+    why: `${FILE_READ_WHY} The answer is a file of the whole ledger, made to be shared outside the company. Its Journal sheet has each line's memo, and a memo can hold a payee's full account number ("Acct # 000123456789"): sensitiveFields names the memos for that. The workbook is a file, so the door cannot mask inside it; the shareable ledger service writes each memo the way the run may see it (lib/services/journal.ts lineMemoFor), which for an agent's run, approved or not, is masked. No reveal is offered.`,
     output: 'file',
     dryRun: 'none',
+    sensitiveFields: ['memo', '*.memo'],
   },
 
   // ---- The single company file ----
@@ -649,7 +676,12 @@ export const ADMIN_CLASSES: ClassificationMap = {
   // but the timer then saves unsaved changes into the company file when a save is due. A read-only
   // handle would not catch that: it happens outside the request.
   'GET /api/company-file/status': { class: 'read', describe: 'Show whether the company file is saved' },
-  'GET /api/company-file/info': { class: 'read', describe: "Show the company file's name and where it is" },
+  'GET /api/company-file/info': {
+    class: 'file',
+    describe: "Show the company file's name and whether it has a password",
+    why: "What the sign-in screen shows before anyone signs in: the company file's name (the folder it is in only to the app's own window on this computer, never to an agent) and whether the file has a password or protection. A read that shows the company file on disk is class file, like the File Utilities reads (plan 4.2): an Admin approves it. Described only, never dry run: a dry run would hand the agent the answer before anyone approved it.",
+    dryRun: 'none',
+  },
   'POST /api/company-file/save': {
     class: 'file',
     describe: 'Save the company file now',
@@ -675,8 +707,12 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
 
   // ---- Companies in the file ----
-  // Writes only on first run with no user at all (a demo company), which no agent can reach.
-  'GET /api/companies': { class: 'read', describe: 'List the companies in this file' },
+  'GET /api/companies': {
+    class: 'read',
+    describe: 'List the companies in this file',
+    availability: 'person_only',
+    why: "A person's own route ('self' in lib/permissions/routes.ts): it lists the company files the signed-in user belongs to, from their session (getSessionGate), and answers every agent \"This is not available to agents.\" An agent is tied to one company and reads it with GET /api/agent/whoami. (Without any user at all it would write a demo company on first run, which no agent can reach either.)",
+  },
   'POST /api/companies': {
     class: 'file',
     describe: 'Make a new company {name}',

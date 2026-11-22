@@ -45,18 +45,32 @@ import {
 import { Money, allocate, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { inventoryValuation } from './inventory';
-import { binQuantities, ensureDefaultSite, serialsInStock, siteQuantities } from './inventorySites';
+import { binQuantities, defaultSiteForRead, serialsInStock, siteQuantities } from './inventorySites';
 
 type Dec = ReturnType<typeof Money.zero>;
 
+/**
+ * Every site, default first. These are reads: a person's first one makes the default site as
+ * before; an agent's (or a read-only one) never does and, before a person has opened the sites,
+ * gets no sites, so each report answers as if none had been set up (defaultSiteForRead).
+ */
 async function loadSites(ctx: ServiceContext) {
-  await ensureDefaultSite(ctx);
+  await defaultSiteForRead(ctx);
   const rows = await ctx.db
     .select()
     .from(inventorySites)
     .where(eq(inventorySites.companyId, ctx.companyId));
   return rows.sort((a, b) => (a.isDefault === b.isDefault ? a.name.localeCompare(b.name) : a.isDefault ? -1 : 1));
 }
+
+/**
+ * What a by-site report says when no default site exists yet (an agent's or a read-only read
+ * before a person opened Inventory Sites). The stock is real, it is just at no site yet: without
+ * this an empty report reads as "the company holds no stock" or "nothing to reorder". Quantity on
+ * Hand by Site and an item's site detail still count it in each item's total (`notAtASite`).
+ */
+export const NO_SITE_YET_NOTE =
+  "No inventory site has been set up yet. Stock that no other site holds is not at any site, so it has no site row and nothing about it is judged by site (Quantity on Hand by Site counts it in each item's total as not at a site). For the items' stock on hand and what to reorder, read the Inventory Stock Status by Item report. A person opening Inventory Sites in Ironbooks sets up the default site (Main Warehouse), which then holds that stock.";
 
 async function loadInventoryItems(ctx: ServiceContext, itemId?: string | null) {
   const conds = [eq(items.companyId, ctx.companyId), eq(items.type, 'inventory')];
@@ -88,6 +102,11 @@ export interface QohBySiteRow {
   bySite: Record<string, string>;
   /** Bin breakdown: [{ siteId, binId, binName, quantity }]. */
   bins: Array<{ siteId: string; binId: string; binName: string; quantity: string }>;
+  /**
+   * Only while no default site exists (NO_SITE_YET_NOTE): the quantity on hand no site holds yet,
+   * which the default site holds once it is made. Counted in totalQuantity and totalValue.
+   */
+  notAtASite?: string;
 }
 
 export async function quantityOnHandBySite(
@@ -95,6 +114,9 @@ export async function quantityOnHandBySite(
   opts?: { siteId?: string | null; itemId?: string | null; includeZero?: boolean },
 ) {
   const sites = await loadSites(ctx);
+  // No default site yet: siteQuantities then gives no default-site remainder, and what no other site
+  // holds is reported per item as not at a site (unless one site was asked for).
+  const noSiteYet = !sites.some((s) => s.isDefault);
   const itemRows = (await loadInventoryItems(ctx, opts?.itemId)).filter((i) => i.isActive || !Money.of(i.quantityOnHand ?? '0').isZero());
   const qty = await siteQuantities(ctx, itemRows.map((i) => i.id));
   const bins = await binQuantities(ctx, { itemIds: itemRows.map((i) => i.id), siteId: opts?.siteId ?? null });
@@ -114,7 +136,13 @@ export async function quantityOnHandBySite(
     // Each site's share of the item's value as the Inventory Valuation Summary carries it (FIFO
     // layers' cents, the average-cost value remainder), split by quantity to the cent — not
     // site qty x a 4dp unit cost, which left the report short of the valuation and the GL.
-    const entries = [...bySiteMap.entries()];
+    const entries: Array<[string | null, Dec]> = [...bySiteMap.entries()];
+    if (noSiteYet) {
+      let atSites = Money.zero();
+      for (const [, q] of bySiteMap) atSites = atSites.plus(q);
+      const rest = Money.of(it.quantityOnHand ?? '0').minus(atSites);
+      if (!rest.isZero()) entries.push([null, rest]);
+    }
     const itemValue = valueOf.get(it.id);
     const shares =
       itemValue && entries.length > 0 && entries.every(([, q]) => q.greaterThan(0))
@@ -123,16 +151,23 @@ export async function quantityOnHandBySite(
     const bySite: Record<string, string> = {};
     let total = Money.zero();
     let value = Money.zero();
-    entries.forEach(([siteId, q], i) => {
-      if (opts?.siteId && siteId !== opts.siteId) return;
-      bySite[siteId] = q.toFixed(4);
+    // Not at a site counts only when no single site was asked for.
+    let notAtASite: Dec | null = noSiteYet && !opts?.siteId ? Money.zero() : null;
+    for (let i = 0; i < entries.length; i++) {
+      const [siteId, q] = entries[i];
+      if (opts?.siteId && siteId !== opts.siteId) continue;
       total = total.plus(q);
       value = value.plus(shares[i]);
+      if (siteId === null) {
+        notAtASite = q;
+        continue;
+      }
+      bySite[siteId] = q.toFixed(4);
       if (siteTotals[siteId]) {
         siteTotals[siteId].quantity = siteTotals[siteId].quantity.plus(q);
         siteTotals[siteId].value = siteTotals[siteId].value.plus(shares[i]);
       }
-    });
+    }
     if (total.isZero() && !opts?.includeZero) continue;
     grandValue = grandValue.plus(value);
     rows.push({
@@ -147,6 +182,7 @@ export async function quantityOnHandBySite(
       bins: bins
         .filter((b) => b.itemId === it.id)
         .map((b) => ({ siteId: b.siteId, binId: b.binId, binName: names.get(b.binId) ?? '', quantity: b.quantity })),
+      ...(notAtASite !== null ? { notAtASite: notAtASite.toFixed(4) } : {}),
     });
   }
 
@@ -163,6 +199,7 @@ export async function quantityOnHandBySite(
       })),
     rows,
     grandTotalValue: toAmountString(grandValue),
+    ...(noSiteYet ? { note: NO_SITE_YET_NOTE } : {}),
   };
 }
 
@@ -191,9 +228,12 @@ export interface StockStatusBySiteRow {
 export async function stockStatusBySite(
   ctx: ServiceContext,
   opts?: { siteId?: string | null; itemId?: string | null },
-): Promise<{ rows: StockStatusBySiteRow[]; attentionCount: number }> {
+): Promise<{ rows: StockStatusBySiteRow[]; attentionCount: number; note?: string }> {
   const sites = (await loadSites(ctx)).filter((s) => s.isActive);
-  const defaultSite = sites.find((s) => s.isDefault) ?? (await ensureDefaultSite(ctx));
+  const defaultSiteId = (sites.find((s) => s.isDefault) ?? (await defaultSiteForRead(ctx)))?.id ?? null;
+  // No default site yet: the stock no other site holds is at no site, so it has no row here. The
+  // note says so, so an empty list does not read as "nothing to reorder" (NO_SITE_YET_NOTE).
+  const note = defaultSiteId ? {} : { note: NO_SITE_YET_NOTE };
   const itemRows = (await loadInventoryItems(ctx, opts?.itemId)).filter((i) => i.isActive);
   const qty = await siteQuantities(ctx, itemRows.map((i) => i.id));
 
@@ -231,7 +271,7 @@ export async function stockStatusBySite(
     for (const it of itemRows) {
       const onHand = qty.get(it.id)?.get(site.id) ?? Money.zero();
       const setting = settingFor.get(`${it.id}|${site.id}`);
-      const isDefault = site.id === defaultSite.id;
+      const isDefault = site.id === defaultSiteId;
       // The default site's reorder point IS the item's reorder point (the reorder list and Create
       // Purchase Orders use it; inventorySiteOps keeps both screens on it); other sites have their own.
       const reorderRaw = isDefault ? it.reorderPoint : (setting?.reorderPoint ?? null);
@@ -271,12 +311,12 @@ export async function stockStatusBySite(
       });
     }
   }
-  return { rows, attentionCount };
+  return { rows, attentionCount, ...note };
 }
 
 export async function reorderBySite(ctx: ServiceContext, opts?: { siteId?: string | null }) {
-  const { rows } = await stockStatusBySite(ctx, opts);
-  return { rows: rows.filter((r) => r.needsReorder) };
+  const { rows, note } = await stockStatusBySite(ctx, opts);
+  return { rows: rows.filter((r) => r.needsReorder), ...(note ? { note } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +584,7 @@ export interface SiteInvariantCheck {
 export async function verifySiteInvariants(
   ctx: ServiceContext,
 ): Promise<{ checks: SiteInvariantCheck[]; allOk: boolean }> {
-  const defaultSite = await ensureDefaultSite(ctx);
+  const defaultSiteId = (await defaultSiteForRead(ctx))?.id ?? null;
   const itemRows = await loadInventoryItems(ctx);
   const qty = await siteQuantities(ctx, itemRows.map((i) => i.id));
   const checks: SiteInvariantCheck[] = [];
@@ -554,12 +594,20 @@ export async function verifySiteInvariants(
   const negIssues: string[] = [];
   for (const it of itemRows) {
     const bySite = qty.get(it.id) ?? new Map();
+    const onHand = Money.of(it.quantityOnHand ?? '0');
     let total = Money.zero();
     for (const [siteId, q] of bySite) {
       total = total.plus(q);
-      if (q.isNegative() && !(siteId === defaultSite.id && Money.of(it.quantityOnHand ?? '0').isNegative())) {
+      if (q.isNegative() && !(siteId === defaultSiteId && onHand.isNegative())) {
         negIssues.push(`${it.name} (${q.toFixed(4)})`);
       }
+    }
+    if (!defaultSiteId) {
+      // No default site yet (an agent's read before anyone opened the sites): what no other site
+      // holds belongs to the default site once it is made, and is judged as it will be then.
+      const rest = onHand.minus(total);
+      if (rest.isNegative() && !onHand.isNegative()) negIssues.push(`${it.name} (${rest.toFixed(4)})`);
+      total = onHand;
     }
     if (!total.equals(Money.of(it.quantityOnHand ?? '0'))) {
       sumIssues.push(`${it.name}: sites ${total.toFixed(4)} vs on hand ${Money.of(it.quantityOnHand ?? '0').toFixed(4)}`);

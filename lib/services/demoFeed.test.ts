@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { users, companies, accounts, bankAccounts, bankTransactions } from '@/lib/db/schema';
+import { users, companies, accounts, auditLogs, bankAccounts, bankTransactions } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { loadDemoFeed } from './demoFeed';
 
@@ -41,5 +41,28 @@ describe('demo bank feed', () => {
 
     const second = await loadDemoFeed(ctx, bankAccountId, new Date('2026-04-01'));
     expect(second.imported).toBe(0); // all deduped
+  });
+
+  it('writes one audit row per line it adds (an agent preview of the load shows them), none on a repeat', async () => {
+    const audit = () =>
+      db
+        .select()
+        .from(auditLogs)
+        .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'bank_transaction')));
+    const rows = await db.select().from(bankTransactions).where(eq(bankTransactions.bankAccountId, bankAccountId));
+    const logged = await audit();
+    expect(logged.map((a) => a.entityId).sort()).toEqual(rows.map((r) => r.id).sort());
+    expect(logged.every((a) => a.action === 'create')).toBe(true);
+    const stripe = rows.find((r) => r.payee === 'Stripe')!;
+    expect(logged.find((a) => a.entityId === stripe.id)?.newValues).toMatchObject({
+      source: 'demo_feed',
+      bankAccountId,
+      fitId: `${bankAccountId}:demo-001`,
+      description: 'STRIPE TRANSFER',
+      payee: 'Stripe',
+      amount: '2450.00',
+    });
+    await loadDemoFeed(ctx, bankAccountId, new Date('2026-04-01'));
+    expect(await audit()).toHaveLength(logged.length);
   });
 });

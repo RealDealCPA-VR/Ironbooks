@@ -180,7 +180,11 @@ const PAYCHECK = req({
     effects: [{ kind: 'email', summary: 'May send an email', detail: { declared: true } }],
     warnings: [],
     loss: null,
-    routePreview: { ran: false, note: 'This was not tried out: this operation has a preview of its own, which is a separate operation to read. Nothing was changed.' },
+    // The bridge's own note (lib/agent/bridge.ts NOT_TRIED.preview), worded for the agent too.
+    routePreview: {
+      ran: false,
+      note: 'This operation has a preview mode of its own: the same operation, sent with its preview option. That preview is a run like any other, so it may need approval too. Nothing was changed.',
+    },
     truncated: false,
   },
 });
@@ -594,8 +598,10 @@ domTest('a request Ironbooks did not try ahead of time says so, claims nothing a
 
   const card = await openCard(PAYCHECK.id);
   const t = textOf(card);
-  check($('[data-not-tried]', card) && t.includes('Ironbooks did not try this ahead of time'), `it says it was not tried: ${t}`);
-  check(t.includes('a preview of its own'), "with Ironbooks' own note");
+  check($('[data-not-tried]', card) && t.includes('What this does is not shown ahead of time'), `it says it was not tried: ${t}`);
+  const why = textOf($('[data-not-tried-note]', card));
+  check(why.includes('that preview is itself a run of the same work, so Ironbooks did not run it ahead of time'), `with why, in a person's words: ${why}`);
+  check(!why.includes('preview option'), "not in the words meant for the agent");
   check(!t.includes('Nothing is posted to the ledger'), 'it never says nothing is posted');
   check(!t.includes('No recipient is named'), 'nor that the email has no recipient');
   check(t.includes('Who it goes to is not known ahead of time.'), 'it says who the email goes to is not known');
@@ -731,18 +737,28 @@ domTest('a done request links the entries the server names, and says why standin
   await unmount();
 });
 
-domTest('approving several at once: two-person and host-only requests cannot be chosen; one not approved is shown with its reason, the rest as done', async () => {
+domTest('approving several at once: two-person and host-only requests cannot be chosen; one not approved is shown with its reason, one sent back with a note says so, the rest as done', async () => {
   const E1 = req({ id: ids(31), summary: 'Enter invoice 1060 for Acme Supply', amount: '100.00' });
   const E2 = req({ id: ids(32), summary: 'Enter invoice 1061 for Acme Supply', amount: '200.00' });
   const TWO = req({ id: ids(33), summary: 'Enter invoice 1062 for Acme Supply', needs: { ...BASE.needs!, twoPerson: true } });
   const HOST = req({ id: ids(34), summary: 'Enter invoice 1063 for Acme Supply', needs: { ...BASE.needs!, hostOnly: true } });
+  const E3 = req({ id: ids(35), summary: 'Enter invoice 1064 for Acme Supply', amount: '300.00' });
   const WHY = 'The agent was paused, so this one was not approved. It is still waiting.';
+  // The approval sent a tried request back with a note (lib/agent/operate.ts: the closing date moved since the ask).
+  const NOTE = 'Ironbooks found that this is dated on or before the closing date, which the request did not show when it was asked.';
+  const back: AgentRequestForPerson = {
+    ...E3,
+    stale: true,
+    amount: null,
+    preview: { ledger: null, records: [], effects: [], warnings: [], loss: null, routePreview: { ran: false, note: NOTE }, truncated: false },
+  };
   const results: ApproveResult[] = [
     { status: 'executed', request: { ...E1, status: 'executed', canApprove: false }, produced: [], effects: [] },
     { status: 'not_approved', request: { ...E2, error: WHY }, produced: [], effects: [] },
+    { status: 'stale', request: back, produced: [], effects: [] },
   ];
   const calls = stubFetch({
-    'GET /api/agent-requests?status=pending': { requests: [E1, E2, TWO, HOST] },
+    'GET /api/agent-requests?status=pending': { requests: [E1, E2, TWO, HOST, E3] },
     'POST /api/agent-requests/batch-approve': { results },
   });
   await mount(page());
@@ -755,18 +771,23 @@ domTest('approving several at once: two-person and host-only requests cannot be 
   check(!box(TWO.id)?.checked, 'choosing it does nothing');
   await click(box(E1.id), 'the first invoice');
   await click(box(E2.id), 'the second invoice');
-  await click(button('Approve chosen (2)…'), 'Approve chosen');
+  await click(box(E3.id), 'the third invoice');
+  await click(button('Approve chosen (3)…'), 'Approve chosen');
   const confirm = await until(dialog, 'the confirmation');
-  await click(button('Approve all 2', confirm), 'Approve all 2');
+  await click(button('Approve all 3', confirm), 'Approve all 3');
   await until(() => textOf(dialog()).includes('What happened'), 'what happened');
-  equal(JSON.stringify(posts(calls, '/api/agent-requests/batch-approve').map((c) => c.body)), JSON.stringify([{ ids: [E1.id, E2.id] }]), 'only the two were sent');
+  equal(JSON.stringify(posts(calls, '/api/agent-requests/batch-approve').map((c) => c.body)), JSON.stringify([{ ids: [E1.id, E2.id, E3.id] }]), 'only the three were sent');
   const done = textOf($('[data-batch-result="executed"]', dialog()!));
   const not = textOf($('[data-batch-result="not_approved"]', dialog()!));
+  const sentBack = textOf($('[data-batch-result="stale"]', dialog()!));
   check(done.includes('Enter invoice 1060') && done.includes('Done.'), `the first is done: ${done}`);
   check(not.includes('Enter invoice 1061') && not.includes('Not approved') && not.includes(WHY), `the second is not approved, with why: ${not}`);
   check(!not.includes('Done.'), 'and is not called done');
+  check(sentBack.includes('Enter invoice 1064') && sentBack.includes('sent this back with a note'), `the third was sent back with a note: ${sentBack}`);
+  check(!sentBack.includes('books changed'), 'and the books are not said to have changed');
   await click(button('Close', dialog()!), 'Close');
   check(textOf(rowOf(E1.id)).includes('Done') && textOf(rowOf(E2.id)).includes('Waiting'), 'the list shows the first done and the second still waiting');
+  check(textOf($('[data-stale-mark]', rowOf(E3.id)!)).includes('An approval sent this back with a note'), 'and the third sent back, as the batch said');
   await unmount();
 });
 
@@ -863,7 +884,7 @@ domTest('the ledger part names what a run voids or deletes, with the amounts, in
   // The new entry reads as new, whatever its description says.
   const made = entryOf('Entry 43');
   check(made && made.getAttribute('data-entry') === 'new' && !made.hasAttribute('data-entry-gone'), 'an entry the run makes is new');
-  equal(labelOf(made), 'Posts', 'and is labelled as posting');
+  equal(labelOf(made), 'New', 'and is labelled new');
   check(!textOf(made).includes('leave the ledger'), `its description does not make it a void: ${textOf(made)}`);
   check(textOf(made).includes('Voided by this request: Check 1041'), 'its description is shown as written');
   // An entry that was void already and that the run only changes moves nothing.
@@ -926,8 +947,13 @@ domTest('a desktop request shows the whole paths it opens and writes, asks the q
   });
   await mount(page());
   const card = await openCard(RESTORE.id);
-  const paths = $$('[data-desktop-path]', card).map((p) => p.textContent);
+  const paths = $$('[data-desktop-path]', card).map((p) => p.getAttribute('data-desktop-path'));
   equal(JSON.stringify(paths), JSON.stringify([BACKUP, WRITTEN]), 'the file it reads and the company file it writes, ".ironbooks" added, in full');
+  // Each as its folder and its file name, both whole: a long folder never hides the name.
+  const parts = (el: Element) => [textOf($('[data-path-folder]', el)), textOf($('[data-path-name]', el))];
+  const [readEl, writeEl] = $$('[data-desktop-path]', card);
+  equal(JSON.stringify(parts(readEl)), JSON.stringify(['D:\\Backups', 'Acme 2026-11-01.bka']), 'the backup, as its folder and its name');
+  equal(JSON.stringify(parts(writeEl)), JSON.stringify(['C:\\Users\\pat\\Documents\\Ironbooks', 'Acme restored.ironbooks']), 'the company file it writes, as its folder and its name');
   const t = textOf(card);
   check(t.includes('Once it is ready, open the new company file now?') && t.includes('open it anyway?'), 'the questions sent with the request are asked');
   check(button('Approve once', card)?.disabled, 'Approve waits for the answers');
@@ -944,7 +970,10 @@ domTest('a desktop request shows the whole paths it opens and writes, asks the q
   await until(() => !dialog(), 'the card to close');
 
   const saved = await openCard(SAVE.id);
-  equal($('[data-file-path]', saved)?.textContent, `${OUTBOX}\\March.pdf`, 'a saved file shows the whole path it is written to');
+  const file = $('[data-file-path]', saved);
+  equal(file?.getAttribute('data-file-path'), `${OUTBOX}\\March.pdf`, 'a saved file shows the whole path it is written to');
+  equal(textOf($('[data-path-name]', file!)), 'March.pdf', 'its file name, on its own');
+  equal(textOf($('[data-path-folder]', file!)), OUTBOX, 'and its folder, whole (the summary shortens it)');
   check(!$('[data-desktop-lines]', saved), 'from the preview, not from what the agent sent');
   await unmount();
 });
@@ -1188,6 +1217,309 @@ domTest('a link followed while the page is open opens its card, and changes the 
   } finally {
     setQuery('');
   }
+});
+
+// ---------------------------------------------------------------------------
+// The third pass (wave 4): warnings the agent said yes to, unknown amounts, optional secrets, the
+// server's own words, a request sent back with a note
+// ---------------------------------------------------------------------------
+
+domTest('the card shows the warnings the agent said yes to, an amount it could not work out, and whose line each is', async () => {
+  type Entry = NonNullable<OperationPreview['ledger']>['entries'][number];
+  const base = LEDGER('310.00').ledger!.entries[0];
+  // The bridge names each line's customer and class (wave 4).
+  const lines = [
+    { accountId: 'x1', accountCode: '1200', accountName: 'Accounts Receivable', debit: '310.00', credit: null, memo: null, entityName: 'Acme Supply', className: 'East' },
+    { accountId: 'x2', accountCode: '4000', accountName: 'Sales', debit: null, credit: '310.00', memo: null, entityName: null, className: 'East' },
+  ] as unknown as Entry['lines'];
+  const DUP = req({
+    id: ids(90),
+    class: 'change',
+    summary: 'Enter invoice 1042 for Acme Supply again',
+    amount: null,
+    input: { body: { customerId: ACME }, confirm: ['allowDuplicateNumber', 'allowReconciledEdit'] },
+    preview: { ...LEDGER('310.00'), ledger: { entries: [{ ...base, lines }], changes: [] }, warnings: [{ flag: 'allowDuplicateNumber', message: 'Invoice number 1042 is already used for Acme Supply.' }] },
+  });
+  stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [DUP] },
+    [`GET /api/agent-requests/${DUP.id}`]: { request: DUP },
+  });
+  await mount(page());
+  const row = await until(() => rowOf(DUP.id), 'the request');
+  equal(textOf($('[data-amount-unknown]', row)), 'Unknown', 'the list says the amount is unknown, never blank');
+  const card = await openCard(DUP.id);
+  equal(textOf($('[data-amount-unknown]', card)), 'Amount unknown', 'and so does the card');
+  check(textOf(card).includes('Any amount limit treats it as more than the limit.'), 'saying what that means');
+  const warnings = $('[data-warnings]', card);
+  check(warnings && textOf(warnings).includes('Invoice number 1042 is already used for Acme Supply.'), `the warning in the app's own words: ${textOf(warnings)}`);
+  check($('[data-warning="accepted"]', warnings!) && textOf(warnings).includes('The agent said to go ahead anyway.'), 'marked as one the agent said yes to');
+  check(textOf($('[data-accepted-ahead]', warnings!)).includes('It changes a transaction that is already reconciled.'), 'and the yes it gave to a warning not shown, in plain words');
+  check(textOf(warnings).includes('approving is your own yes to each of them'), 'approving is the person’s own yes');
+  equal(textOf($('[data-line-name]', card)), 'Name: Acme Supply', 'the line says whose receivable it is');
+  equal(
+    $$('[data-line-class]', card)
+      .map((e) => textOf(e))
+      .join('|'),
+    'Class: East|Class: East',
+    'and each line its class',
+  );
+  await unmount();
+});
+
+domTest('a sign-in the route can do without may be left empty, says when it is needed, and is never sent half typed', async () => {
+  const OPTIONAL = req({
+    id: ids(91),
+    operation: 'backups.restore',
+    class: 'file',
+    area: null,
+    summary: 'Restore the whole company file from backup b1',
+    amount: null,
+    needs: { admin: true, fileAdmin: true, hostOnly: false, flag: null, secrets: ['archive_credentials'], optionalSecrets: ['archive_credentials'], twoPerson: false, grantable: 'no' },
+    input: { query: { id: 'b1' } },
+    preview: null,
+    grantMinutesMax: 0,
+  });
+  const calls = stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [OPTIONAL] },
+    [`GET /api/agent-requests/${OPTIONAL.id}`]: { request: OPTIONAL },
+    [`POST /api/agent-requests/${OPTIONAL.id}/approve`]: { status: 'executed', request: { ...OPTIONAL, status: 'executed', canApprove: false }, produced: [], effects: [] } satisfies ApproveResult,
+  });
+  await mount(page());
+  const card = await openCard(OPTIONAL.id);
+  const t = textOf(card);
+  check(t.includes('Sign-in for the protected backup (only if needed)'), `it says the boxes are only for when they are needed: ${t}`);
+  check(t.includes('Leave these empty for a backup made in this company file.'), 'and when that is');
+  check(!button('Approve once', card)?.disabled, 'it can be approved with the boxes empty');
+  const login = $<HTMLInputElement>('#secret-archive_credentials-login', card);
+  await focus(login, 'the user name');
+  await typeText('patowner');
+  check(button('Approve once', card)?.disabled, 'a user name alone is never sent');
+  await fill(login, '', 'the user name');
+  check(!button('Approve once', card)?.disabled, 'empty again, it can be approved');
+  await click(button('Approve once', card), 'Approve once');
+  await until(() => textOf(dialog()).includes('Done.'), 'the run to be done');
+  equal(JSON.stringify(posts(calls, `/api/agent-requests/${OPTIONAL.id}/approve`)[0].body), JSON.stringify({}), 'nothing was sent for the empty sign-in');
+  await unmount();
+});
+
+domTest("the server's own words show as they come: a password left out, a refusal no approval gets past, standing permission not given", async () => {
+  // lib/services/agentRequests.ts checkTypedSecrets.
+  const TYPE_IT = 'Type the closing-date password on the card, then approve again. Nothing was done.';
+  let closingGets = 0;
+  stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [CLOSING] },
+    [`GET /api/agent-requests/${CLOSING.id}`]: () => {
+      closingGets++;
+      return { request: CLOSING };
+    },
+    [`POST /api/agent-requests/${CLOSING.id}/approve`]: () => reply(400, { error: TYPE_IT, code: 'VALIDATION' }),
+  });
+  await mount(page());
+  const card = await openCard(CLOSING.id);
+  await focus($('#secret-closing_password', card), 'the password');
+  await typeText('Wr0ngPass');
+  await click(button('Approve once', card), 'Approve once');
+  const failure = await until(() => $('[data-approve-failure]', dialog()!), 'the refusal');
+  equal(textOf(failure), TYPE_IT, 'the server\'s words, as they came, with nothing added');
+  await until(() => closingGets >= 2, 'the request to be loaded again');
+  check(!$$<HTMLInputElement>('input[type="password"]', dialog()!).some((i) => i.value), 'the box is empty again');
+  check(button('Approve once', dialog()!), 'and it can be approved again');
+  await unmount();
+
+  // A refusal no approval gets past (plan 4.6): the server settles the request, and the card shows it.
+  const FLOOR = 'Ironbooks never lets an agent change a role that an agent holds: Night closer holds Bookkeeper. Nothing was done.';
+  const ROLE = req({ id: ids(92), operation: 'roles.update', class: 'admin', area: 'users', summary: 'Change what role Bookkeeper allows', amount: null, needs: { ...BASE.needs!, admin: true, grantable: 'no' }, preview: null, grantMinutesMax: 0 });
+  let refused = false;
+  stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [ROLE] },
+    [`GET /api/agent-requests/${ROLE.id}`]: () => ({ request: refused ? { ...ROLE, status: 'failed', canApprove: false, error: FLOOR, decidedByName: 'Pat Owner' } : ROLE }),
+    [`POST /api/agent-requests/${ROLE.id}/approve`]: () => {
+      refused = true;
+      return reply(403, { error: FLOOR, code: 'FORBIDDEN' });
+    },
+  });
+  await mount(page());
+  const role = await openCard(ROLE.id);
+  await click(button('Approve once', role), 'Approve once');
+  await until(() => textOf(dialog()).includes('but it did not go through'), 'the request as it now stands');
+  equal(textOf(dialog()).split(FLOOR).length - 1, 1, 'the refusal, said once');
+  check(!button('Approve once', dialog()!), 'nothing more to approve');
+  check(textOf(rowOf(ROLE.id)).includes('Did not go through'), 'the list shows it too');
+  await unmount();
+
+  // The work was done; the standing permission asked for with it was not given.
+  const UNEXPECTED = 'Standing permission was not given because of an unexpected problem. The work itself was done, so do not ask for it again; the next request like it will ask a person.';
+  stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [BASE] },
+    [`GET /api/agent-requests/${BASE.id}`]: { request: BASE },
+    [`POST /api/agent-requests/${BASE.id}/approve`]: { status: 'executed', request: req({ status: 'executed', canApprove: false, grant: null, grantError: UNEXPECTED }), produced: [], effects: [] } satisfies ApproveResult,
+  });
+  await mount(page());
+  const similar = await openCard(BASE.id);
+  await click(button('Approve similar…', similar), 'Approve similar…');
+  await click(button('Approve this and similar', dialog()!), 'Approve this and similar');
+  await until(() => textOf(dialog()).includes('Done.'), 'the run to be done');
+  equal(textOf($('[data-grant-not-given]', dialog()!)), UNEXPECTED, 'the server\'s words, not said twice');
+  await unmount();
+});
+
+domTest('a request an approval sent back with a note says so, not that the books changed', async () => {
+  const NOTE = 'Ironbooks found that this is dated on or before the closing date, which the request did not show when it was asked. If it is still right, approve it again; you will need the closing-date password.';
+  const ASKED = req({ id: ids(95) });
+  const BACK = req({ id: ids(95), stale: true, amount: null, preview: { ledger: null, records: [], effects: [], warnings: [], loss: null, routePreview: { ran: false, note: NOTE }, truncated: false } });
+  let asked = 0;
+  const path = `/api/agent-requests/${ASKED.id}/approve`;
+  const calls = stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [ASKED] },
+    [`GET /api/agent-requests/${ASKED.id}`]: { request: ASKED },
+    [`POST ${path}`]: () => {
+      asked++;
+      return (asked === 1 ? { status: 'stale', request: BACK, produced: [], effects: [] } : { status: 'executed', request: { ...BACK, stale: false, status: 'executed', canApprove: false }, produced: [], effects: [] }) satisfies ApproveResult;
+    },
+  });
+  await mount(page());
+  const card = await openCard(ASKED.id);
+  await click(button('Approve once', card), 'Approve once');
+  const answer = await until(() => $('[data-stale-answer]', dialog()!), 'the answer');
+  equal(answer.getAttribute('data-stale-answer'), 'note', 'it was sent back with a note');
+  check(textOf(answer).includes('Ironbooks sent this back before running it.'), `the card says so: ${textOf(answer)}`);
+  check(!textOf(dialog()).includes('The books changed since the agent asked'), 'and never that the books changed');
+  equal(textOf($('[data-not-tried-note]', dialog()!)), `Why: ${NOTE}`, "Ironbooks' note, as it came");
+  check(textOf(dialog()).includes('Amount unknown'), 'its amount is unknown');
+  check(textOf($('[data-stale-mark]', rowOf(ASKED.id)!)).includes('An approval sent this back with a note'), 'the list says the same');
+  await click(button('Approve again', dialog()!), 'Approve again');
+  await until(() => textOf(dialog()).includes('Done.'), 'the run to be done');
+  equal((posts(calls, path)[1].body as { acceptStale?: boolean }).acceptStale, true, 'the second yes is to what was shown');
+  await unmount();
+});
+
+// ---------------------------------------------------------------------------
+// The fourth pass (wave 4 review): a new user's password typed twice, a link that waits for the
+// open card, and a refused approval that is not approvable again until the request has loaded
+// ---------------------------------------------------------------------------
+
+domTest("a new user's password is typed twice, compared on the card, and goes as the one password", async () => {
+  const ADD = req({
+    id: ids(100),
+    operation: 'users.create',
+    class: 'admin',
+    area: 'users',
+    summary: 'Add the user Dana Lee',
+    amount: null,
+    needs: { ...BASE.needs!, admin: true, secrets: ['new_user_password'], grantable: 'no' },
+    input: { body: { username: 'dana' } },
+    preview: null,
+    grantMinutesMax: 0,
+  });
+  const path = `/api/agent-requests/${ADD.id}/approve`;
+  const calls = stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [ADD] },
+    [`GET /api/agent-requests/${ADD.id}`]: { request: ADD },
+    [`POST ${path}`]: { status: 'executed', request: { ...ADD, status: 'executed', canApprove: false }, produced: [], effects: [] } satisfies ApproveResult,
+  });
+  await mount(page());
+  const card = await openCard(ADD.id);
+  const field = textOf($('[data-secret-field="new_user_password"]', card));
+  check(field.includes("The new user's password") && field.includes('The same password again'), `two boxes: ${field}`);
+  check(field.includes('Tell it to them yourself'), 'saying the Admin passes it on');
+  const type = async (sel: string, text: string) => {
+    await focus($(sel, dialog()!), sel);
+    await typeText(text);
+  };
+  await type('#secret-new_user_password-password', 'Welcome12');
+  check(button('Approve once', dialog()!)?.disabled, 'it must be typed twice');
+  await type('#secret-new_user_password-confirm', 'Welcome13');
+  await click(button('Approve once', dialog()!), 'Approve once');
+  await until(() => textOf(dialog()).includes('not the same'), 'the copies to differ');
+  equal(posts(calls, path).length, 0, 'nothing was sent');
+  check(!$$<HTMLInputElement>('input[type="password"]', dialog()!).some((i) => i.value), 'and the boxes are empty again');
+  await type('#secret-new_user_password-password', 'Welcome12');
+  await type('#secret-new_user_password-confirm', 'Welcome12');
+  await click(button('Approve once', dialog()!), 'Approve once');
+  await until(() => textOf(dialog()).includes('Done.'), 'the run to be done');
+  equal(JSON.stringify(posts(calls, path)[0].body), JSON.stringify({ secrets: { new_user_password: 'Welcome12' } }), 'the one password went, as typed, the second copy never');
+  check(!reactStateHolds('Welcome12') && !document.body.innerHTML.includes('Welcome12'), 'and it is nowhere afterwards');
+  await unmount();
+});
+
+domTest('a link followed while a card is answering waits: that card keeps its answer, and the linked one opens once it is closed', async () => {
+  const follow = async (query: string) => {
+    setQuery(query);
+    setTestPathname('/agent-requests');
+    await settle();
+  };
+  const SECRET = 'Sh0wn-0nce-7Q';
+  const done = req({ status: 'executed', canApprove: false, decidedByName: 'Pat Owner' });
+  // The approval's answer, held back until the test lets it go.
+  const gate: { release: (() => void) | null } = { release: null };
+  try {
+    stubFetch({
+      'GET /api/agent-requests?status=pending': { requests: [BASE, EMAIL] },
+      [`GET /api/agent-requests/${BASE.id}`]: { request: BASE },
+      [`GET /api/agent-requests/${EMAIL.id}`]: { request: EMAIL },
+      [`POST /api/agent-requests/${BASE.id}/approve`]: () =>
+        new Promise((resolve) => {
+          gate.release = () =>
+            resolve({ status: 'executed', request: done, produced: [{ kind: 'new_user_password', label: 'Temporary password', value: SECRET }], effects: [] } satisfies ApproveResult);
+        }),
+    });
+    setQuery('');
+    await mount(page());
+    const card = await openCard(BASE.id);
+    await click(button('Approve once', card), 'Approve once');
+    await until(() => gate.release !== null, 'the approval to be on its way');
+    await follow(`?id=${EMAIL.id}`);
+    await settle(60);
+    equal(textOf($('[data-request-summary]', dialog()!)), 'Enter invoice 1042 for Acme Supply', 'the card that is answering stays open');
+    check(textOf().includes('Ironbooks is still answering the request that is open. The one from the link opens when you close it.'), 'and the page says when the linked one opens');
+    gate.release?.();
+    await until(() => textOf(dialog()).includes(SECRET), 'the answer, with the secret the run produced');
+    // Another link, while the card shows that secret: it still waits.
+    await follow('');
+    await follow(`?id=${EMAIL.id}`);
+    await settle(60);
+    check(textOf(dialog()).includes(SECRET), 'the secret stays on screen until the person closes the card');
+    check(textOf().includes('The request that is open shows a secret that is not shown again.'), 'and the page says why');
+    await click(button('Close', dialog()!), 'Close');
+    const next = await until(
+      () => (dialog() && textOf($('[data-request-summary]', dialog()!)) === 'Email invoice 1042 to billing@acme-supply.com' ? dialog() : null),
+      'the linked card, once that one is closed',
+    );
+    check(!textOf(next).includes(SECRET), 'without the secret of the other');
+    await click(button('Close', next), 'Close');
+    await until(() => !dialog(), 'the card to close');
+    await settle(60);
+    check(!dialog(), 'nothing else opens after it');
+    await unmount();
+  } finally {
+    setQuery('');
+  }
+});
+
+domTest('after a refused approval nothing is approvable until the card has loaded the request again, and a failed load says so', async () => {
+  let failLoad = false;
+  const path = `/api/agent-requests/${BASE.id}/approve`;
+  const calls = stubFetch({
+    'GET /api/agent-requests?status=pending': { requests: [BASE] },
+    [`GET /api/agent-requests/${BASE.id}`]: () => (failLoad ? reply(500, { error: 'Ironbooks is busy. Try again in a moment.' }) : { request: BASE }),
+    [`POST ${path}`]: () => {
+      failLoad = true;
+      return reply(409, { error: 'Ironbooks could not approve this just now. Nothing was done.', code: 'CONFLICT' });
+    },
+  });
+  await mount(page());
+  const card = await openCard(BASE.id);
+  await click(button('Approve once', card), 'Approve once');
+  await until(() => $('[data-approve-failure]', dialog()!), 'the refusal');
+  const banner = await until(() => $('[data-load-error]', dialog()!), 'the failed load, said on the card');
+  check(textOf(banner).includes('cannot be approved until it loads'), `it says why: ${textOf(banner)}`);
+  check(button('Approve once', dialog()!)?.disabled, 'Approve waits for the fresh copy');
+  check(!button('Approve similar…', dialog()!), 'and so does Approve similar…');
+  failLoad = false;
+  await click(button('Try again', dialog()!), 'Try again');
+  await until(() => !$('[data-load-error]', dialog()!) && !button('Approve once', dialog()!)?.disabled, 'the card to load');
+  equal(posts(calls, path).length, 1, 'only the one approval was sent');
+  await unmount();
 });
 
 void runDomTests();

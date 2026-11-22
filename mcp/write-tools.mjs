@@ -18,17 +18,24 @@
  * door's verb instead of a named action. The answers are the same, and are worded here for all of
  * them (shapeAnswer, settle).
  *
- * Two arguments are the same on every one of these tools:
+ * Three arguments are the same on every one of these tools:
  *
  *   - `dry_run: true` really runs the change inside Ironbooks and rolls it back. The answer shows
  *     the ledger lines it would post, or the reason it would be refused. Nothing is kept.
  *   - `request_id` is the agent's own name for this one change. It is needed for anything that is
  *     kept. Asking again with the same request_id returns the first answer and never enters the
  *     change twice, so a retry after a timeout is always safe.
+ *   - `reason` is one plain sentence saying why the agent wants it. It goes with a real request
+ *     (never with a dry run), and a person who must approve it reads it on the approval card as the
+ *     agent's own words. Left out, the card says no reason was given (lib/agent/actions.ts).
+ *
+ * The tools that edit, void or make inactive also send the version of the record the agent last
+ * read (expected_updated_at). Ironbooks then refuses the change with a 409 when someone changed
+ * the record since, instead of overwriting their work; the answer says to read it again.
  *
  * Field names are the tool's own (snake_case) and are turned into the app's on the way out.
  */
-import { ToolError } from './protocol.mjs';
+import { ToolError, slowDownAdvice } from './protocol.mjs';
 
 const DATE = { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', patternHint: 'must be a date as YYYY-MM-DD' };
 const ID = { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', patternHint: 'must be an id returned by another tool' };
@@ -48,7 +55,24 @@ const REQUEST_ID = {
   description:
     'Your own name for this one change, for example "bill-acme-2026-03-08". Required unless dry_run is true. Asking again with the same request_id returns the first answer and never enters the change twice; use a new one for each new change.',
 };
-const EXPECTED = { type: 'string', maxLength: 40, description: 'The updated_at you got when you last read this record. If someone changed it since, the change is refused instead of overwriting theirs.' };
+/**
+ * The reason argument of every tool that changes the books (the entry tools have the same).
+ * Optional here: without it the request still reaches a person, whose card says no reason was given.
+ */
+export const REASON = {
+  type: 'string',
+  maxLength: 500,
+  description:
+    'Why you want this, in one plain sentence (at most 500 characters). If a person must approve it, they read it on the approval card, labelled as your words, beside the preview Ironbooks makes itself. Not needed for a dry run.',
+};
+const EXPECTED = {
+  type: 'string',
+  maxLength: 40,
+  pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}',
+  patternHint: 'must be the updated_at exactly as get_transaction gave it, for example 2026-03-08T14:05:09.123Z',
+  description:
+    'The version of the record you last read: its updated_at from get_transaction (for an account or an item, its edited_at), exactly as given. Send it. If someone changed the record since, Ironbooks answers 409 and changes nothing, instead of overwriting their work: read it again and make your change on what it says now. Without it, a change made since can be overwritten.',
+};
 
 /** `customer_id` → `customerId`, at every depth. Values are left as they are. */
 export function camelize(v) {
@@ -64,10 +88,19 @@ export function camelize(v) {
   return v;
 }
 
+/**
+ * The ledger part of an answer (lib/agent/actions.ts ChangePreview), or null when the door showed
+ * none: work it could not try ahead (a preview of its own, a desktop step, a read a person must
+ * approve) comes back without one, and that is not the same as "it posts nothing".
+ */
+function ledgerSource(answer) {
+  const source = answer?.ledger ?? answer?.preview?.ledger;
+  return source && typeof source === 'object' && Array.isArray(source.entries) ? source : null;
+}
+
 /** The ledger lines of an answer, compact: one entry per posting, debits first. */
 function ledgerOf(answer) {
-  const source = answer?.ledger ?? answer?.preview?.ledger;
-  const entries = Array.isArray(source?.entries) ? source.entries : [];
+  const entries = ledgerSource(answer)?.entries ?? [];
   return entries.map((e) => ({
     journal_entry_id: e.journalEntryId,
     date: e.date,
@@ -156,6 +189,22 @@ function resendWith(flag, operation, opts) {
 /** A warning no flag accepts (lib/agent/operate.ts needsConfirmationAnswer says the same). */
 const NO_FLAG = 'This warning cannot be accepted with a flag. Change the request so it no longer raises it, or stop and tell the person.';
 
+/**
+ * Whole seconds the door asked the agent to wait (AgentOperationAnswer.retryAfterSeconds, wave 4:
+ * its "slow down"), or null. Such an answer is not a refusal of the work: nothing was done or kept
+ * under the request id, so the same request may be sent again after the wait.
+ */
+function waitOf(/** @type {any} */ answer) {
+  const s = Number(answer?.retryAfterSeconds);
+  return Number.isFinite(s) && s > 0 ? Math.min(Math.ceil(s), 3600) : null;
+}
+
+/** A sentence ends with its full stop (the app's messages usually have one; a note may not). */
+export function sentence(/** @type {unknown} */ text) {
+  const t = String(text ?? '').trim();
+  return !t || /[.!?]$/.test(t) ? t : `${t}.`;
+}
+
 /** One warning of an answer, with how to accept it when it can be. */
 function warningOf(/** @type {any} */ w, /** @type {string | undefined} */ operation, /** @type {any} */ opts) {
   const resend = resendWith(w.flag, operation, opts);
@@ -173,6 +222,10 @@ const MAX_PREVIEW_ROWS = 50;
 export function shapeAnswer(answer, opts = {}) {
   const a = answer ?? {};
   const ledger = ledgerOf(a);
+  // Only an answer that carries a ledger says what would be posted. An empty one ("posts nothing")
+  // is still said; no ledger at all means the door could not tell, so nothing is claimed.
+  const hasLedger = ledgerSource(a) !== null;
+  const wait = waitOf(a);
   const said = SAID[a.outcome];
   const notYet = NOT_YET.has(a.outcome);
   const preview = a.preview && typeof a.preview === 'object' ? a.preview : null;
@@ -195,6 +248,9 @@ export function shapeAnswer(answer, opts = {}) {
       shapedWarnings.length && shapedWarnings.every((w) => !w.resend_with)
         ? 'No flag accepts these warnings. Change the request so it no longer raises them and send it with a NEW request_id, or stop and tell the person about the warning.'
         : 'Check each warning. Only if it is right to go ahead, send the same request again with what resend_with says and a NEW request_id; a request sent with a confirmation may need a person to approve it. Otherwise stop and tell the person about the warning.';
+  } else if (a.outcome === 'refused' && wait) {
+    // The words the connector uses for every "slow down" (protocol.mjs).
+    next = slowDownAdvice(wait);
   } else if (a.outcome === 'refused') {
     next = 'Do not send it again as it is. get_my_permissions shows what you may do; if the work still needs doing, tell the person what you wanted to do and why.';
   } else if (file) {
@@ -211,7 +267,7 @@ export function shapeAnswer(answer, opts = {}) {
     ...(a.requestId && waiting ? { request_id: a.requestId } : {}),
     ...(a.status && waiting ? { status: a.status } : {}),
     ...(who ? { who_decides: who } : {}),
-    ...(notYet ? (a.outcome === 'dry_run' || ledger.length ? { would_post: ledger } : {}) : ledger.length ? { ledger } : {}),
+    ...(notYet ? (hasLedger ? { would_post: ledger } : {}) : ledger.length ? { ledger } : {}),
     ...(records.length
       ? { [notYet ? 'would_change' : 'changed']: records.slice(0, MAX_PREVIEW_ROWS).map((r) => ({ kind: r.kind, id: r.id, action: r.action, fields: r.fields })) }
       : {}),
@@ -223,6 +279,7 @@ export function shapeAnswer(answer, opts = {}) {
     ...(shapedWarnings.length ? { warnings: shapedWarnings } : {}),
     ...(file ? { file } : {}),
     ...(a.grantId ? { under_standing_permission: a.grantId } : {}),
+    ...(wait ? { retry_after_seconds: wait } : {}),
     ...(a.note ? { note: a.note } : {}),
     ...(next ? { next } : {}),
   };
@@ -230,6 +287,7 @@ export function shapeAnswer(answer, opts = {}) {
 
 /**
  * shapeAnswer, except that a refusal is a tool error: the agent reads why, and that nothing was done.
+ * A "slow down" (the answer names seconds to wait) says to wait and send it again, never to stop.
  * @param {any} answer
  * @param {{ fields?: string[] | 'confirm', confirm?: string[] }} [opts]
  */
@@ -237,11 +295,24 @@ export function settle(answer, opts = {}) {
   const shaped = shapeAnswer(answer, opts);
   if (shaped.outcome !== 'refused') return shaped;
   const why = typeof shaped.note === 'string' && shaped.note.trim() ? shaped.note.trim() : 'Ironbooks did not allow this.';
-  throw new ToolError(`Refused: ${/[.!?]$/.test(why) ? why : `${why}.`} Nothing was done. ${shaped.next}`);
+  if (shaped.retry_after_seconds) throw new ToolError(`Not now: ${sentence(why)} ${shaped.next}`);
+  throw new ToolError(`Refused: ${sentence(why)} Nothing was done. ${shaped.next}`);
 }
 
 function schema(properties, required = []) {
-  return { type: 'object', properties: { ...properties, dry_run: DRY_RUN, request_id: REQUEST_ID }, required, additionalProperties: false };
+  return { type: 'object', properties: { ...properties, dry_run: DRY_RUN, request_id: REQUEST_ID, reason: REASON }, required, additionalProperties: false };
+}
+
+/**
+ * What a curated request carries besides its input (lib/agent/actions.ts AgentActionRequest): a
+ * dry run alone, or the request id with the agent's reason. A reason of only spaces is no reason,
+ * and is left out rather than sent empty, so the card says plainly that none was given.
+ * @param {Record<string, any>} args  the tool's arguments
+ */
+export function requestParts(args) {
+  if (args.dry_run === true) return { dryRun: true };
+  const reason = typeof args.reason === 'string' ? args.reason.trim() : '';
+  return { requestId: args.request_id, ...(reason ? { reason } : {}) };
 }
 
 /**
@@ -252,7 +323,56 @@ async function send(client, action, input, args, fields) {
   if (args.dry_run !== true && !args.request_id) {
     throw new ToolError('Give a request_id (your own name for this one change), or set dry_run to true to only check it.');
   }
-  return settle(await client.act({ action, input, ...(args.dry_run === true ? { dryRun: true } : { requestId: args.request_id }) }), { fields });
+  return settle(await client.act({ action, input, ...requestParts(args) }), { fields });
+}
+
+/**
+ * The app answers 409 when the record changed after the version the agent sent (its words say to
+ * reload, which an agent cannot do). The same 409 also answers a request_id used for a different
+ * change, or a request still under way, so the advice says when it applies.
+ */
+export const CHANGED_SINCE =
+  'If it says the record was changed since you read it, nothing was changed: read it again with get_transaction, make your change on what it says now, and send it with the updated_at you read then (edited_at for an account or an item) and a NEW request_id.';
+
+/** send, for a change that names the version it last read (edit, void, make inactive). */
+async function sendVersioned(client, action, input, args) {
+  try {
+    return await send(client, action, input, args);
+  } catch (err) {
+    const e = /** @type {any} */ (err);
+    if (input.expectedUpdatedAt && e?.isIronbooksError === true && e.status === 409) throw new ToolError(`${sentence(e.message)} ${CHANGED_SINCE}`);
+    throw err;
+  }
+}
+
+/** The version the agent last read, in the app's name, when it gave one. */
+const versionOf = (/** @type {Record<string, any>} */ a) => (a.expected_updated_at ? { expectedUpdatedAt: a.expected_updated_at } : {});
+
+/**
+ * A read sent without a request id meets the door's request-id check only when the door would file
+ * it for a person (an Admin set that read to Ask): it asks for a request id, as a 400 VALIDATION,
+ * before anything is read (lib/agent/operate.ts change). A route's own 400 for the read looks the
+ * same, so the door is asked which it was, with the same read as a dry run: a read the door runs on
+ * its own is simply read again ('read', or the same error), while one it would put to a person is
+ * not tried at all ('dry_run'). So it is told by the door's outcome, never by the wording of its
+ * message, which may change. The cost: a route's own 400 (dates out of order, say) is read twice,
+ * and counts twice against the agent's calls per minute. It stays until the door gives its
+ * request-id check a code of its own, which the connector could then read instead.
+ * @param {unknown} err  what the read threw
+ * @param {() => Promise<any>} asDryRun  the same read, sent as a dry run
+ * @returns {Promise<any | null>} the dry run's answer: 'dry_run' (a person must approve this read),
+ *   or 'read' / 'refused' (answer with it). Null when `err` is something else: throw it as it is.
+ */
+export async function askedReadCheck(err, asDryRun) {
+  const e = /** @type {any} */ (err);
+  if (!e || e.isIronbooksError !== true || e.status !== 400 || e.code !== 'VALIDATION') return null;
+  let answer;
+  try {
+    answer = await asDryRun();
+  } catch {
+    return null;
+  }
+  return answer && typeof answer === 'object' && ['dry_run', 'read', 'refused'].includes(answer.outcome) ? answer : null;
 }
 
 /** A tool that enters one new record. `rename` maps tool fields whose app name is not the camelCase of theirs. */
@@ -265,7 +385,7 @@ function enterTool({ name, title, description, action, properties, required, ren
     destructive,
     inputSchema: schema(properties, required),
     handler: (args, client) => {
-      const { dry_run: _d, request_id: _r, ...rest } = args;
+      const { dry_run: _d, request_id: _r, reason: _why, ...rest } = args;
       const input = camelize(rest);
       for (const [from, to] of Object.entries(rename)) {
         if (input[from] !== undefined) {
@@ -631,12 +751,12 @@ const EDIT = [
     changes: true,
     destructive: false,
     description:
-      'Change a transaction that is already entered. Read it first (get_transaction), then send the whole record back with your changes and the updated_at you read. A change to amounts, accounts or the date voids the old posting and posts a new one; a journal entry edited that way comes back with a new id. Nothing on or before the closing date can be changed, and a transaction with payments applied or already reconciled may be refused.',
+      'Change a transaction that is already entered. Read it first (get_transaction), then send the whole record back with your changes and its updated_at as expected_updated_at. If someone changed it after you read it, Ironbooks answers 409 (conflict) and changes nothing: read it again and make your change on what it says now. A change to amounts, accounts or the date voids the old posting and posts a new one; a journal entry edited that way comes back with a new id. Nothing on or before the closing date can be changed, and a transaction with payments applied or already reconciled may be refused.',
     inputSchema: schema(
       { type: { type: 'string', enum: TRANSACTION_TYPES, description: 'What kind of transaction.' }, id: { ...ID, description: 'Its id.' }, expected_updated_at: EXPECTED, changes: CHANGES },
       ['type', 'id', 'changes'],
     ),
-    handler: (a, c) => send(c, `edit_${a.type}`, { id: a.id, ...(a.expected_updated_at ? { expectedUpdatedAt: a.expected_updated_at } : {}), changes: camelize(a.changes) }, a),
+    handler: (a, c) => sendVersioned(c, `edit_${a.type}`, { id: a.id, ...versionOf(a), changes: camelize(a.changes) }, a),
   },
   {
     name: 'void_transaction',
@@ -644,9 +764,9 @@ const EDIT = [
     changes: true,
     destructive: true,
     description:
-      'Void a transaction: it stays on the books with zero effect, and its number is kept. This is how a mistake is removed; nothing is ever deleted. An invoice or bill with payments applied must have those payments voided first. Nothing on or before the closing date can be voided.',
+      'Void a transaction: it stays on the books with zero effect, and its number is kept. This is how a mistake is removed; nothing is ever deleted. Send the updated_at you read (get_transaction) as expected_updated_at: if someone changed it since, Ironbooks answers 409 (conflict) and voids nothing, so read it again first. An invoice or bill with payments applied must have those payments voided first. Nothing on or before the closing date can be voided.',
     inputSchema: schema({ type: { type: 'string', enum: TRANSACTION_TYPES, description: 'What kind of transaction.' }, id: { ...ID, description: 'Its id.' }, expected_updated_at: EXPECTED }, ['type', 'id']),
-    handler: (a, c) => send(c, `void_${a.type}`, { id: a.id, ...(a.expected_updated_at ? { expectedUpdatedAt: a.expected_updated_at } : {}) }, a),
+    handler: (a, c) => sendVersioned(c, `void_${a.type}`, { id: a.id, ...versionOf(a) }, a),
   },
   {
     name: 'edit_list_entry',
@@ -654,7 +774,7 @@ const EDIT = [
     changes: true,
     destructive: false,
     description:
-      'Change a customer, vendor, account or item. Send only the fields that change, with the same names as the tool that adds that kind (add_customer, add_vendor, add_account, add_item).',
+      'Change a customer, vendor, account or item. Send only the fields that change, with the same names as the tool that adds that kind (add_customer, add_vendor, add_account, add_item), and the version you read (get_transaction: updated_at, or edited_at for an account or an item) as expected_updated_at. If someone changed it since, Ironbooks answers 409 (conflict) and changes nothing: read it again first.',
     inputSchema: schema(
       {
         type: { type: 'string', enum: LIST_TYPES, description: 'Which list.' },
@@ -675,7 +795,7 @@ const EDIT = [
         changes.qbType = changes.accountType;
         delete changes.accountType;
       }
-      return send(c, `edit_${a.type}`, { id: a.id, ...(a.expected_updated_at ? { expectedUpdatedAt: a.expected_updated_at } : {}), changes }, a);
+      return sendVersioned(c, `edit_${a.type}`, { id: a.id, ...versionOf(a), changes }, a);
     },
   },
   {
@@ -684,9 +804,10 @@ const EDIT = [
     changes: true,
     destructive: true,
     description:
-      'Make a customer, vendor, account, item or class inactive: it is hidden from lists and forms, and everything already entered with it stays as it is. Nothing is deleted. An account with a balance cannot be made inactive.',
+      'Make a customer, vendor, account, item or class inactive: it is hidden from lists and forms, and everything already entered with it stays as it is. Nothing is deleted. An account with a balance cannot be made inactive. Send the version you read (get_transaction: updated_at, or edited_at for an account or an item) as expected_updated_at: if someone changed it since, Ironbooks answers 409 (conflict) and changes nothing, so read it again first. A class has no version to check: for a class it is not sent.',
     inputSchema: schema({ type: { type: 'string', enum: [...LIST_TYPES, 'class'], description: 'Which list.' }, id: { ...ID, description: 'The entry\'s id.' }, expected_updated_at: EXPECTED }, ['type', 'id']),
-    handler: (a, c) => send(c, `deactivate_${a.type}`, a.type === 'class' ? { id: a.id } : { id: a.id, ...(a.expected_updated_at ? { expectedUpdatedAt: a.expected_updated_at } : {}) }, a),
+    // Making a class inactive takes no version (lib/agent/catalog.ts deactivate_class takes only the id).
+    handler: (a, c) => sendVersioned(c, `deactivate_${a.type}`, a.type === 'class' ? { id: a.id } : { id: a.id, ...versionOf(a) }, a),
   },
 ];
 
@@ -742,7 +863,7 @@ const READS = [
     name: 'get_transaction',
     title: 'Read one record in full',
     description:
-      'Read one transaction or list entry in full, with its lines: a journal entry, invoice, sales receipt, customer payment, bill, bill payment, check or charge, deposit, transfer, customer, vendor, account or item. Use it before edit_transaction, and keep the updated_at it returns to send back with your change.',
+      'Read one transaction or list entry in full, with its lines: a journal entry, invoice, sales receipt, customer payment, bill, bill payment, check or charge, deposit, transfer, customer, vendor, account or item. Use it before you edit, void or make inactive, and send the version it returns (updated_at; edited_at for an account or an item) as expected_updated_at with your change.',
     inputSchema: { type: 'object', additionalProperties: false, required: ['type', 'id'], properties: { type: { type: 'string', enum: Object.keys(READ_PATHS), description: 'What kind of record.' }, id: { ...ID, description: 'Its id.' } } },
     handler: async (a, c) => {
       const res = await c.get(`${READ_PATHS[a.type]}${a.id}`);

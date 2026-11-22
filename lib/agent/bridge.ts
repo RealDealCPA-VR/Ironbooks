@@ -39,21 +39,56 @@
  * caller's copy that differs from the registered one in anything but `activity` is a programming
  * error and throws.
  *
- * Secrets (plan 5.8): only on a commit, only from actor.secrets (typed by the approving person),
- * put in place by applySecrets (lib/agent/guards.ts). Never in a read or a dry run, never from the
- * agent's input (guardInput strips them, and nothing of the input ever becomes a header). The
- * headers they travel in are exactly SERVICE_SCOPE_SECRET_HEADERS (the closing-date password, and
- * the user name, password and recovery key that open a backup, a portable file or an Accountant's
- * Copy). The closing-date override is set only for a closing password that verifies, on a commit,
- * for an access that holds the closed-period right. Its guesses count against the one limiter of
- * that password (lib/closingPasswordLimiter.ts), so approvals cannot be used to try passwords.
+ * Secrets (plan 5.8): only from actor.secrets (typed by the approving person), put in place by
+ * applySecrets (lib/agent/guards.ts), never from the agent's input (guardInput strips them, and
+ * nothing of the input ever becomes a header). All of them on a commit; on a dry run only the
+ * closing-date password, so the rolled-back try an approval makes of closed-period work is judged
+ * on its real figures (nothing a dry run reads with it is protected: it only lets dates on or
+ * before the closing date through); never in a read. The headers they travel in are exactly
+ * SERVICE_SCOPE_SECRET_HEADERS (the closing-date password, and the user name, password and recovery
+ * key that open a backup, a portable file or an Accountant's Copy). A secret the route itself can do
+ * without (OPTIONAL_ROUTE_SECRETS: a backup made in this same file needs no sign-in) is not asked
+ * for before the route runs; the route says so if it needs it after all.
  *
- * The staleness key (plan §7.4) says what the run did and what it read: the versions of the records
- * the input names (read in the same transaction, before the handler runs), the ledger lines it
- * posts, the field values of every record it writes, and the emails, files and print jobs it asks
- * for. Values that differ on every run of the same request (new ids, times of the run) are left out,
- * so two runs over the same books agree, and a price, a rate or a named record changed in between
- * gives another key.
+ * The closing-date password the approver typed is checked ONCE, here, before the route runs, with
+ * the one limiter of that password (lib/closingPasswordLimiter.ts) under the approving person's own
+ * keys, read outside the scope: a wrong one refuses the run at once, whatever the work (a password
+ * typed on the card is taken as needed), a locked limiter refuses even the right one, so approvals
+ * cannot be used to try passwords. A right one sets the closing-date
+ * override for an access holding the closed-period right, and the scope is marked as having
+ * checked it, so Set Closing Date takes that same password as its current one without counting it
+ * a second time, in the scope's realm (lib/serviceScope.ts closingPasswordCheckedInScope).
+ *
+ * The staleness key (plan §7.4) covers the records the run reads and changes that existed before
+ * it: the versions of the records the input names (read in the same transaction, before the handler
+ * runs), the ledger lines it posts, the field values of every record it writes, and the emails,
+ * files and print jobs it asks for. What the run assigns to itself is left out: the next document
+ * or entry number it takes (and that number where its own text repeats it, "Invoice #1043"), every
+ * id that did not exist before the run, wherever it shows (a value, a source reference, a journal
+ * reference made of its first 8 hex digits), and the run's own times. Every other number and time
+ * stays (a reference the run copies, an account number, a date of a record that was there before).
+ * So two runs over the same books agree, two
+ * waiting requests that each take "the next number" do not make each other stale, a posting
+ * elsewhere that touches none of the request's records changes nothing, and a price, a rate or a
+ * named record changed in between gives another key.
+ *
+ * The handler's request also carries, besides the scope's headers:
+ *  - the version of the record the agent last read (OperationInput.expectedUpdatedAt), as
+ *    x-expected-updated-at, so the route's own withVersionCheck compares it inside the committing
+ *    transaction: a person's edit made in between answers 409, never an overwrite;
+ *  - this launch's pass (lib/net/launchPass.ts), only for a run a person approved at the host
+ *    computer's own window (actor.atHost), so a route that asks whether the request came from
+ *    the Ironbooks window here (lib/net/hostOnly.ts isRemoteRequest) answers yes, as it would for
+ *    that person. Only on the handler's own request object, in memory for that one run: never in
+ *    the scope's header set, never stored, never in anything the agent is answered.
+ *
+ * A dry run sent with confirmation flags is first tried without them, in a savepoint that is rolled
+ * back, so the warnings those flags accept are in its preview (preview.warnings): the person
+ * approving it reads the question they would have answered in the window (plan §5.6).
+ *
+ * No agent may change or delete a role any agent holds (plan §4.6, D9): such a run is refused
+ * here, on every way in (a dry run, a run, a run under standing permission, an approved run), and
+ * however the role's id is written (upper case, braces or no hyphens name the same role).
  *
  * Files an operation saves (effects.writeFile) must land inside one of the agent's folders
  * (lib/agent/files.ts allowedFolder): the folder itself, or, when it does not exist yet, its
@@ -82,11 +117,16 @@
  * entries that existed and that it voids, deletes or changes in place (touchedEntries): both are
  * shown in the ledger preview, and counted when the run moves their money (a void, a delete, lines
  * rewritten, a draft posted; not a new title, number or link), so voiding a $50,000 check is a
- * $50,000 request. See factsFor for the rules, "0.00" for a run that moves no entry included.
+ * $50,000 request, and voiding it while posting an unrelated $50,000 is $100,000 (with an amount
+ * field or without; an edit that voids and re-posts its own document counts once). See factsFor for
+ * the rules: "0.00" for a run that only makes new records and moves no entry, unknown for one that
+ * voids, deletes or edits a record that existed and touches no entry (its money cannot be seen).
  *
  * The preview is read by the agent as well as the approver, so its ledger memos, descriptions and
  * field values hide what the run's own answer would: account numbers in memo or description text
- * are masked (shownText, lib/services/journal.ts lineMemoFor) unless a reveal was approved.
+ * are masked (shownText, lib/services/journal.ts lineMemoFor) unless a reveal was approved. Each
+ * ledger line names who it is for (the customer, vendor, employee or other name: whose A/R or A/P
+ * it is) and its class (NamedPostingLine), masked the same way.
  */
 import { createHash } from 'node:crypto';
 import { promises as fsp, type Stats } from 'node:fs';
@@ -134,6 +174,7 @@ import { limitClosingPasswordGuess } from '@/lib/closingPasswordLimiter';
 import { currentEffects, effectsOfFailedRun, pinFile, runWithEffects, type EffectReport, type EffectsMode, type EffectsRun } from '@/lib/effects';
 import { featureOffError } from '@/lib/featureGate';
 import { Money, toAmountString } from '@/lib/money';
+import { LAUNCH_PASS_HEADER, expectedLaunchPass } from '@/lib/net/launchPass';
 import { blockingFeatureGate, resolveCompanyPreferences } from '@/lib/preferences';
 import { authorizeRequest } from '@/lib/permissions/enforce';
 import { isSecretKey, maskSensitive } from '@/lib/permissions/mask';
@@ -143,14 +184,14 @@ import { assertAccountantCopyAllowsPath } from '@/lib/services/accountantCopy/ro
 import { AGENTS_BLOCKED_MESSAGE } from '@/lib/services/agents';
 import { useGrant } from '@/lib/services/agentGrants';
 import { verifyClosingDatePassword } from '@/lib/services/company';
-import { VERSIONED_ENTITIES, versionField, type VersionedEntity } from '@/lib/services/concurrency';
+import { EXPECTED_VERSION_HEADER, VERSIONED_ENTITIES, versionField, type VersionedEntity } from '@/lib/services/concurrency';
 import { getFileLockStatus } from '@/lib/services/fileLock';
-import { lineMemoFor } from '@/lib/services/journal';
+import { lineMemoFor, resolveEntityNames } from '@/lib/services/journal';
 import { assertPasswordChangeNotRequired } from '@/lib/services/passwordPolicy';
 import { isSandboxActive } from '@/lib/services/sandboxState';
 import { getSingleUserMode } from '@/lib/services/sessions';
 import { ServiceError, translateLedgerDbError, type ServiceContext } from '@/lib/services/_base';
-import { changesInTransaction, type ChangePreview, type PostingEntry } from './actions';
+import { changesInTransaction, type ChangePreview, type PostingEntry, type PostingLine } from './actions';
 import {
   BRIDGE_REPORT_TIME_LIMIT_MS,
   BRIDGE_TIME_LIMIT_MS,
@@ -520,30 +561,148 @@ async function settleGates(
   return { closingDate: typeof settings.closingDate === 'string' ? settings.closingDate : null };
 }
 
+/** What the closing-date password the approving person typed does for this run. */
+interface ClosingCheck {
+  /** The closing-date override: the password is right, and the access holds the closed-period right. */
+  override: boolean;
+  /** It was checked here and is right: the scope says so, and the route does not count it again. */
+  checked: boolean;
+}
+
+/** Said when the closing-date password typed on the approval card is not the right one. */
+export const CLOSING_PASSWORD_WRONG_MESSAGE =
+  'The closing-date password typed on the approval card is not correct, so nothing was done. The request has to be sent again and approved with the right password.';
+
 /**
- * The closing-date override of a commit: only for an access holding the closed-period right, and
- * only for a closing password the approving person typed that verifies. Every guess goes through
- * the one limiter of the closing-date password (lib/closingPasswordLimiter.ts: the same keys as
- * the person's own x-closing-password and Set Closing Date), so an approver without the password
+ * The closing-date password the approving person typed, checked once, before the route runs (a dry
+ * run or a commit; a read never gets one). Every guess goes through the one limiter of the
+ * closing-date password (lib/closingPasswordLimiter.ts) under the approving person's own keys: the
+ * request the bridge runs in, read here, outside the scope, the same keys as that person's own
+ * x-closing-password and Set Closing Date in their window. So an approver without the password
  * cannot use approvals to try passwords until one works, nor spread guesses over the ways in. A
- * locked limiter refuses the run before anything runs. The guess is counted against the request
- * the bridge runs in (the approving person's), read here, outside the scope.
+ * locked limiter refuses even the right one. A right one sets the override only for an access that
+ * holds the closed-period right; either way the route takes it without counting it again.
+ *
+ * A wrong one refuses the run at once: the route never runs and nothing hashes it a second time.
+ * A password typed on the card is always taken as needed: the card shows the box only when it asks
+ * for one, and whether the work needs it cannot always be told before it runs (a void sent with
+ * only the record's id, of a record dated in the closed period), so the person is told the true
+ * reason, never the route's closed-period words after a wrong password was dropped.
  */
-async function closingOverride(
+async function closingPasswordCheck(
   db: DB,
   companyId: string,
   actor: BridgeActor,
   access: EffectiveAccess,
   mode: BridgeMode,
-): Promise<boolean | { refusal: BridgeError }> {
+): Promise<ClosingCheck | { refusal: BridgeError }> {
+  const none: ClosingCheck = { override: false, checked: false };
   const supplied = secretValue(actor.secrets, 'closing_password');
-  if (mode !== 'commit' || access.flags.closedPeriod !== true || supplied === null) return false;
+  if (mode === 'read' || supplied === null) return none;
+  let right: boolean;
   try {
-    return await limitClosingPasswordGuess({ companyId, userId: actor.userId }, () => verifyClosingDatePassword(db, companyId, supplied));
+    right = await limitClosingPasswordGuess({ companyId, userId: actor.userId }, () => verifyClosingDatePassword(db, companyId, supplied));
   } catch (err) {
     if (err instanceof ServiceError) return { refusal: serviceErrorAsBridgeError(err) };
     throw err;
   }
+  if (!right) return { refusal: { message: CLOSING_PASSWORD_WRONG_MESSAGE, code: 'FORBIDDEN', details: { closingPassword: 'wrong' } } };
+  return { override: access.flags.closedPeriod === true, checked: true };
+}
+
+/**
+ * Secrets a route goes ahead without when none was typed (ApprovalNeeds.optionalSecrets, wave 4).
+ * The sign-in of another company file, for a backup or an archive sealed with that file's key: a
+ * backup made in this same file needs none (lib/net/archiveCredentials.ts reads the headers only
+ * when they are there), so an approval without it is right, and the route answers in its own words
+ * when it does need one. Every other secret a route lists, it always needs: a commit without it is
+ * refused before anything runs.
+ */
+const OPTIONAL_ROUTE_SECRETS: readonly SecretKind[] = ['archive_credentials'];
+
+/**
+ * A run a person approved at the host computer's own window: the approver is the actor's person,
+ * and the approval names them. Only then does the handler's request carry this launch's pass.
+ */
+function approvedAtHost(actor: BridgeActor): boolean {
+  return actor.atHost === true && typeof actor.userId === 'string' && actor.userId.length > 0 && actor.approval?.approvedBy === actor.userId;
+}
+
+/** Longest version text sent on (an ISO time is 24 characters). */
+const MAX_VERSION_LENGTH = 40;
+
+/**
+ * OperationInput.expectedUpdatedAt, the version of the record the agent last read, as the route's
+ * record locking reads it (lib/services/concurrency.ts expectedVersion): a time Date can read, sent
+ * as given. Taken from the input the bridge was handed (guardInput keeps only what it knows), and
+ * checked here: it is text that becomes a header, so only the characters a time is written with.
+ */
+function expectedVersionOf(input: OperationInput): { value: string | null } | { error: string } {
+  const v = (input as { expectedUpdatedAt?: unknown }).expectedUpdatedAt;
+  if (v === undefined || v === null || v === '') return { value: null };
+  const s = typeof v === 'string' ? v.trim() : '';
+  if (!s || s.length > MAX_VERSION_LENGTH || !/^[0-9TZ:.+\- ]+$/.test(s) || !Number.isFinite(Date.parse(s))) {
+    return { error: 'Send expectedUpdatedAt as the record\'s updatedAt exactly as Ironbooks answered it (for example "2026-11-22T14:05:09.123Z"), or leave it out.' };
+  }
+  return { value: s };
+}
+
+/**
+ * A role key as the held-role check compares it: lower case, and a uuid without its braces and
+ * hyphens. The role route reads the id as a Postgres uuid, which takes upper case, braces and
+ * missing hyphens alike ("{0A1B…}" and "0a1b…" name the same role), so the check must not tell
+ * them apart either. The SQL in heldRoleRefusal reads the stored keys the same way.
+ */
+function roleKeyForm(key: string): string {
+  const text = key.trim().toLowerCase();
+  const hex = text.replace(/[{}-]/g, '');
+  return /^[0-9a-f]{32}$/.test(hex) ? hex : text;
+}
+
+/** The canonical uuid text of a role key in roleKeyForm, or null when it is not a uuid. */
+function canonicalUuidOf(form: string): string | null {
+  if (!/^[0-9a-f]{32}$/.test(form)) return null;
+  return `${form.slice(0, 8)}-${form.slice(8, 12)}-${form.slice(12, 16)}-${form.slice(16, 20)}-${form.slice(20)}`;
+}
+
+/**
+ * No agent may change or delete a role that any agent holds (plan §4.6, D9): changing it would
+ * change what that agent, perhaps the very one asking, may do. A hard-floor refusal on every way
+ * in, whatever the approval: the role editor of Users & Roles (PATCH, PUT or DELETE /api/roles/[id])
+ * naming a role in any agent's roleKeys, however the id is written (roleKeyForm). Null when the
+ * run may go on.
+ */
+async function heldRoleRefusal(db: DB, companyId: string, operation: Operation, params: RouteParams): Promise<BridgeError | null> {
+  if (operation.route !== '/api/roles/[id]' || operation.method === 'GET') return null;
+  const key = typeof params.id === 'string' ? params.id : '';
+  if (!key.trim()) return null;
+  const form = roleKeyForm(key);
+  const res = (await db.execute(sql`
+    SELECT count(*)::int AS n
+      FROM agents a
+     WHERE a.company_id = ${companyId}
+       AND EXISTS (
+             SELECT 1
+               FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(a.role_keys) = 'array' THEN a.role_keys ELSE '[]'::jsonb END) AS k(v)
+              WHERE CASE WHEN regexp_replace(lower(btrim(k.v)), '[{}-]', '', 'g') ~ '^[0-9a-f]{32}$'
+                         THEN regexp_replace(lower(btrim(k.v)), '[{}-]', '', 'g')
+                         ELSE lower(btrim(k.v)) END = ${form})`)) as unknown as {
+    rows: Array<{ n: number }>;
+  };
+  if (!(Number(res.rows[0]?.n ?? 0) > 0)) return null;
+  const canonical = canonicalUuidOf(form);
+  let name = canonical ?? key;
+  if (canonical) {
+    const role = (await db.execute(sql`SELECT name FROM company_roles WHERE id = ${canonical}::uuid AND company_id = ${companyId}`)) as unknown as {
+      rows: Array<{ name: string | null }>;
+    };
+    name = role.rows[0]?.name?.trim() || canonical;
+  }
+  return {
+    message: `No agent may change or delete the role "${name}": an agent holds it. A person can change it in Users & Roles.`,
+    code: 'FORBIDDEN',
+    details: { hardFloor: true, roleHeldByAgent: canonical ?? key },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -705,9 +864,21 @@ interface BuiltRequest {
   scopeHeaders: Record<string, string>;
 }
 
+/** What the handler's request carries besides the input and the secrets. */
+interface RequestExtras {
+  /** The version of the record the agent last read (x-expected-updated-at), or null. */
+  expectedVersion: string | null;
+  /**
+   * This launch's pass, for a run a person approved at the host's own window (approvedAtHost), or
+   * null. On the handler's request only, never in the scope's header set.
+   */
+  hostPass: string | null;
+}
+
 /**
  * The NextRequest for http://127.0.0.1<path>?<query>: the method, the body in the operation's own
- * kind, confirmation flags set, files in place, and only headers in SERVICE_SCOPE_HEADERS.
+ * kind, confirmation flags set, files in place, and only headers in SERVICE_SCOPE_HEADERS, but for
+ * the launch pass of an approval at the host (RequestExtras.hostPass), which the scope never sees.
  */
 async function buildRequest(
   operation: Operation,
@@ -715,6 +886,7 @@ async function buildRequest(
   input: OperationInput,
   owner: FileOwner,
   secretHeaders: Record<string, string>,
+  extras: RequestExtras = { expectedVersion: null, hostPass: null },
 ): Promise<BuiltRequest> {
   const query = buildQuery(input.query);
   if ('error' in query) throw new BridgeRefusal(query.error, 'VALIDATION');
@@ -722,6 +894,7 @@ async function buildRequest(
   const method = operation.method;
   const canHaveBody = method !== 'GET';
   const headers: Record<string, string> = { accept: 'application/json, */*;q=0.8' };
+  if (extras.expectedVersion) headers[EXPECTED_VERSION_HEADER] = extras.expectedVersion;
   // Only the secrets the scope carries (the closing-date password, a backup's or a copy's user
   // name, password and recovery key), and only as applySecrets put them from what the approving
   // person typed: nothing of the agent's input ever becomes a header.
@@ -794,16 +967,53 @@ async function buildRequest(
   // Flags the body cannot carry (no JSON or form body) go in the query, where such routes read them.
   if (kind !== 'json' && kind !== 'multipart') for (const f of flags) query.set(f, 'true');
 
+  // Approved at the host's own window: the route's own "is this the Ironbooks window here?" check
+  // (lib/net/requestInfo.ts originFromHeaders on req.headers) answers yes, as it would for that
+  // person. Left out of the scope's set below, so getRequestOrigin() inside the scope stays an
+  // agent's and no helper that reads the scope's headers ever sees the pass.
+  const hostPass = extras.hostPass ? extras.hostPass : null;
+  if (hostPass) headers[LAUNCH_PASS_HEADER] = hostPass;
+
   const qs = query.toString();
   const req = new NextRequest(`http://127.0.0.1${path}${qs ? `?${qs}` : ''}`, { method, headers, ...(body !== null ? { body } : {}) });
   // The scope's own set: what the handler's request carries (a form's boundary included).
   const scopeHeaders: Record<string, string> = {};
   for (const [name, value] of req.headers) {
+    if (hostPass && name === LAUNCH_PASS_HEADER) continue;
     // Never reached: every name above is from the list. A guard against a later edit here.
     if (!SERVICE_SCOPE_HEADERS.includes(name)) throw new Error(`The route bridge built a request with the header "${name}".`);
     scopeHeaders[name] = value;
   }
   return { req, scopeHeaders };
+}
+
+/**
+ * A copy of the input without these confirmation flags, wherever the agent put them: the list in
+ * `confirm`, the body at the flag's dotted path (guardInput leaves a listed flag the agent wrote
+ * into a body where it was), a form field, a query name. For the try without them (withheldWarnings).
+ */
+function withoutFlags(input: OperationInput, flags: readonly string[], kind: Operation['body']): OperationInput {
+  const out: OperationInput = { ...input, confirm: (input.confirm ?? []).filter((f) => !flags.includes(f)) };
+  if (isObject(input.query)) {
+    const q: Record<string, string | string[]> = { ...(input.query as Record<string, string | string[]>) };
+    for (const f of flags) delete q[f];
+    out.query = q;
+  }
+  if (kind === 'json' && isObject(input.body)) {
+    const body = JSON.parse(JSON.stringify(input.body)) as Record<string, unknown>;
+    for (const f of flags) {
+      const segs = f.split('.');
+      let at: unknown = body;
+      for (const s of segs.slice(0, -1)) at = isObject(at) ? at[s] : undefined;
+      if (isObject(at)) delete at[segs[segs.length - 1]];
+    }
+    out.body = body;
+  } else if (kind === 'multipart' && isObject(input.body) && isObject(input.body.fields)) {
+    const fields = { ...(input.body.fields as Record<string, unknown>) };
+    for (const f of flags) delete fields[f];
+    out.body = { ...input.body, fields };
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,6 +1553,8 @@ async function touchedEntries(
     SELECT je.id::text AS id, je.entry_number, je.date::text AS date, je.description, je.status::text AS status, je.source_ref,
            (je.voided_at IS NOT NULL AND je.voided_at >= date_trunc('milliseconds', now() AT TIME ZONE 'UTC')) AS voided_now,
            (je.deleted_at IS NOT NULL AND je.deleted_at >= date_trunc('milliseconds', now() AT TIME ZONE 'UTC')) AS deleted_now,
+           ${writtenHere('je')} AS own_row,
+           EXISTS (SELECT 1 FROM journal_entry_lines l WHERE l.journal_entry_id = je.id AND ${writtenHere('l')}) AS own_lines,
            coalesce((SELECT sum(l.debit) FROM journal_entry_lines l WHERE l.journal_entry_id = je.id), 0)::text AS total
       FROM journal_entries je
      WHERE je.company_id = ${ctx.companyId} AND je.id = ANY(${list})`)) as unknown as {
@@ -1355,6 +1567,8 @@ async function touchedEntries(
       source_ref: string | null;
       voided_now: boolean;
       deleted_now: boolean;
+      own_row: boolean;
+      own_lines: boolean;
       total: string;
     }>;
   };
@@ -1364,6 +1578,9 @@ async function touchedEntries(
   for (const r of found.rows) {
     const key = r.id.toLowerCase();
     const did = actions(key);
+    // Named only by an audit row of the run (a credit applied against it, say), but neither the
+    // entry nor any of its lines was written: it is as it was, so it is not shown as changed.
+    if (!r.own_row && !r.own_lines && !r.voided_now && !r.deleted_now) continue;
     const how: TouchedHow = did.has('delete') || r.deleted_now ? 'deleted' : did.has('void') || r.voided_now ? 'voided' : 'changed';
     // A draft before the run (null: not known, so it may have been).
     const wasDraft = drafts === null ? null : drafts.has(key);
@@ -1419,30 +1636,47 @@ async function touchedEntries(
 async function touchedPreview(ctx: ServiceContext, touched: readonly TouchedEntry[], audit: readonly AuditRow[], limit: number): Promise<PostingEntry[]> {
   const shown = touched.slice(0, Math.max(0, limit));
   if (!shown.length) return [];
-  const lines = new Map<string, PostingEntry['lines']>();
+  /** Each line with the name and class it carries (named below). */
+  const lines = new Map<string, Array<{ line: NamedPostingLine; ref: LineRef }>>();
   const live = shown.filter((t) => t.status !== 'deleted').map((t) => t.id.toLowerCase());
   if (live.length) {
     const list = sql.raw(`ARRAY[${live.map((id) => `'${id}'`).join(',')}]::uuid[]`);
     const res = (await ctx.db.execute(sql`
       SELECT l.journal_entry_id::text AS id, l.account_id::text AS account_id, a.code AS account_code, a.name AS account_name,
-             l.debit::text AS debit, l.credit::text AS credit, l.memo
+             l.debit::text AS debit, l.credit::text AS credit, l.memo, l.entity_type, l.entity_id::text AS entity_id, l.class_id::text AS class_id
         FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
        WHERE l.journal_entry_id = ANY(${list})
        ORDER BY (l.debit IS NULL OR l.debit = 0), l.id`)) as unknown as {
-      rows: Array<{ id: string; account_id: string; account_code: string | null; account_name: string; debit: string | null; credit: string | null; memo: string | null }>;
+      rows: Array<{
+        id: string;
+        account_id: string;
+        account_code: string | null;
+        account_name: string;
+        debit: string | null;
+        credit: string | null;
+        memo: string | null;
+        entity_type: string | null;
+        entity_id: string | null;
+        class_id: string | null;
+      }>;
     };
     for (const r of res.rows) {
       const k = r.id.toLowerCase();
       lines.set(k, [
         ...(lines.get(k) ?? []),
         {
-          accountId: r.account_id,
-          accountCode: r.account_code,
-          accountName: r.account_name,
-          debit: lineAmount(r.debit),
-          credit: lineAmount(r.credit),
-          memo: shownText(ctx, r.memo),
-          entityName: null,
+          line: {
+            accountId: r.account_id,
+            accountCode: r.account_code,
+            accountName: r.account_name,
+            debit: lineAmount(r.debit),
+            credit: lineAmount(r.credit),
+            memo: shownText(ctx, r.memo),
+            entityName: null,
+            entityType: r.entity_type,
+            className: null,
+          },
+          ref: { entityType: r.entity_type, entityId: r.entity_id, classId: r.class_id },
         },
       ]);
     }
@@ -1465,24 +1699,33 @@ async function touchedPreview(ctx: ServiceContext, touched: readonly TouchedEntr
     };
     for (const r of res.rows) names.set(r.id.toLowerCase(), { code: r.code, name: r.name });
   }
+  const textOf = (v: unknown) => (typeof v === 'string' && v ? v : null);
   for (const [id, kept] of goneLines) {
     lines.set(
       id,
       kept.map((l) => {
         const acct = typeof l.accountId === 'string' ? l.accountId : '';
         const named = names.get(acct.toLowerCase());
+        const entityType = textOf(l.entityType);
         return {
-          accountId: acct,
-          accountCode: named?.code ?? null,
-          accountName: named?.name ?? 'An account',
-          debit: lineAmount(l.debit),
-          credit: lineAmount(l.credit),
-          memo: shownText(ctx, typeof l.memo === 'string' ? l.memo : null),
-          entityName: null,
+          line: {
+            accountId: acct,
+            accountCode: named?.code ?? null,
+            accountName: named?.name ?? 'An account',
+            debit: lineAmount(l.debit),
+            credit: lineAmount(l.credit),
+            memo: shownText(ctx, typeof l.memo === 'string' ? l.memo : null),
+            entityName: null,
+            entityType,
+            className: null,
+          },
+          ref: { entityType, entityId: textOf(l.entityId), classId: textOf(l.classId) },
         };
       }),
     );
   }
+  const all = [...lines.values()].flat();
+  await nameLines(ctx, all);
   return shown.map((t): TouchedPostingEntry => ({
     journalEntryId: t.id,
     entryNumber: t.entryNumber,
@@ -1490,9 +1733,52 @@ async function touchedPreview(ctx: ServiceContext, touched: readonly TouchedEntr
     description: t.description ? `${TOUCHED_WORDS[t.how]}: ${shownText(ctx, t.description)}` : TOUCHED_WORDS[t.how],
     status: t.status,
     source: t.source,
-    lines: lines.get(t.id.toLowerCase()) ?? [],
+    lines: (lines.get(t.id.toLowerCase()) ?? []).map((l) => l.line),
     touched: t.how,
   }));
+}
+
+/** Who a ledger line is for, and its class, as the journal lines hold them. */
+interface LineRef {
+  entityType: string | null;
+  entityId: string | null;
+  classId: string | null;
+}
+
+/**
+ * A ledger line of a preview with who it is for and its class, so a person approving it sees whose
+ * receivable or payable it is (the customer, vendor, employee or other name), not only the account.
+ * actions.ts PostingLine carries the name; the bridge adds the kind of name (entityType: customer,
+ * vendor, employee, other) and the class. Masked like every other text of the preview (shownText).
+ */
+export type NamedPostingLine = PostingLine & { entityType: string | null; className: string | null };
+
+/**
+ * Fill in the name and the class of each line from the ids its row holds (lib/services/journal.ts
+ * resolveEntityNames, the names every journal screen shows), as this run may show them. A line that
+ * already has a name or a class keeps it.
+ */
+async function nameLines(ctx: ServiceContext, lines: ReadonlyArray<{ line: NamedPostingLine; ref: LineRef }>): Promise<void> {
+  const refs = lines.map((l) => l.ref).filter((r) => r.entityType && r.entityId && UUID.test(r.entityId));
+  const names = refs.length ? await resolveEntityNames(ctx, refs) : new Map<string, string>();
+  const classIds = [...new Set(lines.map((l) => (l.ref.classId ?? '').toLowerCase()).filter((id) => UUID.test(id)))];
+  const classNames = new Map<string, string>();
+  if (classIds.length) {
+    // Every id passed the UUID pattern (hex digits and dashes only), so it can be written in place.
+    const list = sql.raw(`ARRAY[${classIds.map((id) => `'${id}'`).join(',')}]::uuid[]`);
+    const res = (await ctx.db.execute(sql`
+      SELECT id::text AS id, name FROM classes WHERE company_id = ${ctx.companyId} AND id = ANY(${list})`)) as unknown as {
+      rows: Array<{ id: string; name: string | null }>;
+    };
+    for (const r of res.rows) if (r.name) classNames.set(r.id.toLowerCase(), r.name);
+  }
+  for (const { line, ref } of lines) {
+    if (!line.entityName && ref.entityType && ref.entityId) line.entityName = names.get(`${ref.entityType}:${ref.entityId.toLowerCase()}`) ?? null;
+    if (!line.className && ref.classId) line.className = classNames.get(ref.classId.toLowerCase()) ?? null;
+    if (line.entityType === undefined || line.entityType === null) line.entityType = ref.entityType ?? null;
+    line.entityName = shownText(ctx, line.entityName);
+    line.className = shownText(ctx, line.className);
+  }
 }
 
 /**
@@ -1509,29 +1795,65 @@ interface LedgerTotals {
   /** The largest single entry it made, or whose money it moved (TouchedEntry.counted). */
   largest: string | null;
   /**
-   * All of it: the entries made, added up, or the counted ones it voided, deleted or changed, added
-   * up, whichever is larger. Not both: an edit that re-posts (voids the old entry, posts the new
-   * one) would otherwise count twice.
+   * All of it: the entries made and the counted ones it voided, deleted or changed, added up. An
+   * edit that re-posts a document (voids or deletes its old entry and posts the new one, both under
+   * the document's source reference, "bill:<id>") counts once, at the larger of the two, not twice;
+   * everything else adds up, so voiding $100,000 and posting an unrelated $100,000 is $200,000.
    */
   sum: string | null;
+  /**
+   * The run both takes money out of the books (an entry it voids, deletes or rewrites, counted)
+   * and posts new entries for something else: a made entry no counted one shares a document with,
+   * and a counted one no made entry shares a document with. Then both sides count (`sum`), also
+   * for an operation with an amount field; an edit that re-posts its own document is not mixed.
+   */
+  mixed: boolean;
   /** A touched entry's total cannot be known: the amount is unknown. */
   unknown: boolean;
+  /**
+   * The run voided, deleted or changed a record that existed before it (an audit row other than
+   * 'create', of a record it did not make). With no entry made or touched, its money cannot be seen
+   * (voiding a payroll adjustment that never posted still takes it off the W-2): unknown, never 0.00.
+   */
+  editsExisting: boolean;
 }
 
-function ledgerTotals(rows: readonly LedgerRow[], touched: readonly TouchedEntry[]): LedgerTotals {
-  const made = new Map<string, ReturnType<typeof Money.zero>>();
-  for (const r of rows) made.set(r.entry_id, Money.add(made.get(r.entry_id) ?? Money.zero(), r.debit));
-  const moved = touched.filter((t) => t.counted !== null).map((t) => Money.of(t.counted));
-  let largest: ReturnType<typeof Money.zero> | null = null;
-  for (const t of [...made.values(), ...moved]) if (largest === null || t.greaterThan(largest)) largest = t;
-  const sumMade = Money.add(...made.values());
-  const sumMoved = Money.add(...moved);
+function ledgerTotals(rows: readonly LedgerRow[], touched: readonly TouchedEntry[], editsExisting: boolean): LedgerTotals {
+  type Amount = ReturnType<typeof Money.zero>;
+  const sourceOf = (s: string | null) => (s && s.trim() ? s.trim().toLowerCase() : null);
+  const made = new Map<string, { total: Amount; source: string | null }>();
+  for (const r of rows) {
+    const e = made.get(r.entry_id);
+    made.set(r.entry_id, { total: Money.add(e?.total ?? Money.zero(), r.debit), source: e?.source ?? sourceOf(r.source_ref) });
+  }
+  const moved = touched.filter((t) => t.counted !== null).map((t) => ({ total: Money.of(t.counted), source: sourceOf(t.source) }));
+  let largest: Amount | null = null;
+  for (const t of [...[...made.values()].map((m) => m.total), ...moved.map((m) => m.total)]) if (largest === null || t.greaterThan(largest)) largest = t;
+  // By document: what it posts and what it takes out, the larger of the two (an edit re-posting it).
+  const bySource = new Map<string, { made: Amount; moved: Amount }>();
+  let sum: Amount = Money.zero();
+  for (const m of made.values()) {
+    if (m.source === null) sum = Money.add(sum, m.total);
+    else bySource.set(m.source, { made: Money.add(bySource.get(m.source)?.made ?? Money.zero(), m.total), moved: bySource.get(m.source)?.moved ?? Money.zero() });
+  }
+  for (const m of moved) {
+    if (m.source === null) sum = Money.add(sum, m.total);
+    else bySource.set(m.source, { made: bySource.get(m.source)?.made ?? Money.zero(), moved: Money.add(bySource.get(m.source)?.moved ?? Money.zero(), m.total) });
+  }
+  for (const g of bySource.values()) sum = Money.add(sum, g.made.greaterThan(g.moved) ? g.made : g.moved);
+  // An entry with no source reference shares a document with nothing.
+  const madeSources = new Set([...made.values()].map((m) => m.source).filter((s): s is string => s !== null));
+  const movedSources = new Set(moved.map((m) => m.source).filter((s): s is string => s !== null));
+  const mixed =
+    [...made.values()].some((m) => m.source === null || !movedSources.has(m.source)) && moved.some((m) => m.source === null || !madeSources.has(m.source));
   const any = made.size > 0 || touched.length > 0;
   return {
     any,
     largest: largest === null ? null : toAmountString(largest),
-    sum: any ? toAmountString(sumMade.greaterThan(sumMoved) ? sumMade : sumMoved) : null,
+    sum: any ? toAmountString(sum) : null,
+    mixed,
     unknown: touched.some((t) => t.unknown),
+    editsExisting,
   };
 }
 
@@ -1616,24 +1938,451 @@ async function versionsOf(db: DB, companyId: string, ids: readonly string[]): Pr
   return res.rows.map((r) => `${r.kind}:${r.id}:${r.v ?? ''}`).sort();
 }
 
+// --- What the run assigns to itself -----------------------------------------------------------
+//
+// The key covers the records the run reads and changes that existed before it. What the run
+// assigns to itself differs on every run of the same request, or moves whenever anyone else posts
+// or numbers something, so it is left out, everywhere it shows:
+//  - every id that did not exist before the run (runIdsOf): written "new:<kinds>", whole, inside a
+//    value ("bill:<id>"), or cut to its first 8 hex digits (a paycheck's journal reference);
+//  - the numbers it takes for itself on what it makes (OWN_NUMBER_KEYS: the next estimate, purchase
+//    order, invoice, sales receipt, credit memo, sales order, transfer, payment, check or journal
+//    entry number, read from the audit rows and the rows of what it makes, and a General Journal
+//    entry's Entry No.), and those numbers where the text of what it makes repeats them ("Invoice
+//    #1043", the reference of the check's own entry). Every other number stays: an account,
+//    routing, tax, serial or lot number, a bill number, a journal reference the run copied;
+//  - times: a key ending in At; a moment of the run itself (from the start of its transaction to
+//    the end), wherever it shows; and on what the run makes, a moment is read as its day only
+//    (a due date the run works out from today). A moment of a record that was there before, from
+//    before the run, stays as it is.
+
+/** A whole value that is a moment (an ISO date and time). */
+const MOMENT = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}(?::?\d{2})?)?$/;
+
+/** A moment's zone, when it gives one (a database timestamp without a zone is UTC wall time here). */
+const MOMENT_ZONE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
+
+/** Slack on each side of the run's own time span, for the two clocks (database and app). */
+const RUN_SPAN_SLACK_MS = 1000;
+
 /**
- * A value as the key reads it: the record ids made by this run become "new:<kind>" (they are new on
- * every run), and keys that hold an id of a record's own row ("id"), the time of a change ("…At"),
- * or a secret are left out. References to records that already existed stay as they are.
+ * Keys of a record the run makes that hold a number it takes for itself (lib/services/docNumbers.ts
+ * allocateDocNumber, lib/services/checkNumbers.ts allocateCheckNumber, posting's next entry number),
+ * or one the agent gave (left out too: the input is the same on every run). A check's number is its
+ * `reference` (expenses, bill payments, liability checks); the reference of an entry the run makes
+ * is not read here but through the ledger part of the key (keyText), where only the numbers taken
+ * here and the run's own id prefixes go. Listed one by one, so a number the run copies from
+ * somewhere else (an account or routing number, a serial or lot number) stays in the key.
  */
-function keyValue(v: unknown, created: ReadonlyMap<string, string>, depth = 0): unknown {
-  if (typeof v === 'string') return v.replace(UUID_IN_TEXT, (m) => created.get(m.toLowerCase()) ?? m.toLowerCase());
+const OWN_NUMBER_KEYS: ReadonlySet<string> = new Set([
+  'number',
+  'docNumber',
+  'doc_number',
+  'refNumber',
+  'ref_number',
+  'entryNumber',
+  'entry_number',
+  'estimateNumber',
+  'estimate_number',
+  'invoiceNumber',
+  'invoice_number',
+  'receiptNumber',
+  'receipt_number',
+  'memoNumber',
+  'memo_number',
+  'orderNumber',
+  'order_number',
+  'poNumber',
+  'po_number',
+  'transferNumber',
+  'transfer_number',
+  'paymentNumber',
+  'payment_number',
+  'checkNumber',
+  'check_number',
+  'checkNo',
+  'reference',
+]);
+
+/** Keys of free text where a record or an entry the run makes may repeat its own number. */
+const OWN_TEXT_KEY = /(?:memo|description|reference|source|sourceRef|source_ref|notes?|title|subject|name|attachments)$/i;
+
+/** Longest number kept as one the run took (a document number is at most 50 characters). */
+const MAX_OWN_NUMBER = 50;
+
+/** An 8-hex-digit token standing alone (not part of a longer id or word): perhaps a new id cut short. */
+const HEX8_TOKEN = /(^|[^0-9a-z-])([0-9a-f]{8})(?![0-9a-z-])/gi;
+
+/** What a value is read through for the key. */
+interface KeyRules {
+  /** Each id the run made (lower case), as the key writes it: "new:<kinds>". */
+  made: ReadonlyMap<string, string>;
+  /** The first 8 hex digits of each id the run made, as the key writes that id. */
+  prefixes: ReadonlyMap<string, string>;
+  /** The numbers the run took for itself, longest first. */
+  numbers: readonly string[];
+  /** The run's own time span (milliseconds since 1970): from its transaction's start to now. */
+  span: { from: number; to: number };
+}
+
+/** How the key writes an id the run made: "new:" and the kinds of record it is, sorted. */
+function placeholderOf(kinds: ReadonlySet<string>): string {
+  return `new:${[...kinds].sort().join('+') || 'record'}`;
+}
+
+function isAlnum(c: string | undefined): boolean {
+  return c !== undefined && /[A-Za-z0-9]/.test(c);
+}
+
+/**
+ * `s` with each number the run took replaced, where it stands alone (not inside a longer word or
+ * number). A number of one or two characters only after "#" ("Invoice #2") or as the whole text
+ * (an entry's reference "2"): standing alone in other text ("2 boxes") it is far more often
+ * something else.
+ */
+function withoutOwnNumbers(s: string, numbers: readonly string[]): string {
+  if (numbers.includes(s.trim())) return '#own';
+  let out = s;
+  for (const n of numbers) {
+    if (!n || !out.includes(n)) continue;
+    let from = 0;
+    let built = '';
+    for (;;) {
+      const at = out.indexOf(n, from);
+      if (at < 0) break;
+      const before = out[at - 1];
+      const after = out[at + n.length];
+      const alone = !isAlnum(before) && !isAlnum(after) && (n.length >= 3 || before === '#');
+      built += out.slice(from, at) + (alone ? '#own' : n);
+      from = at + n.length;
+    }
+    out = built + out.slice(from);
+  }
+  return out;
+}
+
+/** The time a moment stands for, in milliseconds since 1970 (one without a zone read as UTC). */
+function momentMs(s: string): number {
+  const iso = s.replace(' ', 'T');
+  return Date.parse(MOMENT_ZONE.test(iso) ? iso : `${iso}Z`);
+}
+
+/**
+ * A moment as the key reads it: '<time>' when it falls in the run's own time span (when the run
+ * happened, never what it did, wherever it shows); on something the run made (`made`), its day only
+ * (a date it works out from today agrees all day, and a date it copies from elsewhere still
+ * counts); on a record that was there before, as it is.
+ */
+function keyMoment(s: string, rules: KeyRules, made: boolean): string {
+  const ms = momentMs(s);
+  if (Number.isFinite(ms) && ms >= rules.span.from - RUN_SPAN_SLACK_MS && ms <= rules.span.to + RUN_SPAN_SLACK_MS) return '<time>';
+  if (!made) return s;
+  return Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : s.slice(0, 10);
+}
+
+/**
+ * A text as the key reads it. `made`: of something the run made; `ownText`: free text of something
+ * the run made, so the numbers it took for itself go too.
+ */
+function keyText(s: string, rules: KeyRules, made: boolean, ownText: boolean): string {
+  const t = s.trim();
+  if (MOMENT.test(t)) return keyMoment(t, rules, made);
+  let out = s.replace(UUID_IN_TEXT, (m) => rules.made.get(m.toLowerCase()) ?? m.toLowerCase());
+  if (rules.prefixes.size) out = out.replace(HEX8_TOKEN, (m, lead: string, hex: string) => `${lead}${rules.prefixes.get(hex.toLowerCase()) ?? hex}`);
+  if (ownText && rules.numbers.length) out = withoutOwnNumbers(out, rules.numbers);
+  return out;
+}
+
+/**
+ * A value as the key reads it. Keys that hold an id of a record's own row ("id"), the time of a
+ * change ("…At") or a secret are left out; texts go through keyText. `own`: the value is of a
+ * record (or an entry) the run made, so the numbers it took are left out too (OWN_NUMBER_KEYS), its
+ * free text loses them (OWN_TEXT_KEY), and its moments are read as their day. References to
+ * records that already existed stay as they are.
+ */
+function keyValue(v: unknown, rules: KeyRules, own = false, key = '', depth = 0): unknown {
+  if (typeof v === 'string') return keyText(v, rules, own, own && OWN_TEXT_KEY.test(key));
   if (depth > 32) return null;
-  if (Array.isArray(v)) return v.map((item) => keyValue(item, created, depth + 1));
+  if (Array.isArray(v)) return v.map((item) => keyValue(item, rules, own, key, depth + 1));
   if (isObject(v)) {
     const out: Record<string, unknown> = {};
     for (const [k, item] of Object.entries(v)) {
       if (k === 'id' || TIME_KEY.test(k) || isSecretKey(k) || SECRET_WORDS.test(k)) continue;
-      out[k] = keyValue(item, created, depth + 1);
+      if (own && OWN_NUMBER_KEYS.has(k)) continue;
+      out[k] = keyValue(item, rules, own, k, depth + 1);
     }
     return out;
   }
   return v;
+}
+
+/** Every id (lower case) a value holds, whole or inside a text. */
+function idsIn(v: unknown, into: Set<string>, depth = 0): void {
+  if (typeof v === 'string') {
+    for (const m of v.matchAll(UUID_IN_TEXT)) into.add(m[0].toLowerCase());
+  } else if (depth <= 32 && Array.isArray(v)) {
+    for (const item of v) idsIn(item, into, depth + 1);
+  } else if (depth <= 32 && isObject(v)) {
+    for (const item of Object.values(v)) idsIn(item, into, depth + 1);
+  }
+}
+
+/**
+ * The numbers (as text) a record the run made holds under OWN_NUMBER_KEYS, at any depth. `entry`:
+ * the record is a journal entry, whose reference is not a number it took (a bill's number, a
+ * paycheck's id cut short, a reference the run copied): that one is read through the ledger part of
+ * the key, and only what the run took elsewhere (the check's own number) goes from it there.
+ */
+function ownNumbersIn(v: unknown, into: Set<string>, entry: boolean, depth = 0): void {
+  if (depth > 32) return;
+  if (Array.isArray(v)) {
+    for (const item of v) ownNumbersIn(item, into, entry, depth + 1);
+  } else if (isObject(v)) {
+    for (const [k, item] of Object.entries(v)) {
+      const taken = OWN_NUMBER_KEYS.has(k) && !(entry && k === 'reference');
+      if (taken && (typeof item === 'string' || typeof item === 'number')) addOwnNumber(item, into);
+      else ownNumbersIn(item, into, entry, depth + 1);
+    }
+  }
+}
+
+function addOwnNumber(v: unknown, into: Set<string>): void {
+  const s = typeof v === 'number' ? (Number.isFinite(v) ? String(v) : '') : typeof v === 'string' ? v.trim() : '';
+  if (s && s.length <= MAX_OWN_NUMBER && !UUID.test(s)) into.add(s);
+}
+
+/** A table of the company file with a uuid `id`, and how its created_at is kept (null: it has none). */
+interface IdTable {
+  name: string;
+  createdAt: 'timestamp' | 'timestamptz' | null;
+  /** Its OWN_NUMBER_COLUMNS (journal_entries without its reference). */
+  numbers: readonly string[];
+}
+
+/**
+ * Columns of a row the run makes that hold a number it takes for itself: OWN_NUMBER_KEYS as the
+ * database names them. Read from the rows themselves (ownNumbersOfRows), as an audit row does not
+ * always carry the number a document shows (an invoice's audit row has its legacy invoiceNumber, its
+ * entry the document number "INV-0003"). A journal entry's own reference is not one (ownNumbersIn).
+ */
+const OWN_NUMBER_COLUMNS = [
+  'number',
+  'doc_number',
+  'ref_number',
+  'entry_number',
+  'estimate_number',
+  'invoice_number',
+  'receipt_number',
+  'memo_number',
+  'order_number',
+  'po_number',
+  'transfer_number',
+  'payment_number',
+  'check_number',
+  'reference',
+] as const;
+
+/** The tables with a uuid `id` (the schema is the migrations', the same for every company file). */
+let idTableList: readonly IdTable[] | null = null;
+
+async function idTables(db: DB): Promise<readonly IdTable[]> {
+  if (idTableList) return idTableList;
+  const own = sql.join(
+    OWN_NUMBER_COLUMNS.map((c) => sql`${c}`),
+    sql`, `,
+  );
+  const res = (await db.execute(sql`
+    SELECT c.table_name AS name,
+           (SELECT k.data_type FROM information_schema.columns k
+             WHERE k.table_schema = c.table_schema AND k.table_name = c.table_name AND k.column_name = 'created_at') AS created_at,
+           (SELECT string_agg(k.column_name::text, ',' ORDER BY k.column_name) FROM information_schema.columns k
+             WHERE k.table_schema = c.table_schema AND k.table_name = c.table_name AND k.column_name::text IN (${own})) AS numbers
+      FROM information_schema.columns c
+      JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE'
+     WHERE c.table_schema = current_schema() AND c.column_name = 'id' AND c.data_type = 'uuid'
+     ORDER BY c.table_name`)) as unknown as { rows: Array<{ name: string; created_at: string | null; numbers: string | null }> };
+  const list = res.rows
+    .filter((r) => /^[a-z_][a-z0-9_]*$/.test(r.name))
+    .map((r): IdTable => ({
+      name: r.name,
+      createdAt: r.created_at === 'timestamp without time zone' ? 'timestamp' : r.created_at === 'timestamp with time zone' ? 'timestamptz' : null,
+      numbers: (r.numbers ?? '')
+        .split(',')
+        .filter((c) => (OWN_NUMBER_COLUMNS as readonly string[]).includes(c))
+        // An entry's reference is read through the ledger part of the key, never as a number it took.
+        .filter((c) => !(r.name === 'journal_entries' && c === 'reference')),
+    }));
+  if (list.length) idTableList = list;
+  return list;
+}
+
+/**
+ * The numbers the rows the run made hold in their OWN_NUMBER_COLUMNS, read inside its transaction.
+ * Only rows of ids the run made (runIdsOf), so a number of a record that was there before is never
+ * taken for one the run took.
+ */
+async function ownNumbersOfRows(ctx: ServiceContext, made: ReadonlyMap<string, ReadonlySet<string>>, into: Set<string>): Promise<void> {
+  const ids = [...made.keys()].filter((id) => UUID.test(id)).slice(0, MAX_LOOKED_UP_IDS);
+  if (!ids.length) return;
+  const tables = (await idTables(ctx.db)).filter((t) => t.numbers.length);
+  if (!tables.length) return;
+  // Every id passed the UUID pattern and every name the identifier pattern, so both are written in place.
+  const list = `ARRAY[${ids.map((id) => `'${id}'`).join(',')}]::uuid[]`;
+  const parts = tables.flatMap((t) => t.numbers.map((c) => `SELECT "${c}"::text AS n FROM "${t.name}" WHERE id = ANY(${list}) AND "${c}" IS NOT NULL`));
+  const res = (await ctx.db.execute(sql.raw(parts.join(' UNION ALL ')))) as unknown as { rows: Array<{ n: string | null }> };
+  for (const r of res.rows) addOwnNumber(r.n, into);
+}
+
+/**
+ * Where an id was found: 'made' (this run wrote its row, created from the run's start on),
+ * 'written' (this run wrote its row, but its created_at does not say it was new: a table without
+ * one, or a service that dated it back, as FIFO's opening layer is, a millisecond before the
+ * receipt that follows it), or 'existed' (this run did not write it: it was there before).
+ */
+type Found = 'made' | 'written' | 'existed';
+
+/**
+ * Look the ids up in every table with a uuid `id`, inside the run's transaction. A row this
+ * transaction did not write (xmin) was there before the run. One it wrote counts as made by the run
+ * when it was created from the run's start on (created_at: the database's own now() for a default,
+ * or the app's clock, which is later); otherwise it is only 'written', and runIdsOf decides on the
+ * audit trail. An id found nowhere is absent from the answer.
+ */
+async function findIds(ctx: ServiceContext, ids: readonly string[]): Promise<Map<string, Found>> {
+  const out = new Map<string, Found>();
+  if (!ids.length) return out;
+  const tables = await idTables(ctx.db);
+  if (!tables.length) return out;
+  // Every id passed the UUID pattern (hex digits and dashes only), so it can be written in place.
+  const list = `ARRAY[${ids.map((id) => `'${id}'`).join(',')}]::uuid[]`;
+  const written = `(((t.xmin::text::bigint - (txid_current() % ${XID_SPAN})) % ${XID_SPAN}) + ${XID_SPAN}) % ${XID_SPAN} < ${OWN_XID_WINDOW}`;
+  const state = (t: IdTable): string => {
+    if (t.createdAt === null) return `CASE WHEN ${written} THEN 'written' ELSE 'existed' END`;
+    const since =
+      t.createdAt === 'timestamptz'
+        ? `t.created_at >= date_trunc('milliseconds', now())`
+        : `(t.created_at = now() OR t.created_at >= date_trunc('milliseconds', now() AT TIME ZONE 'UTC'))`;
+    return `CASE WHEN NOT (${written}) THEN 'existed' WHEN ${since} THEN 'made' ELSE 'written' END`;
+  };
+  const parts = tables.map((t) => `SELECT t.id::text AS id, ${state(t)} AS state FROM "${t.name}" t JOIN ids ON ids.id = t.id`);
+  const res = (await ctx.db.execute(sql.raw(`WITH ids(id) AS (SELECT unnest(${list})) ${parts.join(' UNION ALL ')}`))) as unknown as {
+    rows: Array<{ id: string; state: Found }>;
+  };
+  // Found in more than one table: it existed if any says so, then written (fail closed, the id stays).
+  const rank: Record<Found, number> = { existed: 2, written: 1, made: 0 };
+  for (const r of res.rows) {
+    const id = r.id.toLowerCase();
+    const state: Found = r.state === 'made' || r.state === 'written' ? r.state : 'existed';
+    const was = out.get(id);
+    if (was === undefined || rank[state] > rank[was]) out.set(id, state);
+  }
+  return out;
+}
+
+/** Most ids looked up for one run; past that, the rest stay in the key as they are (fail closed). */
+const MAX_LOOKED_UP_IDS = 5000;
+
+/**
+ * The ids this run made, each with the kinds of record it is (a set: an audit 'create' of a second
+ * kind on the same id, a retainage billing on the invoice it bills, say, adds a kind and changes
+ * nothing). Read inside the run's transaction, after the handler ran:
+ *  - the entries it posted (created_at = now()) and every id of a row this transaction inserted
+ *    (findIds 'made'), wherever it shows: an audit row's own id, or a value (creditApplicationId,
+ *    depreciationEntryId, bouncedCheckId, applicationId, an account made on first use);
+ *  - a row this transaction wrote whose created_at cannot say it is new (a table without one, a
+ *    row dated back), when an audit 'create' names it;
+ *  - an id an audit 'create' names, or one only a value holds, that names no row at all (made up
+ *    by the run, "assembly_build:<id>");
+ *  - never an id the input names, an entry the run voided, deleted or changed, a row this run did
+ *    not write, a row it wrote that no audit 'create' names, or a record an audit row other than
+ *    'create' names and that is gone (deleted): those stay in the key as they are (fail closed).
+ */
+async function runIdsOf(
+  ctx: ServiceContext,
+  parts: { inputIds: readonly string[]; audit: readonly AuditRow[]; ledger: readonly LedgerRow[]; effects: readonly EffectPreview[]; touched: readonly TouchedEntry[] },
+): Promise<Map<string, Set<string>>> {
+  const made = new Map<string, Set<string>>();
+  const kind = (id: string, k: string) => made.set(id, new Set([...(made.get(id) ?? []), k]));
+  for (const l of parts.ledger) kind(l.entry_id.toLowerCase(), 'journal_entry');
+  const existed = new Set<string>([...parts.inputIds.map((i) => i.toLowerCase()), ...parts.touched.map((t) => t.id.toLowerCase())]);
+
+  const created = new Map<string, Set<string>>();
+  const named = new Set<string>();
+  const seen = new Set<string>();
+  for (const r of parts.audit) {
+    const id = r.entity_id.toLowerCase();
+    if (UUID.test(id)) {
+      seen.add(id);
+      if (r.action === 'create') created.set(id, new Set([...(created.get(id) ?? []), r.entity_type]));
+      else named.add(id);
+    }
+    idsIn(r.old_values, seen);
+    idsIn(r.new_values, seen);
+  }
+  for (const l of parts.ledger) idsIn([l.account_id, l.entity_id, l.class_id, l.description, l.source_ref, l.reference, l.memo], seen);
+  for (const e of parts.effects) idsIn(e.detail, seen);
+
+  const look = [...seen].filter((id) => !made.has(id) && !existed.has(id)).slice(0, MAX_LOOKED_UP_IDS);
+  const found = await findIds(ctx, look);
+  for (const id of look) {
+    const where = found.get(id);
+    if (where === 'existed') continue;
+    const kinds = created.get(id);
+    if (where === 'made') {
+      for (const k of kinds ?? ['record']) kind(id, k);
+    } else if (kinds) {
+      // Written by this run (or in no table at all), and an audit 'create' says the run made it.
+      for (const k of kinds) kind(id, k);
+    } else if (where === undefined && !named.has(id)) {
+      // Names no row anywhere and no audit row says it was there: made up by the run.
+      kind(id, 'value');
+    }
+  }
+  return made;
+}
+
+/**
+ * The rules the key reads values through: the ids the run made, their 8-digit prefixes, the
+ * numbers it took for itself (on the records it made, as their audit rows and their own rows hold
+ * them: a journal entry's reference is not one, see ownNumbersIn), and its own time span.
+ */
+function keyRulesOf(
+  made: ReadonlyMap<string, ReadonlySet<string>>,
+  audit: readonly AuditRow[],
+  ledger: readonly LedgerRow[],
+  rowNumbers: ReadonlySet<string>,
+  span: KeyRules['span'],
+): KeyRules {
+  const ids = new Map<string, string>();
+  const prefixes = new Map<string, string>();
+  for (const [id, kinds] of made) {
+    const p = placeholderOf(kinds);
+    ids.set(id, p);
+    prefixes.set(id.slice(0, 8), p);
+  }
+  const numbers = new Set<string>(rowNumbers);
+  for (const r of audit) {
+    if (!made.has(r.entity_id.toLowerCase())) continue;
+    const entry = r.entity_type === 'journal_entry';
+    ownNumbersIn(r.old_values, numbers, entry);
+    ownNumbersIn(r.new_values, numbers, entry);
+  }
+  // A General Journal entry's reference is its Entry No., the next one when the input gives none
+  // (lib/services/journal.ts nextManualJournalNumber, entries with sourceRef 'manual'): a number it
+  // took. (One the input gave is the same on every run, so nothing is lost leaving it out.)
+  for (const l of ledger) if (l.source_ref === 'manual' && l.reference) addOwnNumber(l.reference, numbers);
+  return { made: ids, prefixes, numbers: [...numbers].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0)), span };
+}
+
+/**
+ * The run's own time span, read in its transaction: from the transaction's start (the database's
+ * now(), which every default timestamp of the run takes) to the app's clock now.
+ */
+async function runSpanOf(ctx: ServiceContext): Promise<KeyRules['span']> {
+  const res = (await ctx.db.execute(sql`SELECT floor(extract(epoch from now()) * 1000)::bigint::text AS ms`)) as unknown as { rows: Array<{ ms: string }> };
+  const from = Number(res.rows[0]?.ms);
+  const to = Date.now();
+  return { from: Number.isFinite(from) ? Math.min(from, to) : to, to };
 }
 
 /** The version an audit row's old values carry, or null. */
@@ -1658,20 +2407,27 @@ function earlier(a: string, b: string): number {
 }
 
 /** The parts of an effect that say what it does (not its size, nor a file id made for this run). */
-function effectKey(e: EffectPreview, created: ReadonlyMap<string, string>): string {
+/**
+ * The parts of an effect that say what it does (not its size, nor a file id made for this run).
+ * Its subject, file name and attachment names are the run's own text: a number it took for itself
+ * there ("Invoice 1043.pdf") goes too.
+ */
+function effectKey(e: EffectPreview, rules: KeyRules): string {
   const d = isObject(e.detail) ? e.detail : {};
   const picked: Record<string, unknown> = { kind: e.kind };
   for (const k of ['to', 'cc', 'bcc', 'subject', 'dir', 'name', 'replaces', 'printer', 'copies', 'host', 'purpose']) {
     if (d[k] !== undefined) picked[k] = d[k];
   }
   if (Array.isArray(d.attachments)) picked.attachments = d.attachments.map((a) => (isObject(a) ? (a.name ?? null) : null));
-  return stableJson(keyValue(picked, created));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(picked)) out[k] = keyValue(v, rules, ['subject', 'name', 'attachments'].includes(k), k);
+  return stableJson(out);
 }
 
 /**
- * The staleness key (plan §7.4): a hash over what the run read and what it did, with what differs
- * on every run of the same request left out (keyValue). Lists are sorted: the audit trail's own
- * order is not the order of the work (its ids are random).
+ * The staleness key (plan §7.4): a hash over what the run read and what it did, with what the run
+ * assigns to itself left out (KeyRules: the ids it made, the numbers it took, times). Lists are
+ * sorted: the audit trail's own order is not the order of the work (its ids are random).
  */
 function stalenessKeyOf(parts: {
   operation: Operation;
@@ -1681,12 +2437,18 @@ function stalenessKeyOf(parts: {
   audit: readonly AuditRow[];
   effects: readonly EffectPreview[];
   touched: readonly TouchedEntry[];
+  made: ReadonlyMap<string, ReadonlySet<string>>;
+  rowNumbers: ReadonlySet<string>;
+  span: KeyRules['span'];
 }): string {
-  const created = new Map<string, string>();
-  for (const r of parts.audit) if (r.action === 'create') created.set(r.entity_id.toLowerCase(), `new:${r.entity_type}`);
-  for (const l of parts.ledger) created.set(l.entry_id.toLowerCase(), 'new:journal_entry');
+  const rules = keyRulesOf(parts.made, parts.audit, parts.ledger, parts.rowNumbers, parts.span);
 
-  // The ledger: every line of every entry made, by account, amount, memo and name.
+  // The ledger: every line of every entry made, by account, amount, memo and name, with its date
+  // (its day), description, status, source and reference. Its entry number is the run's own (the
+  // next number): not read at all. Its reference is read as text of what the run made, so only
+  // what the run took for itself goes from it (a check or document number it took, a General
+  // Journal Entry No., a paycheck's id cut short); a reference it copied from somewhere else (a
+  // bill's number, a bank line's check number) stays.
   const entries = new Map<string, LedgerRow[]>();
   for (const l of parts.ledger) entries.set(l.entry_id, [...(entries.get(l.entry_id) ?? []), l]);
   const amount = (v: string | null) => (v === null ? null : toAmountString(v));
@@ -1699,12 +2461,17 @@ function stalenessKeyOf(parts: {
             description: lines[0].description,
             status: lines[0].status,
             source: lines[0].source_ref,
-            reference: lines[0].reference,
+            entryReference: lines[0].reference,
             lines: lines
-              .map((l) => stableJson(keyValue({ account: l.account_id, debit: amount(l.debit), credit: amount(l.credit), memo: l.memo, nameType: l.entity_type, name: l.entity_id, class: l.class_id }, created)))
+              .map((l) =>
+                stableJson(
+                  keyValue({ account: l.account_id, debit: amount(l.debit), credit: amount(l.credit), memo: l.memo, nameType: l.entity_type, name: l.entity_id, class: l.class_id }, rules, true),
+                ),
+              )
               .sort(),
           },
-          created,
+          rules,
+          true,
         ),
       ),
     )
@@ -1712,22 +2479,22 @@ function stalenessKeyOf(parts: {
 
   // The records written: their values, and the version each record that already existed had
   // before the run (the earliest its audit rows show: a record changed twice shows its in-run
-  // version on the second row).
+  // version on the second row). A record the run made is written by its kinds, never its id.
   const records: string[] = [];
   const firstVersion = new Map<string, string>();
   for (const r of parts.audit) {
     const id = r.entity_id.toLowerCase();
-    const isNew = created.get(id) === `new:${r.entity_type}`;
+    const own = rules.made.get(id);
     records.push(
       stableJson({
         action: r.action,
         kind: r.entity_type,
-        id: isNew ? `new:${r.entity_type}` : id,
-        before: keyValue(r.old_values, created),
-        after: keyValue(r.new_values, created),
+        id: own ?? id,
+        before: keyValue(r.old_values, rules, own !== undefined),
+        after: keyValue(r.new_values, rules, own !== undefined),
       }),
     );
-    const v = isNew ? null : versionIn(r.old_values);
+    const v = own !== undefined ? null : versionIn(r.old_values);
     if (v !== null) {
       const k = `${r.entity_type}:${id}`;
       const seen = firstVersion.get(k);
@@ -1744,7 +2511,7 @@ function stalenessKeyOf(parts: {
 
   return sha256(
     stableJson({
-      key: 'bridge-staleness-v2',
+      key: 'bridge-staleness-v4',
       operation: parts.operation.id,
       status: parts.status,
       named: parts.named,
@@ -1752,7 +2519,7 @@ function stalenessKeyOf(parts: {
       touched: touched.length ? touched : undefined,
       records: records.sort(),
       versions,
-      effects: parts.effects.map((e) => effectKey(e, created)).sort(),
+      effects: parts.effects.map((e) => effectKey(e, rules)).sort(),
     }),
   );
 }
@@ -1766,18 +2533,67 @@ interface Collected {
 
 /** What the run read before the handler ran, in its transaction (versionsOf, draftsBefore). */
 interface Before {
+  /** The ids the input names: records that were there before the run (or nothing at all). */
+  inputIds: readonly string[];
   named: readonly string[];
   drafts: ReadonlySet<string> | null;
 }
 
 async function readBefore(ctx: ServiceContext, companyId: string, input: OperationInput): Promise<Before> {
-  return { named: await versionsOf(ctx.db, companyId, namedIds(input)), drafts: await draftsBefore(ctx.db, companyId) };
+  const inputIds = namedIds(input);
+  return { inputIds, named: await versionsOf(ctx.db, companyId, inputIds), drafts: await draftsBefore(ctx.db, companyId) };
+}
+
+/**
+ * The run voided, deleted or changed a record that existed before it: an audit row other than
+ * 'create', of a record it did not make (lib/agent/bridge.ts runIdsOf).
+ */
+function editsExistingRecord(audit: readonly AuditRow[], made: ReadonlyMap<string, ReadonlySet<string>>): boolean {
+  return audit.some((r) => r.action !== 'create' && !made.has(r.entity_id.toLowerCase()));
+}
+
+/**
+ * The lines of the entries the run made, with who each is for and its class, in the order
+ * changesInTransaction lists them (entry number, debits first, then the line's id): what
+ * changesInTransaction does not fill in yet is filled in from these. A line whose account or
+ * amounts do not match the row in its place keeps what it has (nothing is guessed).
+ */
+async function nameMadeLines(ctx: ServiceContext, entries: PostingEntry[]): Promise<void> {
+  if (!entries.length) return;
+  const res = (await ctx.db.execute(sql`
+    SELECT je.id::text AS entry_id, l.account_id::text AS account_id, l.debit::text AS debit, l.credit::text AS credit,
+           l.entity_type, l.entity_id::text AS entity_id, l.class_id::text AS class_id
+      FROM journal_entries je
+      JOIN journal_entry_lines l ON l.journal_entry_id = je.id
+     WHERE je.company_id = ${ctx.companyId} AND je.created_at = now()
+     ORDER BY je.entry_number, (l.debit IS NULL OR l.debit = 0), l.id`)) as unknown as {
+    rows: Array<{ entry_id: string; account_id: string; debit: string | null; credit: string | null; entity_type: string | null; entity_id: string | null; class_id: string | null }>;
+  };
+  const byEntry = new Map<string, typeof res.rows>();
+  for (const r of res.rows) byEntry.set(r.entry_id.toLowerCase(), [...(byEntry.get(r.entry_id.toLowerCase()) ?? []), r]);
+  const all: Array<{ line: NamedPostingLine; ref: LineRef }> = [];
+  for (const e of entries) {
+    const rows = byEntry.get(e.journalEntryId.toLowerCase()) ?? [];
+    e.lines.forEach((raw, i) => {
+      const line = raw as NamedPostingLine;
+      const row = rows[i];
+      const same = row && row.account_id.toLowerCase() === String(line.accountId).toLowerCase() && lineAmount(row.debit) === line.debit && lineAmount(row.credit) === line.credit;
+      const ref: LineRef = same ? { entityType: row.entity_type, entityId: row.entity_id, classId: row.class_id } : { entityType: null, entityId: null, classId: null };
+      if (line.entityName === undefined) line.entityName = null;
+      if (line.className === undefined) line.className = null;
+      if (line.entityType === undefined) line.entityType = null;
+      all.push({ line, ref });
+    });
+  }
+  await nameLines(ctx, all);
 }
 
 /**
  * Read back what the run did, still inside its transaction. The ledger preview lists the entries
  * the run makes, then those it voids, deletes or changes (their description says which), at most
- * PREVIEW_ROW_LIMIT in all, their memos and descriptions as the run may show them (shownText).
+ * PREVIEW_ROW_LIMIT in all, their memos and descriptions as the run may show them (shownText), each
+ * line naming who it is for and its class. `warnings`: what the route warned about before the
+ * agent's confirmation flags accepted it (withheldWarnings), for the person approving it.
  */
 async function collect(
   ctx: ServiceContext,
@@ -1786,14 +2602,20 @@ async function collect(
   effects: EffectPreview[],
   before: Before,
   status: number,
+  warnings: readonly WarningPreview[] = [],
 ): Promise<Collected> {
   const { named } = before;
   const ledger = await changesInTransaction(ctx);
   const lines = await ledgerRowsInTransaction(ctx);
   const rows = await auditRowsInTransaction(ctx);
   const touched = await touchedEntries(ctx, rows, new Set(lines.map((l) => l.entry_id.toLowerCase())), before.drafts);
+  const made = await runIdsOf(ctx, { inputIds: before.inputIds, audit: rows, ledger: lines, effects, touched });
+  const span = await runSpanOf(ctx);
+  const rowNumbers = new Set<string>();
+  await ownNumbersOfRows(ctx, made, rowNumbers);
   // changesInTransaction gives the memos as stored: a reversal copies its entry's, account numbers and all.
   const madeShown = ledger.entries.slice(0, PREVIEW_ROW_LIMIT).map((e) => shownEntry(ctx, e));
+  await nameMadeLines(ctx, madeShown);
   const touchedShown = await touchedPreview(ctx, touched, rows, PREVIEW_ROW_LIMIT - madeShown.length);
   const { records, cut } = recordDiffs(rows, operation, access);
   const shown = capped(effects);
@@ -1804,13 +2626,13 @@ async function collect(
     ledger.changes.length > PREVIEW_ROW_LIMIT ||
     records.length > PREVIEW_ROW_LIMIT;
   return {
-    ledger: ledgerTotals(lines, touched),
-    stalenessKey: stalenessKeyOf({ operation, status, named, ledger: lines, audit: rows, effects, touched }),
+    ledger: ledgerTotals(lines, touched, editsExistingRecord(rows, made)),
+    stalenessKey: stalenessKeyOf({ operation, status, named, ledger: lines, audit: rows, effects, touched, made, rowNumbers, span }),
     preview: {
       ledger: { entries: [...madeShown, ...touchedShown], changes: ledger.changes.slice(0, PREVIEW_ROW_LIMIT) } satisfies ChangePreview,
       records: records.slice(0, PREVIEW_ROW_LIMIT),
       effects: shown.list,
-      warnings: [],
+      warnings: [...warnings],
       loss: lossOf(rows),
       routePreview: null,
       truncated,
@@ -2011,28 +2833,35 @@ function stoppedAtNetwork(raw: RawAnswer, operation: Operation, actor: BridgeAct
  * (a refusal, an error answer, a warning, a read, a dryRun 'none' commit on its own handle).
  *
  *  - An operation that names an amount field: the larger of what factsOf found and the largest
- *    single entry the run made, voided, deleted or changed. Its amount field not read (absent, or
+ *    single entry the run made, voided, deleted or changed; for a mixed run (LedgerTotals.mixed:
+ *    it takes money out of one document and posts another), the larger of the field and all of
+ *    it (LedgerTotals.sum), so both sides count. Its amount field not read (absent, or
  *    unreadable) keeps null: that is "over every limit" to the policy, and nothing the ledger
  *    shows makes it smaller.
  *  - An operation with no amount field: what the run moves, all of it (LedgerTotals.sum), so a
  *    bulk accept, a rules run, a batch enter or void, a reclassify is judged at its whole, not its
- *    largest row; and "0.00" when the run made no entry and moved none it touched (a new customer,
- *    a memo, a list entry removed, a check number or a title given to a posted entry: nothing to
- *    compare with a limit). A touched entry whose total cannot be known keeps null (fail closed).
+ *    largest row. With no entry made or touched: "0.00" when the run only made new records (a new
+ *    customer, a time entry: nothing to compare with a limit), and unknown (null) when it voided,
+ *    deleted or changed a record that existed before it (a payroll adjustment that never posted,
+ *    an applied credit: money may move that no entry shows). A check number or a title given to a
+ *    posted entry touches an entry and moves none of it: "0.00". A touched entry whose total cannot
+ *    be known keeps null (fail closed).
  */
 function factsFor(operation: Operation, input: OperationInput, closingDate: string | null, answer: unknown, ledger: LedgerTotals | null): RequestFacts {
   const facts = factsOf(operation, input, answer === undefined ? { closingDate } : { closingDate, answer });
   if (ledger === null) return facts;
   if (ledger.unknown) return { ...facts, amount: null };
   if (operation.amountField) {
-    if (facts.amount === null || ledger.largest === null) return facts;
+    const seen = ledger.mixed ? ledger.sum : ledger.largest;
+    if (facts.amount === null || seen === null) return facts;
     try {
-      return Money.gt(ledger.largest, Money.abs(facts.amount)) ? { ...facts, amount: ledger.largest } : facts;
+      return Money.gt(seen, Money.abs(facts.amount)) ? { ...facts, amount: seen } : facts;
     } catch {
       return { ...facts, amount: null };
     }
   }
-  return { ...facts, amount: ledger.any ? ledger.sum : '0.00' };
+  if (ledger.any) return { ...facts, amount: ledger.sum };
+  return { ...facts, amount: ledger.editsExisting ? null : '0.00' };
 }
 
 // ---------------------------------------------------------------------------
@@ -2078,16 +2907,21 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
     );
   }
 
-  // 2. What the agent may never supply; secrets from the approving person, on a commit only.
+  // 2. What the agent may never supply; secrets from the approving person: all of them on a
+  // commit, only the closing-date password on a dry run, none on a read.
   const guarded = guardInput(operation, given);
   if (guarded.refused) return refuse(guarded.refused, 'REFUSED', { stripped: guarded.stripped });
   const asked = guarded.input;
+  const version = expectedVersionOf(given);
+  if ('error' in version) return refuse(version.error, 'VALIDATION');
   let runInput: OperationInput = asked;
   let secretHeaders: Record<string, string> = {};
   if (mode === 'commit') {
     const secrets = actor.secrets ?? {};
     const applied = applySecrets(operation, asked, secrets);
-    const missing = [...new Set([...applied.missing, ...operation.needsSecret.filter((k) => !secretValue(secrets, k))])];
+    const missing = [...new Set([...applied.missing, ...operation.needsSecret.filter((k) => !secretValue(secrets, k))])].filter(
+      (k) => !OPTIONAL_ROUTE_SECRETS.includes(k),
+    );
     if (missing.length) {
       return refuse(
         'This needs a password or key that only the approving person can type. Ask for it to be approved, and the person types it on the approval card.',
@@ -2095,6 +2929,10 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
         { secrets: missing },
       );
     }
+    runInput = applied.input;
+    secretHeaders = applied.headers;
+  } else if (mode === 'dry_run' && secretValue(actor.secrets, 'closing_password') !== null) {
+    const applied = applySecrets(operation, asked, { closing_password: secretValue(actor.secrets, 'closing_password')! });
     runInput = applied.input;
     secretHeaders = applied.headers;
   }
@@ -2108,34 +2946,43 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
     return refuse('These path values lead to a different operation. Check params.', 'VALIDATION', { path: built.path });
   }
 
-  // 3. What getServerContext would have checked for a person.
+  // 3. What getServerContext would have checked for a person, and the hard floor's roles.
   const db = writableDb(base);
   const access = runAccess(actor, operation);
   const gates = await settleGates(db, base.companyId, actor, access, operation.method, built.path);
   if ('refusal' in gates) return errorResult(mode, startFacts, gates.refusal);
+  const held = await heldRoleRefusal(db, base.companyId, operation, built.params);
+  if (held) return errorResult(mode, startFacts, held);
 
-  // 4. The handler's context, from the actor only.
-  const override = await closingOverride(db, base.companyId, actor, access, mode);
-  if (typeof override !== 'boolean') return errorResult(mode, startFacts, override.refusal);
+  // 4. The handler's context, from the actor only. The closing-date password is checked here, once.
+  const closing = await closingPasswordCheck(db, base.companyId, actor, access, mode);
+  if ('refusal' in closing) return errorResult(mode, startFacts, closing.refusal);
   const parts: RunContextParts = {
     companyId: base.companyId,
     access,
     // Never the owner: the agent is not the person who owns the company.
     role: actor.role === 'owner' ? legacyRoleFor(access, false) : actor.role,
-    closingDateOverride: override,
+    closingDateOverride: closing.override,
     actor,
   };
 
   // 5. The request.
   const owner: FileOwner = { companyId: base.companyId, agentId: actor.agent.id };
+  const extras: RequestExtras = { expectedVersion: version.value, hostPass: approvedAtHost(actor) ? expectedLaunchPass() : null };
   let request: BuiltRequest;
   try {
-    request = await buildRequest(operation, built.path, runInput, owner, mode === 'commit' ? secretHeaders : {});
+    request = await buildRequest(operation, built.path, runInput, owner, mode === 'read' ? {} : secretHeaders, extras);
   } catch (err) {
     if (err instanceof BridgeRefusal) return refuse(err.message, err.code, err.details);
     throw err;
   }
-  const scope: ServiceScopeOptions = { path: built.path, method: operation.method, headers: request.scopeHeaders };
+  const scopeOf = (r: BuiltRequest): ServiceScopeOptions => ({
+    path: built.path,
+    method: operation.method,
+    headers: r.scopeHeaders,
+    ...(closing.checked ? { closingPasswordChecked: true } : {}),
+  });
+  const scope = scopeOf(request);
   const sentFlags = Array.isArray(asked.confirm) ? asked.confirm : [];
 
   // A dry run of what cannot be rolled back is described, not run. (A read is simply read.) So is a
@@ -2230,6 +3077,40 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
 
   const stage = (file: Interpreted['file']) => (file ? stageFile(owner, file) : Promise.resolve(null));
 
+  /**
+   * The warnings the agent's confirmation flags accept, in the route's own words (plan §5.6), for
+   * the preview of a dry run sent with flags. The work is tried without them first, each try in a
+   * savepoint of the dry run's transaction that is rolled back at once, its effects only captured
+   * (nothing is sent, no file is looked at); each round adds back the flags the route asked for,
+   * until it asks for none the agent sent. A try that fails some other way ends the search.
+   */
+  const withheldWarnings = async (tx: DB, d: Deadline): Promise<WarningPreview[]> => {
+    const found: WarningPreview[] = [];
+    let accepted: string[] = [];
+    for (let round = 0; round < sentFlags.length && !d.expired; round++) {
+      const tryInput = withoutFlags(runInput, sentFlags.filter((f) => !accepted.includes(f)), operation.body);
+      const got: { raw: RawAnswer | null } = { raw: null };
+      try {
+        await (tx as unknown as { transaction<T>(fn: (sp: unknown) => Promise<T>): Promise<T> }).transaction(async (sp) => {
+          const ctx = handlerContext(sp as DB, parts, false);
+          const tried = await buildRequest(operation, built.path, tryInput, owner, secretHeaders, extras);
+          got.raw = (await runWithEffects('capture', () => invoke(handler, tried, built.params, ctx, scopeOf(tried), false), { pinFiles: true })).value;
+          // Undo the try: its savepoint is rolled back.
+          throw new RolledBack(blank(mode, startFacts));
+        });
+      } catch (err) {
+        if (!(err instanceof RolledBack)) return found;
+      }
+      if (!got.raw) break;
+      const seen = interpret(got.raw, operation, actor, []);
+      const asks = seen.outcome === 'needs_confirmation' ? seen.warnings.filter((w) => sentFlags.includes(w.flag) && !accepted.includes(w.flag)) : [];
+      if (!asks.length) break;
+      for (const w of asks) if (!found.some((f) => f.flag === w.flag)) found.push(w);
+      accepted = [...accepted, ...asks.map((w) => w.flag)];
+    }
+    return found;
+  };
+
   if (isRead) {
     return withDeadline(limit, async (d) => {
       try {
@@ -2247,7 +3128,8 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
           result: seen.result,
           file,
           // A read asked for as a dry run or a commit still only read: nothing was kept or sent.
-          preview: mode === 'read' ? null : { ledger: null, records: [], effects: shown.list, warnings: [], loss: null, routePreview: null, truncated: shown.truncated },
+          preview:
+            mode === 'read' ? null : { ledger: null, records: [], effects: shown.list, warnings: [...seen.warnings], loss: null, routePreview: null, truncated: shown.truncated },
           warnings: seen.warnings,
           error: seen.error,
           produced: seen.produced,
@@ -2260,14 +3142,17 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
 
   if (mode === 'dry_run') {
     return withDeadline(limit, async (d) => {
+      let withheld: WarningPreview[] = [];
       try {
         await db.transaction(async (txRaw) => {
           const ctx = handlerContext(txRaw as unknown as DB, parts, false);
           const before = await readBefore(ctx, base.companyId, asked);
+          if (sentFlags.length) withheld = await withheldWarnings(txRaw as unknown as DB, d);
+          if (d.expired) throw new TimedOut();
           const run = await collectRun('capture', ctx, false);
           if (d.expired) throw new TimedOut();
           await ctx.db.execute(sql`SET CONSTRAINTS ALL IMMEDIATE`);
-          const done = await collect(ctx, operation, access, run.effects, before, run.value.status);
+          const done = await collect(ctx, operation, access, run.effects, before, run.value.status, withheld);
           const seen = interpret(run.value, operation, actor, sentFlags);
           throw new RolledBack({
             ...blank(mode, facts(seen.answer, done.ledger)),
@@ -2288,7 +3173,7 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
           return {
             ...blank(mode, facts(undefined, null)),
             httpStatus: err.raw.status,
-            preview: { ledger: null, records: [], effects: shown.list, warnings: [], loss: null, routePreview: { ran: false, note }, truncated: shown.truncated },
+            preview: { ledger: null, records: [], effects: shown.list, warnings: [...withheld], loss: null, routePreview: { ran: false, note }, truncated: shown.truncated },
           };
         }
         return failed(err);
@@ -2341,7 +3226,7 @@ export const runOperation: RunOperation = async (base, operation, input, mode, a
           outcome: seen.outcome,
           result: seen.result,
           file,
-          preview: { ledger: null, records: [], effects: shown.list, warnings: [], loss: null, routePreview: null, truncated: shown.truncated },
+          preview: { ledger: null, records: [], effects: shown.list, warnings: [...seen.warnings], loss: null, routePreview: null, truncated: shown.truncated },
           warnings: seen.warnings,
           error: seen.error,
           effects,

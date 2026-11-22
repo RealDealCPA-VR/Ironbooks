@@ -2,7 +2,8 @@
  * GET  /api/payroll-items — list payroll items for the active company.
  *        ?includeInactive=true — include deactivated items.
  *        ?kind=earning|tax|deduction|employer_contribution|garnishment — filter.
- *      Seeds the QB-like default item set on first use (write roles only).
+ *      Seeds the QB-like default item set on a person's first visit (write roles only). An agent's
+ *      read never does: it answers with what is there (nothing yet, on such a company).
  * POST /api/payroll-items — create a payroll item.
  *        { name, kind, pretax?, expenseAccountId?, liabilityAccountId?, calcBasis?, defaultRate? }
  */
@@ -32,8 +33,9 @@ function errorResponse(err: unknown) {
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    // Seed defaults on first use — skipped for viewers (read-only contexts can't write).
-    if (ctx.role !== 'viewer') {
+    // Seed defaults on a person's first visit: skipped for viewers, and for an agent, whose read
+    // must not change the books (ensureDefaultPayrollItems also skips any read-only context).
+    if (ctx.role !== 'viewer' && !ctx.agent) {
       await ensureDefaultPayrollItems(ctx);
     }
     const { searchParams } = req.nextUrl;

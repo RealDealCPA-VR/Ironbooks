@@ -16,12 +16,23 @@ import { inventoryDate } from '@/lib/services/inventory';
 import { adjustQuantityAtSite } from '@/lib/services/inventorySiteOps';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { fifoActionSchema } from '@/lib/validation/inventory';
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
   const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
   return NextResponse.json({ error: err.message, code: err.code, details: err.details }, { status });
+}
+
+/**
+ * The body as agents read it described (lib/validation/inventory.ts fifoActionSchema). Called after
+ * the checks above it, which answer first; it refuses only what the service could not use anyway.
+ */
+function checkBody(body: unknown): void {
+  const checked = fifoActionSchema.safeParse(body);
+  if (!checked.success) throw bodyValidationError(checked.error);
 }
 
 /** Optional Advanced Inventory fields from the raw body. */
@@ -90,6 +101,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       if (!date) {
         return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
       }
+      checkBody(body);
 
       const result = await adjustQuantityAtSite(ctx, {
         ...siteFields(body),
@@ -121,6 +133,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       if (!date) {
         return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
       }
+      checkBody(body);
 
       const result = await adjustQuantityAtSite(ctx, {
         ...siteFields(body),

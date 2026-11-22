@@ -9,6 +9,9 @@
  *  2. What an agent may never send is taken out of its input (lib/agent/guards.ts), or the request
  *     is refused outright.
  *  3. The policy decides with what the body says (lib/agent/policy.ts `decide`): refuse, run or ask.
+ *     Then the door's own refusals: a role an agent holds is never changed or deleted, and a
+ *     desktop operation's paths must lie in the agent's folders (firstLook). Nobody is asked about
+ *     what could only be refused.
  *  4. A read runs at once, on the read-only path, with the agent's own access.
  *  5. A dry run really runs and is rolled back. The answer says whether the real thing would run or
  *     would ask a person.
@@ -42,21 +45,31 @@
  *
  * An agent that sends too much is slowed down (plan §11.3): at most AGENT_CALLS_PER_MINUTE calls
  * a minute and AGENT_RUNS_AT_ONCE operations at a time, because the company file answers one
- * transaction at a time and a person is using it too. Every refusal says how long to wait. A verb
- * (handleVerb, which the curated actions of lib/agent/actions.ts go through too) is refused with
- * AgentRateLimited, which the route answers as 429 with a Retry-After header; `operate` itself,
- * called directly, answers a 'refused' whose note says the wait in words, because the answer shape
- * has no field for the seconds.
+ * transaction at a time and a person is using it too. A call is counted before anything of the
+ * policy or the books is read, and every refusal says how long to wait. A verb (handleVerb, which
+ * the curated actions of lib/agent/actions.ts go through too) is refused with AgentRateLimited,
+ * which the route answers as 429 with a Retry-After header; `operate` itself, called directly,
+ * answers a 'refused' with the wait in retryAfterSeconds, which the route answers as 429 too.
+ * doorRun and doorDecision give the curated actions the same count, run places and first look, so
+ * one action is one call however many times it goes through the door.
+ *
+ * A paused agent (or every agent, with Integrated Applications switched off) is refused every verb,
+ * checked once per call: a context taken just before the pause does no better than a new one.
  *
  * Nothing here changes agents, policies, grants or approvals: those operations are on the hard
- * floor of the registry, and `decide` refuses them before anything else is looked at.
+ * floor of the registry, and `decide` refuses them before anything else is looked at. A role an
+ * agent holds is part of that agent (plan §4.6, D9): changing or deleting one is refused here on
+ * every path, and again when a person approves.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '@/lib/db';
-import { agentPermissionRequests, agentRequests, agents, companies, userCompanies } from '@/lib/db/schema';
+import { AGENT_PAUSED_MESSAGE } from '@/lib/agentContext';
+import { AGENTS_BLOCKED_MESSAGE, agentsBlockedFor } from '@/lib/services/agents';
+import { agentPermissionRequests, agentRequests, agents, companies, companyRoles, userCompanies } from '@/lib/db/schema';
 import { ACTIVITIES, VIEW_BALANCE, activitiesOf, supportedActions, type ActivityDef } from '@/lib/permissions/activities';
 import {
   ACTIONS,
@@ -65,6 +78,7 @@ import {
   canActivity,
   emptyActivitySet,
   emptyPermissionSet,
+  builtinRole,
   legacyRoleFor,
   type ActivityKey,
   type Area,
@@ -80,12 +94,12 @@ import { agentCeiling, loadAgentPolicy } from '@/lib/services/agentPolicies';
 import { liveGrants } from '@/lib/services/agentGrants';
 import { cancelAgentRequest, createAgentRequest, listRequestsForAgent, requestForAgent } from '@/lib/services/agentRequests';
 import { listActiveSessions } from '@/lib/services/sessions';
-import { effects, runWithEffects } from '@/lib/effects';
-import { REQUEST_ID_MESSAGE, agentInputHash } from '@/lib/agent/actions';
+import { effects, pinFile, runWithEffects } from '@/lib/effects';
+import { REQUEST_ID_MESSAGE, agentInputHash, type ChangePreview } from '@/lib/agent/actions';
 import { runOperation } from '@/lib/agent/bridge';
 import { guardInput } from '@/lib/agent/guards';
 import { factsOf } from '@/lib/agent/facts';
-import { describeRequest } from '@/lib/agent/describe';
+import { describeRequest, type DescribeNames } from '@/lib/agent/describe';
 import { allowedFolder, readStagedFile, stagedFileInfo, uploadChunk } from '@/lib/agent/files';
 import { AGENT_OUTBOX_NAME, defaultAgentFolders, runShellOperation } from '@/lib/agent/shell';
 import { findOperations, operationById } from '@/lib/agent/operations/registry';
@@ -167,6 +181,47 @@ const REVEALED_MORE_FOR_PERSON =
   'Ironbooks tried this with the full protected values, and it would do more than the request showed: the amount and the number of records here are what it would really do. Its preview is not shown, because it holds those protected values. If it is still right, approve it again.';
 const REVEALED_TWO_FOR_PERSON =
   'Ironbooks tried this with the full protected values. Because of the amount it would really move (shown here) and the two-person limit set for this agent, two different people must approve it. Its preview is not shown, because it holds those protected values.';
+/** A context of an agent that has been removed since (or of no agent at all). */
+const GONE_NOTE = 'This agent has been removed, so it can no longer do anything in this company file.';
+
+/** The longest piece of a value the agent sent that a note repeats. */
+const NOTE_VALUE_MAX = 80;
+
+function shownValue(v: unknown): string {
+  const s = String(v ?? '').replace(/[\p{Cc}\p{Cf}]/gu, ' ').trim();
+  return s.length > NOTE_VALUE_MAX ? `${s.slice(0, NOTE_VALUE_MAX - 1)}…` : s;
+}
+
+/**
+ * Changing or deleting a role an agent holds (plan §4.6, D9): the hard floor, on every path. The
+ * role is named as a person knows it (its name, read by summaryNames), or by the id the agent sent
+ * when no name is found.
+ */
+function roleHeldNote(id: unknown, name?: string | null): string {
+  const shown = name && name.trim() ? shownValue(name) : shownValue(id);
+  return (
+    `No agent may change or delete role "${shown}", because an agent holds it: changing the role would change what that agent may do. ` +
+    'A person can change it in Ironbooks, under Users & Roles.'
+  );
+}
+const ROLE_GRANT_NOTE =
+  'Standing permission cannot be given for changing or deleting roles: no agent may change a role an agent holds, and standing permission could not tell those roles apart. Send each change with run_operation instead.';
+/** Standing permission that the grants service refuses for everyone, Admins included (lib/services/agentGrants.ts). */
+const HOST_ONLY_GRANT_NOTE =
+  'This can only be approved at the computer that holds the company file, one request at a time, so nobody can give standing permission for it. Send each with run_operation instead.';
+const FILE_ADMIN_GRANT_NOTE =
+  "This is company-file work, which the company file's Admin approves one request at a time, so nobody can give standing permission for it. Send each with run_operation instead.";
+/** Standing permission that could never let a request run (grantNeverCovers). */
+const AMOUNT_NEVER_KNOWN_NOTE =
+  'Standing permission limited by amount could never cover this: it cannot be tried ahead of time, so the amount of each request is not known until it runs. Ask again without constraints.max_amount, or send each with run_operation.';
+const COUNT_NEVER_KNOWN_NOTE =
+  'Standing permission for this is limited by the number of records, and this operation never says ahead of time how many it changes, so such permission could never cover a request. Send each with run_operation instead.';
+function twoPersonAlwaysNote(over: string | null): string {
+  return (
+    `Standing permission could never cover this while the two-person limit${over ? ` (${over})` : ''} is set: it cannot be tried ahead of time, ` +
+    'so the amount of each request counts as unknown, and two different people must approve each one. Send each with run_operation instead.'
+  );
+}
 
 const SECRET_WORDS: Record<SecretKind, string> = {
   closing_password: 'the closing-date password',
@@ -297,6 +352,8 @@ interface Door {
   now: string;
   /** The people who gave grants, each looked up once per request (giverWithin). */
   givers: Map<string, Promise<Awaited<ReturnType<typeof resolveAccess>> | null>>;
+  /** The names the one-line summary shows for the records the request names by id (summaryNames). */
+  names?: DescribeNames;
 }
 
 function requireAgent(ctx: ServiceContext): AgentOfContext {
@@ -330,6 +387,202 @@ function decideFor(door: Door, operation: Operation, facts: RequestFacts): Polic
     return { outcome: 'ask', effectiveClass: d.effectiveClass, needs: approvalNeeds(operation, d.effectiveClass, facts, door.policy) };
   }
   return d;
+}
+
+// ---------------------------------------------------------------------------
+// What is refused before anything else: a stopped agent, a role an agent holds, a path outside
+// the agent's folders
+// ---------------------------------------------------------------------------
+
+/**
+ * Why this agent may do nothing at all right now, or null: it was removed, a person paused it, or
+ * Integrated Applications is switched off for the company. Read fresh on every call (two small
+ * reads), so a context taken before the pause, or a call already under way when a person paused
+ * it, does no better than a new request, which the way in (lib/agentContext.ts) refuses.
+ */
+async function stoppedNote(ctx: ServiceContext, agentId: string): Promise<string | null> {
+  if (!UUID_RE.test(agentId)) return GONE_NOTE;
+  const [row] = await ctx.db
+    .select({ companyId: agents.companyId, pausedAt: agents.pausedAt, revokedAt: agents.revokedAt })
+    .from(agents)
+    .where(eq(agents.id, agentId));
+  if (!row || row.revokedAt || row.companyId !== ctx.companyId) return GONE_NOTE;
+  if (isPaused(row.pausedAt)) return AGENT_PAUSED_MESSAGE;
+  if (await agentsBlockedFor(ctx.db, ctx.companyId)) return AGENTS_BLOCKED_MESSAGE;
+  return null;
+}
+
+/**
+ * What changes or removes one role: anything but a read of /api/roles/[id] (today PATCH and
+ * DELETE: lib/services/users.ts updateRole, deleteRole). The bridge refuses the same at its end.
+ */
+function changesRole(operation: Pick<Operation, 'kind' | 'method' | 'route'>): boolean {
+  return operation.kind === 'route' && operation.route === '/api/roles/[id]' && operation.method !== 'GET';
+}
+
+/**
+ * A role key as the database compares it. A custom role's key is its uuid, and the database reads
+ * a uuid in other spellings too (capitals, braces, hyphens left out or moved), so every spelling of
+ * one id comes out the same here. A built-in role's key ("bookkeeper") is compared as written,
+ * ignoring case.
+ */
+function roleKeyOf(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const t = v.trim().toLowerCase();
+  if (!t) return null;
+  const hex = t.replace(/[{}-]/g, '');
+  return /^[0-9a-f]{32}$/.test(hex) ? hex : t;
+}
+
+/** Every role an agent of this company holds (every agent not removed), as roleKeyOf spells them. */
+async function rolesAgentsHold(db: ServiceContext['db'], companyId: string): Promise<Set<string>> {
+  const rows = await db
+    .select({ roleKeys: agents.roleKeys })
+    .from(agents)
+    .where(and(eq(agents.companyId, companyId), isNull(agents.revokedAt)));
+  const held = new Set<string>();
+  for (const r of rows) {
+    for (const k of Array.isArray(r.roleKeys) ? (r.roleKeys as unknown[]) : []) {
+      const key = roleKeyOf(k);
+      if (key) held.add(key);
+    }
+  }
+  return held;
+}
+
+/**
+ * The hard floor of plan §4.6 (D9) for roles: the refusal when this request would change or delete
+ * a role ANY agent holds (the asking agent's own included), otherwise null. Agents' access is read
+ * live from their roles (lib/services/agents.ts agentAccess), so such a change would change that
+ * agent, which no agent may do. Asked of the database each time: a role can become held between an
+ * ask and its approval.
+ */
+async function roleHeldRefusal(db: ServiceContext['db'], companyId: string, operation: Operation, input: OperationInput): Promise<string | null> {
+  if (!changesRole(operation)) return null;
+  const named = input?.params?.id;
+  const key = roleKeyOf(named);
+  // Nothing named: the route has no role to change (the bridge refuses a missing path value).
+  if (key === null) return null;
+  if (!(await rolesAgentsHold(db, companyId)).has(key)) return null;
+  // The role's name, as the card's summary shows it. A role spelled other than its stored id (the
+  // database reads a uuid in other spellings) has no name here, so the id the agent sent is shown.
+  const names = await summaryNames(db, companyId, operation, input);
+  return roleHeldNote(named, typeof named === 'string' ? names?.[named.trim()] : null);
+}
+
+/**
+ * The names a person knows the records of a request by, for its one-line summary
+ * (lib/agent/describe.ts DescribeNames): a role's name for the role id of /api/roles/[id], so the
+ * card reads "Delete role Clerk", not a uuid. Read from this company's own roles; nothing when the
+ * id names no role here.
+ */
+async function summaryNames(db: ServiceContext['db'], companyId: string, operation: Operation, input: OperationInput): Promise<DescribeNames | undefined> {
+  if (operation.kind !== 'route' || !operation.route.startsWith('/api/roles/[id]')) return undefined;
+  const raw = input?.params?.id;
+  if (typeof raw !== 'string' || !raw.trim()) return undefined;
+  const id = raw.trim();
+  const builtin = builtinRole(id);
+  if (builtin?.name) return { [id]: builtin.name };
+  if (!UUID_RE.test(id)) return undefined;
+  const [row] = await db
+    .select({ name: companyRoles.name })
+    .from(companyRoles)
+    .where(and(eq(companyRoles.id, id), eq(companyRoles.companyId, companyId)));
+  return row?.name ? { [id]: row.name } : undefined;
+}
+
+/** The request's one line, with the names the door read for it (summaryNames). */
+function summaryOf(door: Door, operation: Operation, input: OperationInput, answer?: unknown): string {
+  if (door.names) return describeRequest(operation, input, answer, door.names);
+  return answer === undefined ? describeRequest(operation, input) : describeRequest(operation, input, answer);
+}
+
+/** The path fields of a desktop operation (lib/agent/operations/shell.ts): each names a file its flow opens or writes. */
+function shellPathFields(operation: Operation): Array<{ field: string; required: boolean }> {
+  if (operation.kind !== 'shell' || operation.id === SAVE_FILE_OPERATION) return [];
+  const def = SHELL_OPERATIONS.find((d) => d.id === operation.id);
+  if (!def) return [];
+  return Object.entries(def.input)
+    .filter(([, f]) => f.type === 'path')
+    .map(([field, f]) => ({ field, required: f.required === true }));
+}
+
+function pathNotAllowed(field: string, added: readonly string[]): string {
+  const theirs = added.length ? `, or a folder the Admin added for this agent (${added.join('; ')})` : ', or a folder an Admin adds for this agent in Users & Roles > Agents';
+  return (
+    `"${field}" must be the full path of a file in a folder this agent may use, and that folder must already exist. ` +
+    `Use the company file's folder, Documents\\Ironbooks or Documents\\Ironbooks\\${AGENT_OUTBOX_NAME}${theirs}. Nobody was asked.`
+  );
+}
+
+/**
+ * A desktop operation's paths are checked before a person is asked, by the rule the desktop shell
+ * itself applies after the approval (electron/agentShell.js pathProblem): each is a file in a folder
+ * agents may use, which saveStagedFile uses too (saveFolders, allowedFolder: links resolved, never
+ * the top of a drive or share, never a share this computer serves). The shell checks again when it
+ * runs; this only spares a person a question whose answer could only fail. A folder that does not
+ * exist yet is refused here (the shell would accept a new one spelled exactly), which only ever
+ * refuses more. files.save checks its folder in savePreview.
+ */
+async function shellPathRefusal(door: Door, operation: Operation, input: OperationInput): Promise<string | null> {
+  const fields = shellPathFields(operation);
+  if (!fields.length) return null;
+  const b = bodyFields(input.body);
+  const folders = saveFolders(door);
+  for (const { field, required } of fields) {
+    const v = b[field];
+    if ((v === undefined || v === null) && !required) continue;
+    // As the shell reads it: a whole path, with nothing around it.
+    if (typeof v !== 'string' || !v || v !== v.trim() || !path.isAbsolute(v)) return pathNotAllowed(field, folders.added);
+    if (!(await allowedFolder(folders.all, path.dirname(path.resolve(v))))) return pathNotAllowed(field, folders.added);
+  }
+  return null;
+}
+
+/** What the door's first look found: the input it uses, the facts, and the decision on what the request itself says. */
+interface FirstLook {
+  input: OperationInput;
+  /** Dotted paths the guards took out of the agent's input. */
+  stripped: string[];
+  /** Null when the guards refused the request outright: nothing was read. */
+  door: Door | null;
+  facts: RequestFacts;
+  decision: PolicyDecision;
+}
+
+/**
+ * The door's first look at one request, the same for run_operation, a dry run, a curated action
+ * (doorDecision) and a run under standing permission: what the guards refuse outright; then the
+ * policy on what the request itself says (a pause first); then the hard floor for a role an agent
+ * holds, which comes before a refusal of the role or the policy, as the hard floor does in
+ * `decide`; then a desktop operation's paths. Nothing of the record the request names is read.
+ */
+async function firstLook(ctx: ServiceContext, agent: AgentOfContext, operation: Operation, given: OperationInput): Promise<FirstLook> {
+  const guarded = guardInput(operation, given);
+  if (guarded.refused) {
+    return {
+      input: guarded.input,
+      stripped: [],
+      door: null,
+      facts: emptyFacts(given),
+      decision: { outcome: 'refuse', code: 'hard_floor', message: guarded.refused, effectiveClass: baseClass(operation) },
+    };
+  }
+  const input = withVersion(guarded.input, given);
+  const door = await openDoor(ctx, agent);
+  const facts = factsOf(operation, input, { closingDate: door.closingDate });
+  let decision = decideFor(door, operation, facts);
+  if (!(decision.outcome === 'refuse' && (decision.code === 'paused' || decision.code === 'hard_floor'))) {
+    const held = await roleHeldRefusal(ctx.db, ctx.companyId, operation, input);
+    if (held) decision = { outcome: 'refuse', code: 'hard_floor', message: held, effectiveClass: decision.effectiveClass };
+  }
+  if (decision.outcome !== 'refuse') {
+    const outside = await shellPathRefusal(door, operation, input);
+    // The folders are the agent's settings (AgentPolicy.folders): a path outside them is one the
+    // Admin did not allow.
+    if (outside) decision = { outcome: 'refuse', code: 'never', message: outside, effectiveClass: decision.effectiveClass };
+  }
+  return { input, stripped: guarded.stripped, door, facts, decision };
 }
 
 /** Who an agent's own run is for (contract §4). Never a person, never a secret, never a reveal. */
@@ -460,27 +713,112 @@ function figuresKnown(dry: BridgeResult): boolean {
 }
 
 /**
- * Nothing in the run moves money: no ledger entry was posted, nothing was cut from the preview,
- * and every record it touched is a new one (an edit, a void or a delete of something that exists
- * may move money without posting a new entry, so those are never counted as nothing).
+ * How a ledger preview entry came about (lib/agent/bridge.ts TouchedPostingEntry): 'made' by the
+ * run, or an entry that was there before which it 'voided', 'deleted' or 'changed'. Anything else
+ * written there is read as made: money (fail closed).
  */
-function movesNoMoney(p: OperationPreview | null | undefined): boolean {
-  if (!p || !p.ledger || p.truncated) return false;
-  if ((p.ledger.entries ?? []).length > 0) return false;
-  return (p.ledger.changes ?? []).every((c) => c?.action === 'create') && (p.records ?? []).every((r) => r?.action === 'create');
+type EntryHow = 'made' | 'voided' | 'deleted' | 'changed';
+
+function entryHow(entry: unknown): EntryHow {
+  const t = plainObject(entry) ? entry.touched : undefined;
+  return t === 'voided' || t === 'deleted' || t === 'changed' ? t : 'made';
+}
+
+function entriesOf(p: OperationPreview | null | undefined): ChangePreview['entries'] {
+  return Array.isArray(p?.ledger?.entries) ? p.ledger.entries : [];
+}
+
+/** The amount is a known zero. */
+function zeroAmount(amount: string | null | undefined): boolean {
+  if (amount === null || amount === undefined) return false;
+  try {
+    return Money.isZero(amount);
+  } catch {
+    return false;
+  }
 }
 
 /**
- * The facts of a successful dry run (the bridge's, with the amount the run showed). One rule of
- * the door's own, as decided for the whole feature: a run that went all the way and moved no
- * money, of an operation that names no amount field, has the amount "0.00", not unknown. An
- * amount field that could not be read stays unknown (fail closed).
+ * Whether an entry the run only changed moved money, as the bridge marks it, or null when the entry
+ * does not say. The mark is `counted`, as lib/agent/bridge.ts TouchedEntry.counted holds it: the
+ * entry's total when the run rewrote its lines or posted it from a draft, null when it only gave it
+ * a new title, number, link or line memo. TouchedPostingEntry does not carry it yet (asked of the
+ * bridge's owner); until it does, every entry reads as "does not say". A mark that cannot be read
+ * is money (fail closed).
+ */
+function changedEntryMoved(entry: unknown): boolean | null {
+  if (!plainObject(entry) || !Object.hasOwn(entry, 'counted')) return null;
+  const counted = entry.counted;
+  if (counted === null) return false;
+  if (typeof counted !== 'string' && typeof counted !== 'number') return true;
+  return !zeroAmount(String(counted));
+}
+
+/**
+ * Whether a run posted to the ledger (the agent's 'posted' rather than 'done'): it made, voided or
+ * deleted an entry (a void is never "nothing"). An entry it only changed (a new title, number, link
+ * or line memo) is not money. When every entry it touched was only changed, the bridge's mark on
+ * each says whether it moved money (changedEntryMoved). Where an entry has no mark, the amount
+ * decides: a known "0.00" did not post; an amount that is unknown, or more than nothing, did. For
+ * an operation with no amount field that amount is what the ledger moved (the bridge counts a
+ * changed entry only when its lines were rewritten or a draft was posted), so it is exact; for one
+ * with an amount field it is that field's figure, so a run that only retitled an entry of such a
+ * document reads as posted (errs toward "posted") until the bridge marks its entries.
+ */
+function postedToLedger(p: OperationPreview | null | undefined, amount: string | null | undefined): boolean {
+  const entries = entriesOf(p);
+  if (entries.length === 0) return false;
+  if (entries.some((e) => entryHow(e) !== 'changed')) return true;
+  const marks = entries.map(changedEntryMoved);
+  // A preview that was cut may have left out an entry the run voided or deleted: the amount decides.
+  if (!p?.truncated && marks.every((m) => m !== null)) return marks.some((m) => m === true);
+  return !zeroAmount(amount);
+}
+
+/**
+ * Nothing in the run moves money: nothing was cut from the preview, it made, voided or deleted no
+ * ledger entry, and every other record it touched is a new one (an edit, a void or a delete of
+ * something that exists may move money without posting a new entry, so those are never counted as
+ * nothing). An entry it only changed (a new title, number, link or memo), with that entry's own
+ * change in the audit trail, is not money.
+ */
+function movesNoMoney(p: OperationPreview | null | undefined): boolean {
+  if (!p || !p.ledger || p.truncated) return false;
+  const entries = entriesOf(p);
+  if (entries.some((e) => entryHow(e) !== 'changed')) return false;
+  const changedEntries = new Set(entries.map((e) => String(e?.journalEntryId ?? '').toLowerCase()));
+  const nothing = (r: { action?: unknown; kind?: unknown; id?: unknown } | null | undefined) =>
+    r?.action === 'create' || (r?.action === 'update' && r?.kind === 'journal_entry' && changedEntries.has(String(r?.id ?? '').toLowerCase()));
+  return (p.ledger.changes ?? []).every(nothing) && (p.records ?? []).every(nothing);
+}
+
+/**
+ * The run touched no ledger entry at all, yet voided, deleted or changed a record that was there
+ * before (a payroll adjustment entered without its accounts, a customer's details), or the preview
+ * was cut so that this cannot be ruled out. Such a run may still move money outside the ledger
+ * (year-to-date wages on the W-2, 941 and 940, an open balance), so its amount is never "nothing".
+ */
+function changedOutsideLedger(p: OperationPreview | null | undefined): boolean {
+  if (!p || !p.ledger || entriesOf(p).length > 0) return false;
+  if (p.truncated) return true;
+  const existing = (r: { action?: unknown } | null | undefined) => r?.action !== 'create';
+  return (p.ledger.changes ?? []).some(existing) || (p.records ?? []).some(existing);
+}
+
+/**
+ * The facts of a successful dry run (the bridge's, with the amount the run showed). Two rules of
+ * the door's own for an operation that names no amount field, as decided for the whole feature,
+ * once the run went all the way: a run that only made new records and moved no money has the
+ * amount "0.00", not unknown; a run that voided, deleted or changed a record that was there before
+ * and touched no ledger entry has an UNKNOWN amount, whatever figure came with it (fail closed). An
+ * amount field that could not be read stays unknown.
  */
 function dryRunFacts(operation: Operation, dry: BridgeResult, before: RequestFacts): RequestFacts {
   const facts = dry.facts ?? before;
+  if (operation.amountField || !figuresKnown(dry)) return facts;
+  if (changedOutsideLedger(dry.preview)) return { ...facts, amount: null };
   if (facts.amount !== null && facts.amount !== undefined) return facts;
-  if (operation.amountField || !figuresKnown(dry) || !movesNoMoney(dry.preview)) return facts;
-  return { ...facts, amount: '0.00' };
+  return movesNoMoney(dry.preview) ? { ...facts, amount: '0.00' } : facts;
 }
 
 const READ_CLASSES: readonly RiskClass[] = ['read', 'read_sensitive'];
@@ -630,10 +968,6 @@ function dryRunError(operation: Operation, input: OperationInput, r: BridgeResul
   return err;
 }
 
-function hasLedger(preview: OperationPreview | null | undefined): boolean {
-  return (preview?.ledger?.entries?.length ?? 0) > 0;
-}
-
 function previewOf(list: EffectPreview[]): OperationPreview {
   return { ledger: null, records: [], effects: list, warnings: [], loss: null, routePreview: null, truncated: false };
 }
@@ -708,11 +1042,11 @@ function askedAnswer(operation: string, view: AgentRequestView, replayed: boolea
 /**
  * Whether an executed request posted to the ledger: what the run itself posted, as the requests
  * service records it (AgentRequestView.posted); for a row from before that, the preview the
- * request holds (the last one a person saw).
+ * request holds (the last one a person saw) with its amount, by the same rule as a run's own answer.
  */
 function executedPosted(view: AgentRequestView): boolean {
   if (typeof view.posted === 'boolean') return view.posted;
-  return hasLedger(view.preview);
+  return postedToLedger(view.preview, view.amount);
 }
 
 /** What became of a permission request, as the answer to asking again with its request id. */
@@ -930,6 +1264,9 @@ const runOperationArgs = z
     body: z.unknown().optional(),
     confirm: z.array(z.string().min(1).max(80)).max(20).optional(),
     reveal: z.boolean().optional(),
+    // The record's updatedAt as the agent last read it (OperationInput.expectedUpdatedAt): the
+    // bridge checks it and sends it to the route, whose own version check compares it.
+    expectedUpdatedAt: z.string().max(64).optional(),
     dryRun: z.boolean().optional(),
     requestId: z.string().max(200).optional(),
     reason: z.string().max(REASON_MAX, `can be at most ${REASON_MAX} characters`).optional(),
@@ -1099,6 +1436,93 @@ export function resetAgentRateLimits(): void {
   runState.clear();
 }
 
+/**
+ * The agent call under way in this piece of async work: already counted against
+ * AGENT_CALLS_PER_MINUTE, and holding one of the agent's run places when `placed`. Set only by this
+ * module (doorRun, and a run in a place), never from anything an agent sends. A door call made
+ * inside it for the same agent (a curated action's own check, then its run through handleVerb) is
+ * neither counted again nor given a second place: one action is one call.
+ */
+interface CallMark {
+  agentId: string;
+  placed: boolean;
+}
+// Process-wide like the counters: Next.js may load this module once per route bundle.
+const callHolder = globalThis as typeof globalThis & { __bkaAgentDoorCall?: AsyncLocalStorage<CallMark> };
+const callStore = (callHolder.__bkaAgentDoorCall ??= new AsyncLocalStorage<CallMark>());
+
+function callMark(agentId: string): CallMark | null {
+  const mark = callStore.getStore();
+  return mark && mark.agentId === agentId ? mark : null;
+}
+
+/** Count one call of the agent, unless this work is already one; too many is thrown as AgentRateLimited. */
+function countCall(agentId: string): void {
+  if (callMark(agentId)) return;
+  const limited = rateLimited(agentId);
+  if (limited) throw new AgentRateLimited(limited.message, limited.retryAfterSeconds);
+}
+
+/**
+ * Run in one of the agent's AGENT_RUNS_AT_ONCE places (or in the one this work already holds).
+ * Too many under way is thrown as AgentRateLimited. The place comes back however the run ends.
+ */
+async function inPlace<T>(agentId: string, run: () => Promise<T>): Promise<T> {
+  if (callMark(agentId)?.placed) return run();
+  const ran = await inRunSlot(agentId, () => callStore.run({ agentId, placed: true }, run));
+  if (!ran) throw new AgentRateLimited(BUSY.message, BUSY.retryAfterSeconds);
+  return ran.value;
+}
+
+/**
+ * One call of the agent behind `ctx` that does work of its own (a curated action of
+ * lib/agent/actions.ts): counted against AGENT_CALLS_PER_MINUTE first, before anything is read,
+ * and run in one of its AGENT_RUNS_AT_ONCE places. Too many of either is thrown as
+ * AgentRateLimited (the route answers 429 with Retry-After). Whatever `run` sends through the door
+ * for the same agent (handleVerb, operate, doorDecision) counts as this same call, in this same
+ * place.
+ */
+export async function doorRun<T>(ctx: ServiceContext, run: () => Promise<T>): Promise<T> {
+  const agent = requireAgent(ctx);
+  countCall(agent.id);
+  return inPlace(agent.id, run);
+}
+
+/** What the door's first look decides for one request (doorDecision). */
+export interface DoorDecision {
+  /** The registry's own operation (never the caller's copy of it). */
+  operation: Operation;
+  /** The input as the door uses it: what the agent may never send is taken out. */
+  input: OperationInput;
+  /** Dotted paths taken out of it, because only a person may set them. */
+  stripped: string[];
+  /** The facts the decision was made on: what the request itself says, before any dry run. */
+  facts: RequestFacts;
+  /**
+   * The door's decision on those facts: refuse, run (now, or under standing permission, before the
+   * giver is checked) or ask. A refusal here is final and in the door's own words; a run or an ask
+   * may still change once the door tries the request and decides again on what it really does.
+   */
+  decision: PolicyDecision;
+}
+
+/**
+ * The door's first look at one request of the agent behind `ctx`, and nothing more: nothing runs,
+ * nothing is asked, nothing of the record the request names is read. Exactly what run_operation
+ * would decide before it tries the request: the guards, a pause, the hard floor (a role an agent
+ * holds included), the role, the policy and a desktop operation's folders. Counted as a call first,
+ * unless it is part of one already (doorRun); too many is thrown as AgentRateLimited.
+ */
+export async function doorDecision(ctx: ServiceContext, operation: Operation | string, input: OperationInput = {}): Promise<DoorDecision> {
+  const agent = requireAgent(ctx);
+  countCall(agent.id);
+  const id = typeof operation === 'string' ? operation : operation?.id;
+  const registered = typeof id === 'string' ? operationById(id) : null;
+  if (!registered) throw validation(unknownOperationNote(String(id ?? '')));
+  const look = await firstLook(ctx, agent, registered, input ?? {});
+  return { operation: registered, input: look.input, stripped: look.stripped, facts: look.facts, decision: look.decision };
+}
+
 // ---------------------------------------------------------------------------
 // Saving a staged file (the server's own operation "files.save")
 // ---------------------------------------------------------------------------
@@ -1144,13 +1568,22 @@ async function savePreview(ctx: ServiceContext, door: Door, input: OperationInpu
   if (!dir) return { refused: folderNotAllowed(folders.added) };
   const name = text(b.name) || staged.file.name;
   // The name is checked first (writeFile refuses separators and the like), so looking for the
-  // file never reaches outside the allowed folder.
-  const run = await runWithEffects('capture', () => effects.writeFile({ dir, name, bytes: staged.bytes }));
+  // file never reaches outside the allowed folder. The folder is checked above, so the save is
+  // pinned to it ({ pinFiles }): the disk is looked at only there, as the bridge does.
+  const run = await runWithEffects(
+    'capture',
+    async () => {
+      const w = await effects.writeFile({ dir, name, bytes: staged.bytes });
+      await pinFile(w.effect, dir);
+      return w;
+    },
+    { pinFiles: true },
+  );
   const there = await fsp.lstat(path.join(dir, name)).then(
     () => true,
     () => false,
   );
-  if (there || run.value.replaces) return { refused: alreadyThere(name) };
+  if (there || run.value.replaces || run.value.effect?.detail?.replaces === true) return { refused: alreadyThere(name) };
   return { preview: previewOf(run.effects) };
 }
 
@@ -1165,21 +1598,41 @@ function inputOf(req: z.infer<typeof runOperationArgs>): OperationInput {
     ...(req.body !== undefined ? { body: req.body } : {}),
     ...(req.confirm !== undefined ? { confirm: req.confirm } : {}),
     ...(req.reveal !== undefined ? { reveal: req.reveal } : {}),
+    ...(req.expectedUpdatedAt !== undefined ? { expectedUpdatedAt: req.expectedUpdatedAt } : {}),
   };
 }
 
 /**
+ * The guarded input with the version of the record the agent last read put back
+ * (OperationInput.expectedUpdatedAt): the guards keep only the parts they know, and this one is
+ * neither a secret nor anything only a person sets. The bridge checks its form and sends it to the
+ * route, whose own version check compares it inside the committing transaction, so a person's
+ * edit made in between is a 409, never overwritten. An approved run carries it too.
+ */
+function withVersion(guarded: OperationInput, given: OperationInput | null | undefined): OperationInput {
+  const v = (given as { expectedUpdatedAt?: unknown } | null | undefined)?.expectedUpdatedAt;
+  return v === undefined || v === null ? guarded : { ...guarded, expectedUpdatedAt: v as string };
+}
+
+/**
  * Policy, grants, bridge and requests in one place: the only way an agent's operation runs. Too
- * many calls (a minute, or at once) is answered as a refusal that says how long to wait; the verbs
- * of the route answer the same as 429 (handleVerb).
+ * many calls (a minute, or at once) is answered as a refusal that says how long to wait, in words
+ * and in retryAfterSeconds (the route answers it as 429 with Retry-After); the verbs of the route
+ * throw it instead (handleVerb). Inside a call already counted (doorRun) it is not counted again.
  */
 export const operate: Operate = async (ctx, req) => {
   const agent = requireAgent(ctx);
   const named = typeof req?.operation === 'string' ? req.operation : '';
-  const limited = rateLimited(agent.id);
-  if (limited) return refused(named, limited.message);
-  const ran = await inRunSlot(agent.id, () => operateOnce(ctx, agent, req));
-  return ran ? ran.value : refused(named, BUSY.message);
+  if (!callMark(agent.id)) {
+    const limited = rateLimited(agent.id);
+    if (limited) return refused(named, limited.message, { retryAfterSeconds: limited.retryAfterSeconds });
+  }
+  try {
+    return await inPlace(agent.id, () => operateOnce(ctx, agent, req));
+  } catch (err) {
+    if (err instanceof AgentRateLimited) return refused(named, err.message, { retryAfterSeconds: err.retryAfterSeconds });
+    throw err;
+  }
 };
 
 async function operateOnce(ctx: ServiceContext, agent: AgentOfContext, raw: RunOperationRequest | unknown): Promise<AgentOperationAnswer> {
@@ -1187,14 +1640,12 @@ async function operateOnce(ctx: ServiceContext, agent: AgentOfContext, raw: RunO
   const operation = operationById(req.operation);
   if (!operation) return refused(req.operation, unknownOperationNote(req.operation));
 
-  const guarded = guardInput(operation, inputOf(req));
-  if (guarded.refused) return refused(operation.id, guarded.refused);
-  const input = guarded.input;
-
-  const door = await openDoor(ctx, agent);
-  const facts = factsOf(operation, input, { closingDate: door.closingDate });
-  const decision = decideFor(door, operation, facts);
-  if (decision.outcome === 'refuse') return withStripped(refused(operation.id, decision.message), guarded.stripped);
+  const look = await firstLook(ctx, agent, operation, inputOf(req));
+  const { input, facts, decision } = look;
+  if (decision.outcome === 'refuse') return withStripped(refused(operation.id, decision.message), look.stripped);
+  // Null only when the guards refused it, which is a refusal.
+  const door = look.door as Door;
+  door.names = await summaryNames(ctx.db, ctx.companyId, operation, input);
 
   let answer: AgentOperationAnswer;
   if (decision.outcome === 'run' && decision.effectiveClass === 'read') {
@@ -1204,12 +1655,12 @@ async function operateOnce(ctx: ServiceContext, agent: AgentOfContext, raw: RunO
   } else {
     answer = await change(ctx, door, operation, input, facts, decision, req);
   }
-  return withStripped(answer, guarded.stripped);
+  return withStripped(answer, look.stripped);
 }
 
 async function readNow(ctx: ServiceContext, door: Door, operation: Operation, input: OperationInput): Promise<AgentOperationAnswer> {
   const r = await runOperation(ctx, operation, input, 'read', ownActor(door, null));
-  if (r.outcome === 'needs_confirmation') return needsConfirmationAnswer(operation, r, describeRequest(operation, input, r.result));
+  if (r.outcome === 'needs_confirmation') return needsConfirmationAnswer(operation, r, summaryOf(door, operation, input, r.result));
   if (r.outcome === 'error') throw appError(r);
   return { operation: operation.id, outcome: 'read', result: r.result, ...(r.file ? { file: r.file } : {}) };
 }
@@ -1232,7 +1683,7 @@ async function tryOnly(
   facts: RequestFacts,
   decision: PolicyDecision,
 ): Promise<AgentOperationAnswer> {
-  const summary = describeRequest(operation, input);
+  const summary = summaryOf(door, operation, input);
   if (!bridgePreviewable(operation, decision)) {
     let preview: OperationPreview | null = null;
     if (operation.id === SAVE_FILE_OPERATION) {
@@ -1276,7 +1727,7 @@ async function tryOnly(
   return {
     operation: operation.id,
     outcome: 'dry_run',
-    summary: describeRequest(operation, input, dry.result),
+    summary: summaryOf(door, operation, input, dry.result),
     result: dry.result,
     ...(dry.file ? { file: dry.file } : {}),
     ...(dry.preview ? { preview: dry.preview } : {}),
@@ -1284,6 +1735,50 @@ async function tryOnly(
     ...(dry.warnings?.length ? { warnings: dry.warnings } : {}),
     note: `${NOTHING_KEPT} ${again}`,
   };
+}
+
+/** Most tries without the agent's confirmation flags, one for each warning a route raises in turn. */
+const SILENCED_TRIES = 5;
+
+/**
+ * The warnings the agent's confirmation flags silenced (plan §5.6), so that the approval card asks
+ * the person the question the agent answered: the request tried again without its flags, rolled
+ * back, as `actor`. A route raises one warning at a time, so each warning found is accepted for the
+ * next try, until the route raises none, or one the agent did not accept. Only warnings of flags
+ * the agent sent; nothing else of these tries is kept. None when the request has no flags, and none
+ * when the tries cannot be made (the card then shows the flags it was sent with, as before).
+ */
+async function silencedWarnings(base: ServiceContext, operation: Operation, input: OperationInput, actor: BridgeActor): Promise<WarningPreview[]> {
+  const sent = [...new Set((input.confirm ?? []).filter((f): f is string => typeof f === 'string'))];
+  if (!sent.length || operation.kind !== 'route' || operation.dryRun === 'none') return [];
+  const without: OperationInput = { ...input };
+  delete without.confirm;
+  const accepted: string[] = [];
+  const found: WarningPreview[] = [];
+  try {
+    for (let i = 0; i < Math.min(sent.length, SILENCED_TRIES); i++) {
+      const tried = await runOperation(base, operation, { ...without, ...(accepted.length ? { confirm: [...accepted] } : {}) }, 'dry_run', actor);
+      if (tried.outcome !== 'needs_confirmation') break;
+      const raised = tried.warnings?.length ? tried.warnings : (tried.preview?.warnings ?? []);
+      const fresh = raised.filter((w) => w && typeof w.flag === 'string' && sent.includes(w.flag) && !accepted.includes(w.flag));
+      if (!fresh.length) break;
+      for (const w of fresh) {
+        found.push({ flag: w.flag, message: typeof w.message === 'string' ? w.message : '' });
+        accepted.push(w.flag);
+      }
+    }
+  } catch {
+    // Informational only: the request stands on the preview it has.
+  }
+  return found;
+}
+
+/** The preview with the silenced warnings added (each flag once). */
+function withWarnings(preview: OperationPreview, warnings: WarningPreview[]): OperationPreview {
+  if (!warnings.length) return preview;
+  const had = preview.warnings ?? [];
+  const add = warnings.filter((w) => !had.some((h) => h?.flag === w.flag));
+  return add.length ? { ...preview, warnings: [...had, ...add] } : preview;
 }
 
 /** A real request: run it, or ask a person. Needs a request id. */
@@ -1309,10 +1804,12 @@ async function change(
   let preview: OperationPreview | null = null;
   let stalenessKey: string | null = null;
   let answerSoFar: unknown;
+  // The bridge tried it and it went through: the preview is that run's.
+  let tried = false;
 
   if (dryRunFirst(operation, firstDecision)) {
     const dry = await runOperation(ctx, operation, input, 'dry_run', ownActor(door, null));
-    if (dry.outcome === 'needs_confirmation') return needsConfirmationAnswer(operation, dry, describeRequest(operation, input));
+    if (dry.outcome === 'needs_confirmation') return needsConfirmationAnswer(operation, dry, summaryOf(door, operation, input));
     if (dry.outcome === 'error') {
       if (closingDateFailure(dry)) {
         // Dated on or before the closing date where the body did not show it: closed-period work.
@@ -1332,6 +1829,7 @@ async function change(
       preview = dry.preview;
       stalenessKey = dry.stalenessKey;
       answerSoFar = dry.result;
+      tried = true;
     }
   } else if (firstDecision.outcome === 'ask' && operation.id === SAVE_FILE_OPERATION) {
     const p = await savePreview(ctx, door, input);
@@ -1349,12 +1847,15 @@ async function change(
   const judged = known ? facts : unchecked(facts);
   const { decision, actor } = await settleGrant(ctx, door, operation, judged, decideFor(door, operation, judged));
 
-  const summary = describeRequest(operation, input, answerSoFar);
+  const summary = summaryOf(door, operation, input, answerSoFar);
   if (decision.outcome === 'refuse') return refused(operation.id, decision.message, { summary });
   if (decision.outcome === 'ask') {
     const reason = (req.reason ?? '').trim();
     // Never put a request to a person without the agent saying why.
     if (!reason) return refused(operation.id, NO_REASON_NOTE, { summary, ...(preview ? { preview } : {}) });
+    // The warnings the agent's confirmation flags silenced, for the card (plan §5.6): the same
+    // question the person would have answered in the window, with the agent's yes beside it.
+    if (preview && tried) preview = withWarnings(preview, await silencedWarnings(ctx, operation, input, ownActor(door, null)));
     return askPerson(ctx, door, {
       kind: 'operation',
       requestKey,
@@ -1408,7 +1909,7 @@ async function commit(
     throw await keepFailure(claimId, said);
   }
   if (r.outcome === 'needs_confirmation') {
-    const summary = describeRequest(operation, input, r.result);
+    const summary = summaryOf(door, operation, input, r.result);
     if (nothingKept(operation, r)) {
       // A warning the agent may accept comes before anything is done (plan §5.6): the same request
       // id may be sent again with the flag.
@@ -1435,8 +1936,8 @@ async function commit(
   }
   const answer: AgentOperationAnswer = {
     operation: operation.id,
-    outcome: hasLedger(r.preview) ? 'posted' : 'done',
-    summary: describeRequest(operation, input, r.result),
+    outcome: postedToLedger(r.preview, r.facts?.amount) ? 'posted' : 'done',
+    summary: summaryOf(door, operation, input, r.result),
     result: r.result,
     ...(r.file ? { file: r.file } : {}),
     ...(r.preview ? { preview: r.preview } : {}),
@@ -1662,6 +2163,9 @@ export const runApproved: RunApproved = async (approver, request, approve, opts)
   if (operation.availability !== 'agent') {
     throw new ServiceError('FORBIDDEN', "Agents can never do this, even with a person's approval. A person can do it in Ironbooks.");
   }
+  // The role may have become one an agent holds since the agent asked: looked at again now.
+  const held = await roleHeldRefusal(approver.db, approver.companyId, operation, request.input ?? {});
+  if (held) throw new ServiceError('FORBIDDEN', `Nothing was done. ${held}`);
   if (operation.hostOnly && !opts.atHost) {
     throw new ServiceError('FORBIDDEN', 'This can only be approved at the computer that holds the company file.');
   }
@@ -1679,6 +2183,8 @@ export const runApproved: RunApproved = async (approver, request, approve, opts)
   const stored: OperationInput = request.input ?? {};
   const guarded = guardInput(operation, stored);
   if (guarded.refused) throw new ServiceError('FORBIDDEN', guarded.refused);
+  // The version the agent last read goes with the approved run too: a person's edit since is a 409.
+  guarded.input = withVersion(guarded.input, stored);
 
   const actor: BridgeActor = {
     agent: { id: agent.id, name: agent.name, preset: policy.preset, onBehalfOf: approver.userId },
@@ -1721,11 +2227,16 @@ export const runApproved: RunApproved = async (approver, request, approve, opts)
   // and only its figures are kept).
   let real: RequestFacts | null = null;
   if (canTryAhead(operation)) {
-    const dry = await runOperation(approver, operation, guarded.input, 'dry_run', { ...actor, reveal: false, secrets: {} });
+    const dryActor: BridgeActor = { ...actor, reveal: false, secrets: {} };
+    const dry = await runOperation(approver, operation, guarded.input, 'dry_run', dryActor);
+    // A new preview the person is shown carries the warnings the agent's flags silenced, as the
+    // first one did (change).
+    const shownAgain = async (r: BridgeResult): Promise<BridgeResult> =>
+      r.outcome === 'ok' && r.preview ? { ...r, preview: withWarnings(r.preview, await silencedWarnings(approver, operation, guarded.input, dryActor)) } : r;
     if (closingDateFailure(dry)) {
-      // Dated on or before the closing date: no dry run gets through that (the closing-date
-      // override is the commit's alone, lib/agent/bridge.ts closingOverride), so the request is
-      // judged as closed-period work, whatever it was shown as, and its amount stays unknown.
+      // Dated on or before the closing date: this dry run gets no typed secrets (above), so it never
+      // gets through that, and the request is judged as closed-period work, whatever it was shown
+      // as, and its amount stays unknown.
       const closed: RequestFacts = { ...shownFacts, closedPeriod: true };
       refuseOverPolicy(ceiling.access, policy, operation, closed);
       // Shown as open-period work (the closing date moved since it was asked): back to the person,
@@ -1735,7 +2246,7 @@ export const runApproved: RunApproved = async (approver, request, approve, opts)
       if (ask.stalenessKey) return dry;
     } else if (ask.stalenessKey) {
       // The books changed since the person's preview: what would happen now is shown instead.
-      if (dry.stalenessKey !== ask.stalenessKey) return dry;
+      if (dry.stalenessKey !== ask.stalenessKey) return shownAgain(dry);
       if (figuresKnown(dry)) real = dryRunFacts(operation, dry, shownFacts);
     } else if (dry.outcome === 'ok') {
       // Asked without a preview (the agent's masked rights, an older request, closing-date work
@@ -1743,7 +2254,7 @@ export const runApproved: RunApproved = async (approver, request, approve, opts)
       // do is judged against what the person read, and shown to them first when it is more.
       if (figuresKnown(dry)) {
         real = dryRunFacts(operation, dry, shownFacts);
-        if (exceedsShown(real, readOnCard(ask.shown, operation, guarded.input))) return dry;
+        if (exceedsShown(real, readOnCard(ask.shown, operation, guarded.input))) return shownAgain(dry);
       }
     } else if (dry.outcome === 'needs_confirmation') {
       // It would stop at the same warning: the request ends with it, and the agent can send it
@@ -1762,7 +2273,7 @@ export const runApproved: RunApproved = async (approver, request, approve, opts)
     }
     // The real figures need two people where the request did not (a limit set since, say): the
     // person sees this preview again and a second person approves too.
-    if (real && dry.outcome === 'ok' && !ask.twoPerson && needsTwoPerson(policy, real, operation)) return dry;
+    if (real && dry.outcome === 'ok' && !ask.twoPerson && needsTwoPerson(policy, real, operation)) return shownAgain(dry);
   }
   // Nothing showed the real figures (it cannot be tried, or no try could get through): the amount
   // counts as unknown. A request that did not already need two people for that goes back to the
@@ -1910,15 +2421,27 @@ async function summaryFor(ctx: ServiceContext, door: Door, operation: Operation)
   };
 }
 
+/**
+ * The notes of describe_operation: how it is tried, and what that means for how it is judged. They
+ * follow the door's own rules (bridgePreviewable, figuresSeenAhead), so a note never promises a
+ * try the door will not make: a route that needs something only the approver types (a password, a
+ * key) is never tried ahead, whatever its dry run kind.
+ */
 function notesFor(operation: Operation): string[] {
   const notes: string[] = [];
-  if (READ_CLASSES.includes(baseClass(operation))) notes.push('A read: it changes nothing.');
-  else if (operation.dryRun === 'transaction') notes.push('Send it with dry_run: true first to see exactly what it would do; nothing is kept.');
+  const read = READ_CLASSES.includes(baseClass(operation));
+  const typed = (operation.needsSecret ?? []).length > 0;
+  if (read) notes.push('A read: it changes nothing.');
+  else if (typed && operation.kind === 'route' && operation.dryRun !== 'none') {
+    notes.push(
+      `This cannot be tried ahead of time, because it needs ${joinWords(operation.needsSecret.map((s) => SECRET_WORDS[s] ?? 'a password'))}, which only the person approving it types: a dry run only describes it.`,
+    );
+  } else if (operation.dryRun === 'transaction') notes.push('Send it with dry_run: true first to see exactly what it would do; nothing is kept.');
   else if (operation.dryRun === 'preview') notes.push("A dry run uses the app's own preview of this request.");
   else notes.push('This cannot be tried without really doing it: a dry run only describes it.');
-  if (!READ_CLASSES.includes(baseClass(operation))) {
+  if (!read) {
     notes.push(
-      operation.dryRun === 'transaction'
+      figuresSeenAhead(operation)
         ? 'Before it runs or asks, it is tried and the policy decides again on what it would really do: the true amount, number of records and date.'
         : 'Because it cannot be tried ahead of time, its amount counts as unknown: above any two-person limit, and outside the amount of standing permission.',
     );
@@ -1967,11 +2490,61 @@ function grantSummary(operation: Operation, cls: RiskClass, c: GrantConstraints,
   );
 }
 
+/**
+ * Why standing permission for this operation, with these limits, could never let a request of it
+ * run, or null when it could. A grant limited by records needs a count, and an operation that names
+ * no list of records never has one. Every real request of an operation whose figures are never seen
+ * ahead is judged with its amount unknown (change): while the two-person limit applies to an
+ * unknown amount, no grant covers one at all (decide never lets a grant answer what needs two
+ * people), and otherwise a grant limited by amount never covers one. The two-person reason is
+ * given first: the other one says to ask again without max_amount, which would not help then.
+ */
+function grantNeverCovers(policy: AgentPolicy, operation: Operation, c: GrantConstraints): string | null {
+  if (GRANTABLE[baseClass(operation)] === 'capped' && !operation.countField) return COUNT_NEVER_KNOWN_NOTE;
+  if (figuresSeenAhead(operation)) return null;
+  if (needsTwoPerson(policy, unchecked(typicalFacts(operation)), operation)) return twoPersonAlwaysNote(policy.twoPersonOver);
+  if (c.maxAmount !== undefined && c.maxAmount !== null) return AMOUNT_NEVER_KNOWN_NOTE;
+  return null;
+}
+
+/**
+ * Whether a request of this operation may have an amount that is never known, even after it is
+ * tried: one that names no amount field and does more than make new records. Such a run that
+ * changes, voids or deletes a record that was there before and touches no ledger entry has an
+ * UNKNOWN amount (dryRunFacts), so with the two-person limit set no grant covers it, whatever its
+ * max_amount. Which requests post nothing is only known from each one's dry run, so this can only
+ * warn.
+ */
+function amountMayStayUnknown(operation: Operation): boolean {
+  return !operation.amountField && baseClass(operation) !== 'enter';
+}
+
+/** amountMayStayUnknown, in words, for an agent asking for standing permission while the two-person limit is set. */
+const UNKNOWN_AMOUNT_GRANT_NOTE =
+  'While the two-person limit is set, standing permission for this covers only requests whose dry run shows the amount they move. A change to a record ' +
+  "that is already there that posts nothing to the ledger (a name's details, say) has no amount that can be checked, so each such request still needs " +
+  'two people, and standing permission never covers it. If that is all this work does, send each with run_operation instead.';
+
+function twoPersonLimitSet(policy: AgentPolicy): boolean {
+  return policy.twoPersonOver !== null && policy.twoPersonOver !== undefined;
+}
+
+/** What the agent is told to do when standing permission would need two people (askForPermission). */
+function twoPersonGrantNote(policy: AgentPolicy, operation: Operation): string {
+  const words = [
+    `Standing permission only covers what one person may approve. Set constraints.max_amount at or below ${policy.twoPersonOver ?? 'the two-person limit'} and send it again.`,
+  ];
+  if (twoPersonLimitSet(policy) && amountMayStayUnknown(operation)) words.push(UNKNOWN_AMOUNT_GRANT_NOTE);
+  return words.join(' ');
+}
+
 async function askForPermission(ctx: ServiceContext, agent: AgentOfContext, args: z.infer<typeof verbArgs.ask_for_permission>): Promise<AgentOperationAnswer> {
   const operation = operationById(args.operation);
   if (!operation) return refused(args.operation, unknownOperationNote(args.operation));
   const cls = baseClass(operation);
   const constraints: GrantConstraints = { ...(args.constraints ?? {}) };
+  // The hard floor for roles an agent holds (plan §4.6): a grant names no role, so it could cover one.
+  if (changesRole(operation)) return refused(operation.id, ROLE_GRANT_NOTE);
   if (operation.kind === 'shell') {
     // A desktop or file action never runs on an agent's own say-so (decideFor), so standing
     // permission for one would do nothing: a person approves each.
@@ -1980,12 +2553,16 @@ async function askForPermission(ctx: ServiceContext, agent: AgentOfContext, args
       'A person approves each desktop or file action on its own, so standing permission cannot be given for it. Send each with run_operation (or save_file) instead.',
     );
   }
+  // Refused for everyone by the grants service, Admins included (lib/services/agentGrants.ts).
+  if (operation.hostOnly) return refused(operation.id, HOST_ONLY_GRANT_NOTE);
+  if (operation.fileAdmin) return refused(operation.id, FILE_ADMIN_GRANT_NOTE);
   if (GRANTABLE[cls] === 'no' || operation.alwaysAsk || !operation.classified) {
     return refused(
       operation.id,
       `A person cannot give standing permission for this (${RISK_CLASS_LABELS[cls]}): each one is asked on its own. Send each with run_operation instead.`,
     );
   }
+  if (GRANTABLE[cls] === 'capped' && !operation.countField) return refused(operation.id, COUNT_NEVER_KNOWN_NOTE);
   if (GRANTABLE[cls] === 'capped' && constraints.maxCount === undefined) {
     return refused(operation.id, 'Say the most records one request may change, in constraints.max_count, and send it again.');
   }
@@ -1998,6 +2575,13 @@ async function askForPermission(ctx: ServiceContext, agent: AgentOfContext, args
   if (earlier) return earlier;
 
   const door = await openDoor(ctx, agent);
+  // Limited by amount, on work whose amount is never known ahead: it could never be used. Looked at
+  // before the policy decides, which would take the limit for the request's amount. With the
+  // two-person limit set, that is the reason given (grantNeverCovers): asking again without
+  // max_amount would be refused too.
+  if (!figuresSeenAhead(operation) && constraints.maxAmount !== undefined) {
+    return refused(operation.id, grantNeverCovers(door.policy, operation, constraints) ?? AMOUNT_NEVER_KNOWN_NOTE);
+  }
   const facts = grantFacts(constraints);
   // A grant already given covers it only when its giver still could give it (settleGrant).
   const { decision: d } = await settleGrant(ctx, door, operation, facts, decideFor(door, operation, facts));
@@ -2008,12 +2592,11 @@ async function askForPermission(ctx: ServiceContext, agent: AgentOfContext, args
   if (d.needs.grantable === 'no') {
     return refused(operation.id, 'A person cannot give standing permission for requests like this: each one is asked on its own. Send each with run_operation instead.');
   }
-  if (d.needs.twoPerson) {
-    return refused(
-      operation.id,
-      `Standing permission only covers what one person may approve. Set constraints.max_amount at or below ${door.policy.twoPersonOver ?? 'the two-person limit'} and send it again.`,
-    );
-  }
+  // A grant that could never let a request run is never put to a person (the two-person limit on
+  // work whose amount is never known ahead, most of all: lowering max_amount would not help).
+  const never = grantNeverCovers(door.policy, operation, constraints);
+  if (never) return refused(operation.id, never);
+  if (d.needs.twoPerson) return refused(operation.id, twoPersonGrantNote(door.policy, operation));
   const most = d.needs.grantable === 'short' ? SHORT_GRANT_MINUTES : 24 * 60;
   const minutes = Math.min(args.minutes ?? Math.min(60, most), most);
   const reason = args.reason.trim();
@@ -2034,6 +2617,8 @@ async function askForPermission(ctx: ServiceContext, agent: AgentOfContext, args
     grantAsked: { constraints, minutes },
     action,
     hash,
+    // Asked, but it may still never cover the requests this agent has in mind: it is told so.
+    note: twoPersonLimitSet(door.policy) && amountMayStayUnknown(operation) ? UNKNOWN_AMOUNT_GRANT_NOTE : null,
   });
 }
 
@@ -2101,19 +2686,17 @@ function realLimits(c: GrantConstraints, policy: AgentPolicy, operation: Operati
 /**
  * The live grants that would really let something run (their giver still could give them, within
  * the agent's role), with their real limits. Left out: a grant on a desktop or file action (a
- * person approves each, decideFor), and on an operation that cannot be tried ahead, a grant limited
- * by amount or one whose unknown amount needs two people, since neither ever covers a request
- * (every real request of it has its amount unknown: change).
+ * person approves each, decideFor), on a role change (the hard floor for roles an agent holds),
+ * and any grant that could never cover a request (grantNeverCovers: on an operation that cannot be
+ * tried ahead, one limited by amount or one whose unknown amount needs two people; one limited by
+ * records on an operation that never counts them).
  */
 async function grantsInEffect(ctx: ServiceContext, door: Door): Promise<AgentGrant[]> {
   const out: AgentGrant[] = [];
   for (const g of door.grants) {
     const operation = operationById(g.operation);
-    if (!operation || operation.kind === 'shell') continue;
-    if (!figuresSeenAhead(operation)) {
-      if (g.constraints?.maxAmount !== undefined && g.constraints?.maxAmount !== null) continue;
-      if (needsTwoPerson(door.policy, typicalFacts(operation), operation)) continue;
-    }
+    if (!operation || operation.kind === 'shell' || changesRole(operation)) continue;
+    if (grantNeverCovers(door.policy, operation, g.constraints ?? {})) continue;
     if (!(await giverWithin(ctx, door, operation, typicalFacts(operation), g))) continue;
     out.push({ ...g, constraints: realLimits(g.constraints ?? {}, door.policy, operation) });
   }
@@ -2122,21 +2705,40 @@ async function grantsInEffect(ctx: ServiceContext, door: Door): Promise<AgentGra
 
 /** Verbs that run an operation: they hold the company file while they run (AGENT_RUNS_AT_ONCE). */
 async function runVerb(agentId: string, run: () => Promise<AgentOperationAnswer>): Promise<AgentOperationAnswer> {
-  const ran = await inRunSlot(agentId, run);
-  if (!ran) throw new AgentRateLimited(BUSY.message, BUSY.retryAfterSeconds);
-  return ran.value;
+  return inPlace(agentId, run);
+}
+
+/** find_operations for an agent that may do nothing right now: every operation refused, with why. */
+function stoppedSummary(operation: Operation, note: string): OperationSummary {
+  return {
+    id: operation.id,
+    describe: operation.describe,
+    class: baseClass(operation),
+    area: operation.area,
+    method: operation.method,
+    route: operation.route,
+    treatment: 'refused',
+    why: note,
+  };
 }
 
 /**
  * One verb of POST /api/agent/actions (`{ verb, ...args }`). Arguments are checked here. Too many
  * calls is an error for every verb (AgentRateLimited: the route answers 429 with Retry-After), so
- * an agent never reads "slow down" as a refusal of the work itself.
+ * an agent never reads "slow down" as a refusal of the work itself. The call is counted first,
+ * before anything is read. Then, once per call, whether the agent may do anything at all (removed,
+ * paused, every agent switched off): if not, every verb is refused (FORBIDDEN) except
+ * find_operations, which reads only the list of operations and answers each one as refused, with
+ * why.
  */
 export const handleVerb: HandleVerb = async (ctx, verb, args) => {
   const agent = requireAgent(ctx);
   if (!isAgentVerb(verb)) throw unknownVerb(verb);
-  const limited = rateLimited(agent.id);
-  if (limited) throw new AgentRateLimited(limited.message, limited.retryAfterSeconds);
+  countCall(agent.id);
+  const stopped = await stoppedNote(ctx, agent.id);
+  if (stopped && verb !== 'find_operations') {
+    throw new ServiceError('FORBIDDEN', stopped, { agent: true, ...(stopped === AGENT_PAUSED_MESSAGE ? { paused: true } : {}) });
+  }
   const owner: FileOwner = { companyId: ctx.companyId, agentId: agent.id };
 
   switch (verb) {
@@ -2144,6 +2746,7 @@ export const handleVerb: HandleVerb = async (ctx, verb, args) => {
       const a = parseArgs(verbArgs.find_operations, args);
       const limit = Math.min(a.limit ?? FIND_LIMIT, FIND_LIMIT);
       const found = findOperations({ query: a.query, area: a.area, class: a.class, limit: limit + 1 });
+      if (stopped) return { operations: found.slice(0, limit).map((op) => stoppedSummary(op, stopped)), more: found.length > limit };
       const door = await openDoor(ctx, agent);
       const operations: OperationSummary[] = [];
       for (const op of found.slice(0, limit)) operations.push(await summaryFor(ctx, door, op));
@@ -2162,7 +2765,6 @@ export const handleVerb: HandleVerb = async (ctx, verb, args) => {
         notes.push('The list of fields could not be loaded just now. A dry run shows what the app expects.');
       }
       // Examples where the operation, its desktop flow or its classification has them (plan §6.1).
-      // The contract's description has no field for them yet, so they ride beside it.
       let examples: OperationExample[] = [];
       try {
         examples = examplesOf(operation);
@@ -2170,7 +2772,7 @@ export const handleVerb: HandleVerb = async (ctx, verb, args) => {
         // Written wrong: the registry test names it. The rest of the description stands.
       }
       if (examples.length) notes.push('Each of examples is a request as run_operation takes it: params, query, body and confirm.');
-      const description: OperationDescription & { examples: OperationExample[] } = {
+      const description: OperationDescription = {
         ...(await summaryFor(ctx, door, operation)),
         params: [...operation.params],
         bodySchema: schemas.body ?? null,

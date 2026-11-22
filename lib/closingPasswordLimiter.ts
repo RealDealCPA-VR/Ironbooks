@@ -8,10 +8,21 @@
  *
  * Guesses are limited like sign-in (review round 5): this was the one password with no attempt
  * limit, so a user with the closed-period right but not the password (an Accountant, an External
- * Accountant) could try passwords until one worked. All three ways share the same keys, so guesses
- * cannot be spread over them: the person in this company, plus the global cap. Never the address
- * alone: everyone working on this computer shares 'local', and one person's wrong guesses must not
- * lock the others out.
+ * Accountant) could try passwords until one worked. The keys are the person in this company, plus
+ * the global cap, in the realm of where the request came from (lib/net/rateLimit.ts attemptKeys:
+ * 'local' for the Ironbooks window on this computer, the device for a teammate's). Never the
+ * address alone: everyone working on this computer shares 'local', and one person's wrong guesses
+ * must not lock the others out.
+ *
+ * A person's own guesses, made in their own window, all count under the same keys, whichever of the
+ * three ways they come in, so they cannot be spread over them. A password typed on an approval
+ * card is counted under the approving person's own keys only: the bridge checks it before each run
+ * of the agent's work it is handed to (the rolled-back try an approval may make, the commit),
+ * outside the agent's service scope (so in the approver's realm). A wrong one refuses that run at
+ * once, whatever the work, before the route runs: nothing after it is tried, so one approval is at
+ * most one wrong guess. A right one reaches Set Closing Date marked as already checked
+ * (lib/serviceScope.ts closingPasswordCheckedInScope), which compares it again without counting it,
+ * so it is never counted under the agent scope's keys ("this computer, outside Ironbooks").
  *
  * A locked limiter refuses before the password is even looked at, so the right password does not
  * get through a lock either.

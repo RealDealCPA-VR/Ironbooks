@@ -69,6 +69,19 @@ describe('classification: reports', () => {
     for (const o of ops()) if (o.method === 'GET' && o.area === 'file_utilities') expect(o.class, o.id).toBe('file');
   });
 
+  it('never offers the raw transaction log to an agent: it cannot be masked; the masked log stays a read', () => {
+    expect(op('transaction-log.download')).toMatchObject({ method: 'GET', class: 'file', availability: 'hard_floor' });
+    expect(op('transaction-log.download').why).toMatch(/cannot be masked/);
+    // What an agent reads instead.
+    for (const id of ['transaction-log', 'transaction-log.export', 'transaction-log.verify']) {
+      expect(operationById(id), id).toMatchObject({ class: 'read', availability: 'agent' });
+    }
+  });
+
+  it("says that an agent's read of the audit trail leaves out Users & Roles and File Utilities", () => {
+    for (const id of ['audit-trail', 'audit-trail.get']) expect(op(id).why, id).toMatch(/auditReaderFor/);
+  });
+
   it('never dry runs a GET classed above read: a dry run would hand the agent the answer before anyone approved it', () => {
     for (const o of ops()) {
       if (o.method === 'GET' && o.class !== 'read' && o.class !== 'read_sensitive') expect(o.dryRun, o.id).toBe('none');

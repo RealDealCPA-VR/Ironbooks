@@ -20,7 +20,8 @@ import { payPayrollLiabilities } from '@/lib/services/liabilityPayments';
 import { payrollLiabilityBalances } from '@/lib/services/payrollReports';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
-import { parseDateInput } from '@/lib/validation/helpers';
+import { bodyValidationError, parseDateInput } from '@/lib/validation/helpers';
+import { payLiabilitiesByItemSchema } from '@/lib/validation/liabilities';
 
 function errorStatus(code: string): number {
   return serviceErrorStatus(code);
@@ -88,6 +89,10 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
+    // The body as agents read it described (lib/validation/liabilities.ts). The checks above answer
+    // first; the service checks each item.
+    const checked = payLiabilitiesByItemSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const entry = await payPayrollLiabilities(ctx, {
       date,

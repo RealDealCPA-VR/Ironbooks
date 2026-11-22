@@ -6,9 +6,13 @@
  * The optional Advanced Inventory fields pick the site the build happens at (components are
  * drawn from it, finished goods land in it) and the bins / serials / lots involved.
  *
- * Builds or unbuilds the specified quantity of an assembly item.
- * No GL entry is posted — both sides of the transaction are account 1300 (net $0).
- * Quantities and averageCost are updated on the item records directly.
+ * Builds or unbuilds the specified quantity of an assembly item. Like QB's Build Assembly, it posts
+ * to the GL: one value-move entry per component (lib/services/assemblies.ts postValueMove), Dr the
+ * assembly's inventory asset account / Cr the component's, sourceRef
+ * `assembly_build:<buildId>:<componentId>:<assemblyId>` (an unbuild posts the reverse,
+ * `assembly_unbuild:…`). When both items use the same account the entry nets to $0 on it, but it is
+ * still posted, so the closing date applies; a component with no value moved posts nothing.
+ * Quantities and averageCost are updated on the item records.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';

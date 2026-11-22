@@ -7,8 +7,8 @@ import { describeSchemas } from '../schemas';
 import { NEVER_ALLOW_CLASSES, type Operation, type RequestFacts } from '../types';
 import type { OperationInput } from '@/lib/agent/contract';
 import { describeRequest } from '@/lib/agent/describe';
-import { approvalNeeds } from '@/lib/agent/policy';
-import { redactAnswer } from '@/lib/agent/guards';
+import { approvalNeeds, effectiveClass } from '@/lib/agent/policy';
+import { guardInput, redactAnswer } from '@/lib/agent/guards';
 
 const BUCKET: ClassBucket = 'documents';
 const ops = (): Operation[] => allOperations().filter((o) => o.kind === 'route' && bucketOfRoute(o.route) === BUCKET);
@@ -71,23 +71,69 @@ describe('classification: documents', () => {
     expect(needs.grantable).toBe('no');
   });
 
-  it('the text read off a receipt is hidden in what the door answers; revealing it takes an Admin', () => {
-    // A W-9 dropped into the receipt inbox through a phone link: its text holds a full SSN.
-    const text = 'Form W-9 Request for Taxpayer Identification Number SSN 123-45-6789 Acme Supply';
+  it('the text read off a receipt is hidden in what the door answers; an approved reveal shows it', () => {
+    // A W-9 dropped into the receipt inbox through a phone link: its text holds a full SSN, and a
+    // bank statement's a labelled account number.
+    const text = 'Form W-9 Request for Taxpayer Identification Number SSN 123-45-6789 Acme Supply Account Number: 000123456789';
     const receipt = { id: 'r1', vendorName: 'Acme Supply', total: '12.00', cardLast4: '4242', rawText: text };
-    const list = redactAnswer(op('receipts.list'), { receipts: [receipt, { ...receipt, id: 'r2' }] }, { reveal: false }).answer;
-    const one = redactAnswer(op('receipts.get'), { receipt, suggestions: null }, { reveal: false }).answer;
-    for (const answer of [list, one]) {
+    // The list as it would read should it ever carry the text again (sensitiveFields is its backstop).
+    const answers = [
+      redactAnswer(op('receipts.list'), { receipts: [receipt, { ...receipt, id: 'r2' }] }, { reveal: false }).answer,
+      redactAnswer(op('receipts.get'), { receipt, suggestions: null }, { reveal: false }).answer,
+    ];
+    for (const answer of answers) {
       expect(JSON.stringify(answer)).not.toContain('123-45');
+      expect(JSON.stringify(answer)).not.toContain('Form W-9');
       expect(JSON.stringify(answer)).toContain('Acme Supply');
       expect(JSON.stringify(answer)).toContain('4242');
     }
     // The receipt inbox itself stays everyday work: a plain read and a prepare.
     expect(op('receipts.list').class).toBe('read');
     expect(op('receipts.get').class).toBe('prepare');
-    for (const id of ['receipts.list', 'receipts.get']) {
-      expect(approvalNeeds(op(id), 'read_sensitive', { ...PLAIN, reveal: true }, { twoPersonOver: null }).admin, id).toBe(true);
-    }
+    // The list never carries the text (lib/services/receipts.ts listReceipts), so it offers no
+    // reveal: one would send a person an approval whose answer holds nothing. Its why points to
+    // the one receipt's read.
+    expect(op('receipts.list').reveal ?? null).toBeNull();
+    expect(guardInput(op('receipts.list'), { reveal: true }).refused).not.toBeNull();
+    expect(op('receipts.list').why).toMatch(/receipts\.get/);
+    // One receipt: the agent may ask for its text (the guards let reveal through) ...
+    const get = op('receipts.get');
+    expect(guardInput(get, { params: { id: 'r1' }, reveal: true }).refused).toBeNull();
+    // ... and whoever approves holds "View sensitive payroll data": the text can hold a full SSN.
+    const needs = approvalNeeds(get, 'read_sensitive', { ...PLAIN, reveal: true }, { twoPersonOver: null });
+    expect(needs.flags ?? []).toEqual(['sensitivePayroll']);
+    expect(needs.grantable).toBe('no');
+    expect(get.why).toMatch(/reveal: true/);
+    // The why says what that approval does not cover: a number in the text with no label.
+    expect(get.why).toMatch(/no label/);
+    // Approved: the text shows, its labelled account number still masked (one kind at a time, D6).
+    const approved = redactAnswer(get, { receipt, suggestions: null }, { reveal: true }).answer;
+    expect(JSON.stringify(approved)).toContain('SSN 123-45-6789');
+    expect(JSON.stringify(approved)).not.toContain('000123456789');
+    expect(JSON.stringify(approved)).toContain('6789');
+  });
+
+  it('a bank import is prepare work, whatever the body: for an agent it only stages lines, and posting is asked about on its own', () => {
+    const imp = op('import');
+    expect(imp).toMatchObject({ method: 'POST', class: 'prepare', countField: 'rows' });
+    // Its dry run is kept: an agent's import (and any rolled-back preview) loads no AI settings.
+    expect(imp.dryRun).toBe('transaction');
+    // A statement that does not tie out, sent anyway, is one class higher and never under a grant.
+    expect(imp.confirmFlags).toEqual(['statement.acknowledgeDifference']);
+    expect(effectiveClass(imp, { ...PLAIN, confirm: ['statement.acknowledgeDifference'] })).toBe('enter');
+    expect(effectiveClass(imp, PLAIN)).toBe('prepare');
+    // The why cites the service's own rule and the operation that posts.
+    expect(imp.why).toMatch(/autoPostHere/);
+    expect(imp.why).toMatch(/ai\.bank-suggestions\.run/);
+    expect(imp.why).not.toMatch(/every body can post|ledger preview shows what would post/);
+    expect(op('ai.bank-suggestions.run').class).not.toBe('prepare');
+  });
+
+  it('the AI proposals route says agent work is decided in Agent requests, not there', () => {
+    const proposals = op('ai.proposals.action');
+    expect(proposals.availability).toBe('hard_floor');
+    expect(proposals.why).toMatch(/approved or denied in Agent requests/);
+    expect(proposals.why).not.toMatch(/agent proposals live here/);
   });
 
   it('classes the File Utilities reads of the QuickBooks conversion and Rebuild Data file', () => {
@@ -122,9 +168,10 @@ describe('classification: documents', () => {
     const memorize = op('ai.recurring.memorize');
     const line = (autoEnter?: boolean) =>
       describeRequest(memorize, { body: { docType: 'bill', sourceDocId: 'b1', frequency: 'monthly', nextRunDate: '2026-12-01', ...(autoEnter === undefined ? {} : { autoEnter }) } });
-    expect(line()).toBe('Memorize bill b1 as a recurring transaction (monthly, from 2026-12-01)');
-    expect(line(false)).toMatch(/\(enters itself with nobody reviewing it: no\)$/);
-    expect(line(true)).toMatch(/\(enters itself with nobody reviewing it: yes\)$/);
+    // lib/agent/describe.ts may add the next dates the schedule would run on; that is its own rule.
+    expect(line()).toMatch(/^Memorize bill b1 as a recurring transaction \(monthly, from 2026-12-01\)(?: \(next dates: [^()]*\))?$/);
+    expect(line(false)).toMatch(/\(enters itself with nobody reviewing it: no\)/);
+    expect(line(true)).toMatch(/\(enters itself with nobody reviewing it: yes\)/);
     expect(line()).not.toMatch(/enters itself|true/);
   });
 

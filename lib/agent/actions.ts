@@ -7,18 +7,22 @@
  * action names the route a person uses for the same thing (`route`), which is one operation of the
  * registry, and is a thin wrapper round that operation:
  *
+ *  0. the request is counted as one of the agent's calls before anything is read for it, as the
+ *     door counts a verb: an agent over its limit gets the door's "slow down" (429 with
+ *     Retry-After) and nothing else;
  *  1. its input is checked with the action's own schema (the fields the curated tools send);
  *  2. the input is turned into the route's own request: path parameters, query and body
- *     (`request`);
- *  3. a check of the action's own (the version of a record the agent last read) runs only once
+ *     (`request`), and the version of the record the agent last read (expectedUpdatedAt), which
+ *     the route compares inside the transaction that commits;
+ *  3. a check of the action's own (that same version, as a quick first answer) runs only once
  *     the policy has had its say. A request the policy or the agent's role refuses is refused
  *     before anything about the record is read, exactly as run_operation refuses it, so a refusal
  *     never says who last changed a record, or whether it exists;
  *  4. that request goes through the door as the run_operation verb itself (handleVerb), with the
- *     agent's request id, the dry run flag and its reason. The policy, standing permission, the
- *     route bridge, dry runs, request ids, permission requests and the "slow down" (429 with
- *     Retry-After) are all the door's, so a curated action can never do what run_operation would
- *     not;
+ *     agent's request id, the dry run flag and its reason (the agent's own words; the placeholder
+ *     of noReasonGiven only when the request has no reason field at all). The policy, standing
+ *     permission, the route bridge, dry runs, request ids, permission requests and the "slow
+ *     down" are all the door's, so a curated action can never do what run_operation would not;
  *  5. the door's answer comes back in the action's words (`answer`: documentResult and friends).
  *     A refusal keeps the door's own words: the action's one-line summary, which may name a
  *     customer, vendor, account or bank, is made only for work the door looked at.
@@ -40,7 +44,8 @@
  *    answers.
  *
  * Requests copied from the old approval queue are still entered the old way, under the approving
- * person's permissions, by runApprovedAgentAction.
+ * person's permissions, by runApprovedAgentAction, which only the approval center calls
+ * (lib/services/agentRequests.ts).
  */
 import { createHash } from 'node:crypto';
 import { and, eq, sql } from 'drizzle-orm';
@@ -52,16 +57,14 @@ import { featureOffError } from '@/lib/featureGate';
 import { authorizeRequest } from '@/lib/permissions/enforce';
 import { legacyRoleFor } from '@/lib/permissions/model';
 import { assertAccountantCopyAllowsPath } from '@/lib/services/accountantCopy/routeGate';
+import { lineMemoFor, resolveEntityNames } from '@/lib/services/journal';
 import { type ServiceContext, ServiceError, translateLedgerDbError, validation } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { toDecimal, type MoneyInput } from '@/lib/money';
 import type { EffectReport } from '@/lib/effects';
 import { operationForRoute } from './operations/registry';
-import { decide } from './policy';
-import { factsOf } from './facts';
-import { guardInput } from './guards';
 import type { AgentOperationAnswer, AgentOutcome, OperationInput, OperationPreview, StagedFile } from './contract';
-import type { ApprovalNeeds, Operation, PolicyDecision, RequestStatus, WarningPreview } from './operations/types';
+import type { ApprovalNeeds, Operation, RequestStatus, WarningPreview } from './operations/types';
 
 export type AgentActionMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
@@ -104,7 +107,9 @@ export interface AgentActionDef<I = unknown> {
   answer?: (routeAnswer: unknown, input: I, how: ActionAnswerContext) => unknown;
   /**
    * A check of the action's own before the request is sent (the version of a record the agent
-   * last read). It runs only when the policy does not refuse the request (see the top of this file).
+   * last read, as a quick first answer; the route compares it again where it counts, inside the
+   * committing transaction). It runs only when the policy does not refuse the request (see the
+   * top of this file).
    */
   check?: (ctx: ServiceContext, input: I) => Promise<void>;
   /** 'door' (the default): through the agent's door. 'own' and 'self': see the top of this file. */
@@ -149,8 +154,19 @@ export interface PostingLine {
   accountName: string;
   debit: string | null;
   credit: string | null;
+  /** As the caller may see it (lib/services/journal.ts lineMemoFor). */
   memo: string | null;
+  /**
+   * The customer, vendor, employee or other name the line is for, when it names one. As the caller
+   * may see it, like the memo: a name is typed text too.
+   */
   entityName: string | null;
+  /**
+   * The class of the line, when it has one, as the caller may see it. Optional only because what
+   * was stored before lines carried it (an answer kept under a request id, a preview a request
+   * holds, a proposal still waiting in the old approval queue) has none; every line made now has it.
+   */
+  className?: string | null;
 }
 export interface PostingEntry {
   journalEntryId: string;
@@ -274,21 +290,35 @@ function ledgerAmount(v: unknown): string | null {
  * The ledger entries and audit rows written so far in the CURRENT transaction (their created_at
  * is the transaction's own start time, which no other transaction shares: PGlite runs one at a
  * time). Called just before a dry run is rolled back, or before a real change commits.
+ *
+ * What it gives back is shown to whoever ran the change (the agent's answer, the approval card),
+ * so the free text of the books is as `ctx` may see it: a line memo or an entry description can
+ * hold a payee's full account number ("Acct # 000123456789", typed, or copied by a reversal), and
+ * goes through lineMemoFor (lib/services/journal.ts) with the caller's access, the rule every other
+ * answer that shows a memo follows. Each line also carries the name it is for and its class (typed
+ * text as well, so shown by the same rule), so a person approving an A/R line sees which customer
+ * it is for. The lines keep their order (entry number, debits first, then line id):
+ * lib/agent/parity.test.ts reads them in that same order.
  */
 export async function changesInTransaction(ctx: ServiceContext): Promise<ChangePreview> {
   const rows = (await ctx.db.execute(sql`
     SELECT je.id AS entry_id, je.entry_number, je.date, je.description, je.status, je.source_ref,
            l.account_id, a.code AS account_code, a.name AS account_name, l.debit, l.credit, l.memo,
-           l.entity_type, l.entity_id
+           l.entity_type, l.entity_id::text AS entity_id, c.name AS class_name
       FROM journal_entries je
       JOIN journal_entry_lines l ON l.journal_entry_id = je.id
       JOIN accounts a ON a.id = l.account_id
+      LEFT JOIN classes c ON c.id = l.class_id AND c.company_id = je.company_id
      WHERE je.company_id = ${ctx.companyId} AND je.created_at = now()
      ORDER BY je.entry_number, (l.debit IS NULL OR l.debit = 0), l.id`)) as unknown as {
     rows: Array<Record<string, unknown>>;
   };
   const entries = new Map<string, PostingEntry>();
   const text = (v: unknown) => (v === null || v === undefined ? null : String(v));
+  const names = await resolveEntityNames(
+    ctx,
+    rows.rows.map((r) => ({ entityType: text(r.entity_type), entityId: text(r.entity_id) })),
+  );
   for (const r of rows.rows) {
     const id = String(r.entry_id);
     let e = entries.get(id);
@@ -298,21 +328,26 @@ export async function changesInTransaction(ctx: ServiceContext): Promise<ChangeP
         journalEntryId: id,
         entryNumber: r.entry_number === null || r.entry_number === undefined ? null : Number(r.entry_number),
         date: Number.isNaN(d.getTime()) ? String(r.date).slice(0, 10) : d.toISOString().slice(0, 10),
-        description: text(r.description),
+        description: lineMemoFor(ctx, text(r.description)),
         status: String(r.status),
         source: text(r.source_ref),
         lines: [],
       };
       entries.set(id, e);
     }
+    const type = text(r.entity_type);
+    const entityId = text(r.entity_id);
     e.lines.push({
       accountId: String(r.account_id),
       accountCode: text(r.account_code),
       accountName: String(r.account_name),
       debit: ledgerAmount(r.debit),
       credit: ledgerAmount(r.credit),
-      memo: text(r.memo),
-      entityName: null,
+      memo: lineMemoFor(ctx, text(r.memo)),
+      // A customer's, vendor's or class's name is typed text like a memo, and may hold an account
+      // number as well: shown by the same rule (as the bridge shows its own lines, bridge.ts nameLines).
+      entityName: lineMemoFor(ctx, type && entityId ? (names.get(`${type}:${entityId}`) ?? null) : null),
+      className: lineMemoFor(ctx, text(r.class_name)),
     });
   }
   const audit = (await ctx.db.execute(sql`
@@ -377,8 +412,9 @@ interface Asked {
 }
 
 /**
- * The words that stand in for a reason when the request has no reason field at all. The curated
- * tools of today's connector have none, and a person is never asked without one, so the card says
+ * The words that stand in for a reason when the request has no reason field at all: a client that
+ * never sends one (an older connector, whose curated tools had no reason field; today's send the
+ * agent's own, mcp/write-tools.mjs). A person is never asked without a reason, so the card says
  * plainly that this is not the agent's own explanation. A client that sends the field (even empty)
  * knows it: an empty reason then meets the door's own rule (operate.ts NO_REASON_NOTE).
  */
@@ -483,28 +519,46 @@ export async function runAgentAction(ctx: ServiceContext, body: AgentActionReque
   if (!agent) throw new ServiceError('FORBIDDEN', 'This is for agents.');
   const action = agentAction(body?.action);
   if (!action) throw validation(`Unknown action "${String(body?.action ?? '')}".`, { actions: agentActionNames() });
-  const input = parseInput(action, body?.input);
-  const asked = askedOf(action, body);
 
-  if (action.runs === 'self') return { action: action.name, outcome: 'read', result: await action.run(ctx, input) };
-
-  const operation = actionOperation(action);
-  if (asked.requestId !== undefined && !asked.dryRun) {
-    const before = await answerFromBefore(agent.id, asked.requestId, action, input);
-    if (before) return before;
+  if (action.runs === 'self') {
+    const input = parseInput(action, body?.input);
+    askedOf(action, body);
+    // Its run is a verb of the door's (list_my_requests), which counts the call itself.
+    return { action: action.name, outcome: 'read', result: await action.run(ctx, input) };
   }
-  if (action.runs === 'own') return runOwn(ctx, action, operation, input, asked);
-  return throughDoor(ctx, action, operation, input, asked);
+
+  // Loaded when used: the door imports this module (request ids, changesInTransaction).
+  const { doorRun } = await import('./operate');
+  // One call of the agent's, counted before anything is read for it and run in one of its places,
+  // as the door counts and places a verb: over the limit, the answer is the door's "slow down"
+  // (429 with Retry-After), never a record's version, a policy's answer or an earlier request's.
+  // Whatever the action then sends through the door (its first look, its run, a read for its
+  // answer) is this same call.
+  return doorRun(ctx, async () => {
+    const input = parseInput(action, body?.input);
+    const asked = askedOf(action, body);
+    const operation = actionOperation(action);
+    if (asked.requestId !== undefined && !asked.dryRun) {
+      const before = await answerFromBefore(agent.id, asked.requestId, action, input);
+      if (before) return before;
+    }
+    if (action.runs === 'own') return runOwn(ctx, action, operation, input, asked);
+    return throughDoor(ctx, action, operation, input, asked);
+  });
 }
 
 /**
  * The door, reached exactly as run_operation reaches it: the verb itself (lib/agent/operate.ts
- * handleVerb). Too many calls a minute, or too many under way at once, is thrown as the door's
- * AgentRateLimited, which the route answers 429 with Retry-After, so the connector waits instead
- * of reading "slow down" as a refusal of the work.
+ * handleVerb), inside the call runAgentAction counted (doorRun), so it is neither counted again
+ * nor given a second place.
+ *
+ * The version of the record the agent last read goes with the request (OperationInput
+ * expectedUpdatedAt): the bridge sends it to the route as x-expected-updated-at, and the route's
+ * own withVersionCheck compares it inside the transaction that commits. That is the real guard
+ * against overwriting a person's edit; the action's own check (lib/agent/catalog.ts versionCheck)
+ * is only the quick first answer.
  */
 async function door(ctx: ServiceContext, operation: Operation, request: OperationInput, asked: Asked): Promise<AgentOperationAnswer> {
-  // Loaded when used: the door imports this module (request ids, changesInTransaction).
   const { handleVerb } = await import('./operate');
   const answer = await handleVerb(ctx, 'run_operation', {
     operation: operation.id,
@@ -517,23 +571,22 @@ async function door(ctx: ServiceContext, operation: Operation, request: Operatio
 }
 
 /**
- * Whether the door refuses this request at its first look (lib/agent/operate.ts operateOnce): what
- * the guards refuse outright, then the policy on what the request itself says. Nothing of the
- * record the request names is read.
+ * The door's first look at the action's request (lib/agent/operate.ts doorDecision): what the
+ * guards refuse outright, a pause, the hard floor, the role and the policy, on what the request
+ * itself says. Nothing of the record the request names is read.
  */
-async function refusedAtFirstLook(ctx: ServiceContext, operation: Operation, request: OperationInput): Promise<boolean> {
-  const guarded = guardInput(operation, request);
-  if (guarded.refused) return true;
-  return (await decideNow(ctx, ctx.agent!.id, operation, guarded.input)).outcome === 'refuse';
+async function firstLook(ctx: ServiceContext, operation: Operation, request: OperationInput) {
+  const { doorDecision } = await import('./operate');
+  return doorDecision(ctx, operation, request);
 }
 
 /**
  * The door's own refusal of a request it refuses at its first look, in its words, exactly as
- * run_operation gives it (and counted as a call like any other). It is asked as a dry run: should
- * the agent's settings have changed in between so that the door does not refuse after all,
- * nothing was done, and the answer is null so the caller decides again. An error the door throws
- * (its "slow down", input it cannot read, or what the real request's own tried run would meet) is
- * passed on as it is, before the action's check has read anything.
+ * run_operation gives it. It is asked as a dry run: should the agent's settings have changed in
+ * between so that the door does not refuse after all, nothing was done, and the answer is null so
+ * the caller decides again. An error the door throws (its "this agent is paused", input it cannot
+ * read, or what the real request's own tried run would meet) is passed on as it is, before the
+ * action's check has read anything.
  */
 async function doorRefusal(ctx: ServiceContext, operation: Operation, request: OperationInput, asked: Asked): Promise<AgentOperationAnswer | null> {
   const answer = await door(ctx, operation, request, { ...asked, dryRun: true });
@@ -544,7 +597,9 @@ async function doorRefusal(ctx: ServiceContext, operation: Operation, request: O
  * Send the action's request through the agent's door, as run_operation sends it. The action's own
  * check (the version of the record the agent last read, or opening stock on a new item) runs only
  * for a request the policy does not refuse: a refusal comes first, in the door's words, before the
- * record is looked at, so it never says who changed a record last or whether it exists.
+ * record is looked at, so it never says who changed a record last or whether it exists. All of it
+ * comes after the call was counted (runAgentAction, doorRun): a check that answers "changed since"
+ * counts as a call like any other.
  * `decided`: the caller already knows the policy does not refuse it (runOwn).
  */
 async function throughDoor<I>(
@@ -557,7 +612,7 @@ async function throughDoor<I>(
 ): Promise<AgentActionAnswer> {
   const request = actionRequest(action, input);
   if (action.check) {
-    if (!decided && (await refusedAtFirstLook(ctx, operation, request))) {
+    if (!decided && (await firstLook(ctx, operation, request)).decision.outcome === 'refuse') {
       const refusal = await doorRefusal(ctx, operation, request, asked);
       if (refusal) return inActionWords(ctx, action, input, refusal);
     }
@@ -642,76 +697,6 @@ export async function readForAnswer(ctx: ServiceContext, method: AgentActionMeth
 // Actions that run themselves ('own'), decided by the policy for their route's operation
 // ---------------------------------------------------------------------------
 
-/** The company's closing date (settings.closingDate), for the request's facts. */
-async function closingDateOf(ctx: ServiceContext): Promise<string | null> {
-  const [row] = await ctx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
-  const date = (row?.settings as { closingDate?: unknown } | null | undefined)?.closingDate;
-  return typeof date === 'string' && date ? date : null;
-}
-
-/** The policy's answer for this request, exactly as the door works it out (lib/agent/operate.ts openDoor). */
-async function decideNow(ctx: ServiceContext, agentId: string, operation: Operation, input: OperationInput): Promise<PolicyDecision> {
-  const [{ agentCeiling, loadAgentPolicy }, { liveGrants }] = await Promise.all([import('@/lib/services/agentPolicies'), import('@/lib/services/agentGrants')]);
-  const now = new Date();
-  const policy = await loadAgentPolicy(ctx, agentId);
-  const ceiling = await agentCeiling(ctx, agentId);
-  const grants = await liveGrants(ctx, agentId, now);
-  const facts = factsOf(operation, input, { closingDate: await closingDateOf(ctx) });
-  return decide({ access: ceiling.access, policy, operation, facts, grants, now: now.toISOString() });
-}
-
-// The door's own count of each agent's calls and of its operations under way (lib/agent/operate.ts
-// rateLimited and inRunSlot): the same process-wide stores and the same window, so a run of an
-// action's own counts and waits exactly as one through the door does. The door does not export
-// these two yet, so the rule is repeated here, word for word.
-const RATE_WINDOW_MS = 60_000;
-const BUSY_RETRY_SECONDS = 2;
-const rateHolder = globalThis as typeof globalThis & { __bkaAgentDoorRate?: Map<string, number[]>; __bkaAgentDoorRuns?: Map<string, number> };
-
-function seconds(n: number): string {
-  return `${n} second${n === 1 ? '' : 's'}`;
-}
-
-/**
- * One call of an action's own run, as the door makes one of its own: counted against
- * AGENT_CALLS_PER_MINUTE and run in one of the agent's AGENT_RUNS_AT_ONCE places (a statement
- * import holds a write transaction of up to 5000 lines, and the company file does one at a time).
- * Too many is thrown as the door's AgentRateLimited, which the route answers 429 with Retry-After.
- * The place is given back however the run ends.
- */
-async function ownCall<T>(agentId: string, run: () => Promise<T>): Promise<T> {
-  const { AGENT_CALLS_PER_MINUTE, AGENT_RUNS_AT_ONCE, AgentRateLimited } = await import('./operate');
-  const calls = (rateHolder.__bkaAgentDoorRate ??= new Map<string, number[]>());
-  const now = Date.now();
-  const recent = (calls.get(agentId) ?? []).filter((t) => now - t < RATE_WINDOW_MS);
-  if (recent.length >= AGENT_CALLS_PER_MINUTE) {
-    calls.set(agentId, recent);
-    const wait = Math.max(1, Math.ceil((RATE_WINDOW_MS - (now - recent[0])) / 1000));
-    throw new AgentRateLimited(
-      `This agent has sent more than ${AGENT_CALLS_PER_MINUTE} requests in the last minute, which slows Ironbooks down for everyone. Wait about ${seconds(wait)}, then carry on.`,
-      wait,
-    );
-  }
-  recent.push(now);
-  calls.set(agentId, recent);
-  const runs = (rateHolder.__bkaAgentDoorRuns ??= new Map<string, number>());
-  const open = runs.get(agentId) ?? 0;
-  if (open >= AGENT_RUNS_AT_ONCE) {
-    throw new AgentRateLimited(
-      `This agent already has ${AGENT_RUNS_AT_ONCE} requests under way, and the company file does one piece of work at a time. Wait about ${seconds(BUSY_RETRY_SECONDS)} for one to finish, then send this again.`,
-      BUSY_RETRY_SECONDS,
-    );
-  }
-  runs.set(agentId, open + 1);
-  try {
-    return await run();
-  } finally {
-    const left = (runs.get(agentId) ?? 1) - 1;
-    if (left > 0) runs.set(agentId, left);
-    else runs.delete(agentId);
-  }
-}
-
 /** The input as it identifies a request (lib/agent/operate.ts hashInput): confirmation flags in any order. */
 function hashInput(input: OperationInput): unknown {
   return { ...input, ...(input.confirm ? { confirm: [...input.confirm].sort() } : {}) };
@@ -739,31 +724,31 @@ function strippedNote(stripped: readonly string[]): string {
  * An action that runs itself, decided by the policy for its route's operation exactly as the door
  * decides it, before anything else is done. A refusal is the door's own (doorRefusal); Ask and
  * standing permission go through the door as that operation; only what the agent may do on its
- * own is run here, within ownCall.
+ * own is run here. The call was counted, and given one of the agent's places, before any of this
+ * (runAgentAction, doorRun): a statement import holds a write transaction of up to 5000 lines, and
+ * the company file does one piece of work at a time.
  */
 async function runOwn<I>(ctx: ServiceContext, action: AgentActionDef<I>, operation: Operation, input: I, asked: Asked): Promise<AgentActionAnswer> {
   const agent = ctx.agent!;
   const request = actionRequest(action, input);
-  const guarded = guardInput(operation, request);
-  const decision = guarded.refused ? null : await decideNow(ctx, agent.id, operation, guarded.input);
+  const look = await firstLook(ctx, operation, request);
+  const decision = look.decision;
   const ownRefusal = (note: string): AgentActionAnswer => ({ action: action.name, operation: operation.id, outcome: 'refused', note });
 
-  if (!decision || decision.outcome === 'refuse') {
+  if (decision.outcome === 'refuse') {
     const refusal = await doorRefusal(ctx, operation, request, asked);
     // The door did not refuse after all: an own run follows only the decision just made, so this
-    // one is not run (the door counted the call).
+    // one is not run.
     return refusal ? inActionWords(ctx, action, input, refusal) : ownRefusal(SETTINGS_CHANGED);
   }
 
   if (action.kind === 'read') {
     // A read the policy would ask about is not one this action can ask for: its route is a
     // different read (see the action), and an approved run of that would not answer this.
-    if (decision.outcome !== 'run') return ownCall(agent.id, async () => ownRefusal(OWN_READ_ASKS));
-    return ownCall(agent.id, async () => {
-      if (guarded.stripped.length) return ownRefusal(strippedNote(guarded.stripped));
-      await assertActionAllowed(ctx, action);
-      return { action: action.name, operation: operation.id, outcome: 'read', result: await action.run(ctx, input) };
-    });
+    if (decision.outcome !== 'run') return ownRefusal(OWN_READ_ASKS);
+    if (look.stripped.length) return ownRefusal(strippedNote(look.stripped));
+    await assertActionAllowed(ctx, action);
+    return { action: action.name, operation: operation.id, outcome: 'read', result: await action.run(ctx, input) };
   }
 
   // Ask, or standing permission: the door, as the route's operation. A person then approves (or
@@ -775,28 +760,26 @@ async function runOwn<I>(ctx: ServiceContext, action: AgentActionDef<I>, operati
     return throughDoor(ctx, action, operation, input, asked, true);
   }
 
-  return ownCall(agent.id, async () => {
-    // The run below takes the action's own input, not the guarded request: anything the guards
-    // would have taken out (a person-only or secret field, a confirmation flag the operation does
-    // not list) must not reach the service by that way round.
-    if (guarded.stripped.length) return ownRefusal(strippedNote(guarded.stripped));
-    await assertActionAllowed(ctx, action);
-    const summary = await action.describe(ctx, input);
-    if (asked.dryRun) {
-      const checked = await dryRun(ctx, action, input);
-      return {
-        action: action.name,
-        operation: operation.id,
-        outcome: 'dry_run',
-        summary,
-        result: checked.result,
-        ledger: checked.ledger,
-        note: 'Nothing was kept. Sent without dry_run and with a request_id, it would be done straight away.',
-      };
-    }
-    const requestKey = requireRequestId(asked.requestId);
-    return keepOwn(ctx, action, operation, input, summary, requestKey, agentInputHash(operation.id, hashInput(guarded.input)));
-  });
+  // The run below takes the action's own input, not the guarded request: anything the guards
+  // would have taken out (a person-only or secret field, a confirmation flag the operation does
+  // not list) must not reach the service by that way round.
+  if (look.stripped.length) return ownRefusal(strippedNote(look.stripped));
+  await assertActionAllowed(ctx, action);
+  const summary = await action.describe(ctx, input);
+  if (asked.dryRun) {
+    const checked = await dryRun(ctx, action, input);
+    return {
+      action: action.name,
+      operation: operation.id,
+      outcome: 'dry_run',
+      summary,
+      result: checked.result,
+      ledger: checked.ledger,
+      note: 'Nothing was kept. Sent without dry_run and with a request_id, it would be done straight away.',
+    };
+  }
+  const requestKey = requireRequestId(asked.requestId);
+  return keepOwn(ctx, action, operation, input, summary, requestKey, agentInputHash(operation.id, hashInput(look.input)));
 }
 
 /**
@@ -868,10 +851,11 @@ export interface AgentProposalPayload {
 }
 
 /**
- * Enter a change an agent proposed in the old approval queue, now that a person approved it
- * (called by approveProposal in lib/services/aiAssistant.ts and by the approval center for requests
- * copied from those proposals, inside their transaction, with the approving person's context).
- * Nothing new goes to that queue: this is for what is still waiting in it.
+ * Enter a change an agent proposed in the old approval queue, now that a person approved it. The
+ * only caller is the approval center (lib/services/agentRequests.ts), for a request copied from
+ * such a proposal, inside its transaction, with the approving person's context. Ask AI no longer
+ * approves agent proposals: it only lists them, with a link to Agent requests. Nothing new goes
+ * to that queue: this is for what is still waiting in it.
  *
  * It runs under the PERSON's permissions: the action's route is checked against their access, and
  * their closing-date password (if they gave it) is theirs to use. The records name both: proposed
@@ -891,7 +875,8 @@ export async function runApprovedAgentAction(tx: ServiceContext, payload: unknow
 /**
  * The proposals this agent made in the old approval queue, newest first, with what a person
  * decided. list_my_proposals answers with the agent's requests now (they include the requests
- * copied from these proposals); this stays for the screens that still show the old queue.
+ * copied from these proposals), and nothing in the app calls this any more; it is kept for a
+ * caller outside the app that still reads the old queue.
  */
 export async function listAgentProposals(ctx: ServiceContext, limit = 50) {
   if (!ctx.agent) return [];

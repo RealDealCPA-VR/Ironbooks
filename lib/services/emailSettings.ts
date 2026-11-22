@@ -121,20 +121,102 @@ export const mailTransport = {
   create: (options: Record<string, unknown>) => nodemailer.createTransport(options),
 };
 
-const EMAIL_RE = /^[^\s@<>,;"]+@[^\s@<>,;"]+\.[^\s@<>,;"]+$/;
+/**
+ * One email address as it is typed into the app: no spaces, one "@", a dot in the domain, and none
+ * of the characters the mailer (nodemailer's address parser, behind lib/services/email.ts sendMail)
+ * reads as something other than part of one address: "( )" a comment, '"' a quoted name, "< >" the
+ * "Name <address>" form, "[ ]" an address literal, "\" an escape, ":" a group name, and "," or ";"
+ * a second address. Mail to a text holding one of them can go somewhere other than where it reads
+ * ("a(b)@acme.com" and "acme.com:x@evil.example" both reach another mailbox), so these are refused
+ * for a person's entry too.
+ */
+const EMAIL_RE = /^[^\s@<>()[\]\\:,;"]+@[^\s@<>()[\]\\:,;"]+\.[^\s@<>()[\]\\:,;"]+$/;
+/**
+ * What an address saved before that rule had to look like. Only for reading what is already saved
+ * (the Bcc copy list, a person's own send-from address): a company's mail keeps working exactly as
+ * it did until someone saves those settings again.
+ */
+const SAVED_EMAIL_RE = /^[^\s@<>,;"]+@[^\s@<>,;"]+\.[^\s@<>,;"]+$/;
+/** The domain of an address an agent sends to: letters, digits and hyphens, in dot-separated parts. */
+const PLAIN_DOMAIN_RE = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+/**
+ * The part before the "@" of an address an agent sends to: printable ASCII letters, digits and the
+ * punctuation an address may hold unquoted. No control characters or invisible marks (a
+ * right-to-left override, a zero-width space): the approval card leaves those out, so the address a
+ * person approves would not be the text sent.
+ */
+const PLAIN_LOCAL_RE = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+$/;
 const HOST_RE = /^(?:\[[0-9a-fA-F:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|[0-9a-fA-F:]+)$/;
 
 function isSecurity(v: unknown): v is MailSecurity {
   return typeof v === 'string' && (MAIL_SECURITY as readonly string[]).includes(v);
 }
 
-/** Split "a@x.com, b@y.com" into checked addresses (VALIDATION on a bad one). */
-export function parseAddressList(v: string | null | undefined, label: string): string[] {
+/** True for one email address as the app takes it from a person (EMAIL_RE). */
+export function isEmailAddress(v: string): boolean {
+  return EMAIL_RE.test(v);
+}
+
+/**
+ * True for one plain address, the only kind an agent may send to: an email address (EMAIL_RE)
+ * whose domain is letters, digits, dots and hyphens only and whose part before the "@" is
+ * printable ASCII (PLAIN_LOCAL_RE). The whole address is then exactly what the approval card shows
+ * a person.
+ */
+export function isPlainAddress(v: string): boolean {
+  if (!EMAIL_RE.test(v)) return false;
+  const at = v.indexOf('@');
+  return PLAIN_LOCAL_RE.test(v.slice(0, at)) && PLAIN_DOMAIN_RE.test(v.slice(at + 1));
+}
+
+/** What an agent is told when a recipient is not one plain address. */
+export const SEND_JUST_THE_ADDRESS =
+  'Send just the email address, like name@example.com, with no name, quotes, brackets or spaces around it, and one address only.';
+/** What an agent is told when a recipient list holds something that is not a plain address. */
+export const SEND_JUST_THE_ADDRESSES =
+  'Send just the email addresses, like name@example.com, separated by commas, with no names, quotes, brackets or spaces around them.';
+
+/**
+ * Why `value` cannot be what an email goes to, in plain words, or null when it can. 'one' is a
+ * field for a single recipient (no comma or semicolon); 'list' takes several, separated by commas
+ * or semicolons. A person's entry must be email addresses (isEmailAddress); an agent's must be plain
+ * addresses (isPlainAddress), and its message says to send just the address. The routes refuse
+ * this before anything is sent; the agent door refuses it before a person is asked.
+ */
+export function recipientProblem(ctx: Pick<ServiceContext, 'agent'>, value: string, kind: 'one' | 'list' = 'one'): string | null {
+  const v = value.trim();
+  const parts = kind === 'list' ? v.split(/[,;]/).map((x) => x.trim()).filter(Boolean) : [v];
+  const fits = ctx.agent ? isPlainAddress : isEmailAddress;
+  const bad = parts.length === 0 ? v : parts.find((a) => !fits(a));
+  if (bad === undefined) return null;
+  if (ctx.agent) return kind === 'list' ? SEND_JUST_THE_ADDRESSES : SEND_JUST_THE_ADDRESS;
+  const shown = bad.length > 60 ? `${bad.slice(0, 60)}…` : bad;
+  return kind === 'list'
+    ? `"${shown}" is not an email address. Type each address alone, like name@example.com, separated by commas.`
+    : `"${shown}" is not one email address. Type just the address, like name@example.com, with no name, quotes or brackets.`;
+}
+
+/**
+ * Split "a@x.com, b@y.com" into checked addresses (VALIDATION on a bad one). With `ctx` of an agent
+ * each must be a plain address (isPlainAddress). `saved`: a value read back from the company file,
+ * checked by the rule it was saved under (SAVED_EMAIL_RE).
+ */
+export function parseAddressList(
+  v: string | null | undefined,
+  label: string,
+  opts: { ctx?: Pick<ServiceContext, 'agent'>; saved?: boolean } = {},
+): string[] {
   const list = (v ?? '')
     .split(/[,;]/)
     .map((x) => x.trim())
     .filter(Boolean);
-  for (const a of list) if (!EMAIL_RE.test(a)) throw validation(`${label}: "${a}" is not an email address.`);
+  for (const a of list) {
+    if (opts.saved ? SAVED_EMAIL_RE.test(a) : EMAIL_RE.test(a)) {
+      if (!opts.ctx?.agent || isPlainAddress(a)) continue;
+      throw validation(`${label}: ${SEND_JUST_THE_ADDRESSES}`);
+    }
+    throw validation(`${label}: "${a}" is not an email address.`);
+  }
   return list;
 }
 
@@ -201,7 +283,8 @@ export async function resolveMailConfig(ctx: ServiceContext): Promise<MailConfig
       fromName: row.fromName ?? '',
       fromEmail: row.fromEmail,
       replyTo: row.replyTo || null,
-      bcc: parseAddressList(row.bcc, 'Bcc'),
+      // As saved: a list saved before the stricter address rule keeps sending as it did.
+      bcc: parseAddressList(row.bcc, 'Bcc', { saved: true }),
       useSenderAddress: row.useSenderAddress,
       source: 'file',
     };
@@ -270,7 +353,7 @@ export async function getEmailSetup(ctx: ServiceContext): Promise<EmailSetupView
   return view(row, (await openPassword(ctx, row)) !== null, await savedConnectionInsecure(row));
 }
 
-function cleanInput(input: EmailSetupInput) {
+function cleanInput(ctx: Pick<ServiceContext, 'agent'>, input: EmailSetupInput) {
   const host = String(input.host ?? '').trim();
   if (!host) throw validation('Enter the mail server name, for example smtp.office365.com.');
   if (host.length > 255 || !HOST_RE.test(host) || /^[a-z]+:\/\//i.test(host)) {
@@ -281,9 +364,11 @@ function cleanInput(input: EmailSetupInput) {
   if (!isSecurity(input.security)) throw validation('Pick the connection security: SSL/TLS, STARTTLS or None.');
   const fromEmail = String(input.fromEmail ?? '').trim();
   if (!EMAIL_RE.test(fromEmail)) throw validation('Enter the email address forms are sent from.');
+  if (ctx.agent && !isPlainAddress(fromEmail)) throw validation(`The address forms are sent from: ${SEND_JUST_THE_ADDRESS}`);
   const replyTo = String(input.replyTo ?? '').trim();
   if (replyTo && !EMAIL_RE.test(replyTo)) throw validation('The reply-to address is not an email address.');
-  const bcc = parseAddressList(input.bcc, 'Always send a copy to').join(', ');
+  if (replyTo && ctx.agent && !isPlainAddress(replyTo)) throw validation(`The reply-to address: ${SEND_JUST_THE_ADDRESS}`);
+  const bcc = parseAddressList(input.bcc, 'Always send a copy to', { ctx }).join(', ');
   if (bcc.length > 500) throw validation('Too many copy addresses.');
   const username = String(input.username ?? '').trim();
   if (username.length > 255) throw validation('The user name is too long.');
@@ -334,7 +419,7 @@ export const RETYPE_PASSWORD_MESSAGE =
  */
 export async function saveEmailSetup(ctx: ServiceContext, input: EmailSetupInput): Promise<EmailSetupView> {
   requireActivity(ctx, 'company.send_forms', 'modify');
-  const clean = cleanInput(input);
+  const clean = cleanInput(ctx, input);
   // Before anything is written: never a mailbox password over the internet without encryption.
   await assertPlainMailAllowed(clean, 'save');
   return inTransaction(ctx, async (tx) => {
@@ -540,9 +625,9 @@ async function senderPrefs(ctx: ServiceContext) {
     }
     const [u] = await ctx.db.select({ name: users.name, email: users.email }).from(users).where(eq(users.id, ctx.userId));
     userName = u?.name ?? '';
-    loginEmail = u?.email && EMAIL_RE.test(u.email) ? u.email : '';
+    loginEmail = u?.email && SAVED_EMAIL_RE.test(u.email) ? u.email : '';
   }
-  const ownEmail = my?.sendFromEmail && EMAIL_RE.test(my.sendFromEmail) ? my.sendFromEmail : '';
+  const ownEmail = my?.sendFromEmail && SAVED_EMAIL_RE.test(my.sendFromEmail) ? my.sendFromEmail : '';
   const ownName = my?.sendFromName?.trim() || userName;
   return { ownEmail, ownName, loginEmail, bccMe: Boolean(my?.bccMe) };
 }
@@ -648,7 +733,7 @@ export async function sendTestEmail(
   let cfg: MailConfig | null;
   if (input.draft) {
     requireActivity(ctx, 'company.send_forms', 'modify');
-    const clean = cleanInput(input.draft);
+    const clean = cleanInput(ctx, input.draft);
     const saved = await storedRow(ctx);
     const typed = typeof input.draft.password === 'string' && input.draft.password !== '' ? input.draft.password : null;
     let password: string | null = null;
@@ -682,6 +767,7 @@ export async function sendTestEmail(
   }
   if (!to) to = sender.userEmail || sender.from.address;
   if (!EMAIL_RE.test(to)) throw validation('Enter the address to send the test email to.');
+  if (ctx.agent && !isPlainAddress(to)) throw validation(SEND_JUST_THE_ADDRESS);
 
   const server: MailConfig = cfg;
   const from = sender.from.address;

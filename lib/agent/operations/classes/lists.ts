@@ -39,7 +39,9 @@ export const LISTS_CLASSES: ClassificationMap = {
   },
 
   // Classes and locations. The PATCH is not an edit: it only makes the entry inactive and reads no
-  // body (deactivateClass / deactivateLocation, checked and audited as a delete). Nothing in the app
+  // body (the handler ignores its request and calls deactivateClass / deactivateLocation with the
+  // id alone, checked and audited as a delete), so body 'none' is right; classes/lists.test.ts
+  // reads the handlers to hold that. Nothing in the app
   // makes a class or location active again (no route, and Undo does not cover them), so it is
   // treated like a delete, the same rule as customers and vendors.
   'GET /api/classes': { class: 'read', describe: 'List classes' },
@@ -97,7 +99,7 @@ export const LISTS_CLASSES: ClassificationMap = {
   'POST /api/type-lists/vendor-assign': {
     class: 'change',
     describe: 'Set the vendor type of vendor {vendorId} to {vendorTypeId}',
-    why: 'Edits an existing vendor record (its type); nothing new is entered. The answer is the whole vendor row, masked by the service as the vendor screens are (assignVendorType passes it through maskForContext): the tax ID needs "view sensitive payroll data" and the account number "view full account numbers". No reveal: setting a type has no need of either, and a person or agent who does reads the vendor (vendors.get, with reveal). sensitiveFields keeps both out of previews, stored requests and logs.',
+    why: 'Edits an existing vendor record (its type); nothing new is entered. The answer is the whole vendor row, masked by the service as the vendor screens are (assignVendorType passes it through maskForContext): the tax ID needs "view sensitive payroll data" and the account number "view full account numbers". No reveal: setting a type has no need of either. An agent that needs the full tax ID reads the vendor with reveal (vendors.get), which a person approves; that reveal shows the tax ID only, and our account number with the vendor stays masked for an agent, since one reveal names one kind of data. A person sees the full tax ID on the vendor screens when their role has "view sensitive payroll data". sensitiveFields keeps both out of previews, stored requests and logs.',
     sensitiveFields: ['taxId', 'accountNumber'],
   },
 

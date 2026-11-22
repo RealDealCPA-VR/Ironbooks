@@ -8,6 +8,8 @@ import { getServerContext } from '@/lib/context';
 import { assignRepToInvoice } from '@/lib/services/salesReps';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { assignSalesRepSchema } from '@/lib/validation/salesReps';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -25,6 +27,9 @@ export async function POST(req: NextRequest) {
     if (!body.invoiceId) {
       return NextResponse.json({ error: 'invoiceId is required', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/salesReps.ts); the check above answers first.
+    const checked = assignSalesRepSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     const invoice = await assignRepToInvoice(ctx, {
       invoiceId: body.invoiceId,
       salesRepId: body.salesRepId ?? null,

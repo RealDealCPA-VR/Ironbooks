@@ -35,6 +35,9 @@
  *    cannot be swapped out;
  *  - requestHeaders() gives the synthetic set: stamped path and method, origin "agent", and an
  *    x-closing-password only when one was given;
+ *  - a closing-date password the bridge already checked (closingPasswordCheckedInScope) is
+ *    recognised only inside an open, unchanged scope opened as checked, and only for the password
+ *    its own headers carry; nothing a request carries makes it so;
  *  - getSessionGate (a person's own account) refuses inside a scope unless given a gate value, and
  *    then answers only on a 'self' route;
  *  - sign-out refuses inside a scope and leaves the person's cookie alone;
@@ -1102,5 +1105,54 @@ describe('the closing-date password limiter (lib/closingPasswordLimiter.ts), sha
     expect(await limitClosingPasswordGuess({ companyId, userId: ownerId }, async () => true)).toBe(true);
     request('GET', '/api/accounts', { user: ownerId, headers: { [CLOSING_PASSWORD_HEADER]: 'anything' } });
     expect((await getServerContext()).closingDateOverride).toBe(true);
+  });
+});
+
+describe('a closing-date password the bridge already checked (closingPasswordCheckedInScope)', () => {
+  const { closingPasswordCheckedInScope } = serviceScopeModule;
+  const checked: ServiceScopeOptions = { ...OPTS, headers: { [CLOSING_PASSWORD_HEADER]: 'right-pw' }, closingPasswordChecked: true };
+
+  it('is true only inside a scope opened as checked, and only for the very password its headers carry', async () => {
+    const seen = await runWithServiceContext(ctxA, checked, async () => [
+      closingPasswordCheckedInScope('right-pw'),
+      closingPasswordCheckedInScope('right-pwX'),
+      closingPasswordCheckedInScope('Right-pw'),
+      closingPasswordCheckedInScope(''),
+    ]);
+    expect(seen).toEqual([true, false, false, false]);
+    // A scope that carries the password but was not opened as checked: the route counts it as always.
+    const unchecked = await runWithServiceContext(ctxA, { ...checked, closingPasswordChecked: false }, async () => closingPasswordCheckedInScope('right-pw'));
+    expect(unchecked).toBe(false);
+    // Checked, but with no password in its headers: nothing to match.
+    const empty = await runWithServiceContext(ctxA, { ...OPTS, closingPasswordChecked: true }, async () => closingPasswordCheckedInScope('right-pw'));
+    expect(empty).toBe(false);
+    // Outside any scope (a person's own request): never.
+    request('PATCH', '/api/company/closing-date', { user: ownerId, headers: { [CLOSING_PASSWORD_HEADER]: 'right-pw' } });
+    expect(closingPasswordCheckedInScope('right-pw')).toBe(false);
+  });
+
+  it('is false for work the scope left running, and once its context changed', async () => {
+    let late!: Promise<boolean>;
+    await runWithServiceContext(ctxA, checked, async () => {
+      late = new Promise((resolve) => setTimeout(() => resolve(closingPasswordCheckedInScope('right-pw')), 20));
+    });
+    expect(await late).toBe(false);
+    const changing = agentCtx(ctxA.companyId);
+    const afterChange = await runWithServiceContext(changing, checked, async () => {
+      changing.role = 'admin';
+      return closingPasswordCheckedInScope('right-pw');
+    });
+    expect(afterChange).toBe(false);
+  });
+
+  it('nothing a request carries makes it true: the option is the bridge\'s, never a header', async () => {
+    request('PATCH', '/api/company/closing-date', {
+      user: ownerId,
+      headers: { [CLOSING_PASSWORD_HEADER]: 'right-pw', 'x-bka-closing-checked': '1', closingPasswordChecked: 'true' },
+    });
+    expect(closingPasswordCheckedInScope('right-pw')).toBe(false);
+    await expect(
+      runWithServiceContext(ctxA, { ...OPTS, headers: { closingPasswordChecked: 'true' } }, async () => closingPasswordCheckedInScope('right-pw')),
+    ).rejects.toThrow(/cannot carry the header/);
   });
 });

@@ -32,7 +32,17 @@
  * answers 'stale' once more when they moved. "Approve similar…" then takes again from the new
  * preview only what the person had not changed (its amount, the count of a bulk change): a shorter
  * time, fewer uses, other dates or an unticked limit stay as they left them (words.ts
- * rebuildGrantForm).
+ * rebuildGrantForm). The same second yes is asked when the approval sent the request back with a
+ * note instead of running it (lib/agent/operate.ts: dated in a closed period, two people needed,
+ * more done once protected values were shown): the card then says so, not that the books changed
+ * (words.ts staleKind).
+ *
+ * An approval the server refuses before anything runs (a password left out, a refusal Ironbooks
+ * never lets an agent past, someone else answered first) shows the server's own words, and the card
+ * loads the request again so it shows where it now stands; nothing is approvable until it has.
+ *
+ * While an answer is on its way, or the card shows a secret the run produced, the page does not
+ * swap it for the request a link names (onHold): that one opens once this card is closed.
  */
 import * as React from 'react';
 import Link from 'next/link';
@@ -43,13 +53,15 @@ import { sourceFormHref } from '@/lib/reports/drilldown';
 import { RISK_CLASS_LABELS, type SecretKind } from '@/lib/agent/operations/types';
 import type { EffectReport } from '@/lib/effects';
 import type { AgentRequestForPerson, ApproveInput, ApproveResult, FlowQuestion, ProducedSecret } from '@/lib/agent/contract';
-import RequestPreview, { DomainChips, NeedsChips, UNUSUAL_NOTE } from './Preview';
+import RequestPreview, { DomainChips, NeedsChips, PathParts, UNUSUAL_NOTE } from './Preview';
 import ApproveSimilar from './ApproveSimilar';
 import ProducedSecrets from './ProducedSecrets';
 import { requestsChanged } from './notify';
 import {
+  AMOUNT_UNKNOWN_WHY,
   ageText,
-  amountText,
+  amountShown,
+  approveFailureText,
   approverLines,
   canGiveGrant,
   clockTime,
@@ -61,6 +73,7 @@ import {
   grantFromForm,
   grantGivenText,
   grantNeverHere,
+  grantNotGivenText,
   grantRuleLine,
   initialGrantForm,
   isUnusualDomain,
@@ -73,6 +86,7 @@ import {
   secretFieldReady,
   secretFieldsOf,
   secretValueOf,
+  staleKind,
   waitsForSecondPerson,
   writtenPathOf,
   type GrantForm,
@@ -81,6 +95,8 @@ import {
 
 /** What the card says once the books changed between the ask and the approval (plan 7.4). */
 export const STALE_MESSAGE = 'The books changed since the agent asked. This is what would happen now.';
+/** What the card says once the approval sent the request back with a note instead of running it. */
+export const SENT_BACK_MESSAGE = 'Ironbooks sent this back before running it.';
 
 /**
  * What the card says of a request the server marks as changed (its preview is already the new one),
@@ -89,6 +105,10 @@ export const STALE_MESSAGE = 'The books changed since the agent asked. This is w
 export const STALE_MARK = 'The books changed since the agent asked.';
 export const STALE_MARK_NEXT =
   'The preview below is what would happen now. Read it, then approve: the first approval only confirms you have seen it, and nothing runs until you approve again.';
+/** The same, for a request an earlier approval sent back with a note. */
+export const SENT_BACK_MARK = 'An earlier approval sent this back with a note before it ran.';
+export const SENT_BACK_MARK_NEXT =
+  'Read the note below, then approve: the first approval only confirms you have seen it, and nothing runs until you approve again.';
 
 /** Said on a request that asks to see full values (plan 5.9, D6). */
 export const REVEAL_NOTE =
@@ -198,13 +218,11 @@ function GrantGiven({ request, now }: { request: AgentRequestForPerson; now: Dat
   );
 }
 
-/** The run went through, and the standing permission asked for with it was not given: why. */
+/** The run went through, and the standing permission asked for with it was not given: why, in the server's words. */
 function GrantNotGiven({ request }: { request: AgentRequestForPerson }) {
-  const why = plain(request.grantError).trim();
   return (
-    <p data-grant-not-given="" className="mt-0.5 text-amber-800">
-      It was done, but standing permission was not given, so {plain(request.agentName)} will ask again next time.
-      {why ? ` Why: ${why}` : ''}
+    <p data-grant-not-given="" className="mt-0.5 whitespace-pre-wrap break-words text-amber-800">
+      {grantNotGivenText(request.agentName, request.grantError)}
     </p>
   );
 }
@@ -298,11 +316,18 @@ function MailServer({ server }: { server: NonNullable<ReturnType<typeof mailServ
   );
 }
 
+/**
+ * Why a card must not be swapped for another without the person closing it: an answer is on its way
+ * ('busy'), or it shows something only once, a secret the run produced ('once').
+ */
+export type CardHold = 'busy' | 'once' | null;
+
 export default function RequestCard({
   id,
   initial,
   onClose,
   onChanged,
+  onHold,
 }: {
   id: string;
   /** The list's copy, shown while the card loads the latest. Never approvable by itself. */
@@ -310,6 +335,8 @@ export default function RequestCard({
   onClose: () => void;
   /** The request as it now stands, for the list (never with what the run produced). */
   onChanged: (request: AgentRequestForPerson, stale: boolean) => void;
+  /** Told whenever the card starts or stops holding (CardHold), and null once it is gone. */
+  onHold?: (hold: CardHold) => void;
 }) {
   const [request, setRequest] = React.useState<AgentRequestForPerson | null>(initial);
   // Whether `request` is the card's own fresh copy from the server (or an approval's answer).
@@ -338,6 +365,16 @@ export default function RequestCard({
   const resultRef = React.useRef<HTMLDivElement>(null);
   const onChangedRef = React.useRef(onChanged);
   onChangedRef.current = onChanged;
+  const onHoldRef = React.useRef(onHold);
+  onHoldRef.current = onHold;
+
+  // The page swaps cards when a link names another request; it waits while this one holds (an
+  // answer on its way, or a secret shown only here) and opens the other once this one is closed.
+  const hold: CardHold = busy ? 'busy' : outcome && outcome.produced.length > 0 ? 'once' : null;
+  React.useEffect(() => {
+    onHoldRef.current?.(hold);
+  }, [hold]);
+  React.useEffect(() => () => onHoldRef.current?.(null), []);
 
   // The latest state of the request: someone else may have answered it, or the books may have
   // changed it, since the list loaded. Nothing is approvable until this copy is here.
@@ -448,7 +485,7 @@ export default function RequestCard({
         setGrantForm(again ? (rebuilt?.form ?? initialGrantForm(r.request, now)) : null);
         setMode(withGrant && again ? 'similar' : 'main');
       } else if (r.status === 'not_approved') {
-        // Nothing ran and it still waits: say why, and let the person try again.
+        // Nothing ran: say why in the server's words (the request says where it now stands).
         setFailure(plain(r.request.error) || 'It was not approved, and nothing was done. Try again in a moment.');
       } else {
         setStale(false);
@@ -457,7 +494,13 @@ export default function RequestCard({
       }
       window.setTimeout(() => resultRef.current?.focus(), 0);
     } catch (e) {
+      // Refused before anything ran (a password left out, a refusal no approval gets past, someone
+      // else answered first): the server's words as they came, then the request as it now stands.
+      // Until that copy is here the one on screen may be out of date, so nothing is approvable on
+      // it, and a load that fails says so with Try again.
       setFailure(errMsg(e));
+      setFresh(false);
+      setLoadRound((n) => n + 1);
     } finally {
       setBusy(null);
     }
@@ -490,6 +533,8 @@ export default function RequestCard({
       Close
     </Button>
   );
+  // Why the yes is asked again: the books changed, or the approval sent it back with a note.
+  const sentBack = !!request && staleKind(request) === 'note';
   let footer: React.ReactNode = close;
   if (request && actionable) {
     if (mode === 'deny') {
@@ -522,7 +567,9 @@ export default function RequestCard({
                   ? 'Give permission as it stands now'
                   : 'Give permission'
                 : stale
-                  ? 'Approve what would happen now, and similar'
+                  ? sentBack
+                    ? 'Approve again, and similar'
+                    : 'Approve what would happen now, and similar'
                   : 'Approve this and similar'}
             </Button>
           )}
@@ -540,7 +587,7 @@ export default function RequestCard({
             </Button>
           )}
           <Button loading={busy === 'approve'} disabled={!ready} onClick={() => approve(false)}>
-            {stale ? 'Approve what would happen now' : 'Approve once'}
+            {stale ? (sentBack ? 'Approve again' : 'Approve what would happen now') : 'Approve once'}
           </Button>
         </>
       );
@@ -550,7 +597,7 @@ export default function RequestCard({
   const title = request ? `Request from ${plain(request.agentName)}` : 'Agent request';
   const reason = request ? reasonText(request.reason) : '';
   const decided = request && outcome === null ? decidedText(request) : null;
-  const amount = request ? amountText(request.amount) : '';
+  const amount = request ? amountShown(request) : null;
   const desktop = request ? desktopLines(request) : [];
   const mail = request ? mailServerOf(request) : null;
   const who = request && isWaiting(request.status) ? approverLines(request.needs) : [];
@@ -630,9 +677,13 @@ export default function RequestCard({
               </div>
             )}
             {stale && actionable && (
-              <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
-                <div className="font-semibold">{STALE_MESSAGE}</div>
-                <p className="mt-0.5">Nothing was done. Read it again below, and approve once more only if it is still right.</p>
+              <div data-stale-answer={sentBack ? 'note' : 'changed'} className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+                <div className="font-semibold">{sentBack ? SENT_BACK_MESSAGE : STALE_MESSAGE}</div>
+                <p className="mt-0.5">
+                  {sentBack
+                    ? "Nothing was done. Read Ironbooks' note below, and approve once more only if it is still right."
+                    : 'Nothing was done. Read it again below, and approve once more only if it is still right.'}
+                </p>
               </div>
             )}
             {decided && (
@@ -654,9 +705,9 @@ export default function RequestCard({
           {outcome && <ProducedSecrets produced={outcome.produced} />}
 
           {staleMark && (
-            <div data-stale-notice="" className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
-              <div className="font-semibold">{STALE_MARK}</div>
-              <p className="mt-0.5">{STALE_MARK_NEXT}</p>
+            <div data-stale-notice={sentBack ? 'note' : 'changed'} className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+              <div className="font-semibold">{sentBack ? SENT_BACK_MARK : STALE_MARK}</div>
+              <p className="mt-0.5">{sentBack ? SENT_BACK_MARK_NEXT : STALE_MARK_NEXT}</p>
             </div>
           )}
 
@@ -684,21 +735,27 @@ export default function RequestCard({
               </p>
               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-navy/70">
                 <Badge tone="info">{RISK_CLASS_LABELS[request.class] ?? plain(request.class)}</Badge>
-                {amount && <span className="tabular-nums">Amount {amount}</span>}
+                {amount &&
+                  (amount.unknown ? (
+                    <span data-amount-unknown="" className="font-semibold text-amber-800">
+                      {amount.text}
+                    </span>
+                  ) : (
+                    <span className="tabular-nums">Amount {amount.text}</span>
+                  ))}
                 <span>Asked {ageText(request.createdAt).toLowerCase()}</span>
                 {isWaiting(request.status) && <span>Waits until {formatDate(request.expiresAt, 'MMM d, yyyy h:mm a')}</span>}
               </div>
+              {amount?.unknown && isWaiting(request.status) && <p className="mt-1 text-xs text-navy/60">{AMOUNT_UNKNOWN_WHY}</p>}
               <NeedsChips needs={request.needs} />
             </div>
             {desktop.length > 0 && (
               <div data-desktop-lines="" className="space-y-2 rounded-lg border border-slate-200 p-3 text-sm text-navy">
                 {desktop.map((d) => (
                   <div key={d.label}>
-                    <div className="text-xs text-navy/60">{d.label}</div>
+                    <div className="text-xs font-medium text-navy/70">{d.label}</div>
                     {d.path ? (
-                      <code data-desktop-path="" className="mt-0.5 block break-all rounded border border-slate-200 bg-slate-50 px-2 py-1 font-mono text-xs text-navy">
-                        {d.value}
-                      </code>
+                      <PathParts path={d.value} attr="data-desktop-path" />
                     ) : (
                       <span className="mt-0.5 flex flex-wrap items-center gap-1.5">
                         <DomainChips domains={[d.value]} attr="data-network-host" />
@@ -723,7 +780,7 @@ export default function RequestCard({
               </div>
             )}
             {request.input?.reveal && <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-900">{REVEAL_NOTE}</p>}
-            {request.kind === 'operation' && <RequestPreview preview={request.preview} />}
+            {request.kind === 'operation' && <RequestPreview preview={request.preview} confirm={request.input?.confirm} />}
             {request.input && (
               <details className="text-xs text-navy/60">
                 <summary className="cursor-pointer">What the agent sent, as it sent it</summary>
@@ -849,10 +906,11 @@ export default function RequestCard({
             </section>
           )}
 
-          {failure && (
-            <p role="alert" className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-              {failure}
-              {secretFields.length > 0 && actionable ? ' Type the password again to try once more.' : ''}
+          {/* Not repeated when the request, loaded again, already says the same as how it ended. */}
+          {failure && !(!actionable && plain(request.error).trim() === failure.trim()) && (
+            <p role="alert" data-approve-failure="" className="whitespace-pre-wrap break-words rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+              {/* The boxes were emptied by the send: say to type again, unless the server already says what to type. */}
+              {approveFailureText(failure, secretFields.length > 0 && actionable)}
             </p>
           )}
         </div>

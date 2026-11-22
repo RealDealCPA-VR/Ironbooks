@@ -81,6 +81,69 @@ describe('classification: admin', () => {
     expect(reads.sort()).toEqual(['integrity', 'integrity.books-in-balance']);
   });
 
+  it("does not offer a person's own reads of the company file to agents; the file's name is class file", () => {
+    // 'self' routes answer from the signed-in user's session: every agent gets "not available".
+    for (const id of ['companies.list', 'file-protection.status']) {
+      expect(op(id), id).toMatchObject({ method: 'GET', rule: 'self', availability: 'person_only' });
+      expect(op(id).why, id).toMatch(/getSessionGate/);
+    }
+    expect(op('company-file.info')).toMatchObject({ method: 'GET', class: 'file', availability: 'agent', dryRun: 'none' });
+    // Every other GET of a person's own account ('self') is not offered either.
+    for (const o of ops()) if (o.method === 'GET' && o.rule === 'self') expect(o.availability, o.id).not.toBe('agent');
+  });
+
+  it('every restore is class file, needs the file Admin and is approved at the host only; a whole-file restore says it ends every agent', () => {
+    // condense.archives.post restores the copy saved before a condense (its id is the rule's).
+    const whole = ['backup.restore', 'backups.restore', 'condense.archives.post'];
+    const asNew = ['backup.company.restore', 'portable.restore'];
+    for (const id of [...whole, ...asNew]) {
+      expect(op(id), id).toMatchObject({ method: 'POST', class: 'file', fileAdmin: true, hostOnly: true });
+      expect(['none', 'preview'], id).toContain(op(id).dryRun);
+    }
+    for (const id of whole) expect(op(id).why, id).toMatch(/takes away every agent's access/);
+    // The approver reads the line, not the why: it says so there too, whatever the backup is called.
+    for (const id of whole) {
+      for (const input of [{ body: { id: 'b1' } }, {}]) {
+        expect(describeRequest(op(id), input), id).toMatch(/\(ends every agent's access, this one's included\)$/);
+      }
+    }
+    // A restore as a new company or a new file leaves the open books' agents as they are.
+    for (const id of asNew) expect(op(id).why, id).toMatch(/starts with no agent access/);
+    // Every POST of File Utilities that the route map files as a delete (a restore) is among them.
+    const restores = ops().filter((o) => o.method === 'POST' && o.area === 'file_utilities' && o.action === 'delete' && o.availability === 'agent');
+    expect(restores.map((o) => o.id).filter((id) => !whole.includes(id) && !asNew.includes(id) && id !== 'condense')).toEqual([]);
+  });
+
+  it('adding a user: the approving Admin types the password and nothing is produced', () => {
+    expect(op('users.create')).toMatchObject({ class: 'admin', needsSecret: ['new_user_password'], producesSecret: [] });
+    expect(op('users.create').why).toMatch(/Nothing is produced/);
+  });
+
+  it("a role change names the role, and says no agent may change or delete a role any agent holds", () => {
+    const line = describeRequest(op('roles.update'), { params: { id: 'r-1' }, body: { permissions: {} } }, { key: 'r-1', name: 'Month-end helper' });
+    expect(line).toBe('Change what role r-1 allows (called Month-end helper after the change)');
+    // As the door words it: {id} by the role's name now (summaryNames), the answer's name after.
+    expect(describeRequest(op('roles.update'), { params: { id: 'r-1' }, body: { permissions: {} } }, { key: 'r-1', name: 'Clerk' }, { 'r-1': 'Clerk' })).toBe(
+      'Change what role Clerk allows (called Clerk after the change)',
+    );
+    expect(describeRequest(op('roles.update'), { params: { id: 'r-1' }, body: { name: 'Clerk helper' } }, { key: 'r-1', name: 'Clerk helper' }, { 'r-1': 'Clerk' })).toBe(
+      'Change what role Clerk allows (called Clerk helper after the change)',
+    );
+    expect(describeRequest(op('roles.update'), { params: { id: 'r-1' } })).toBe('Change what role r-1 allows');
+    for (const id of ['roles.update', 'roles.delete']) {
+      expect(op(id).why, id).toMatch(/ANY agent holds/);
+      expect(op(id).why, id).toMatch(/hard floor/);
+      // The service's own backstop, as it is on disk.
+      expect(op(id).why, id).toMatch(/refuseAgentOnAgentRole/);
+      expect(op(id).why, id).not.toMatch(/never looks at agents/);
+    }
+  });
+
+  it('the shareable ledger names its memos as protected', () => {
+    expect(op('portable.shareable')).toMatchObject({ class: 'file', output: 'file', reveal: null });
+    expect(op('portable.shareable').sensitiveFields).toContain('memo');
+  });
+
   it('never dry runs a GET classed above read: a dry run would hand the agent the answer before anyone approved it', () => {
     for (const o of ops()) {
       if (o.method === 'GET' && o.class !== 'read' && o.class !== 'read_sensitive') expect(o.dryRun, o.id).toBe('none');

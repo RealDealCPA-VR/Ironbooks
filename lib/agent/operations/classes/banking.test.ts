@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import { describeRequest } from '@/lib/agent/describe';
 import { amountOf } from '@/lib/agent/facts';
-import { decide, resolvePolicy } from '@/lib/agent/policy';
+import { classRank, decide, resolvePolicy } from '@/lib/agent/policy';
 import { clampForAgent } from '@/lib/permissions/agentAccess';
 import { fullAccess } from '@/lib/permissions/model';
-import { operationById } from '../registry';
-import { NEVER_ALLOW_CLASSES, type Operation, type RequestFacts } from '../types';
+import { operationById, operationForRoute } from '../registry';
+import { NEVER_ALLOW_CLASSES, type Operation, type RequestFacts, type RiskClass } from '../types';
 import { bucketProblems } from './check';
-import { BANKING_CLASSES } from './banking';
+import { BANKING_CLASSES, BANKING_CLASS_BY_INPUT } from './banking';
+
+const routeSource = (pattern: string): string =>
+  fs.readFileSync(path.join(process.cwd(), 'app', ...pattern.split('/').filter(Boolean), 'route.ts'), 'utf8');
 
 const op = (id: string): Operation => {
   const found = operationById(id);
@@ -63,5 +68,60 @@ describe('classification: banking', () => {
     const unmatch = op('bank-transactions.unmatch');
     expect(unmatch.amountField).toBe('amount');
     expect(amountOf(unmatch, { body: { bankTransactionId: 'b1' } }, { id: 'b1', amount: '-4250.00', matched: false })).toBe('-4250.00');
+  });
+});
+
+describe('classification: banking, a request that does two kinds of work', () => {
+  const entries = Object.entries(BANKING_CLASS_BY_INPUT);
+
+  it('keeps each such operation at the strictest class its input can give (the policy reads one class)', () => {
+    expect(entries.map(([key]) => key).sort()).toEqual(['GET /api/bank-transactions/suggestions', 'PATCH /api/reconciliations/[id]']);
+    for (const [key, split] of entries) {
+      const [method, pattern] = key.split(' ');
+      const o = operationForRoute(method, pattern)!;
+      const all: RiskClass[] = [...Object.values(split!.classes), split!.otherwise];
+      const strictest = all.reduce((a, b) => (classRank(b) > classRank(a) ? b : a));
+      expect(o.class, key).toBe(strictest);
+    }
+  });
+
+  it('names every action the Reconcile window\'s PATCH carries out (read off the route)', () => {
+    const src = routeSource('/api/reconciliations/[id]');
+    const patch = src.slice(src.indexOf('export async function PATCH'));
+    const acted = [...new Set([...patch.matchAll(/action === '(\w+)'/g)].map((m) => m[1]))].sort();
+    const split = BANKING_CLASS_BY_INPUT['PATCH /api/reconciliations/[id]']!;
+    expect(acted.length).toBeGreaterThan(0);
+    expect(Object.keys(split.classes).sort()).toEqual(acted);
+    // Ticking and the statement figures are prepare; what posts or completes is change.
+    expect(split.classes).toEqual({ setClearedMany: 'prepare', toggleCleared: 'prepare', updateStatement: 'prepare', complete: 'change', adjustments: 'change' });
+  });
+
+  it('sends bank lines off this computer only with ai=1, as the suggestions route reads it', () => {
+    const src = routeSource('/api/bank-transactions/suggestions');
+    expect(src).toMatch(/searchParams\.get\('ai'\) === '1'/);
+    expect(BANKING_CLASS_BY_INPUT['GET /api/bank-transactions/suggestions']).toEqual({ from: 'query', field: 'ai', classes: { '1': 'outside' }, otherwise: 'read' });
+    expect(op('bank-transactions.suggestions')).toMatchObject({ class: 'outside', effects: ['network'], dryRun: 'none' });
+  });
+
+  it('keeps excluding a bank line a change: an excluded line leaves the review list, on text outsiders wrote', () => {
+    const exclude = op('bank-transactions.exclude');
+    expect(exclude.class).toBe('change');
+    expect(exclude.why).toMatch(/leaves the review list/);
+    expect(exclude.why).toMatch(/text outsiders wrote/);
+    // Reconciling the account shows a real charge that was excluded, so the why must not say that
+    // nothing ever does; nor that ticking a reconciliation line is prepare today (it is a change).
+    expect(exclude.why).not.toMatch(/no later step shows a person/);
+    expect(exclude.why).not.toMatch(/Ticking a reconciliation line is prepare/);
+    expect(op('reconciliations.update').class).toBe('change');
+    // Under the default preset a person is asked; prepare would have run it unasked.
+    const d = decide({
+      access: clampForAgent(fullAccess()),
+      policy: resolvePolicy('ask_every_change', []),
+      operation: op('bank-transactions.exclude'),
+      facts: PLAIN,
+      grants: [],
+      now: '2026-11-20T12:00:00.000Z',
+    });
+    expect(d.outcome).toBe('ask');
   });
 });

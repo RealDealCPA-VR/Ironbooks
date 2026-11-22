@@ -562,9 +562,11 @@ export function roleProblem(access: EffectiveAccess, operation: Operation): stri
 
 /**
  * A route the permission map has no rule for. roleProblem refuses it for every role, an Admin too,
- * so decide tells the agent to ask a person rather than to ask for a role change that cannot help.
+ * so decide tells the agent to ask a person rather than to ask for a role change that cannot help
+ * (NO_RULE_FOR_AGENT), and no person can approve it either (NO_RULE_FOR_APPROVER, for the approval
+ * center: lib/services/agentRequests.ts).
  */
-function routeWithoutRule(operation: Pick<Operation, 'rule' | 'kind'>): boolean {
+export function routeWithoutRule(operation: Pick<Operation, 'rule' | 'kind'>): boolean {
   const rule = operation.rule;
   if (rule === 'public' || rule === 'self' || rule === 'member') return false;
   if (rule && typeof rule === 'object') return false;
@@ -764,11 +766,12 @@ const TWO_PERSON_BOOK_CLASSES: readonly RiskClass[] = ['enter', 'change', 'bulk'
  *    (`amountField`: an outside send or a print run that pays or posts money);
  *  - no amount, and the caller did not say what the operation is, or nobody classified it.
  * The caller (lib/agent/operate.ts) decides a second time with the facts of the dry run. That
- * second decision clears this rule only when the dry run reports an amount. Today it often does
- * not: an operation with no `amountField` (a new customer, a memo edit, a list delete, a new
- * closing date) whose dry run posts nothing to the ledger still has no amount, so with any
- * threshold set it needs two people. That fails closed; the fix belongs to whoever builds the
- * facts (report "0.00" when a dry run posted nothing), not to this rule.
+ * second decision clears this rule only when the dry run reports an amount. For an operation with
+ * no `amountField` the door reports "0.00" when the run only made new records and moved no money
+ * (a new customer), and keeps the amount unknown when it voided, deleted or changed a record that
+ * was there before without touching the ledger (a customer's details, a list entry deleted, a
+ * payroll adjustment voided): such a run may move money outside the ledger, so it still needs two
+ * people (fail closed). This rule only reads the amount it is given.
  */
 export function needsTwoPerson(
   policy: Pick<AgentPolicy, 'twoPersonOver'>,
@@ -952,9 +955,14 @@ const CLASS_DOING: Record<RiskClass, string> = {
 // Every refusal says what the agent can do instead: ask a person to do it, ask an Admin to change
 // the role or the agent's settings, split the work, or send the request without the part refused.
 const ROLE_HINT = "Ask an Admin to change this agent's role.";
-// A route with no permission rule is refused to every role, an Admin too: a role change cannot help.
-const NO_RULE =
+/**
+ * A route with no permission rule (routeWithoutRule) is refused to every role, an Admin too: a role
+ * change cannot help. The agent's words (decide's refusal), and the approving person's.
+ */
+export const NO_RULE_FOR_AGENT =
   'No role can allow this request, not even Admin, because Ironbooks has no permission rule for it. Ask a person to do it in Ironbooks.';
+export const NO_RULE_FOR_APPROVER =
+  'No role can allow this request, not even Admin, because Ironbooks has no permission rule for it. Deny it; a person can do the work in Ironbooks if it is still needed.';
 const NEVER_HINT = "Ask a person to do it instead, or ask an Admin to change this agent's settings in Users & Roles > Agents.";
 const PAUSED =
   'This agent is paused, so it cannot do anything right now. Ask a person to turn it back on in Users & Roles > Agents, then try again.';
@@ -1012,7 +1020,7 @@ export function decide(input: PolicyInput): PolicyDecision {
 
   const missing = roleProblem(access, operation);
   if (missing) {
-    if (routeWithoutRule(operation)) return refuse('role', NO_RULE, cls);
+    if (routeWithoutRule(operation)) return refuse('role', NO_RULE_FOR_AGENT, cls);
     return refuse('role', `Your role does not allow this: it needs ${missing}. ${ROLE_HINT}`, cls);
   }
   for (const flag of flagsNeeded(operation, facts)) {

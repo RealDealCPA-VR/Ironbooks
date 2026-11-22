@@ -140,14 +140,23 @@ export function repeatsPreset(draft: PolicyDraft, o: PolicyOverride): boolean {
 /**
  * The adjustments that change nothing today: each keeps the setting its cell would follow anyway
  * (the preset's everywhere, everywhere's in an area), only so a later change cannot move it. They
- * count as the agent's own settings (AgentView.overrideCount counts every stored row), so the
- * detail page says how many of them are only kept as chosen.
+ * are the agent's own settings but do not make it differ from its preset, so "(adjusted: N)" leaves
+ * them out (differingCount) and the detail page says how many of them are only kept as chosen.
  */
 export function keptAsChosen(draft: PolicyDraft): PolicyOverride[] {
   return draft.overrides.filter((o) => {
     const s = o.setting === 'allow' && !canBeAllowed(o.class) ? 'ask' : o.setting;
     return s === inheritedSetting(draft, o.area ?? null, o.class);
   });
+}
+
+/**
+ * How many of the agent's own settings differ from the preset: those that change what their cell
+ * would otherwise follow. "(adjusted: N)" on the detail page, worked out here from the settings
+ * themselves, so it is right whether or not the server's overrideCount counts the same way.
+ */
+export function differingCount(draft: PolicyDraft): number {
+  return draft.overrides.length - keptAsChosen(draft).length;
 }
 
 /** The preset's own setting for a class, as the engine holds it (an Allow it never gives is Ask). */
@@ -200,10 +209,10 @@ export function capThatApplies(draft: PolicyDraft): number | null {
 //
 // A person who may manage agents but is not an Admin may make an agent stricter or pause it. What
 // counts as loosening: a higher preset, a cell that lets the agent do more by itself than it does
-// now (as the engine resolves it), a higher limit on records per request or none, another folder,
-// a higher two-person amount or none, and, as the server also holds them (lib/services/
-// agentPolicies.ts), a longer wait for requests and turning the email notice on (an outside
-// send). Everything is compared with what was saved (`before`),
+// now (as the engine resolves it), a higher limit on records per request or none, a folder outside
+// the ones it has (addedFolders), a higher two-person amount or none, and, as the server also
+// holds them (lib/services/agentPolicies.ts), a longer wait for requests and turning the email
+// notice on (an outside send). Everything is compared with what was saved (`before`),
 // so a person who tightened something in the draft may always put it back. The screen uses this to
 // disable those controls and say why; the server checks the same and has the last word.
 
@@ -303,19 +312,67 @@ export function notifyLoosened(before: PolicyDraft, after: PolicyDraft): boolean
   return after.notifyEmail && !before.notifyEmail;
 }
 
-/**
- * Folders in `after` that `before` did not have (the same folder in other letter case is not new).
- *
- * Deliberately stricter than the server: lib/services/agentPolicies.ts loosenings does not count a
- * folder inside one the agent already has, but only when that folder really reaches something on
- * this computer's disk (not a whole drive, a mounted volume or one of Ironbooks' own folders), and
- * a window cannot see the disk. So here every new path counts, and a person who is not an Admin is
- * not offered "Add folder" at all (LimitsForm). It fails closed: nothing the server would refuse is
- * ever sent, and an Admin is never held back by it.
- */
-export function addedFolders(before: PolicyDraft, after: PolicyDraft): string[] {
+/** Folders in `after` that `before` did not have (the same folder in other letter case is not new). */
+export function newFolders(before: PolicyDraft, after: PolicyDraft): string[] {
   const had = new Set(before.folders.map((f) => f.toLowerCase()));
   return after.folders.filter((f) => !had.has(f.toLowerCase()));
+}
+
+/** A Windows path: a drive letter or a network share. Compared without regard to letter case. */
+const WINDOWS_PATH = /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])/;
+
+/**
+ * A full path as its parts, by the words alone (no disk): a drive ("c:"), a share ("\\server\share")
+ * or "/" first, then each folder. Null when it is not a full path or has a "." or ".." part, which
+ * the words cannot place: such a path never counts as inside another one.
+ */
+function pathParts(p: string): string[] | null {
+  const t = p.trim();
+  if (WINDOWS_PATH.test(t)) {
+    const parts = t.replace(/\//g, '\\').split('\\');
+    if (parts[0] === '' && parts[1] === '') {
+      // \\server\share\rest: the share is the root.
+      const [, , server, share, ...rest] = parts;
+      if (!server || !share) return null;
+      return clean([`\\\\${server}\\${share}`.toLowerCase(), ...rest.map((s) => s.toLowerCase())]);
+    }
+    return clean(parts.map((s) => s.toLowerCase()));
+  }
+  if (t.startsWith('/')) return clean(['/', ...t.split('/')]);
+  return null;
+}
+
+function clean(parts: string[]): string[] | null {
+  const [root, ...rest] = parts;
+  const folders = rest.filter((s) => s !== '');
+  return folders.some((s) => s === '.' || s === '..') ? null : [root, ...folders];
+}
+
+/**
+ * `child` is a folder inside `parent`, by the words alone: both full paths, `parent` not a whole
+ * drive or share (the server never takes one as an agent's folder), and every part of `parent`
+ * starts `child`. Windows paths compare without regard to letter case, as the server does there.
+ */
+export function insideFolder(child: string, parent: string): boolean {
+  const c = pathParts(child);
+  const p = pathParts(parent);
+  if (!c || !p || p.length < 2 || c.length <= p.length) return false;
+  return p.every((part, i) => c[i] === part);
+}
+
+/**
+ * The new folders that would let the agent use something it cannot use now: those not inside a
+ * folder it already has (`before`), by the words.
+ *
+ * As the server counts them (lib/services/agentPolicies.ts loosenings): a folder inside one the
+ * agent already has gives it nothing more. The server also asks the disk whether that stored folder
+ * really reaches the new one (not a mounted volume, a link off elsewhere, or one of Ironbooks' own
+ * places), which a window cannot see; when it does not, the server refuses the save in its own
+ * words, and the page shows them. So a person who is not an Admin may add a folder inside one the
+ * agent has (LimitsForm), and the server has the last word.
+ */
+export function addedFolders(before: PolicyDraft, after: PolicyDraft): string[] {
+  return newFolders(before, after).filter((f) => !before.folders.some((had) => insideFolder(f, had)));
 }
 
 const SETTING_WORD: Record<PolicySetting, string> = { allow: 'Allow', ask: 'Ask', never: 'Never' };

@@ -57,6 +57,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { isReadOnlyDb } from '@/lib/db/readOnly';
 import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 // ---------------------------------------------------------------------------
@@ -178,7 +179,11 @@ function trackingOf(item: { trackingMode: string | null }): TrackingMode {
 // Sites
 // ---------------------------------------------------------------------------
 
-/** The company's default site, creating "Main Warehouse" on first use. */
+/**
+ * The company's default site, creating "Main Warehouse" on first use. For the work that records
+ * stock at a site. A read takes defaultSiteForRead instead: an agent's read, or any context that
+ * only reads, must not make it.
+ */
 export async function ensureDefaultSite(ctx: ServiceContext): Promise<SiteRow> {
   const [existing] = await ctx.db
     .select()
@@ -203,8 +208,32 @@ export async function ensureDefaultSite(ctx: ServiceContext): Promise<SiteRow> {
   return winner;
 }
 
+/**
+ * Whether a read may save the first-use default site. A person's read does, as it always has: the
+ * first visit to Inventory Sites shows "Main Warehouse". An agent's read never does, nor does any
+ * context that only reads (ctx.readOnly, the read-only database handle of lib/db/readOnly.ts): a
+ * read must not change the books, and on the read-only handle the insert would make the read fail.
+ */
+function readMayMakeDefaultSite(ctx: ServiceContext): boolean {
+  return !ctx.readOnly && !ctx.agent && !isReadOnlyDb(ctx.db);
+}
+
+/**
+ * The default site for a read: made on a person's first read (ensureDefaultSite), and null for an
+ * agent's or a read-only read until someone has made it. Such a read then answers as if no site
+ * exists yet, which is what the books hold: the stock is not at any site until the default exists.
+ */
+export async function defaultSiteForRead(ctx: ServiceContext): Promise<SiteRow | null> {
+  if (readMayMakeDefaultSite(ctx)) return ensureDefaultSite(ctx);
+  const [existing] = await ctx.db
+    .select()
+    .from(inventorySites)
+    .where(and(eq(inventorySites.companyId, ctx.companyId), eq(inventorySites.isDefault, true)));
+  return existing ?? null;
+}
+
 export async function listSites(ctx: ServiceContext, opts?: { includeInactive?: boolean }) {
-  await ensureDefaultSite(ctx);
+  await defaultSiteForRead(ctx);
   const conds = [eq(inventorySites.companyId, ctx.companyId)];
   if (!opts?.includeInactive) conds.push(eq(inventorySites.isActive, true));
   const rows = await ctx.db.select().from(inventorySites).where(and(...conds));
@@ -463,12 +492,14 @@ export async function updateBin(ctx: ServiceContext, id: string, patch: { name?:
 /**
  * Per-item, per-site quantities for the company (optionally limited to some items).
  * Includes the derived default-site remainder; sites with a zero quantity are omitted.
+ * An agent's or a read-only read before the default site exists (defaultSiteForRead) gets no
+ * remainder: what no other site holds is at no site yet.
  */
 export async function siteQuantities(
   ctx: ServiceContext,
   itemIds?: string[],
 ): Promise<Map<string, Map<string, Dec>>> {
-  const defaultSite = await ensureDefaultSite(ctx);
+  const defaultSite = await defaultSiteForRead(ctx);
   if (itemIds && itemIds.length === 0) return new Map();
 
   const itemConds = [eq(items.companyId, ctx.companyId), eq(items.type, 'inventory')];
@@ -478,7 +509,8 @@ export async function siteQuantities(
     .from(items)
     .where(and(...itemConds));
 
-  const mvConds = [eq(inventoryMovements.companyId, ctx.companyId), ne(inventoryMovements.siteId, defaultSite.id)];
+  const mvConds = [eq(inventoryMovements.companyId, ctx.companyId)];
+  if (defaultSite) mvConds.push(ne(inventoryMovements.siteId, defaultSite.id));
   if (itemIds) mvConds.push(inArray(inventoryMovements.itemId, itemIds));
   const sums = await ctx.db
     .select({
@@ -498,6 +530,7 @@ export async function siteQuantities(
     const q = Money.of(s.qty);
     if (!q.isZero()) m.set(s.siteId, q);
   }
+  if (!defaultSite) return result;
   for (const it of itemRows) {
     const m = result.get(it.id)!;
     let other = Money.zero();

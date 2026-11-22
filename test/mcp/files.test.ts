@@ -3,6 +3,7 @@
  * folders an Admin opened to the agent (real folders, links and junctions on this disk), a staged
  * file handed back as an image, text or base64, and saving a file through a person.
  */
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -19,12 +20,15 @@ import {
   NOT_A_PATH_MESSAGE,
   NOT_FOUND_MESSAGE,
   NO_FOLDERS_MESSAGE,
+  ONLY_THIS_COMPUTER_FOLDERS_MESSAGE,
+  THIS_COMPUTER_SHARE_MESSAGE,
   UPLOAD_CHUNK_BYTES,
   UPLOAD_MAX_BYTES,
   contentBlock,
   decodeBase64,
   ironbooksFiles,
   ironbooksFolders,
+  isThisComputerShare,
   outsideMessage,
   plainPath,
   readAllowedFile,
@@ -32,7 +36,8 @@ import {
   uploadBytes,
 } from '../../mcp/files-tools.mjs';
 import * as endpointFile from '@/lib/agent/endpointFile';
-import { stagedFilesRoot } from '@/lib/agent/files';
+import { isThisComputerShare as appIsThisComputerShare, stagedFilesRoot } from '@/lib/agent/files';
+import thisComputerShares from '@/lib/agent/thisComputerShares.json';
 
 const companySession = createRequire(import.meta.url)('../../electron/companySession.js') as {
   workingRoot: (o: { platform?: string; env?: Record<string, string | undefined>; userData?: string }) => string;
@@ -350,7 +355,12 @@ describe('attach_local_file: only from the folders an Admin opened to the agent'
       vi.spyOn(fsp, 'realpath').mockImplementation(deny('realpath') as never),
       vi.spyOn(fsp, 'stat').mockImplementation(deny('stat') as never),
       vi.spyOn(fsp, 'open').mockImplementation(deny('open') as never),
-      vi.spyOn(fs.realpath, 'native').mockImplementation(((p: unknown) => touched.push(`realpath.native ${String(p)}`)) as never),
+      // Fails the way the real one fails (through its callback), so a look that slips through is
+      // seen and refused, never left waiting for an answer.
+      vi.spyOn(fs.realpath, 'native').mockImplementation(((p: unknown, done: (err: Error) => void) => {
+        touched.push(`realpath.native ${String(p)}`);
+        done(new Error('touched realpath.native'));
+      }) as never),
     ];
     try {
       const refused = [path.join(ALLOWED, 'CON'), path.join(ALLOWED, 'nul.txt'), `${path.join(ALLOWED, 'statement.csv')}:hidden`, `\\\\?\\${path.join(ALLOWED, 'statement.csv')}`, `\\\\.\\${path.join(ALLOWED, 'statement.csv')}`];
@@ -437,6 +447,62 @@ describe('attach_local_file: only from the folders an Admin opened to the agent'
       }
     });
 
+    it('under any spelling of them: case, trailing dots and spaces, a letter NTFS folds, a short name', async () => {
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const parent = path.dirname(OWN);
+      try {
+        const spellings = [
+          // Upper case, there or not.
+          path.join(WORKING.toUpperCase(), 'DATA', 'PG_VERSION'),
+          path.join(OWN.toUpperCase(), 'no-such-file'),
+          // "ſ" (long s) is "S" in the upper case NTFS compares in: refused whether or not the disk agrees.
+          path.join(parent, 'Ironbookſ', 'no-such-file'),
+          ...(WIN
+            ? [
+                // Windows drops trailing dots and spaces from a name: "Ironbooks." is "Ironbooks".
+                path.join(parent, 'Ironbooks.', 'Working', 'company-1', 'data', 'PG_VERSION'),
+                path.join(parent, 'Ironbooks. .', 'no-such-folder', 'x.txt'),
+                path.join(parent, 'Ironbooks ', 'agent-files', 'no-such-file'),
+              ]
+            : []),
+        ];
+        for (const p of spellings) await expect(readAllowedFile(p, [ALLOWED], { own }), p).rejects.toThrow(IRONBOOKS_OWN_MESSAGE);
+        // A folder beside them whose name merely starts the same is not one of them.
+        fs.mkdirSync(path.join(parent, 'Ironbooks-notes'), { recursive: true });
+        fs.writeFileSync(path.join(parent, 'Ironbooks-notes', 'n.txt'), 'notes');
+        expect((await readAllowedFile(path.join(parent, 'Ironbooks-notes', 'n.txt'), [ALLOWED], { own })).bytes.toString()).toBe('notes');
+        await expect(readAllowedFile(path.join(parent, 'Ironbooks-notes', 'no-such-file'), [ALLOWED], { own })).rejects.toThrow(NOT_FOUND_MESSAGE);
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
+    it.runIf(WIN)('by its short (8.3) name too, there or not', async () => {
+      // The short name as Windows gives it; some disks make none, and then there is nothing to test.
+      let short = '';
+      try {
+        // Verbatim, so the quotes reach cmd as written (it strips the outer pair: /s).
+        const out = spawnSync('cmd.exe', ['/d', '/s', '/c', `"for %I in ("${OWN}") do @echo %~sI"`], { encoding: 'utf8', windowsHide: true, windowsVerbatimArguments: true });
+        short = out.status === 0 ? String(out.stdout).trim() : '';
+      } catch {
+        short = '';
+      }
+      if (!short || short.toLowerCase() === OWN.toLowerCase()) {
+        console.warn('this disk makes no short names; the short-name case is covered where it does');
+        return;
+      }
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        for (const p of [path.join(short, 'agent-files', 'other-agent.bin'), path.join(short, 'no-such-file'), path.join(short, 'no-such-folder', 'x.txt')]) {
+          await expect(readAllowedFile(p, [ALLOWED], { own }), p).rejects.toThrow(IRONBOOKS_OWN_MESSAGE);
+        }
+        // And Ironbooks' folder named by its short name, the file asked for by its long one.
+        await expect(readAllowedFile(path.join(OWN, 'no-such-file'), [ALLOWED], { own: { folders: [short], files: [] } })).rejects.toThrow(IRONBOOKS_OWN_MESSAGE);
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
     it('attach_local_file keeps them out with what this computer says they are, and sends nothing', async () => {
       const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
       const saved = process.env.IRONBOOKS_USER_DATA;
@@ -510,6 +576,144 @@ describe('attach_local_file: only from the folders an Admin opened to the agent'
       await expect(readAllowedFile(path.join(ALLOWED, 'statement.csv'), ['relative/folder'])).rejects.toThrow(NO_FOLDERS_MESSAGE);
       expect(String(stderr.mock.calls.at(-1)?.[0])).toMatch(/no folders are open to this agent/);
     } finally {
+      stderr.mockRestore();
+    }
+  });
+});
+
+/** One case of lib/agent/thisComputerShares.json, with `templated` when it named this computer through a template. */
+interface ShareCase {
+  path: string;
+  want: boolean;
+  env?: Record<string, string>;
+  since?: string;
+  why?: string;
+  templated?: boolean;
+}
+
+/**
+ * A share of this very computer, by the words alone: the connector's port (mcp/files-tools.mjs
+ * isThisComputerShare) and the app's rule (lib/agent/files.ts) are both held to the one table,
+ * lib/agent/thisComputerShares.json, so the two cannot drift apart. Its templates are filled in
+ * for this computer as lib/agent/files.test.ts fills them; a case whose template cannot be filled
+ * here is left out.
+ */
+function thisComputerCases(): ShareCase[] {
+  let ownIPv4: string | null = null;
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list ?? []) if (!ownIPv4 && a.family === 'IPv4' && !a.internal) ownIPv4 = a.address;
+  }
+  const host = os.hostname();
+  const fill: Record<string, string | null> = {
+    '{hostname}': host,
+    '{hostname:lower}': host.toLowerCase(),
+    '{hostname:upper}': host.toUpperCase(),
+    '{COMPUTERNAME}': process.env.COMPUTERNAME?.trim() || null,
+    '{ownIPv4}': ownIPv4,
+  };
+  const out: ShareCase[] = [];
+  for (const c of thisComputerShares.cases as ShareCase[]) {
+    let p: string | null = c.path;
+    for (const [t, v] of Object.entries(fill)) if (p?.includes(t)) p = v === null ? null : p.split(t).join(v);
+    if (p !== null) out.push({ ...c, path: p, templated: p !== c.path });
+  }
+  return out;
+}
+
+/** Run `fn` with `values` in process.env (as lib/agent/files.ts reads it), then put them back. */
+function withEnv(values: Record<string, string> | undefined, fn: () => void): void {
+  const before = Object.fromEntries(Object.keys(values ?? {}).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, values ?? {});
+  try {
+    fn();
+  } finally {
+    for (const [k, v] of Object.entries(before)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+describe('a share of this very computer (\\\\localhost, a loopback address, its own name) is never read from', () => {
+  it('the connector\'s rule answers every case of the app\'s table as the app does, by the words alone', () => {
+    const cases = thisComputerCases();
+    expect(cases.length).toBeGreaterThan(50);
+    for (const c of cases) {
+      const say = JSON.stringify(c.path);
+      // Judged as Windows judges them, on any system the test runs on: the table's answer. A case
+      // that names this computer through a template is this computer's name only here.
+      if (!c.templated) expect(isThisComputerShare(c.path, { platform: 'win32', env: c.env ?? {} }), say).toBe(c.want);
+      // On other systems a path written that way is no share at all.
+      expect(isThisComputerShare(c.path, { platform: 'linux', env: c.env }), say).toBe(false);
+      // Here, held to lib/agent/files.ts and to the table: the same answer for every case.
+      withEnv(c.env, () => {
+        expect(isThisComputerShare(c.path), say).toBe(appIsThisComputerShare(c.path));
+        expect(isThisComputerShare(c.path), say).toBe(WIN ? c.want : false);
+      });
+    }
+    expect(isThisComputerShare(5)).toBe(false);
+  });
+
+  it.runIf(WIN)('a path through one is refused before anything is looked at, and logged', async () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const touched: string[] = [];
+    const deny = (name: string) => async (p: unknown) => {
+      touched.push(`${name} ${String(p)}`);
+      throw new Error(`touched ${name}`);
+    };
+    const spies = [
+      vi.spyOn(fsp, 'lstat').mockImplementation(deny('lstat') as never),
+      vi.spyOn(fsp, 'realpath').mockImplementation(deny('realpath') as never),
+      vi.spyOn(fsp, 'stat').mockImplementation(deny('stat') as never),
+      vi.spyOn(fsp, 'open').mockImplementation(deny('open') as never),
+      vi.spyOn(fs.realpath, 'native').mockImplementation(((p: unknown, done: (err: Error) => void) => {
+        touched.push(`realpath.native ${String(p)}`);
+        done(new Error('touched realpath.native'));
+      }) as never),
+    ];
+    // The allowed folder named through this computer's own share, as an older stored folder may be.
+    const viaShare = `\\\\localhost\\${ALLOWED.slice(0, 1).toLowerCase()}$${ALLOWED.slice(2)}`;
+    try {
+      for (const p of [
+        path.join(viaShare, 'statement.csv'),
+        `\\\\127.1\\c$\\Users\\someone\\AppData\\Local\\Ironbooks\\agent-files\\x.bin`,
+        `\\\\${os.hostname()}\\c$\\Users\\someone\\AppData\\Roaming\\Ironbooks\\config.json`,
+      ]) {
+        await expect(readAllowedFile(p, [ALLOWED, viaShare]), p).rejects.toThrow(THIS_COMPUTER_SHARE_MESSAGE);
+      }
+      // A folder open to the agent only through such a share opens nothing: said so, plainly.
+      await expect(readAllowedFile(path.join(ALLOWED, 'statement.csv'), [viaShare])).rejects.toThrow(ONLY_THIS_COMPUTER_FOLDERS_MESSAGE);
+      expect(touched).toEqual([]);
+      const lines = stderr.mock.calls.map(([line]) => String(line)).filter((l) => l.includes('attach_local_file refused'));
+      expect(lines).toHaveLength(4);
+      expect(lines.slice(0, 3).every((l) => l.endsWith(': it reaches this computer through one of its own network shares.\n'))).toBe(true);
+      expect(lines[3]).toMatch(/: every folder open to this agent is a share of this same computer\.\n$/);
+    } finally {
+      for (const s of spies) s.mockRestore();
+      stderr.mockRestore();
+    }
+    expect(THIS_COMPUTER_SHARE_MESSAGE).toMatch(/Give the file's own path on this computer instead/);
+    expect(ONLY_THIS_COMPUTER_FOLDERS_MESSAGE).toMatch(/An Admin can open the folder again by its own path on this computer/);
+    // The real folder beside it still works; the share beside it allows nothing more.
+    expect((await readAllowedFile(path.join(ALLOWED, 'statement.csv'), [viaShare, ALLOWED])).bytes.toString()).toBe(CSV);
+  });
+
+  it.runIf(WIN)('a file the disk gives as one (a drive mapped to this computer\'s own share) is refused too', async () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const target = path.join(ALLOWED, 'statement.csv');
+    const native = fs.realpath.native;
+    const spy = vi.spyOn(fs.realpath, 'native').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      const done = rest[rest.length - 1] as (err: Error | null, out?: string) => void;
+      if (String(p).toLowerCase() === target.toLowerCase()) {
+        done(null, `\\\\localhost\\c$\\mapped\\statement.csv`);
+        return;
+      }
+      (native as unknown as (...a: unknown[]) => void)(p, ...rest);
+    }) as never);
+    try {
+      await expect(readAllowedFile(target, [ALLOWED])).rejects.toThrow(THIS_COMPUTER_SHARE_MESSAGE);
+    } finally {
+      spy.mockRestore();
       stderr.mockRestore();
     }
   });

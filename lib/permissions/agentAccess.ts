@@ -101,16 +101,15 @@ function copyAccess(access: EffectiveAccess): EffectiveAccess {
  *    roles, backups, restore, passwords) can never be set to Allow, so an Admin must say yes to
  *    each one.
  *  - Users & Roles and File Utilities are no longer taken away (plan 5.3), so the door can ask an
- *    Admin about their operations. The door asks by the operation's CLASS, not its area, and some
- *    GETs of these areas are classed 'read' in lib/agent/operations/classes/*.ts today (the user
- *    and role lists, the password rules, the permissions report, the backup history, list exports
- *    and other File Utilities reads). Through the door those run under the read setting, which is
- *    Allow in every preset, for an agent whose role holds the view right (the Admin role holds
- *    both areas; Full Access, Accountant and External Accountant hold File Utilities): nobody is
- *    asked. That is for the registry to class (admin or file, as plan 4.2 has it);
- *    agentAccess.test.ts pins the list so it can only shrink. An agent's own HTTP request never
- *    reaches these areas (AGENT_DOOR_ONLY_AREAS, agentRouteAllowed) and its access leaves them out
- *    (agentDirectAccess).
+ *    Admin about their operations. The door asks by the operation's CLASS, not its area, so the
+ *    registry classes their reads as plan 4.2 has it: every read of Users & Roles is 'admin', and
+ *    every File Utilities read that shows file names, folders or backups, or produces a file, is
+ *    'file'; an Admin is asked about each one. Only the pure checks of the books stay 'read' (data
+ *    integrity, books in balance, and Clean Up's preview of unused list entries): through the
+ *    door they run under the read setting, which is Allow in every preset, for an agent whose role
+ *    holds the view right. agentAccess.test.ts pins that list exactly. An agent's own HTTP
+ *    request never reaches these areas (AGENT_DOOR_ONLY_AREAS, agentRouteAllowed) and its access
+ *    leaves them out (agentDirectAccess).
  *  - The View flags (full SSNs, full account numbers) and the closed-period right are no longer
  *    switched off here. They are what the policy checks before an agent may even ask to reveal
  *    protected data (read_sensitive) or to work in a closed period (period). They never unmask
@@ -182,14 +181,6 @@ export { AGENT_ACTION_ROUTE, isAgentActionRequest };
  */
 export const AGENT_OWN_ROUTES: readonly string[] = ['/api/agent/whoami', '/api/agent/requests', '/api/agent/requests/[id]'];
 
-/**
- * @deprecated The fixed list of reads is gone (plan 5.3): any GET the registry classes as a plain
- * read open to agents is reachable (agentRouteAllowed). Only the agent's own routes are left, so
- * this is AGENT_OWN_ROUTES under its old name, kept until the tests that still import it are
- * rewritten for the new rule. Do not use it in new code.
- */
-export const AGENT_READ_ROUTES: readonly string[] = AGENT_OWN_ROUTES;
-
 /** True for a path the route map matches to one of AGENT_OWN_ROUTES. */
 function agentOwnRoute(path: string): boolean {
   const pattern = matchRoutePattern(path);
@@ -207,17 +198,12 @@ export const AGENT_HARD_FLOOR_ROUTES: readonly string[] = ['/api/agents', '/api/
  * Areas an agent's own request never reaches, even for a plain read, and that its access leaves
  * out (agentDirectAccess). The ceiling keeps them now, so the door can ask an Admin about their
  * operations (D1), but a direct read runs with no policy and no person. Through the door an
- * operation is asked about by its class: the ones classed admin or file always ask an Admin, while
- * the GETs of these areas still classed 'read' run without asking (see clampForAgent).
+ * operation is asked about by its class: the reads of Users & Roles are 'admin' and the File
+ * Utilities reads that show the files on disk are 'file', so an Admin is asked about each; only
+ * the pure checks of the books stay 'read' and run without asking (see clampForAgent). The audit
+ * trail is read with an agent's access less these areas too (lib/services/auditTrail.ts).
  */
 export const AGENT_DOOR_ONLY_AREAS: readonly Area[] = ['users', 'file_utilities'];
-
-/**
- * @deprecated The clamp no longer takes these areas away (plan 5.3). This is AGENT_DOOR_ONLY_AREAS
- * under its old name, kept until the tests that still import it are rewritten. Do not use it in
- * new code.
- */
-export const AGENT_DENIED_AREAS: readonly Area[] = AGENT_DOOR_ONLY_AREAS;
 
 /** What agentRouteAllowed needs to know about the operation a GET names (from the registry). */
 export type AgentRouteOperation = Pick<Operation, 'classified' | 'class' | 'availability' | 'area' | 'rule'>;

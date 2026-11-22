@@ -11,9 +11,10 @@
  * entries already in the books that it voided, deleted or changed in place. With an amountField the
  * amount is the larger of that field and the largest SINGLE one of those entries, which is only the
  * largest row of a request that posts an entry per row (so those name their rows with '*'). With
- * none it is all of them added up, and "0.00" for a run that posted and touched no entry. A void
- * posts nothing new (it marks the existing entry void), but the bridge counts the voided entry at
- * its total, so a void is sized by the larger of its amountField and that entry.
+ * none it is all of them added up, and "0.00" only for a run that made new records and posted no
+ * entry; one that voided, deleted or changed a record already there and touched no entry stays
+ * unknown. A void posts nothing new (it marks the existing entry void), but the bridge counts the
+ * voided entry at its total, so a void is sized by the larger of its amountField and that entry.
  *
  * Confirmation flags: the bill payment and vendor credit body schemas carry allowReconciledEdit
  * because one schema serves the new record and the edit, but only the edit asks for it
@@ -26,11 +27,20 @@
 import type { ClassificationMap } from '../types';
 
 // The default "Main Warehouse" site is created by ensureDefaultSite (lib/services/inventorySites.ts)
-// the first time a company's sites are read, or by the first site operation of any kind. It has no
-// read-only guard. The GETs that reach it are still reads: an agent's read runs on the read-only
-// database handle (lib/agent/bridge.ts, mode 'read'), so that one write can never happen under an
-// agent's name. Classing them 'enter' instead made listing sites ask a person every time and kept a
-// Read only agent from listing them at all, for a write that happens once per company.
+// the first time a person reads a company's sites, or by the first site operation of any kind. The
+// reads go through defaultSiteForRead, which makes it for a person only: an agent's read, or any
+// context that only reads, gets what is there (no site yet, on such a company), so these GETs are
+// plain reads.
+const READS_DEFAULT_SITE =
+  'Reads only. A person\'s first call on a company with no inventory site makes the default "Main Warehouse", ' +
+  'as it always has; an agent\'s read, or any read-only one, never makes it (defaultSiteForRead, ' +
+  'lib/services/inventorySites.ts) and answers as if no site had been set up yet: no sites, and the ' +
+  'stock at no site until the default exists.';
+
+// GET /api/inventory-sites/reorder-points goes through lib/services/inventorySiteOps.ts
+// listSiteReorderPoints, which still calls ensureDefaultSite. It stays a read: an agent's read runs
+// on the read-only database handle (lib/agent/bridge.ts, mode 'read'), so that one write can never
+// happen under an agent's name, and the read fails on such a company instead.
 const MAKES_DEFAULT_SITE =
   'Read only for an agent: the first call on a company with no default inventory site would create ' +
   '"Main Warehouse" (ensureDefaultSite has no read-only guard), and the read-only database handle refuses ' +
@@ -102,6 +112,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
     class: 'bulk',
     id: 'vendors.bulk.save',
     describe: 'Add or change several vendors at once',
+    why: 'Add/Edit Multiple: one request saves every row (new vendors, and edits of existing ones when a row has an id), all or nothing. Its preview option is dryRun: true in the body: every row is checked and the whole batch rolled back, so nothing is saved.',
     countField: 'rows',
     dryRun: 'preview',
     bodySchema: '@/lib/validation/lists#bulkSchema',
@@ -255,6 +266,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'POST /api/receiving/bill': {
     class: 'enter',
     describe: 'Enter a bill for items received from vendor {vendorId}',
+    why: 'Enters and posts the bill for items already received. Its preview option is preview: true in the body: the route answers the price variances and the journal entry it would post, and saves nothing.',
     confirmFlags: ['allowDuplicateNumber'],
     dryRun: 'preview',
     // The posted answer is the bill row (total), as for POST /api/bills. The route's own preview
@@ -345,7 +357,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
     describe: 'Make purchase orders from the reorder list',
     why:
       'Makes one purchase order per preferred vendor. itemIds is an upper bound on the count; without it the ' +
-      'whole reorder list is used, and the preview (dryRun) lists the orders it would make.',
+      'whole reorder list is used. Its preview option is dryRun: true in the body: it lists the orders it would make and saves none.',
     countField: 'itemIds',
     dryRun: 'preview',
   },
@@ -368,7 +380,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/inventory-sites': {
     class: 'read',
     describe: 'List inventory sites',
-    why: MAKES_DEFAULT_SITE,
+    why: READS_DEFAULT_SITE,
   },
   'POST /api/inventory-sites': { class: 'enter', describe: 'Add inventory site {name}' },
   'GET /api/inventory-sites/[id]': { class: 'read', describe: 'Show inventory site {id}' },
@@ -393,7 +405,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/inventory-sites/reports': {
     class: 'read',
     describe: 'Run the inventory-by-site report {report}',
-    why: MAKES_DEFAULT_SITE,
+    why: READS_DEFAULT_SITE,
   },
 
   // Inventory transfers between sites. POST /[id] voids.

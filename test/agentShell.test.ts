@@ -5,9 +5,11 @@
  *    everything else it covers (answers, folders, file, secret kinds), the sealed part and the
  *    signed answer; electron/agentShell.js does the same, byte for byte.
  *  - electron/agentShell.js: the replay memory, the folders agents may use ("..", another drive, a
- *    share, device paths, links, never the top of a drive or share), the host an agent may join
- *    (never this computer, nor a virtual machine or container it runs), the scripted dialogs (a
- *    question without an answer stops the flow cleanly, naming the question; nothing ever waits on
+ *    share, device paths, links, never the top of a drive, share or mounted volume, never a share
+ *    of this very computer, held to lib/agent/files.ts by one table of cases), the host an agent
+ *    may join (never this computer, nor a virtual machine or container it runs), the scripted
+ *    dialogs (a question without an answer stops the flow cleanly, naming the question; "Save a
+ *    Copy and Open It" is never pressed; nothing ever waits on
  *    screen), the endpoint itself over a real named pipe or Unix socket with fake flows (nothing
  *    else can listen on its name, nothing private goes on it in the open or into the log, a silent
  *    connection is let go quickly), printing from a hidden window, the desktop notice.
@@ -58,6 +60,7 @@ import {
 } from '@/lib/agent/shell';
 import { showAgentRequestNotice } from '@/lib/desktop/agentNotice';
 import { effects, setPrintHandler } from '@/lib/effects';
+import thisComputerShares from '@/lib/agent/thisComputerShares.json';
 
 const mocks = vi.hoisted(() => ({
   folders: [] as string[],
@@ -69,7 +72,9 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/lib/services/agentPolicies', () => ({
   loadAgentPolicy: vi.fn(async () => ({ folders: mocks.folders })),
 }));
-vi.mock('@/lib/agent/files', () => ({
+vi.mock('@/lib/agent/files', async (orig) => ({
+  // The rule itself is the real one: lib/agent/shell.ts and the shell's port are held to it below.
+  isThisComputerShare: (await orig<typeof import('@/lib/agent/files')>()).isThisComputerShare,
   readStagedFile: vi.fn(async (owner: { companyId: string; agentId: string }, fileId: string) => mocks.staged.get(`${owner.companyId}/${owner.agentId}/${fileId}`) ?? null),
   allowedFolder: vi.fn(async (allowed: readonly string[], folder: string) => {
     const want = path.resolve(folder).toLowerCase();
@@ -454,7 +459,87 @@ describe('the folders agents may use', () => {
       },
       realpath: (p: string) => (p === 'C:\\Docs\\Ironbooks' ? 'E:\\' : p),
     };
-    expect(agentShell.pathProblem('C:\\Docs\\Ironbooks\\Books\\x.ironbooks', ['C:\\Docs\\Ironbooks'], { platform: 'win32', fs: linked })).toMatch(/leads outside/);
+    expect(agentShell.pathProblem('C:\\Docs\\Ironbooks\\Books\\x.ironbooks', ['C:\\Docs\\Ironbooks'], { platform: 'win32', fs: linked })).toMatch(
+      /is in a folder that is the top of a whole drive, share or disk .* so it was refused/,
+    );
+  });
+
+  it('on macOS and Linux, a mounted volume’s top folder is a root too: never an agent folder', () => {
+    const roots = [
+      '/',
+      '/Volumes',
+      '/Volumes/USB',
+      '/Volumes/Office Share/',
+      '/volumes/usb', // macOS disks mostly ignore case
+      '/System/Volumes/Data',
+      '/media',
+      '/media/pat',
+      '/media/pat/USB',
+      '/run/media',
+      '/run/media/pat',
+      '/run/media/pat/USB',
+      '/mnt',
+      '/mnt/c', // WSL: the whole C: drive
+      '/mnt/backup/',
+      '/Volumes/USB/..',
+    ];
+    const folders = ['/Volumes/USB/Books', '/media/pat/USB/Books', '/run/media/pat/USB/Books', '/mnt/c/Users', '/home/pat', '/Users/pat/Documents', '/run/user', '/home'];
+    for (const platform of ['darwin', 'linux']) {
+      for (const root of roots) {
+        expect(agentShell.driveOrShareRoot(root, platform), `${platform} ${root}`).toBe(true);
+        expect(isDriveOrShareRoot(root, platform as NodeJS.Platform), `server ${platform} ${root}`).toBe(true);
+      }
+      for (const folder of folders) {
+        expect(agentShell.driveOrShareRoot(folder, platform), `${platform} ${folder}`).toBe(false);
+        expect(isDriveOrShareRoot(folder, platform as NodeJS.Platform), `server ${platform} ${folder}`).toBe(false);
+      }
+    }
+    // On Windows those words are no volume of their own (C:\Volumes is a folder).
+    expect(agentShell.driveOrShareRoot('C:\\Volumes\\USB', 'win32')).toBe(false);
+    expect(isDriveOrShareRoot('C:\\Volumes\\USB', 'win32')).toBe(false);
+    // The finding's probe: a company file at the top of a USB stick or a mounted share leaves only Documents.
+    const docs = '/Users/pat/Documents';
+    const onlyDocuments = [`${docs}/Ironbooks`, `${docs}/Ironbooks/${AGENT_OUTBOX_NAME}`];
+    for (const companyFile of ['/Volumes/USB/Acme.ironbooks', '/Volumes/Office/Acme.ironbooks', '/media/pat/USB/Acme.ironbooks', '/run/media/pat/USB/Acme.ironbooks', '/mnt/books/Acme.ironbooks']) {
+      expect(agentShell.defaultFolders({ companyFile, documents: docs, platform: 'darwin' }), companyFile).toEqual(onlyDocuments);
+    }
+    const usb = agentShell.defaultFolders({ companyFile: '/Volumes/USB/Acme.ironbooks', documents: docs, platform: 'darwin' });
+    expect(agentShell.pathProblem('/Volumes/USB/Other.ironbooks', usb, { platform: 'darwin', fs: null })).toMatch(/not in a folder agents may use/);
+    // Named by the Admin, the top of a volume is not used either; a folder inside it is.
+    expect(agentShell.pathProblem('/Volumes/USB/Books/x.ironbooks', ['/Volumes/USB'], { platform: 'darwin', fs: null })).toMatch(/not in a folder agents may use/);
+    expect(agentShell.pathProblem('/Volumes/USB/Books/x.ironbooks', ['/Volumes/USB/Books'], { platform: 'darwin', fs: null })).toBeNull();
+    expect(agentShell.defaultFolders({ companyFile: '/Volumes/USB/Books/Acme.ironbooks', documents: docs, platform: 'darwin' })[0]).toBe('/Volumes/USB/Books');
+  });
+
+  it('a disk mounted into a folder (another device than the folder it sits in) is the top of a volume', () => {
+    const enoent = () => Object.assign(new Error('not there'), { code: 'ENOENT' });
+    const there = ['C:\\', 'C:\\Docs', 'C:\\Docs\\Ironbooks', 'C:\\Docs\\Ironbooks\\Books'];
+    const disk = (mounted: string | null) => ({
+      lstat: (p: string) => {
+        if (!there.includes(p)) throw enoent();
+      },
+      realpath: (p: string) => p,
+      stat: (p: string) => {
+        if (!there.includes(p)) throw enoent();
+        // Everything from the mount point down is on the second disk.
+        return { dev: mounted && (p === mounted || p.startsWith(`${mounted}\\`)) ? 2 : 1 };
+      },
+    });
+    const opts = (mounted: string | null) => ({ platform: 'win32', fs: disk(mounted) });
+    const file = 'C:\\Docs\\Ironbooks\\Books\\x.ironbooks';
+    expect(agentShell.pathProblem(file, ['C:\\Docs\\Ironbooks'], opts(null))).toBeNull();
+    // C:\Docs\Ironbooks is where a second disk is mounted: the whole disk, refused.
+    expect(agentShell.pathProblem(file, ['C:\\Docs\\Ironbooks'], opts('C:\\Docs\\Ironbooks'))).toMatch(/top of a whole drive, share or disk/);
+    // A folder below the mount point is a folder of its own.
+    expect(agentShell.pathProblem(file, ['C:\\Docs\\Ironbooks\\Books'], opts('C:\\Docs\\Ironbooks'))).toBeNull();
+    // An allowed folder that is not there yet is no mount point.
+    expect(agentShell.pathProblem('C:\\Docs\\Ironbooks\\New\\x.ironbooks', ['C:\\Docs\\Ironbooks\\New'], opts(null))).toBeNull();
+    // A folder the disk will say nothing about counts as one (fail closed).
+    const silent = { ...disk(null), stat: (p: string) => {
+      if (p === 'C:\\Docs\\Ironbooks') throw Object.assign(new Error('no'), { code: 'EACCES' });
+      return { dev: 1 };
+    } };
+    expect(agentShell.pathProblem(file, ['C:\\Docs\\Ironbooks'], { platform: 'win32', fs: silent })).toMatch(/top of a whole drive, share or disk/);
   });
 
   it('the server’s own folders follow the same rule (files.save, the ask-time check)', () => {
@@ -472,6 +557,145 @@ describe('the folders agents may use', () => {
     }
     expect(isDriveOrShareRoot(top)).toBe(true);
     expect(isDriveOrShareRoot(TMP)).toBe(false);
+  });
+});
+
+/** One case of lib/agent/thisComputerShares.json, with `templated` when it named this computer through a template. */
+interface ShareCase {
+  path: string;
+  want: boolean;
+  env?: Record<string, string>;
+  since?: string;
+  why?: string;
+  templated?: boolean;
+}
+
+/**
+ * A share of this very computer, by the words alone: the shell's port (electron/agentShell.js
+ * isThisComputerShare) is held to the server's rule (lib/agent/files.ts) through that rule's own
+ * table, lib/agent/thisComputerShares.json, so the two cannot drift apart. Its templates are filled
+ * in for this computer as lib/agent/files.test.ts fills them; a case whose template cannot be
+ * filled here is left out.
+ */
+function thisComputerCases(): ShareCase[] {
+  let ownIPv4: string | null = null;
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list ?? []) if (!ownIPv4 && a.family === 'IPv4' && !a.internal) ownIPv4 = a.address;
+  }
+  const host = os.hostname();
+  const fill: Record<string, string | null> = {
+    '{hostname}': host,
+    '{hostname:lower}': host.toLowerCase(),
+    '{hostname:upper}': host.toUpperCase(),
+    '{COMPUTERNAME}': process.env.COMPUTERNAME?.trim() || null,
+    '{ownIPv4}': ownIPv4,
+  };
+  const out: ShareCase[] = [];
+  for (const c of thisComputerShares.cases as ShareCase[]) {
+    let p: string | null = c.path;
+    for (const [t, v] of Object.entries(fill)) if (p?.includes(t)) p = v === null ? null : p.split(t).join(v);
+    if (p !== null) out.push({ ...c, path: p, templated: p !== c.path });
+  }
+  return out;
+}
+
+/** Run `fn` with `values` in process.env (as lib/agent/files.ts reads it), then put them back. */
+function withEnv(values: Record<string, string> | undefined, fn: () => void): void {
+  const before = Object.fromEntries(Object.keys(values ?? {}).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, values ?? {});
+  try {
+    fn();
+  } finally {
+    for (const [k, v] of Object.entries(before)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+describe('a share of this very computer (\\\\localhost, a loopback address, its own name) is never an agent folder', () => {
+  const WIN32 = process.platform === 'win32';
+  /** This computer as the tests describe it: FRONT-DESK, one office address, its loopback. */
+  const front = {
+    platform: 'win32',
+    fs: null,
+    env: { COMPUTERNAME: 'FRONT-DESK' },
+    hostname: () => 'front-desk.office.example',
+    interfaces: () => ({ Ethernet: [{ address: '192.168.1.202' }], Loopback: [{ address: '127.0.0.1' }] }),
+  };
+
+  it('the shell’s rule says what the server’s says, case by case, by the words alone', async () => {
+    const files = await vi.importActual<typeof import('@/lib/agent/files')>('@/lib/agent/files');
+    const cases = thisComputerCases();
+    expect(cases.length).toBeGreaterThan(50);
+    for (const c of cases) {
+      const say = JSON.stringify(c.path);
+      // Judged as Windows judges them, on any system the test runs on: the table's answer. A case
+      // that names this computer through a template is this computer's name only here.
+      if (!c.templated) expect(agentShell.isThisComputerShare(c.path, { platform: 'win32', env: c.env ?? {} }), say).toBe(c.want);
+      // On other systems a path written that way is no share at all.
+      expect(agentShell.isThisComputerShare(c.path, { platform: 'linux', env: c.env }), say).toBe(false);
+      // Here, held to lib/agent/files.ts and to the table: the same answer for every case.
+      withEnv(c.env, () => {
+        expect(agentShell.isThisComputerShare(c.path), say).toBe(files.isThisComputerShare(c.path));
+        expect(agentShell.isThisComputerShare(c.path), say).toBe(WIN32 ? c.want : false);
+      });
+    }
+    expect(agentShell.isThisComputerShare(5)).toBe(false);
+    // This computer's own name and addresses, as it gives them.
+    for (const p of ['\\\\FRONT-DESK\\Books', '\\\\front-desk.office.example\\Books', '\\\\192.168.1.202\\c$', '\\\\0xc0a801ca\\c$']) {
+      expect(agentShell.isThisComputerShare(p, front), p).toBe(true);
+    }
+    expect(agentShell.isThisComputerShare('\\\\FRONT-DESK-2\\Books', front)).toBe(false);
+    expect(agentShell.isThisComputerShare('\\\\192.168.1.203\\Books', front)).toBe(false);
+  });
+
+  it('a path through one is refused, as typed, and allowed folders through one allow nothing', () => {
+    const refused = /reaches this computer through one of its own network shares, so it was refused/;
+    // Typed so, even inside a folder the Admin named the same way.
+    expect(agentShell.pathProblem('\\\\localhost\\c$\\Users\\Dana\\Documents\\Ironbooks\\x.ironbooks', ['\\\\localhost\\c$\\Users\\Dana\\Documents\\Ironbooks'], front)).toMatch(refused);
+    // Ironbooks' own folders under another name: refused, whatever folders are allowed.
+    expect(agentShell.pathProblem('\\\\127.1\\c$\\Users\\Dana\\AppData\\Local\\Ironbooks\\x.ironbooks', ['C:\\Users\\Dana'], front)).toMatch(refused);
+    expect(agentShell.pathProblem('\\\\FRONT-DESK\\Books\\x.ironbooks', ['\\\\FRONT-DESK\\Books'], front)).toMatch(refused);
+    // A space or a dot beside the server's name leaves the same server.
+    for (const server of ['localhost ', ' localhost', 'localhost. ']) {
+      const base = `\\\\${server}\\c$\\Users\\Dana\\Documents\\Ironbooks`;
+      expect(agentShell.pathProblem(`${base}\\x.ironbooks`, [base], front), server).toMatch(refused);
+    }
+    // An allowed entry that is such a share allows nothing, not even a path that is no share.
+    expect(agentShell.pathProblem('C:\\Users\\Dana\\x.ironbooks', ['\\\\localhost\\c$\\Users\\Dana'], front)).toMatch(/not in a folder agents may use/);
+    // Another computer's share is as before.
+    expect(agentShell.pathProblem('\\\\office\\books\\Clients\\x.ironbooks', ['\\\\office\\books\\Clients'], front)).toBeNull();
+    // insideFolder itself never says yes through one.
+    expect(agentShell.insideFolder('\\\\127.0.0.1\\c$\\Books\\x.ironbooks', '\\\\127.0.0.1\\c$\\Books', 'win32')).toBe(false);
+    expect(agentShell.insideFolder('\\\\office\\books\\Clients\\x.ironbooks', '\\\\office\\books\\Clients', 'win32')).toBe(true);
+    // The message says what to do instead, in plain words.
+    expect(agentShell.pathProblem('\\\\localhost\\c$\\x.ironbooks', ['C:\\'], front)).toMatch(/Give the file's own path on this computer instead/);
+  });
+
+  it('as the disk has it: a folder that leads to one (a link, a mapped drive) is refused too', () => {
+    const enoent = () => Object.assign(new Error('not there'), { code: 'ENOENT' });
+    const linked = {
+      lstat: (p: string) => {
+        if (!['C:\\', 'C:\\Docs', 'C:\\Docs\\Ironbooks'].includes(p)) throw enoent();
+      },
+      realpath: (p: string) => (p === 'C:\\Docs\\Ironbooks' ? '\\\\localhost\\c$\\Users\\Dana\\AppData\\Local\\Ironbooks' : p),
+    };
+    expect(agentShell.pathProblem('C:\\Docs\\Ironbooks\\x.ironbooks', ['C:\\Docs\\Ironbooks'], { ...front, fs: linked })).toMatch(/reaches this computer through one of its own network shares/);
+  });
+
+  it.runIf(WIN32)('the server’s own folders: a company file opened through one adds no folder of its own', () => {
+    const keep = process.env.BKA_COMPANY_FILE;
+    try {
+      process.env.BKA_COMPANY_FILE = '\\\\localhost\\c$\\Books\\Acme.ironbooks';
+      expect(defaultAgentFolders()).toHaveLength(2);
+      expect(defaultAgentFolders().some((f) => f.startsWith('\\\\'))).toBe(false);
+      process.env.BKA_COMPANY_FILE = '\\\\office\\books\\Clients\\Acme.ironbooks';
+      expect(defaultAgentFolders()[0]).toBe('\\\\office\\books\\Clients');
+    } finally {
+      if (keep === undefined) delete process.env.BKA_COMPANY_FILE;
+      else process.env.BKA_COMPANY_FILE = keep;
+    }
   });
 });
 
@@ -696,14 +920,40 @@ describe('a flow’s dialogs answered from the request', () => {
   });
 
   it('yes and no, and the window’s own button words for a choice', () => {
-    const s = script('shell.company.open', { answers: { cloudFolder: true, temporaryFolder: 'open it here anyway', readOnlyFile: 'Maybe' } });
+    const s = script('shell.company.open', { answers: { cloudFolder: true, temporaryFolder: 'open it here anyway' } });
     expect(s.messageBox([{ message: 'In OneDrive', buttons: ['Open It', 'Cancel'], cancelId: 1 }]).response).toBe(0);
     expect(s.messageBox([{ message: 'Temporary', buttons: ['Save a Copy and Open It', 'Open It Here Anyway', 'Cancel'], cancelId: 2 }]).response).toBe(1);
-    expect(s.messageBox([{ message: 'Read-only', buttons: ['Save a Copy and Open It', 'Cancel'], cancelId: 1 }]).response).toBe(1);
-    expect(s.problems[0]).toMatch(/not one of its choices/);
+    expect(s.problems).toEqual([]);
+    const odd = script('shell.company.open', { answers: { temporaryFolder: 'Maybe' } });
+    expect(odd.messageBox([{ message: 'Temporary', buttons: ['Save a Copy and Open It', 'Open It Here Anyway', 'Cancel'], cancelId: 2 }]).response).toBe(2);
+    expect(odd.problems[0]).toMatch(/not one of its choices \(Open It Here Anyway, Cancel\)/);
     const no = script('shell.company.close', { answers: { closeWhileHosting: false } });
     expect(no.messageBox([{ message: 'Close it?', buttons: ['Close Company', 'Cancel'], cancelId: 1 }]).response).toBe(1);
     expect(no.stoppedBy).toMatch(/the answer to "Close it\?" was "Cancel"/);
+  });
+
+  it('"Save a Copy and Open It" is never pressed for an agent: the open company file never switches by itself', () => {
+    const temporary = { message: 'Acme.ironbooks is in a temporary folder', buttons: ['Save a Copy and Open It', 'Open It Here Anyway', 'Cancel'], defaultId: 0, cancelId: 2 };
+    const readOnly = { message: 'Acme.ironbooks is read-only', buttons: ['Save a Copy and Open It', 'Cancel'], defaultId: 0, cancelId: 1 };
+    for (const op of ['shell.company.new', 'shell.company.open', 'shell.backup.restoreAsNew']) {
+      // Even when the answer names it (an older card, or answers sent by hand): its cancel button, and not done.
+      const asked = script(op, { answers: { temporaryFolder: 'save a copy and open it' } });
+      expect(asked.messageBox([WIN, temporary]).response, op).toBe(2);
+      expect(asked.problems[0], op).toMatch(/was "Save a Copy and Open It", which an agent's request never chooses/);
+      expect(asked.problems[0], op).toMatch(/choose "Open It Here Anyway" or "Cancel" on the approval card/);
+      expect(agentShell.answerOf(asked, { done: true, restarting: true }, null).ok, op).toBe(false);
+      // A read-only company file: nothing to choose but the copy, so the request stops, saying why.
+      const ro = script(op, { answers: { readOnlyFile: 'Save a Copy and Open It' } });
+      expect(ro.messageBox([WIN, readOnly]).response, op).toBe(1);
+      expect(ro.problems[0], op).toMatch(/^Acme\.ironbooks is read-only\. Ironbooks cannot work in a read-only company file/);
+      expect(ro.problems[0], op).toMatch(/A person can open it from File > Open or Restore Company/);
+      expect(ro.asked, op).toEqual([]);
+    }
+    // The card never offers it.
+    for (const d of SHELL_OPERATIONS) {
+      for (const q of d.questions) expect(q.choices ?? [], `${d.id} ${q.id}`).not.toContain('Save a Copy and Open It');
+      expect(d.questions.map((q) => q.id), d.id).not.toContain('readOnlyFile');
+    }
   });
 
   it('a question the operation does not cover is never answered yes', () => {
@@ -1262,14 +1512,18 @@ describe('the endpoint and the server’s side of it', () => {
   it('the log has the operation and its plain outcome only: never a password or a file', async () => {
     // A flow whose error quotes the password, and a print job: their lines are written too.
     const input = { file: path.join(ALLOWED, 'Acme.bkp'), target: path.join(ALLOWED, 'Logged.ironbooks') };
+    const before = logged.length;
     expect((await run('shell.portable.open', input, {}, { backup_password: `${SECRET} 3` })).ok).toBe(false);
     expect((await run('shell.portable.open', input, {}, { backup_password: SECRET })).ok).toBe(true);
     const fileId = '8'.repeat(32);
     mocks.staged.set(`${COMPANY}/${AGENT}/${fileId}`, { file: { fileId, name: 'Checks.pdf', type: 'application/pdf', size: PDF.length }, bytes: PDF });
     expect((await run('shell.print.file', { fileId })).ok).toBe(true);
-    // Everything this endpoint logged in the whole block, the runs above and every earlier one
-    // (wrong and right passwords, the printed PDFs, refused and replayed tickets).
-    expect(logged.length).toBeGreaterThan(10);
+    // One line for each run above. This test does not count on the ones before it: run alone
+    // (vitest -t) only its own three are there.
+    expect(logged.length - before).toBe(3);
+    // Everything this endpoint logged in the whole block: the runs above and, when the block runs
+    // whole, every earlier one too (wrong and right passwords, the printed PDFs, refused and
+    // replayed tickets).
     expect(logged).toContain('shell.portable.open: done');
     expect(logged.some((m) => /^shell\.portable\.open: not done: /.test(m))).toBe(true);
     expect(logged).toContain('shell.print.file: done');
@@ -1470,12 +1724,41 @@ describe('the shell operations (lib/agent/operations/shell.ts)', () => {
         const boxes = agentShell.QUESTIONS.filter((b: { id?: string }) => b.id === q.id);
         expect(boxes.length, q.id).toBeGreaterThan(0);
         for (const box of boxes) expect(box.kind, q.id).toBe(q.kind);
-        if (q.kind === 'choice') expect(boxes.map((b: { buttons: string[] }) => b.buttons)).toContainEqual(q.choices);
+        if (q.kind === 'choice') {
+          // The card offers the window's own button words, less those an agent's request never presses.
+          const offered = boxes.map((b: { buttons: string[]; refused?: string[] }) => b.buttons.filter((x) => !(b.refused ?? []).includes(x)));
+          expect(offered, q.id).toContainEqual(q.choices);
+        }
       }
       if (spec.password) expect(d.needsSecret, d.id).toContain(spec.password);
     }
     const asked = new Set(electron.flatMap((d) => d.questions.map((q) => q.id)));
     for (const box of agentShell.QUESTIONS) if (box.id) expect(asked.has(box.id), box.id).toBe(true);
+    // A box that only stops the request says why, in a sentence.
+    for (const box of agentShell.QUESTIONS as { stop?: string; why?: string }[]) if (box.stop) expect(box.why, box.stop).toMatch(/^[A-Z].*\.$/);
+  });
+
+  it('a secret a flow always needs is one it takes; none of today’s flows needs one every time', () => {
+    for (const d of SHELL_OPERATIONS) {
+      for (const k of d.alwaysNeedsSecret ?? []) expect(d.needsSecret, d.id).toContain(k);
+    }
+    // A portable file or an Accountant's Copy asks for its password only when it was saved with one.
+    for (const id of ['shell.portable.open', 'shell.accountantCopy.open']) {
+      expect(SHELL_OPERATIONS.find((d) => d.id === id)?.needsSecret, id).toEqual(['backup_password']);
+      expect(SHELL_OPERATIONS.find((d) => d.id === id)?.alwaysNeedsSecret, id).toEqual([]);
+    }
+  });
+
+  it('the why texts and questions read as the person approving reads them: plain sentences, the agent named as "the agent"', () => {
+    for (const d of SHELL_OPERATIONS) {
+      // Never "your connection" or "connect again" said to the agent: a person reads this on the card.
+      expect(d.why, d.id).not.toMatch(/\byour connection\b|\bYour connection\b|\bconnect again in\b|\byou may work\b|\byou cannot\b|\byour staged\b|\bfor you\b|\bgave you\b/);
+      expect(d.why, d.id).toMatch(/^[A-Z"'].*[.)]$/);
+      for (const q of d.questions) {
+        expect(q.text, `${d.id} ${q.id}`).toMatch(/\?/);
+        expect(q.text, `${d.id} ${q.id}`).not.toMatch(/\byour connection\b/i);
+      }
+    }
   });
 
   it('is pure data that client code may read: type-only imports, nothing that runs', () => {
@@ -1484,7 +1767,8 @@ describe('the shell operations (lib/agent/operations/shell.ts)', () => {
     expect(imports.length).toBeGreaterThan(0);
     for (const i of imports) expect(i).toMatch(/^import type \{[^}]+\} from '[^']+';$/);
     expect(src).not.toMatch(/\brequire\(|\bimport\(|\bprocess\.|\bexport (async )?function\b|\bawait\b/);
-    expect(src.match(/^export /gm)).toEqual(['export ']);
+    // The list, and the type of its entries (the contract's ShellOperationDef plus what it lacks).
+    expect(src.match(/^export \S+ \S+/gm)).toEqual(['export interface ShellOperationEntry', 'export const SHELL_OPERATIONS:']);
   });
 });
 
@@ -1973,7 +2257,7 @@ describe('main.js and preload.js', () => {
     const guard = copy.indexOf('if (fs.existsSync(file)) throw new Error(');
     expect(guard).toBeGreaterThan(-1);
     expect(guard).toBeLessThan(copy.indexOf('await saveCopyAsFlow();'));
-    // The answer names the file the restart really opens ("Save a Copy and Open It" opens a copy).
+    // The answer names the file the restart really opens, from the next launch's config.
     expect(fnBody('async function agentShellRestartFlow(run, result = {}) {')).toContain('agentShellOpening()');
   });
 
@@ -2012,11 +2296,25 @@ describe('main.js and preload.js', () => {
   });
 
   it('staged files go when the company file closes, and the servers never take a staged-files folder from this computer', () => {
+    // All of them (clearStagedFiles({ all: true }), done by the shell): the working copy's, or with
+    // a company folder open those in this computer's app data folder (not in client mode, where
+    // this computer ran no server of its own).
+    const clear = fnBody('function clearStagedAgentFiles() {');
+    expect(clear).toContain('if (openFile && openFile.workDir) companySession.clearAgentFiles(openFile.workDir);');
+    expect(clear).toContain('else if (!remoteHostOrigin) companySession.clearAppDataAgentFiles();');
+    // As soon as the company file is saved and released (an update's installer may end the app
+    // before will-quit), and never when the save failed and the person keeps working in it.
+    const close = main.slice(main.indexOf("app.on('before-quit', (event) => {"), main.indexOf('// Second pass: backup done'));
+    const released = close.indexOf('.then(() => closeOpenCompanyFile())');
+    const keptWorking = close.indexOf('if (goOn === false) {');
+    const cleared = close.indexOf('clearStagedAgentFiles();');
+    expect(released).toBeGreaterThan(-1);
+    expect(keptWorking).toBeGreaterThan(released);
+    expect(cleared).toBeGreaterThan(close.indexOf('quittingAfterBackup = true;', keptWorking));
+    expect(cleared).toBeLessThan(close.indexOf('autoUpdater.quitAndInstall(false, true);'));
+    // And again on quit, for anything staged in the moment before the server stopped.
     const quit = main.slice(main.indexOf("app.on('will-quit', () => {"), main.indexOf('async function agentRequestCountForNotice() {'));
-    expect(quit).toContain('if (openFile && openFile.workDir) companySession.clearAgentFiles(openFile.workDir);');
-    // A company folder kept them in this computer's app data folder: those go on quit too (not
-    // in client mode, where this computer ran no server of its own).
-    expect(quit).toContain('else if (!remoteHostOrigin) companySession.clearAppDataAgentFiles();');
+    expect(quit).toContain('clearStagedAgentFiles();');
     // …and when the server starts, before it can hand any out (what a crash left).
     const start = fnBody('async function startNextServer() {');
     expect(start).toContain('companySession.clearAppDataAgentFiles();');

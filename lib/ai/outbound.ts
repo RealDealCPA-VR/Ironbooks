@@ -16,13 +16,9 @@
  * Purposes are short plain phrases that read after "for": "Contact api.openai.com for sending a
  * request about the books to an AI model". They say what is sent, never the content itself.
  *
- * Known gap, outside lib/ai: the vendor lookup (lib/services/vendorLookup.ts lookupVendor, called
- * by lib/services/aiCategorizer.ts before the model call of prefill and bank-category suggestions)
- * still calls the company's SearXNG through policyFetch directly, not through here. In an agent's
- * preview it can send a payee's name there, and SearXNG passes it on to public search engines,
- * before the model call is stopped. Its fix: wrap that fetch in outboundCall('looking up what kind
- * of business a vendor is', hostOf(policy.vendorLookupUrl, 'the vendor lookup server'), ...) and
- * let EffectNotRunInPreview through its catch-all instead of answering "nothing known".
+ * Outside lib/ai, the vendor lookup (lib/services/vendorLookup.ts lookupVendor, which sends a
+ * payee's name to the company's SearXNG) goes through outboundCall too, and passes
+ * EffectNotRunInPreview on to its caller instead of answering "nothing known".
  *
  * No database or Next imports, and nothing here is needed by the browser: the AI settings page
  * imports lib/ai/presets.ts and lib/ai/types.ts only.

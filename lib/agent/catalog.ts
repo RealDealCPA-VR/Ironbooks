@@ -165,20 +165,25 @@ const editSchema = <S extends z.ZodTypeAny>(changes: S) => z.object({ id: zUuid,
 const targetSchema = z.object({ id: zUuid, expectedUpdatedAt: expectedVersion }).strict();
 
 /**
- * The version the agent last read, checked before the request is sent: a change someone made
- * since is refused instead of overwritten (409, details.staleVersion), as a person's window is.
- * It runs only for a request the policy does not refuse (lib/agent/actions.ts throughDoor): its
- * answer names who changed the record last, which an agent refused the work must not learn.
- * The route compares it again only for a request that carries the version header, which a request
- * through the door cannot yet (lib/agent/contract.ts OperationInput has no field for it), so a
- * change made between this check and the commit is not caught here; a request a person approves
- * later is covered by the preview's staleness check instead (lib/agent/bridge.ts).
+ * The version the agent last read goes with the request to the route (versioned below): the
+ * bridge sends it as x-expected-updated-at, and the route's own withVersionCheck compares it inside
+ * the transaction that commits, so a person's edit made at any moment before the commit is refused
+ * with 409 (details.staleVersion) instead of overwritten, as a person's window is. That is the real
+ * guard, for the agent's own run and for a run a person approved later alike.
+ *
+ * This check is only the quick first answer, before the door's dry run and decision: a request
+ * that is already stale is told so at once. It runs only for a request the policy does not refuse
+ * (lib/agent/actions.ts throughDoor): its answer names who changed the record last, which an agent
+ * refused the work must not learn.
  */
 const versionCheck =
   (entity: VersionedEntity) =>
   async (ctx: ServiceContext, i: { id: string; expectedUpdatedAt?: string | null }): Promise<void> => {
     if (i.expectedUpdatedAt) await assertCurrentVersion(ctx, entity, i.id, i.expectedUpdatedAt);
   };
+
+/** The version the agent last read, as the door takes it (OperationInput.expectedUpdatedAt), when it sent one. */
+const versioned = (i: { expectedUpdatedAt?: string | null }) => (i.expectedUpdatedAt ? { expectedUpdatedAt: i.expectedUpdatedAt } : {});
 
 interface RecordKind {
   /** The word used in action names and answers: 'invoice', 'bill_payment' … */
@@ -300,7 +305,7 @@ function editAction(kind: RecordKind): AgentActionDef<Any> {
     schema: editSchema(kind.editSchema),
     describe: (_ctx, i) => `Edit ${kind.label} ${i.id}`,
     check: versionCheck(kind.entity),
-    request: (i) => ({ params: { id: i.id }, body: i.changes }),
+    request: (i) => ({ params: { id: i.id }, body: i.changes, ...versioned(i) }),
     answer: (r) => kind.shape(r),
     run: async (ctx, i) => kind.shape(await withVersionCheck(ctx, kind.entity, i.id, i.expectedUpdatedAt ?? null, (c) => kind.edit(c, i.id, i.changes))),
   };
@@ -314,7 +319,7 @@ function removeAction(kind: RecordKind, verb: 'void' | 'deactivate'): AgentActio
     schema: targetSchema,
     describe: (_ctx, i) => `${verb === 'void' ? 'Void' : 'Make inactive:'} ${kind.label} ${i.id}`,
     check: versionCheck(kind.entity),
-    request: (i) => ({ params: { id: i.id } }),
+    request: (i) => ({ params: { id: i.id }, ...versioned(i) }),
     answer: (r) => kind.shape(r),
     run: async (ctx, i) => kind.shape(await withVersionCheck(ctx, kind.entity, i.id, i.expectedUpdatedAt ?? null, (c) => kind.remove(c, i.id))),
   };

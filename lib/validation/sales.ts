@@ -1,11 +1,11 @@
 /**
  * wave2 sales — zod field groups shared by the A/R document schemas (invoices, sales receipts,
  * sales orders, estimates, credit memos): shipping fields (QB "Ship Date / Via / FOB / Tracking #
- * / Ship To / P.O. No."), the to-be-printed / to-be-emailed queue flags, and the credit-limit
- * override acknowledgement.
+ * / Ship To / P.O. No."), the to-be-printed / to-be-emailed queue flags (and setting them on a saved
+ * form), and the credit-limit override acknowledgement.
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zUuid } from './helpers';
+import { zDate, zDecimal, zLenient, zUuid } from './helpers';
 
 const shortText = z.string().max(100).nullish();
 
@@ -30,6 +30,20 @@ export const sendFlagFields = {
   toBePrinted: z.boolean().optional().describe('True to put the form in the queue of forms to print later.'),
   toBeEmailed: z.boolean().optional().describe('True to put the form in the queue of forms to email later.'),
 };
+
+/**
+ * PATCH /api/sales-forms/:kind/:id/flags — set or clear the "to be printed" / "to be emailed" mark
+ * of one sales form (wave2 sales C7; lib/services/salesForms.ts setSendFlags). The route takes a
+ * flag only when it is true or false, so both are zLenient and the check refuses nothing.
+ */
+export const sendFlagsUpdateSchema = z.object({
+  toBePrinted: zLenient(z.boolean()).describe(
+    'true puts the form in the queue of forms to print later; false takes it off. Leave out to keep the mark as it is.',
+  ),
+  toBeEmailed: zLenient(z.boolean()).describe(
+    'true puts the form in the queue of forms to email later; false takes it off. Leave out to keep the mark as it is.',
+  ),
+});
 
 /** salesar (B8): the Customer Message list entry printed at the foot of a sales form. */
 export const customerMessageField = {

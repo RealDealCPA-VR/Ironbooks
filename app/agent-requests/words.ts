@@ -189,6 +189,27 @@ export function amountText(amount: string | null | undefined): string {
   return formatCurrency(m);
 }
 
+/** Kinds of work that may move money: for these a missing amount is said to be unknown, never left blank. */
+const MONEY_CLASSES: readonly RiskClass[] = ['prepare', 'enter', 'change', 'bulk', 'remove', 'period'];
+
+/** Said where the amount of a request is not known (lib/agent/facts.ts: null is "not known", never 0). */
+export const AMOUNT_UNKNOWN = 'Amount unknown';
+export const AMOUNT_UNKNOWN_WHY =
+  'Ironbooks could not work out this amount ahead of time. Any amount limit treats it as more than the limit.';
+
+/**
+ * The amount of a request as the list and the card show it: money, or "unknown" for work that may
+ * move money and whose amount Ironbooks could not work out (a request it could not try ahead, or
+ * one that voids, deletes or edits something already in the books). Null when there is nothing to
+ * say: a request for standing permission, or work that moves no money (settings, users, reads).
+ */
+export function amountShown(r: Pick<AgentRequestView, 'kind' | 'class' | 'amount'>): { text: string; unknown: boolean } | null {
+  const text = amountText(r.amount);
+  if (text) return { text, unknown: false };
+  if (r.kind !== 'operation' || !MONEY_CLASSES.includes(r.class)) return null;
+  return { text: AMOUNT_UNKNOWN, unknown: true };
+}
+
 /** "15 minutes", "1 hour", "1 hour 30 minutes". */
 export function durationLabel(minutes: number): string {
   const h = Math.floor(minutes / 60);
@@ -389,13 +410,25 @@ export interface SecretField {
   ready?: SecretPartName[][];
   /** Said under the boxes. */
   help?: string;
+  /**
+   * The route goes ahead without it (ApprovalNeeds.optionalSecrets, wave 4): the boxes may be left
+   * empty. Once something is typed, it must be whole (a user name needs its password).
+   */
+  optional?: boolean;
+  /**
+   * The boxes are one password and a second copy of it, compared on the card: the password alone is
+   * sent, as typed, never as parts (lib/agent/guards.ts places it as one value).
+   */
+  typedTwice?: boolean;
 }
 
 /**
  * The archive of another protected company file: a user name and password from it, or its recovery
- * key. The route itself needs none for a backup this file's own key opens, but the approval does
- * (lib/services/agentRequests.ts checkTypedSecrets and the bridge refuse a run without every secret
- * the operation lists), so the boxes are required here and the help says what to type.
+ * key. The route itself needs none for a backup this file's own key opens. A server that says so
+ * (ApprovalNeeds.optionalSecrets) lets the boxes be left empty, and the help says when they are
+ * needed (ARCHIVE_OPTIONAL_HELP). An older server refuses a run without every secret the operation
+ * lists (lib/services/agentRequests.ts checkTypedSecrets and the bridge), so there the boxes are
+ * required and the help says what to type for a backup of this same file.
  */
 const ARCHIVE_FIELD: Omit<SecretField, 'kind' | 'label'> = {
   parts: [
@@ -409,6 +442,43 @@ const ARCHIVE_FIELD: Omit<SecretField, 'kind' | 'label'> = {
     'A backup made in this company file usually needs neither, but Ironbooks asks for a sign-in before it does this for an agent: type your own user name and password in this company file. ' +
     'If you have none, do this yourself in Ironbooks and deny the request.',
 };
+
+const ARCHIVE_OPTIONAL_HELP =
+  'Needed only for a backup made in another protected company file: type a user name and password from that file, or its recovery key. ' +
+  'Leave these empty for a backup made in this company file.';
+
+/** When a secret the route can do without is needed, for the help under its empty box. */
+const OPTIONAL_HELP: Partial<Record<SecretKind, string>> = {
+  closing_password: 'Needed only if the work is dated on or before the closing date. Otherwise leave it empty.',
+  file_password: 'Needed only if the company file has a password. Otherwise leave it empty.',
+  backup_password: 'Needed only if the backup file was saved with a password. Otherwise leave it empty.',
+  mail_password: 'Needed only if the mail server asks for a password. Otherwise leave it empty.',
+};
+const OPTIONAL_HELP_ANY = 'You may leave this empty: the work goes ahead without it when it is not needed.';
+
+/**
+ * An operation where the kind's own words would name the wrong file: a desktop flow that opens a
+ * portable company file or an Accountant's Copy asks for the password that file was saved with
+ * (lib/agent/operations/shell.ts, the nearest kind is backup_password), not a backup's. Its box is
+ * named for that file, and says when it is needed.
+ */
+const PASSWORD_OF_FILE: Readonly<Record<string, { kind: SecretKind; label: string; whenNeeded: string }>> = {
+  'shell.portable.open': {
+    kind: 'backup_password',
+    label: 'Portable company file password',
+    whenNeeded: 'Needed only if the portable company file was saved with a password. Otherwise leave it empty.',
+  },
+  'shell.accountantCopy.open': {
+    kind: 'backup_password',
+    label: "Accountant's Copy file password",
+    whenNeeded: "Needed only if the Accountant's Copy transfer file was saved with a password. Otherwise leave it empty.",
+  },
+};
+
+function passwordOfFile(operation: string, kind: SecretKind): (typeof PASSWORD_OF_FILE)[string] | null {
+  const own = Object.prototype.hasOwnProperty.call(PASSWORD_OF_FILE, operation) ? PASSWORD_OF_FILE[operation] : null;
+  return own && own.kind === kind ? own : null;
+}
 
 /**
  * POST /api/file-protection, /file-key and /recovery-key: the secret is the approving file Admin's
@@ -446,13 +516,60 @@ function fileLockField(body: unknown): Omit<SecretField, 'kind' | 'label'> {
   };
 }
 
-/** The boxes of one secret kind on this request: several for the kinds guards.ts reads as parts. */
-function secretField(kind: SecretKind, r: Pick<AgentRequestView, 'operation' | 'input'>): SecretField {
-  const field: SecretField = { kind, label: SECRET_LABELS[kind] };
-  if (kind === 'archive_credentials') return { ...field, ...ARCHIVE_FIELD };
-  if (kind === 'file_password' && r.operation === 'file-lock.change') return { ...field, ...fileLockField(r.input?.body) };
-  if (kind === 'file_password' && r.operation.startsWith('file-protection.')) return { ...field, ...OWN_SIGN_IN_FIELD };
-  return field;
+/**
+ * The new user's password (users.create, users.reset-password): chosen by the approving Admin (plan
+ * 5.8, inputs), so nothing is produced for that request and the card says the Admin passes it on.
+ * Typed twice and compared on the card, as a new company file password is: it is typed into masked
+ * boxes and never shown again, so a slip would set a password nobody knows. Only the one value is
+ * sent, as typed (guards.ts puts it in the body's `password`).
+ */
+const NEW_USER_FIELD: Omit<SecretField, 'kind' | 'label'> = {
+  parts: [
+    { name: 'password', label: 'Password', type: 'password' },
+    { name: 'confirm', label: 'The same password again', type: 'password' },
+  ],
+  ready: [['password', 'confirm']],
+  typedTwice: true,
+  help: 'The password this person will sign in with. Tell it to them yourself: the agent never sees it, and Ironbooks does not show it again.',
+};
+
+/**
+ * The boxes of one secret kind on this request: several for the kinds guards.ts reads as parts, and
+ * two for a password typed twice. `own`: the operation gives the box words of its own (which
+ * password it is, what it does), which an optional box keeps.
+ */
+function secretField(kind: SecretKind, r: Pick<AgentRequestView, 'operation' | 'input'>): { field: SecretField; own: boolean } {
+  const field: SecretField = { kind, label: passwordOfFile(r.operation, kind)?.label ?? SECRET_LABELS[kind] };
+  if (kind === 'archive_credentials') return { field: { ...field, ...ARCHIVE_FIELD }, own: false };
+  if (kind === 'new_user_password') return { field: { ...field, ...NEW_USER_FIELD }, own: true };
+  if (kind === 'file_password' && r.operation === 'file-lock.change') return { field: { ...field, ...fileLockField(r.input?.body) }, own: true };
+  if (kind === 'file_password' && r.operation.startsWith('file-protection.')) return { field: { ...field, ...OWN_SIGN_IN_FIELD }, own: true };
+  return { field, own: false };
+}
+
+/**
+ * A field the route can do without (ApprovalNeeds.optionalSecrets): marked optional, named so
+ * ("… (only if needed)"), and its help says when it is needed instead of asking for it outright. A
+ * box with words of its own for this operation (the file Admin's own sign-in password, a file-lock
+ * password) keeps them, and only adds that it may be left empty: the kind's usual words ("needed
+ * only if the company file has a password") would contradict them.
+ */
+function optionalField(field: SecretField, operation: string, own: boolean): SecretField {
+  return { ...field, label: `${field.label} (only if needed)`, help: whenNeeded(field, operation, own), optional: true };
+}
+
+function whenNeeded(field: SecretField, operation: string, own: boolean): string {
+  if (field.kind === 'archive_credentials') return ARCHIVE_OPTIONAL_HELP;
+  const forFile = passwordOfFile(operation, field.kind);
+  if (forFile) return forFile.whenNeeded;
+  if (own) return field.help ? `${field.help} ${OPTIONAL_HELP_ANY}` : OPTIONAL_HELP_ANY;
+  return OPTIONAL_HELP[field.kind] ?? OPTIONAL_HELP_ANY;
+}
+
+/** The kinds of secret this request's route goes ahead without: only kinds it needs at all. */
+function optionalKinds(needs: ApprovalNeeds | null | undefined): SecretKind[] {
+  const listed = Array.isArray(needs?.optionalSecrets) ? needs.optionalSecrets : [];
+  return listed.filter((k) => isSecretKind(k) && (needs?.secrets ?? []).includes(k));
 }
 
 /**
@@ -463,16 +580,24 @@ function secretField(kind: SecretKind, r: Pick<AgentRequestView, 'operation' | '
  *
  * A field is always named by Ironbooks' own words for that kind of secret (SECRET_LABELS, or the
  * words for the operation where it uses a kind for a nearby password, such as the file Admin's own
- * sign-in password of file protection), never by a question's text: the card says plainly which
+ * sign-in password of file protection, or the password of a portable company file), never by a
+ * question's text: the card says plainly which
  * password it is, and nothing else can change that wording into a request for some other password.
+ *
+ * A secret the server lists in needs.optionalSecrets (wave 4) may be left empty: its field is
+ * marked optional and says when it is needed. Only a secret the needs list can be optional, and
+ * only the server says which: a desktop flow's password question the needs do not list is never.
  */
 export function secretFieldsOf(
   r: Pick<AgentRequestForPerson, 'kind' | 'operation' | 'needs' | 'questions'> & Partial<Pick<AgentRequestView, 'input'>>,
 ): { fields: SecretField[]; unanswerable: boolean } {
   const req = { operation: r.operation, input: r.input ?? null };
+  const optional = optionalKinds(r.needs);
   const fields: SecretField[] = [];
   for (const kind of r.needs?.secrets ?? []) {
-    if (isSecretKind(kind) && !fields.some((f) => f.kind === kind)) fields.push(secretField(kind, req));
+    if (!isSecretKind(kind) || fields.some((f) => f.kind === kind)) continue;
+    const { field, own } = secretField(kind, req);
+    fields.push(optional.includes(kind) ? optionalField(field, req.operation, own) : field);
   }
   let unanswerable = false;
   for (const q of flowQuestionsOf(r)) {
@@ -481,7 +606,7 @@ export function secretFieldsOf(
       unanswerable = true;
       continue;
     }
-    if (!fields.some((f) => f.kind === q.secret)) fields.push(secretField(q.secret, req));
+    if (!fields.some((f) => f.kind === q.secret)) fields.push(secretField(q.secret, req).field);
   }
   return { fields, unanswerable };
 }
@@ -491,8 +616,13 @@ export function secretBoxes(field: SecretField): Array<{ name: SecretPartName | 
   return field.parts?.length ? field.parts : [{ name: 'value', label: field.label, type: 'password' }];
 }
 
-/** Whether enough of a field is typed to send it. `filled` says, by box name, whether a box holds something. */
+/**
+ * Whether enough of a field is typed to send it. `filled` says, by box name, whether a box holds
+ * something. An optional field is ready when it is left empty, or once what is typed is whole: a
+ * user name alone is never sent, so it never goes as a sign-in that cannot work.
+ */
 export function secretFieldReady(field: SecretField, filled: (name: SecretPartName | 'value') => boolean): boolean {
+  if (field.optional && !secretBoxes(field).some((b) => filled(b.name))) return true;
   if (!field.parts?.length) return filled('value');
   const groups = field.ready?.length ? field.ready : [field.parts.map((p) => p.name)];
   return groups.some((g) => g.length > 0 && g.every((n) => filled(n)));
@@ -500,8 +630,8 @@ export function secretFieldReady(field: SecretField, filled: (name: SecretPartNa
 
 /**
  * The one text a field sends, from what its boxes hold (`read` gives a box's value): as typed for a
- * plain field, encodeSecretParts for one in parts. Null when nothing is typed. An error, in plain
- * words, when the two copies of a new password differ.
+ * plain field and for a password typed twice, encodeSecretParts for one in parts. Null when nothing
+ * is typed. An error, in plain words, when the two copies of a new password differ.
  */
 export function secretValueOf(field: SecretField, read: (name: SecretPartName | 'value') => string): { value: string } | { error: string } | null {
   if (!field.parts?.length) {
@@ -513,6 +643,8 @@ export function secretValueOf(field: SecretField, read: (name: SecretPartName | 
   if (names.includes('confirm') && get('password') !== get('confirm')) {
     return { error: 'The two copies of the new password are not the same, so nothing was sent.' };
   }
+  // One password typed twice: the password alone, as typed (the second copy never travels).
+  if (field.typedTwice) return get('password') ? { value: get('password') } : null;
   const parts = { login: get('login').trim(), password: get('password'), currentPassword: get('currentPassword'), recoveryKey: get('recoveryKey').trim() };
   if (!parts.login && !parts.password && !parts.currentPassword && !parts.recoveryKey) return null;
   return { value: encodeSecretParts(parts) };
@@ -635,6 +767,23 @@ export function filePathOf(e: EffectPreview): string | null {
   return s ? s : null;
 }
 
+/**
+ * A whole path as its folder and its file name, so both can be read on their own: a long folder
+ * wraps without hiding the name, and the name is never lost at the end of a line. Nothing is cut
+ * or tidied (a ".." stays in sight): the folder and the name together are the whole path. A path
+ * that ends in a separator is a folder only (name null); one with no separator is a name only
+ * (folder null). A root keeps its separator ("C:\", "/").
+ */
+export function pathParts(path: string): { folder: string | null; name: string | null } {
+  const p = plain(path).trim();
+  const cut = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
+  if (cut < 0) return { folder: null, name: p || null };
+  if (cut === p.length - 1) return { folder: p, name: null };
+  const head = p.slice(0, cut);
+  const folder = head === '' || /^[a-z]:$/i.test(head) ? p.slice(0, cut + 1) : head;
+  return { folder, name: p.slice(cut + 1) };
+}
+
 /** What a desktop request's run answered about the file it wrote: `file` (the shell) or `path` (files.save). */
 export function writtenPathOf(r: Pick<AgentRequestView, 'operation' | 'result'>): string | null {
   if (!(DESKTOP_WRITES[r.operation] || r.operation === 'files.save') || !r.result || typeof r.result !== 'object' || Array.isArray(r.result)) return null;
@@ -658,6 +807,47 @@ export function notTriedNote(preview: OperationPreview | null | undefined): stri
   if (!rp || typeof rp !== 'object' || (rp as { ran?: unknown }).ran !== false) return null;
   const note = (rp as { note?: unknown }).note;
   return typeof note === 'string' ? plain(note).trim() : '';
+}
+
+/**
+ * The bridge's reasons for not trying a request ahead (lib/agent/bridge.ts NOT_TRIED), which are
+ * worded for the agent too ("sent with its preview option", "hand its answer to the agent"), in the
+ * words of the person approving it. Recognised by what each says, so a small rewording on the
+ * server still finds it. A note that is none of them is shown as it came: the approval's own notes
+ * (lib/agent/operate.ts) and a trial stopped at a call to another computer (lib/effects.ts, which
+ * names the computer) are already written for the person.
+ */
+const NOT_TRIED_FOR_PERSON: ReadonlyArray<{ test: RegExp; text: string }> = [
+  {
+    test: /preview (mode|option)/i,
+    text: 'This work has a preview of its own, but that preview is itself a run of the same work, so Ironbooks did not run it ahead of time. Nothing was changed.',
+  },
+  {
+    test: /hand (its|the) answer to the agent/i,
+    text: 'This reads something the agent may see only once a person approves it, so Ironbooks did not read it ahead of time. Nothing was read or changed.',
+  },
+  {
+    test: /cannot be run and then undone/i,
+    text: 'This cannot be tried and then undone: it works outside the books, or on the company file itself. Nothing was changed.',
+  },
+];
+
+/** The note of a request Ironbooks did not try ahead, as the card says it. Empty when there is none. */
+export function notTriedText(note: string | null | undefined): string {
+  const s = plain(note).trim();
+  if (!s) return '';
+  return NOT_TRIED_FOR_PERSON.find((n) => n.test.test(s))?.text ?? s;
+}
+
+/**
+ * Why a waiting request needs its yes again (`stale`, plan 7.4): 'changed' when the books moved and
+ * the preview is what would happen now; 'note' when the approval sent it back without running it
+ * and with a note instead (lib/agent/operate.ts: the work turned out to be dated in a closed
+ * period, to need two people, or to do more once protected values were shown). The second kind has
+ * no tried preview: only a real trial run can show that the books changed.
+ */
+export function staleKind(r: Pick<AgentRequestView, 'preview'>): 'changed' | 'note' {
+  return notTriedNote(r.preview) !== null ? 'note' : 'changed';
 }
 
 /**
@@ -733,7 +923,29 @@ export function entryWords(e: LedgerEntry): { label: string; note: string | null
   }
   if (status === 'draft') return { label: 'New draft', note: 'A draft posts nothing to the ledger.', tone: 'new' };
   if (status === 'void') return { label: 'New, and void', note: 'It is void, so it moves nothing in the ledger.', tone: 'new' };
-  return { label: 'Posts', note: null, tone: 'new' };
+  return { label: 'New', note: null, tone: 'new' };
+}
+
+type LedgerLine = LedgerEntry['lines'][number];
+
+function lineText(line: LedgerLine, keys: string[]): string | null {
+  const o = line as unknown as Record<string, unknown>;
+  for (const k of keys) {
+    const v = o[k];
+    const s = typeof v === 'string' ? plain(v).trim() : '';
+    if (s) return s;
+  }
+  return null;
+}
+
+/**
+ * Who a ledger line is for (the customer, vendor, employee or other name, so a person can see
+ * whose receivable or payable it is) and its class, when the preview names them. The bridge adds
+ * the class this wave (wave 4) beside actions.ts PostingLine's entityName; it is read under the
+ * names it may use and shown only when it is there.
+ */
+export function lineNameAndClass(line: LedgerLine): { name: string | null; className: string | null } {
+  return { name: lineText(line, ['entityName']), className: lineText(line, ['className', 'class']) };
 }
 
 /**
@@ -774,6 +986,9 @@ const POSTING_KINDS: ReadonlySet<string> = new Set([
   'payment',
   'payment_received',
   'paycheck',
+  'pay_run',
+  'payroll_ytd_adjustment',
+  'retainage_billing',
   'transfer',
   'item_receipt',
   'inventory_adjustment',
@@ -956,6 +1171,30 @@ export function doneEntryIds(r: Pick<AgentRequestView, 'operation' | 'result' | 
 }
 
 /**
+ * The run went through and the standing permission asked for with it was not given: what the card
+ * says. The server's own words (`grantError`) are shown as they came; when they already say that
+ * no standing permission was given (lib/services/agentRequests.ts GRANT_NOT_GIVEN_MESSAGE), they
+ * are the whole line, not repeated after the card's own.
+ */
+export function grantNotGivenText(agentName: string, why: string | null | undefined): string {
+  const reason = plain(why).trim();
+  if (/standing permission was not given/i.test(reason)) return reason;
+  const head = `It was done, but standing permission was not given, so ${plain(agentName)} will ask again next time.`;
+  return reason ? `${head} Why: ${reason}` : head;
+}
+
+/**
+ * What the card says when an approval was refused before anything ran (the server answered an
+ * error): the server's message as it came, and, when the card had password boxes (emptied by the
+ * send), that they must be typed again, unless the message already says what to type.
+ */
+export function approveFailureText(message: string, hadSecrets: boolean): string {
+  const s = plain(message).trim() || 'It was not approved, and nothing was done. Try again in a moment.';
+  if (!hadSecrets || /\btype\b/i.test(s)) return s;
+  return `${s} Type the password again to try once more.`;
+}
+
+/**
  * The standing permission given with an approval, in one sentence, from what the server says was
  * really given (`grant`: it may be narrower than what was asked).
  */
@@ -965,6 +1204,98 @@ export function grantGivenText(agentName: string, grant: NonNullable<AgentReques
   const how = minutes ? ` for ${durationLabel(minutes)}` : '';
   const when = Number.isFinite(until) ? `, until about ${clockTime(new Date(until))}` : '';
   return `${plain(agentName)} may do more of the same without asking${how}${when}. You can take it back in Users & Roles > Agents.`;
+}
+
+// ---------------------------------------------------------------------------
+// Warnings the agent said yes to (plan 5.6)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a confirmation flag says yes to, in plain words: the question the window would have asked.
+ * Every flag the guards accept (lib/agent/guards.ts CONFIRM_FLAG_NAMES) is listed, and a flag the
+ * registry names by its place in the body (POST /api/import's statement.acknowledgeDifference)
+ * under that whole name; any other is named from its own words.
+ */
+const CONFIRM_FLAG_WORDS: Readonly<Record<string, string>> = {
+  allowDuplicateNumber: 'Its number is already used by another transaction.',
+  allowDuplicate: 'It looks like something already entered.',
+  allowReconciledEdit: 'It changes a transaction that is already reconciled.',
+  confirmReconciledRepost: 'It changes a transaction that is already reconciled.',
+  allowLedgerRewrite: 'It rewrites entries already in the ledger.',
+  allowOverBilling: 'It bills more than the estimate allows.',
+  allowUnnamedControl: 'It posts to Accounts Receivable or Accounts Payable without naming a customer or vendor.',
+  allowZero: 'Its amount is zero.',
+  allowInactive: 'It uses something marked inactive.',
+  allowDeposited: 'It changes a payment that is already deposited.',
+  overrideCreditLimit: 'It takes the customer over their credit limit.',
+  removeFromDeposit: 'It takes a payment out of the bank deposit it is in; the deposit keeps its other items.',
+  acceptVariance:
+    "Some accounts the import brings in do not match the QuickBooks report, and the differences go to the 'QB Import Suspense' account.",
+  acceptExistingEntries:
+    'Accounts the import posts to already hold balances that did not come from a General Ledger import, so they may be counted twice.',
+  acknowledgeDifference: 'The statement does not tie out to its opening and closing balances.',
+  'statement.acknowledgeDifference': 'The statement does not tie out to its opening and closing balances.',
+};
+
+/**
+ * A flag name as the app writes them ("allowDuplicateNumber"), or a body path to one
+ * ("statement.acknowledgeDifference"); anything else is not shown as one. The server refuses a
+ * flag the operation does not list, so this only keeps odd text off the card.
+ */
+const FLAG_RE = /^[a-z][A-Za-z0-9]*(\.[a-z][A-Za-z0-9]*)*$/;
+const FLAG_MAX = 100;
+
+function isFlagName(f: unknown): f is string {
+  return typeof f === 'string' && f.length <= FLAG_MAX && FLAG_RE.test(f);
+}
+
+/**
+ * The flag in words: "Its number is already used by another transaction.". A path is looked up
+ * whole, then by its last name ("acknowledgeDifference"); a flag with no words of its own is said
+ * from its name ("Allow something new.").
+ */
+export function confirmFlagText(flag: string): string {
+  const own = Object.prototype.hasOwnProperty.call(CONFIRM_FLAG_WORDS, flag) ? CONFIRM_FLAG_WORDS[flag] : undefined;
+  if (own) return own;
+  const last = flag.slice(flag.lastIndexOf('.') + 1);
+  const byLast = Object.prototype.hasOwnProperty.call(CONFIRM_FLAG_WORDS, last) ? CONFIRM_FLAG_WORDS[last] : undefined;
+  return byLast ?? `${fieldLabel(last)}.`;
+}
+
+export interface WarningLine {
+  message: string;
+  /** The agent sent this warning's flag: it asks to go ahead past it. */
+  accepted: boolean;
+}
+
+/**
+ * The warnings a person would have been asked about in the window (plan 5.6). First those the
+ * preview carries, in Ironbooks' own words, each marked when the agent sent its flag (it asks to go
+ * ahead past it). Then, in Ironbooks' words for each flag, the flags the agent sent that no warning
+ * in the preview names: it answered a question the person has not seen, so the card says what it
+ * answered. `confirm` is the agent's own list (OperationInput.confirm); only well-formed names count.
+ */
+export function warningLines(
+  preview: Pick<OperationPreview, 'warnings'> | null | undefined,
+  confirm: unknown,
+): { warnings: WarningLine[]; acceptedAhead: string[] } {
+  const sent = (Array.isArray(confirm) ? confirm : []).filter(isFlagName).slice(0, 20);
+  const warnings: WarningLine[] = [];
+  const named = new Set<string>();
+  for (const w of preview?.warnings ?? []) {
+    const message = plain(w?.message).trim();
+    if (!message) continue;
+    const flag = typeof w.flag === 'string' ? w.flag : '';
+    if (flag) named.add(flag);
+    warnings.push({ message, accepted: !!flag && sent.includes(flag) });
+  }
+  const acceptedAhead: string[] = [];
+  for (const f of sent) {
+    if (named.has(f)) continue;
+    const text = confirmFlagText(f);
+    if (!acceptedAhead.includes(text)) acceptedAhead.push(text);
+  }
+  return { warnings, acceptedAhead };
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +1403,11 @@ export function batchBlock(r: AgentRequestForPerson, operation: string | null): 
   if (r.needs?.hostOnly) return 'This one can be approved only at the host computer, on its own. Open it to approve it.';
   if (flowQuestionsOf(r).length) return 'This one has questions to answer. Open it to approve it on its own.';
   // A yes must be given again on the new preview, by someone who was shown it (plan 7.4).
-  if (r.stale) return 'The books changed since the agent asked. Open it to see what would happen now, and approve it on its own.';
+  if (r.stale) {
+    return staleKind(r) === 'note'
+      ? 'An approval sent this back with a note. Open it to read the note, and approve it on its own.'
+      : 'The books changed since the agent asked. Open it to see what would happen now, and approve it on its own.';
+  }
   // Approving many at once rests on each preview: one Ironbooks could not try out is read alone.
   if (!previewTried(r.preview)) return 'Ironbooks could not try this one ahead of time. Open it and read it before you approve it on its own.';
   if (operation && r.operation !== operation) return 'Only requests for the same kind of work can be approved together.';
@@ -1269,7 +1604,20 @@ export function rebuildGrantForm(
     if (FORM_SHAPE.includes(k)) continue;
     if (!sameValue(form[k], base[k])) set[k] = form[k];
   }
+  // A figure the new preview does not show never drops a limit the form had: standing permission
+  // must not grow wider because Ironbooks now knows less (an unknown amount, a count it cannot tell).
+  const amountKept = fresh.amount === '' && form.amountOn && form.amount !== '';
+  if (amountKept) {
+    next.amountOn = true;
+    next.amount = form.amount;
+  }
+  if (fresh.count === '' && form.count !== '') {
+    next.count = form.count;
+    next.countOn = form.countOn;
+  }
   if (next.countRequired) next.countOn = true;
+  // Never longer than the form said when the person pressed Approve, even where they had left it as it opened.
+  if (next.minutes > form.minutes) next.minutes = form.minutes;
   let shorter = false;
   const options = durationOptions(after.grantMinutesMax, after.kind === 'grant' ? (after.grantAsked?.minutes ?? null) : null, now);
   if (!options.some((o) => o.minutes === next.minutes)) {
@@ -1278,12 +1626,13 @@ export function rebuildGrantForm(
     next.minutes = fit?.minutes ?? 0;
   }
   const refilled = (['amount', 'count'] as const).filter((k) => next[k] !== form[k]);
-  const words: string[] = ['The books changed.'];
+  const words: string[] = [staleKind(after) === 'note' ? 'Ironbooks sent this back with new figures.' : 'The books changed.'];
   words.push(
     refilled.length
       ? `The ${refilled.map((k) => (k === 'amount' ? 'amount' : 'number of records')).join(' and ')} below now come${refilled.length === 1 ? 's' : ''} from what would happen now; every limit you had changed is kept.`
       : 'The limits below are as you left them.',
   );
+  if (amountKept) words.push('Ironbooks could not work out the amount of what would happen now, so the amount limit you had is kept.');
   if (shorter) words.push(`For how long is now at most ${durationLabel(next.minutes)}: that is the most you may give now.`);
   words.push('Check them before you approve.');
   return { form: next, note: words.join(' ') };

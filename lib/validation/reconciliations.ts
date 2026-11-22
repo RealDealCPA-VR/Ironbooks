@@ -1,6 +1,6 @@
 /**
- * Zod schema for PATCH /api/reconciliations/:id — work on a reconciliation in progress
- * (lib/services/reconcile.ts).
+ * Zod schemas for PATCH /api/reconciliations/:id — work on a reconciliation in progress — and
+ * POST /api/reconciliations/:id/pay — pay the card after one (lib/services/reconcile.ts).
  *
  * The route reads this body by hand, and its own checks answer first with the messages they always
  * gave. The schema is checked after them: it says what each field is, for agents (describe_operation,
@@ -60,3 +60,28 @@ export const reconciliationUpdateSchema = z.discriminatedUnion('action', [
     ),
   }),
 ]);
+
+/**
+ * POST /api/reconciliations/:id/pay — QB "Write a check for the balance" after a credit card
+ * reconciliation is completed (lib/services/reconcile.ts payCreditCardBalance): Dr the card, Cr the
+ * bank, once per reconciliation. The route checks paymentAccountId itself; the service checks the
+ * rest with its own messages, so those fields are zLenient. The one change is for a
+ * paymentAccountId that is not text (such as 5): it gets past the route's own check, and is now
+ * answered 400 with this schema's message, before the service's "Choose the account to pay from."
+ * and before its Write Checks permission check (which answered 403 first). Nothing that could be
+ * paid is refused.
+ */
+export const payCreditCardBalanceSchema = z.object({
+  paymentAccountId: z
+    .string({ invalid_type_error: 'must be the id of a bank account' })
+    .min(1)
+    .describe('Id of the bank account (chart of accounts) the payment comes out of.'),
+  amount: zLenient(z.union([z.string(), z.number()]).nullable()).describe(
+    "Amount paid to the card, as decimal text such as \"512.40\"; leave out to pay the reconciliation's statement ending balance.",
+  ),
+  date: zLenient(z.string().nullable()).describe('Date of the payment, YYYY-MM-DD; leave out for today.'),
+  memo: zLenient(z.string().nullable()).describe('Description of the payment entry; leave out for "Credit card payment — <card name>".'),
+  exchangeRate: zLenient(z.union([z.string(), z.number()]).nullable()).describe(
+    "Foreign-currency cards only: home-currency units per 1 unit of the card's currency, as decimal text such as \"1.10\"; leave out for the currency list's rate.",
+  ),
+});

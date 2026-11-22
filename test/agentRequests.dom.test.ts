@@ -2,25 +2,31 @@
  * Agent requests (app/agent-requests): the approval center on screen, in a real browser window
  * (test/dom/agentRequests.dom.tsx), and the small rules it is built on (app/agent-requests/words.ts).
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { AgentRequestForPerson, FlowQuestion, OperationPreview } from '@/lib/agent/contract';
 import { ARCHIVE_LOGIN_HEADER, ARCHIVE_PASSWORD_HEADER, ARCHIVE_RECOVERY_KEY_HEADER, SECRET_PARTS_MARKER, applySecrets, encodeSecretParts } from '@/lib/agent/guards';
-import { operationById } from '@/lib/agent/operations/registry';
+import { allOperations, operationById } from '@/lib/agent/operations/registry';
 import { SHELL_OPERATIONS } from '@/lib/agent/operations/shell';
 import { BATCH_APPROVE_MAX } from '@/lib/validation/agentAccess';
 import {
+  AMOUNT_UNKNOWN,
   BATCH_MAX,
   DESKTOP_READS,
   DESKTOP_WRITES,
   STATUS_FILTERS,
+  amountShown,
   amountText,
   amountValue,
+  approveFailureText,
   approverLines,
   asciiDomain,
   batchBlock,
   batchChoice,
   canGiveGrant,
   companyFilePath,
+  confirmFlagText,
   constraintLines,
   desktopLines,
   domainOf,
@@ -34,16 +40,20 @@ import {
   grantFromForm,
   grantGivenText,
   grantNeverHere,
+  grantNotGivenText,
   grantRuleLine,
   initialGrantForm,
   isUnusualDomain,
   isWaiting,
   ledgerRemovals,
+  lineNameAndClass,
   mailServerOf,
   monthOf,
   needsLabels,
   networkHost,
   notTriedNote,
+  notTriedText,
+  pathParts,
   plain,
   postedEntryIds,
   previewTried,
@@ -54,7 +64,9 @@ import {
   secretFieldReady,
   secretFieldsOf,
   secretValueOf,
+  staleKind,
   statusLabel,
+  warningLines,
   writtenPathOf,
   type SecretField,
 } from '@/app/agent-requests/words';
@@ -83,13 +95,20 @@ describe('the approval center', () => {
       "nothing is approvable on the list's copy: the card's own copy must load first, and a failed load says so with Try again",
       'a request the server marks as changed says so in the list and on the card; Approve similar… is filled in again from the new preview',
       'a done request links the entries the server names, and says why standing permission was not given',
-      'approving several at once: two-person and host-only requests cannot be chosen; one not approved is shown with its reason, the rest as done',
+      'approving several at once: two-person and host-only requests cannot be chosen; one not approved is shown with its reason, one sent back with a note says so, the rest as done',
       'the ledger part names what a run voids or deletes, with the amounts, instead of saying nothing is posted',
       'a desktop request shows the whole paths it opens and writes, asks the questions sent with it, and names the file it wrote',
       'secrets of several parts go as the one text the guards read: the sign-in of a protected backup, and a new company file password typed twice',
       'the status words, who can approve, who can give standing permission, and the server a typed mail password goes to',
       'the address can name an agent to start with, and a request to open',
       'a link followed while the page is open opens its card, and changes the agent filter',
+      'the card shows the warnings the agent said yes to, an amount it could not work out, and whose line each is',
+      'a sign-in the route can do without may be left empty, says when it is needed, and is never sent half typed',
+      "the server's own words show as they come: a password left out, a refusal no approval gets past, standing permission not given",
+      'a request an approval sent back with a note says so, not that the books changed',
+      "a new user's password is typed twice, compared on the card, and goes as the one password",
+      'a link followed while a card is answering waits: that card keeps its answer, and the linked one opens once it is closed',
+      'after a refused approval nothing is approvable until the card has loaded the request again, and a failed load says so',
     ]);
   }, 300_000);
 });
@@ -197,8 +216,12 @@ describe('what an approval needs, in words', () => {
   });
 
   it("a desktop flow's questions are the ones the server sent with the request, never what the preview carries", () => {
+    // The shell's own list (lib/agent/operations/shell.ts), whatever it holds today: the card asks
+    // exactly what the server sends, in its order.
     const questions: FlowQuestion[] = SHELL_OPERATIONS.find((o) => o.id === 'shell.company.open')!.questions;
-    expect(flowQuestionsOf(req({ operation: 'shell.company.open', questions })).map((q) => q.id)).toEqual(['temporaryFolder', 'readOnlyFile', 'cloudFolder']);
+    const sentIds = questions.map((q) => q.id);
+    expect(sentIds.length).toBeGreaterThan(0);
+    expect(flowQuestionsOf(req({ operation: 'shell.company.open', questions })).map((q) => q.id)).toEqual(sentIds);
     // Without questions on the request, none are asked: the client no longer has its own list.
     expect(flowQuestionsOf(req({ operation: 'shell.company.open' }))).toEqual([]);
     // A request for standing permission runs nothing, so it has nothing to answer.
@@ -208,8 +231,8 @@ describe('what an approval needs, in words', () => {
     expect(flowQuestionsOf(req({ preview: carried }))).toEqual([]);
     expect(secretFieldsOf(req({ preview: carried }))).toEqual({ fields: [], unanswerable: false });
     // One that is not well formed is left out; the same id twice is asked once.
-    const odd = [...questions, { id: 'cloudFolder', text: 'Again?', kind: 'yes_no' }, { id: 'x', text: 'Pick', kind: 'choice' }, { id: 'y', kind: 'yes_no' }] as FlowQuestion[];
-    expect(flowQuestionsOf(req({ operation: 'shell.company.open', questions: odd })).map((q) => q.id)).toEqual(['temporaryFolder', 'readOnlyFile', 'cloudFolder']);
+    const odd = [...questions, { id: sentIds[0], text: 'Again?', kind: 'yes_no' }, { id: 'x', text: 'Pick', kind: 'choice' }, { id: 'y', kind: 'yes_no' }] as FlowQuestion[];
+    expect(flowQuestionsOf(req({ operation: 'shell.company.open', questions: odd })).map((q) => q.id)).toEqual(sentIds);
   });
 
   it("a password question goes with the secrets, named in Ironbooks' own words; one that names no secret cannot be answered here", () => {
@@ -296,6 +319,88 @@ describe('secrets of several parts (plan 5.8): one text, made the way the guards
     }
     // Elsewhere the kind keeps its own name.
     expect(secretFieldsOf(req({ operation: 'shell.test.protected', needs: { ...BASE.needs!, secrets: ['file_password'] } })).fields[0].label).toBe('Company file password');
+    // A new user's password is chosen by the approving Admin, who passes it on: nothing is produced for it.
+    expect(operationById('users.create')?.producesSecret).toEqual([]);
+    const user = secretFieldsOf(req({ operation: 'users.create', class: 'admin', needs: { ...BASE.needs!, admin: true, secrets: ['new_user_password'] } })).fields[0];
+    expect(user).toMatchObject({ kind: 'new_user_password', label: "The new user's password" });
+    expect(user.help).toMatch(/Tell it to them yourself: the agent never sees it/);
+  });
+
+  it("a new user's password is typed twice and compared on the card; the one value goes, as typed, where the guards put it", () => {
+    for (const operation of ['users.create', 'users.reset-password']) {
+      const [user] = secretFieldsOf(req({ operation, class: 'admin', needs: { ...BASE.needs!, admin: true, secrets: ['new_user_password'] } })).fields;
+      expect(user.parts?.map((p) => p.name), operation).toEqual(['password', 'confirm']);
+      expect(user.parts?.every((p) => p.type === 'password'), operation).toBe(true);
+      expect(secretFieldReady(user, (n) => n === 'password'), operation).toBe(false);
+      expect(secretFieldReady(user, (n) => n === 'password' || n === 'confirm'), operation).toBe(true);
+      expect(secretValueOf(user, reader({ password: 'Welcome1!', confirm: 'Welcome1?' })), operation).toEqual({ error: expect.stringMatching(/not the same, so nothing was sent/) });
+      // The password alone, as typed: never the parts format, never the second copy.
+      const typed = secretValueOf(user, reader({ password: ' Welcome 1! ', confirm: ' Welcome 1! ' }));
+      expect(typed, operation).toEqual({ value: ' Welcome 1! ' });
+      expect(secretValueOf(user, reader({})), operation).toBeNull();
+    }
+    const op = operationById('users.create');
+    const placed = applySecrets(op!, { body: { username: 'dana' } }, { new_user_password: 'Welcome1!' });
+    expect(placed.missing).toEqual([]);
+    expect(placed.input.body).toEqual({ username: 'dana', password: 'Welcome1!' });
+  });
+
+  it('a secret the route can do without (needs.optionalSecrets) may be left empty, says when it is needed, and is never sent half typed', () => {
+    const needs = { ...BASE.needs!, secrets: ['archive_credentials' as const], optionalSecrets: ['archive_credentials' as const] };
+    const r = req({ operation: 'backups.restore', class: 'file', needs, input: { query: { id: 'b1' } } });
+    const [field] = secretFieldsOf(r).fields;
+    expect(field.optional).toBe(true);
+    expect(field.label).toBe('Sign-in for the protected backup (only if needed)');
+    expect(field.help).toMatch(/^Needed only for a backup made in another protected company file/);
+    expect(field.help).toMatch(/Leave these empty for a backup made in this company file\./);
+    expect(field.help).not.toMatch(/type your own user name/);
+    // Empty: ready, and nothing is sent for it.
+    expect(secretFieldReady(field, () => false)).toBe(true);
+    expect(secretValueOf(field, reader({}))).toBeNull();
+    // Started: it must be whole, so a user name never goes without its password.
+    expect(secretFieldReady(field, (n) => n === 'login')).toBe(false);
+    expect(secretFieldReady(field, (n) => n === 'login' || n === 'password')).toBe(true);
+    expect(secretFieldReady(field, (n) => n === 'recoveryKey')).toBe(true);
+    // A single box: optional, with its own words for when it is needed.
+    const closing = secretFieldsOf(req({ needs: { ...BASE.needs!, secrets: ['closing_password'], optionalSecrets: ['closing_password'] } })).fields[0];
+    expect(closing).toMatchObject({ kind: 'closing_password', label: 'Closing date password (only if needed)', optional: true });
+    expect(closing.help).toMatch(/closing date/);
+    expect(secretFieldReady(closing, () => false)).toBe(true);
+    expect(secretFieldReady(closing, (n) => n === 'value')).toBe(true);
+    // Only a secret the needs list can be optional; the rest stay required.
+    const mixed = secretFieldsOf(req({ needs: { ...BASE.needs!, secrets: ['closing_password'], optionalSecrets: ['backup_password', 'nonsense' as never] } }));
+    expect(mixed.fields).toEqual([{ kind: 'closing_password', label: 'Closing date password' }]);
+    expect(secretFieldReady(mixed.fields[0], () => false)).toBe(false);
+  });
+
+  it('an optional box with words of its own keeps them; one that opens another kind of file names that file', () => {
+    const optional = (operation: string, kind: 'file_password' | 'backup_password', body?: unknown) =>
+      secretFieldsOf(req({ operation, needs: { ...BASE.needs!, secrets: [kind], optionalSecrets: [kind] }, input: { body } })).fields[0];
+    // The file Admin's own sign-in password: still said to be that, never "only if the company file has a password".
+    const own = optional('file-protection.protect', 'file_password');
+    expect(own).toMatchObject({ label: 'Your own Ironbooks sign-in password (only if needed)', optional: true });
+    expect(own.help).toMatch(/not the company file password/);
+    expect(own.help).toMatch(/You may leave this empty/);
+    expect(own.help).not.toMatch(/company file has a password/);
+    // A file-lock password keeps its own words too.
+    const lock = optional('file-lock.change', 'file_password', { action: 'set' });
+    expect(lock.help).toMatch(/^Everyone who opens this company file will need the new password\./);
+    expect(lock.help).not.toMatch(/company file has a password/);
+    // Elsewhere the kind's own words for when it is needed.
+    expect(optional('shell.test.protected', 'file_password').help).toBe('Needed only if the company file has a password. Otherwise leave it empty.');
+    // A desktop flow that opens a portable company file or an Accountant's Copy names that file, not a backup.
+    expect(optional('shell.portable.open', 'backup_password')).toMatchObject({
+      label: 'Portable company file password (only if needed)',
+      help: 'Needed only if the portable company file was saved with a password. Otherwise leave it empty.',
+    });
+    expect(optional('shell.accountantCopy.open', 'backup_password')).toMatchObject({
+      label: "Accountant's Copy file password (only if needed)",
+      help: expect.stringMatching(/^Needed only if the Accountant's Copy transfer file was saved with a password\./),
+    });
+    // Required (an older server): named for that file all the same.
+    const required = secretFieldsOf(req({ operation: 'shell.portable.open', needs: { ...BASE.needs!, secrets: ['backup_password'] } })).fields[0];
+    expect(required).toEqual({ kind: 'backup_password', label: 'Portable company file password' });
+    expect(optional('backups.restore', 'backup_password').help).toMatch(/^Needed only if the backup file was saved with a password\./);
   });
 
   it('a mail password names the server it goes to, spelled as it really is', () => {
@@ -359,6 +464,33 @@ describe('whether Ironbooks tried the request out', () => {
     expect(previewTried(BASE.preview)).toBe(true);
     // A declared email names nobody: its one-line summary is not read for addresses either.
     expect(emailDomains(described.effects[0])).toEqual([]);
+  });
+
+  it("the bridge's reasons for not trying a request are said in the words of the person approving it", () => {
+    // The bridge's own notes, as they are on disk (lib/agent/bridge.ts NOT_TRIED), so a rewording
+    // there that the card no longer recognises shows up here.
+    const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'agent', 'bridge.ts'), 'utf8');
+    const block = /const NOT_TRIED[^=]*=\s*\{([\s\S]*?)\n\};/.exec(source)?.[1] ?? '';
+    const notes = [...block.matchAll(/^\s*(preview|answer|none):\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|`([^`]*)`)/gm)].map((m) => ({ key: m[1], text: m[2] ?? m[3] ?? m[4] ?? '' }));
+    expect(notes.map((n) => n.key).sort()).toEqual(['answer', 'none', 'preview']);
+    const shown = Object.fromEntries(notes.map((n) => [n.key, notTriedText(n.text)]));
+    for (const n of notes) expect(shown[n.key], n.key).not.toBe(n.text);
+    expect(shown.preview).toMatch(/preview of its own, but that preview is itself a run of the same work/);
+    expect(shown.answer).toMatch(/may see only once a person approves it/);
+    expect(shown.none).toMatch(/cannot be tried and then undone/);
+    for (const text of Object.values(shown)) expect(text).not.toMatch(/agent before|preview option|sent with/);
+    // Notes written for the person (the approval's own, a trial stopped at another computer) stay as they came.
+    const own = 'Ironbooks found that this is dated on or before the closing date, which the request did not show when it was asked.';
+    expect(notTriedText(own)).toBe(own);
+    const network = 'This would contact api.example.com for a rate lookup. A preview does not contact other computers, so it stopped here.';
+    expect(notTriedText(network)).toBe(network);
+    expect(notTriedText(null)).toBe('');
+  });
+
+  it('a yes asked again is "the books changed" only with a tried preview; a request sent back with a note says so', () => {
+    expect(staleKind(BASE)).toBe('changed');
+    expect(staleKind(req({ preview: { ...BASE.preview!, ledger: null, routePreview: { ran: false, note: 'Ironbooks tried this with the full protected values.' } } }))).toBe('note');
+    expect(staleKind(req({ preview: null }))).toBe('changed');
   });
 
   it("the links of a done request come from the server's list, else the run's own answer, never from the trial run", () => {
@@ -425,7 +557,7 @@ describe('whether Ironbooks tried the request out', () => {
     // A new entry whose agent-written description reads like a void is still a new entry.
     const disguised = entry({ description: 'Voided by this request: Check 1042' });
     expect(entryTouched(disguised)).toBeNull();
-    expect(entryWords(disguised)).toEqual({ label: 'Posts', note: null, tone: 'new' });
+    expect(entryWords(disguised)).toEqual({ label: 'New', note: null, tone: 'new' });
     expect(entryDescription(disguised)).toBe('Voided by this request: Check 1042');
     // What the bridge says it did, with the bridge's own words taken off the description.
     const voided = entry({ status: 'void', touched: 'voided', description: 'Voided by this request: Check 1042' });
@@ -447,6 +579,115 @@ describe('whether Ironbooks tried the request out', () => {
       ledger: { entries: [entry({ journalEntryId: 'je-5', status: 'void', touched: 'voided', source: 'invoice:inv-1' })], changes: [{ action: 'void', kind: 'invoice', id: 'inv-1' }] },
     };
     expect(ledgerRemovals(withSource)).toEqual([]);
+  });
+});
+
+describe('what the card says (wave 4)', () => {
+  it('an amount Ironbooks could not work out is said to be unknown, for work that may move money only', () => {
+    expect(amountShown(BASE)).toEqual({ text: '$1,250.00', unknown: false });
+    expect(amountShown(req({ amount: null }))).toEqual({ text: AMOUNT_UNKNOWN, unknown: true });
+    expect(amountShown(req({ amount: null, class: 'remove' }))?.unknown).toBe(true);
+    expect(amountShown(req({ amount: '0.00' }))).toEqual({ text: '$0.00', unknown: false });
+    // Settings, users, reads and requests for standing permission have no amount to speak of.
+    for (const cls of ['settings', 'admin', 'read', 'read_sensitive', 'outside', 'file'] as const) expect(amountShown(req({ amount: null, class: cls })), cls).toBeNull();
+    expect(amountShown(req({ kind: 'grant', amount: null }))).toBeNull();
+  });
+
+  it('warnings: the route\'s own words, which ones the agent said yes to, and flags it sent that no warning shown names', () => {
+    const preview: OperationPreview = { ...BASE.preview!, warnings: [{ flag: 'allowDuplicateNumber', message: 'Bill number 88 is already used for Staples.' }, { flag: 'allowZero', message: 'The amount is zero.' }] };
+    expect(warningLines(preview, ['allowDuplicateNumber', 'allowReconciledEdit'])).toEqual({
+      warnings: [
+        { message: 'Bill number 88 is already used for Staples.', accepted: true },
+        { message: 'The amount is zero.', accepted: false },
+      ],
+      acceptedAhead: ['It changes a transaction that is already reconciled.'],
+    });
+    // With no warnings in the preview, every flag the agent sent is said in Ironbooks' words.
+    expect(warningLines({ warnings: [] }, ['allowDuplicateNumber'])).toEqual({ warnings: [], acceptedAhead: ['Its number is already used by another transaction.'] });
+    expect(warningLines(null, ['allowSomethingNew'])).toEqual({ warnings: [], acceptedAhead: ['Allow something new.'] });
+    // Only flag names as the app writes them; nothing else the agent put in its list is shown.
+    expect(warningLines(null, ['<b>x</b>', 42, 'allow Duplicate', 'allowDuplicateNumber', 'allowDuplicateNumber']).acceptedAhead).toEqual(['Its number is already used by another transaction.']);
+    expect(warningLines(null, undefined)).toEqual({ warnings: [], acceptedAhead: [] });
+    expect(confirmFlagText('allowLedgerRewrite')).toBe('It rewrites entries already in the ledger.');
+  });
+
+  it('a flag named by its place in the body (statement.acknowledgeDifference) counts, and is said in words', () => {
+    const TIE = 'statement.acknowledgeDifference';
+    // POST /api/import lists it so (lib/agent/operations/classes/documents.ts), and the bridge puts it on the warning it withheld.
+    const preview: OperationPreview = { ...BASE.preview!, warnings: [{ flag: TIE, message: 'The rows are off from the statement by 12.50.' }] };
+    expect(warningLines(preview, [TIE])).toEqual({ warnings: [{ message: 'The rows are off from the statement by 12.50.', accepted: true }], acceptedAhead: [] });
+    expect(warningLines(null, [TIE])).toEqual({ warnings: [], acceptedAhead: ['The statement does not tie out to its opening and closing balances.'] });
+    // Still only names: a path with odd parts is not shown.
+    expect(warningLines(null, ['statement..x', '.x', 'x.', 'statement.Acknowledge', `a.${'b'.repeat(120)}`]).acceptedAhead).toEqual([]);
+    // A path with no words of its own is said from its last name.
+    expect(confirmFlagText('lines.allowZero')).toBe('Its amount is zero.');
+    expect(confirmFlagText('lines.allowSomethingNew')).toBe('Allow something new.');
+  });
+
+  it('every confirmation flag the registry lists has words of its own, never its bare name', () => {
+    const flags = new Set(allOperations().flatMap((o) => o.confirmFlags ?? []));
+    // And every flag the guards accept (lib/agent/guards.ts CONFIRM_FLAG_NAMES), read from the file.
+    const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'agent', 'guards.ts'), 'utf8');
+    const block = /const CONFIRM_FLAG_NAMES[^=]*=\s*new Set\(\[([\s\S]*?)\]\)/.exec(source)?.[1] ?? '';
+    for (const m of block.matchAll(/'([^']+)'/g)) flags.add(m[1]);
+    expect(flags.size).toBeGreaterThan(10);
+    for (const f of flags) {
+      const last = f.slice(f.lastIndexOf('.') + 1);
+      expect(confirmFlagText(f), f).not.toBe(`${last.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().replace(/^./, (c) => c.toUpperCase())}.`);
+    }
+  });
+
+  it('a path is shown as its folder and its file name, whole', () => {
+    expect(pathParts('C:\\Users\\pat\\Documents\\Ironbooks\\Agent Outbox\\March.pdf')).toEqual({ folder: 'C:\\Users\\pat\\Documents\\Ironbooks\\Agent Outbox', name: 'March.pdf' });
+    expect(pathParts('/home/pat/Out/March.pdf')).toEqual({ folder: '/home/pat/Out', name: 'March.pdf' });
+    expect(pathParts('C:\\March.pdf')).toEqual({ folder: 'C:\\', name: 'March.pdf' });
+    expect(pathParts('/March.pdf')).toEqual({ folder: '/', name: 'March.pdf' });
+    expect(pathParts('\\\\server\\share\\Books\\Acme.ironbooks')).toEqual({ folder: '\\\\server\\share\\Books', name: 'Acme.ironbooks' });
+    expect(pathParts('C:\\Out\\')).toEqual({ folder: 'C:\\Out\\', name: null });
+    expect(pathParts('March.pdf')).toEqual({ folder: null, name: 'March.pdf' });
+    // Nothing is tidied away: a ".." stays in sight.
+    expect(pathParts('C:\\Out\\..\\Windows\\x.dll')).toEqual({ folder: 'C:\\Out\\..\\Windows', name: 'x.dll' });
+    // Invisible characters cannot turn a name around.
+    expect(pathParts('C:\\Out\\Invoice‮fdp.exe').name).toBe('Invoicefdp.exe');
+  });
+
+  it("a ledger line names who it is for and its class, when the preview has them", () => {
+    type Line = NonNullable<OperationPreview['ledger']>['entries'][number]['lines'][number];
+    const line: Line = { accountId: 'a', accountCode: '1200', accountName: 'Accounts Receivable', debit: '50.00', credit: null, memo: null, entityName: 'Acme Supply' };
+    expect(lineNameAndClass(line)).toEqual({ name: 'Acme Supply', className: null });
+    expect(lineNameAndClass({ ...line, entityName: null, className: 'East' } as unknown as Line)).toEqual({ name: null, className: 'East' });
+    expect(lineNameAndClass({ ...line, entityName: '  ', class: 'West' } as unknown as Line)).toEqual({ name: null, className: 'West' });
+  });
+
+  it('standing permission that was not given: the server\'s words as they came, not said twice', () => {
+    // lib/services/agentRequests.ts GRANT_NOT_GIVEN_MESSAGE.
+    const unexpected = 'Standing permission was not given because of an unexpected problem. The work itself was done, so do not ask for it again; the next request like it will ask a person.';
+    expect(grantNotGivenText('Month-end helper', unexpected)).toBe(unexpected);
+    expect(grantNotGivenText('Month-end helper', 'Standing permission for this can last at most 30 minutes.')).toBe(
+      'It was done, but standing permission was not given, so Month-end helper will ask again next time. Why: Standing permission for this can last at most 30 minutes.',
+    );
+    expect(grantNotGivenText('Month-end helper', null)).toBe('It was done, but standing permission was not given, so Month-end helper will ask again next time.');
+  });
+
+  it('a refused approval: the server\'s words, and "type it again" only where they do not already say what to type', () => {
+    const closing = 'Type the closing-date password on the card, then approve again. Nothing was done.';
+    expect(approveFailureText(closing, true)).toBe(closing);
+    expect(approveFailureText('That closing date password is not correct.', true)).toBe('That closing date password is not correct. Type the password again to try once more.');
+    expect(approveFailureText('Ironbooks never lets an agent change a role that an agent holds.', false)).toBe('Ironbooks never lets an agent change a role that an agent holds.');
+    expect(approveFailureText('', false)).toMatch(/nothing was done/);
+  });
+
+  it('after the books changed, a figure the new preview cannot show never drops a limit the form had, and the time never grows', () => {
+    const before = req({ amount: '1300.00' });
+    const opened = initialGrantForm(before, NOW);
+    const unknown = rebuildGrantForm(opened, before, req({ amount: null }), NOW);
+    expect(unknown.form).toMatchObject({ amountOn: true, amount: '1300.00' });
+    expect(unknown.note).toMatch(/the amount limit you had is kept/);
+    // The most this person may give went up: what the form said is still the most.
+    const wider = rebuildGrantForm({ ...opened, minutes: 30 }, req({ amount: '1300.00', grantMinutesMax: 30 }), req({ amount: '1325.00', grantMinutesMax: 120 }), NOW);
+    expect(wider.form.minutes).toBe(30);
+    const sentBack = req({ amount: '1325.00', preview: { ...BASE.preview!, ledger: null, routePreview: { ran: false, note: 'Ironbooks tried this with the full protected values.' } } });
+    expect(rebuildGrantForm(opened, before, sentBack, NOW).note).toMatch(/^Ironbooks sent this back with new figures\./);
   });
 });
 
@@ -521,6 +762,10 @@ describe('approving several at once', () => {
     expect(batchBlock(req({ needs: { ...BASE.needs!, hostOnly: true } }), null)).toMatch(/only at the host computer/);
     // The books changed: a yes is given again on the new preview, on its own.
     expect(batchBlock(req({ stale: true }), null)).toMatch(/books changed/);
+    // Sent back with a note: said so, never "the books changed".
+    const sentBack = batchBlock(req({ stale: true, preview: { ...BASE.preview!, ledger: null, routePreview: { ran: false, note: 'x' } } }), null);
+    expect(sentBack).toMatch(/sent this back with a note/);
+    expect(sentBack).not.toMatch(/books changed/);
   });
 
   it('never a request Ironbooks could not try ahead of time: its preview cannot be relied on', () => {

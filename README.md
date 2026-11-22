@@ -265,6 +265,11 @@ picks an account for a payee it has never seen and says why, and reviews the boo
 unbalanced, duplicate or miscategorized entries. **It suggests. You decide.**
 [`PRIVACY.md`](./PRIVACY.md) lists exactly what can leave the machine, and the switch for each.
 
+**Bring your own agent, too.** An Admin can let an outside AI agent (Claude Code, Claude Desktop,
+or any MCP client) work in one company's books, with a role and rules for what it does by itself.
+Everything else it asks for, and a person approves it in Ironbooks after seeing exactly what would
+happen. Off until an Admin makes one; see [`AGENT_ACCESS.md`](./AGENT_ACCESS.md).
+
 ## 🔐 Security you never notice
 
 The best protection is the kind that never interrupts you. No extra prompts, no extra passwords,

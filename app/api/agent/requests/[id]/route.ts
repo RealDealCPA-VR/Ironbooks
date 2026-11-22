@@ -6,8 +6,8 @@
  * for. Answers { request: AgentRequestView }.
  *
  * Only an agent's context gets here; a person sees requests on the Agent requests page
- * (app/api/agent-requests/_guards.ts). Another agent's request, or one that does not exist, is
- * "not found" alike.
+ * (app/api/agent-requests/_guards.ts): a request with no agent token is answered before its
+ * session is read. Another agent's request, or one that does not exist, is "not found" alike.
  *
  * The long-poll cap (plan 11.3: a rate limit per agent): one agent holds at most WAITS_PER_AGENT
  * (4) long polls open at once (app/api/agent-requests/_guards.ts). Each one re-reads the company
@@ -23,10 +23,17 @@ import { getServerContext, inServiceScope } from '@/lib/context';
 import { requestForAgent, waitForDecision } from '@/lib/services/agentRequests';
 import { WAIT_MAX_SECONDS } from '@/lib/agent/contract';
 import type { RequestStatus } from '@/lib/agent/operations/types';
-import { routeError } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { agentRequestWaitQuerySchema } from '@/lib/validation/agentAccess';
-import { NO_STORE, agentOnly, tooManyWaits, withWaitSlot } from '@/app/api/agent-requests/_guards';
+import {
+  AGENT_UNEXPECTED_MESSAGE,
+  NO_STORE,
+  agentOnly,
+  refuseNonAgentRequest,
+  routeErrorPlain,
+  tooManyWaits,
+  withWaitSlot,
+} from '@/app/api/agent-requests/_guards';
 
 export const dynamic = 'force-dynamic';
 
@@ -41,6 +48,8 @@ function notFound(): NextResponse {
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const early = refuseNonAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
     const agentId = ctx.agent?.id;
     if (!agentId) return agentOnly();
@@ -57,6 +66,6 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     if (request.agentId !== agentId) return notFound();
     return NextResponse.json({ request }, { headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agent/requests/[id]/route');
+    return routeErrorPlain(err, 'agent/requests/[id]/route', AGENT_UNEXPECTED_MESSAGE);
   }
 }

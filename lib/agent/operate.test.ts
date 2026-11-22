@@ -29,7 +29,15 @@
  *  - the verbs (find and describe judged as a real request is, examples, permissions with grants'
  *    real limits and this company's people signed in), the rate limits with when to try again, and
  *    the route sending `{ verb }` bodies to them (429 with Retry-After when slowed down) and
- *    everything else to the curated actions.
+ *    everything else to the curated actions;
+ *  - (wave 4) the hard floor for a role any agent holds, on every path and again at approval; a
+ *    paused, removed or switched-off agent refused every verb on every call; a desktop operation's
+ *    paths checked against the agent's folders before anyone is asked; doorRun and doorDecision
+ *    (one call, one place, the same first look); standing permission that could never cover a
+ *    request never asked for; describe_operation's notes for work that needs a typed secret; posted
+ *    or done by what the run moved, and an unknown amount for a run that changed existing records
+ *    outside the ledger; the warnings an agent's flags silenced shown on the card; the version the
+ *    agent last read carried on every run; the route's 429 for an answer that carries the wait.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -70,6 +78,8 @@ const m = vi.hoisted(() => ({
   defaultAgentFolders: vi.fn(),
   listActiveSessions: vi.fn(),
   getServerContext: vi.fn(),
+  runAgentAction: vi.fn(),
+  realRunAgentAction: null as null | ((...a: unknown[]) => unknown),
 }));
 
 // Stand-ins by default; the real module behind each, for the block that runs the real bridge.
@@ -87,7 +97,10 @@ vi.mock('@/lib/services/agentRequests', () => ({
 }));
 // The schemas are a stand-in; the examples are the real reading of them (examplesOf).
 vi.mock('@/lib/agent/operations/schemas', async (orig) => ({ ...(await orig<Record<string, unknown>>()), describeSchemas: m.describeSchemas }));
-vi.mock('@/lib/agent/files', () => ({
+// The staged files are stand-ins; anything else the module exports (its pure path rules, which the
+// shell module's own save uses) is the real one.
+vi.mock('@/lib/agent/files', async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
   uploadChunk: m.uploadChunk,
   readStagedFile: m.readStagedFile,
   stagedFileInfo: m.stagedFileInfo,
@@ -119,6 +132,13 @@ vi.mock('@/lib/agent/operations/registry', async (orig) => ({
 }));
 vi.mock('@/lib/services/sessions', async (orig) => ({ ...(await orig<Record<string, unknown>>()), listActiveSessions: m.listActiveSessions }));
 vi.mock('@/lib/context', async (orig) => ({ ...(await orig<Record<string, unknown>>()), getServerContext: m.getServerContext }));
+// The curated runner is the real one (beforeEach), replaced only where the route's own handling of
+// an answer is tested.
+vi.mock('@/lib/agent/actions', async (orig) => {
+  const actual = await orig<Record<string, unknown>>();
+  m.realRunAgentAction = actual.runAgentAction as (...a: unknown[]) => unknown;
+  return { ...actual, runAgentAction: m.runAgentAction };
+});
 
 import { getDb, closeDb, type DB } from '@/lib/db';
 import {
@@ -166,6 +186,8 @@ import {
   AgentRateLimited,
   NO_REASON_NOTE,
   agentRetryAfter,
+  doorDecision,
+  doorRun,
   handleVerb,
   intersectAccess,
   lowerRole,
@@ -174,6 +196,8 @@ import {
   runApproved,
 } from './operate';
 import { POST as actionsPOST } from '@/app/api/agent/actions/route';
+import { AGENT_PAUSED_MESSAGE } from '@/lib/agentContext';
+import { AGENTS_BLOCKED_MESSAGE } from '@/lib/services/agents';
 
 type Out = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 
@@ -502,6 +526,7 @@ beforeEach(() => {
     return view;
   });
   m.requestForAgent.mockImplementation(async (_ctx: ServiceContext, idOrKey: string) => m.views.get(idOrKey) ?? m.views.get(`key:${idOrKey}`) ?? null);
+  m.runAgentAction.mockImplementation((...a: unknown[]) => m.realRunAgentAction!(...a));
   bridgeAnswers({});
 });
 
@@ -1177,6 +1202,10 @@ describe('operate', () => {
     const a = await operate(agentCtx, { operation: 'invoices.list' });
     expect(a.outcome).toBe('refused');
     expect(a.note).toMatch(/more than 120 requests in the last minute.*Wait about \d+ seconds?, then carry on/);
+    // The wait in seconds too (AgentOperationAnswer.retryAfterSeconds), the same as the note says.
+    expect(a.retryAfterSeconds).toBeGreaterThanOrEqual(1);
+    expect(a.retryAfterSeconds).toBeLessThanOrEqual(60);
+    expect(a.note).toContain(`Wait about ${a.retryAfterSeconds} second`);
     expect(m.runOperation).not.toHaveBeenCalled();
     // Every verb, an operation's included, is slowed down as an error that carries the wait.
     for (const verb of ['get_my_permissions', 'run_operation'] as const) {
@@ -1201,7 +1230,7 @@ describe('operate', () => {
     const running = Array.from({ length: AGENT_RUNS_AT_ONCE }, () => operate(agentCtx, { operation: 'invoices.list' }));
     await vi.waitFor(() => expect(gates).toHaveLength(AGENT_RUNS_AT_ONCE));
     const busy = await operate(agentCtx, { operation: 'invoices.list' });
-    expect(busy).toMatchObject({ outcome: 'refused' });
+    expect(busy).toMatchObject({ outcome: 'refused', retryAfterSeconds: 2 });
     expect(busy.note).toMatch(/already has 4 requests under way.*Wait about 2 seconds/);
     const verb = await expectError(handleVerb(agentCtx, 'run_operation', { operation: 'invoices.list' }), 'FORBIDDEN', /already has 4 requests under way/);
     expect(agentRetryAfter(verb)).toBe(2);
@@ -1829,7 +1858,11 @@ describe('handleVerb', () => {
     classified.examples = [{ body: { customerId: 'c-1', total: '10.00' }, confirm: ['allowDuplicateNumber'], note: 'A plain invoice' }, { customerId: 'c-2', total: '5.00' }];
     try {
       const d = (await handleVerb(agentCtx, 'describe_operation', { operation: 'invoices.create' })) as Out;
-      expect(d.examples).toEqual([{ body: { customerId: 'c-1', total: '10.00' }, confirm: ['allowDuplicateNumber'] }, { body: { customerId: 'c-2', total: '5.00' } }]);
+      // The note beside an example is passed on with it (contract.ts OperationDescription.examples).
+      expect(d.examples).toEqual([
+        { body: { customerId: 'c-1', total: '10.00' }, confirm: ['allowDuplicateNumber'], note: 'A plain invoice' },
+        { body: { customerId: 'c-2', total: '5.00' } },
+      ]);
       expect(d.notes.join(' ')).toMatch(/Each of examples is a request as run_operation takes it/);
       // Still the whole description beside them.
       expect(d).toMatchObject({ id: 'invoices.create', treatment: 'run', confirmFlags: ['allowDuplicateNumber'] });
@@ -2065,6 +2098,637 @@ describe('handleVerb', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Refused before anything else: a role an agent holds, a stopped agent, a path outside the folders
+// ---------------------------------------------------------------------------
+
+/** An agent row of this company holding these roles (removed when `revoked`). */
+async function agentHolding(roleKeys: string[], revoked = false): Promise<string> {
+  const [a] = await db
+    .insert(agents)
+    .values({
+      companyId,
+      name: `Holder ${randomUUID().slice(0, 8)}`,
+      roleKeys,
+      mode: 'propose',
+      tokenHash: (randomUUID() + randomUUID()).replace(/-/g, ''),
+      tokenPrefix: 'ib_test',
+      ...(revoked ? { revokedAt: new Date() } : {}),
+    })
+    .returning();
+  return a.id;
+}
+
+/** The two operations that change or remove a role (their route rule is the test's own, within CEILING). */
+const ROLE_UPDATE = op({
+  id: 'roles.update',
+  route: '/api/roles/[id]',
+  method: 'PATCH',
+  params: ['id'],
+  rule: { area: 'customers', action: 'modify' },
+  action: 'modify',
+  class: 'admin',
+  describe: 'Change what role {id} allows',
+});
+const ROLE_DELETE = op({
+  id: 'roles.delete',
+  route: '/api/roles/[id]',
+  method: 'DELETE',
+  params: ['id'],
+  rule: { area: 'customers', action: 'delete' },
+  action: 'delete',
+  class: 'admin',
+  body: 'none',
+  describe: 'Delete role {id}',
+});
+/** The same route classed as everyday change work, so that standing permission could cover it. */
+const ROLE_RENAME = op({ ...ROLE_UPDATE, id: 'roles.rename', class: 'change', describe: 'Rename role {id}' });
+
+describe('the hard floor for roles an agent holds (plan §4.6, D9)', () => {
+  beforeEach(() => {
+    for (const o of [ROLE_UPDATE, ROLE_DELETE, ROLE_RENAME]) m.ops.set(o.id, o);
+  });
+
+  it('a role any agent holds is never changed or deleted: dry run, run, ask, standing permission; whatever its id is spelled like', async () => {
+    usePolicy('full_with_asks');
+    const held = randomUUID();
+    await agentHolding([held]);
+    const HELD = /No agent may change or delete role ".+", because an agent holds it.*A person can change it in Ironbooks, under Users & Roles\./;
+    for (const o of [ROLE_UPDATE, ROLE_DELETE]) {
+      for (const spelled of [held, held.toUpperCase(), `{${held}}`, held.replace(/-/g, ''), ` ${held} `]) {
+        const base = { operation: o.id, params: { id: spelled }, ...(o.method === 'PATCH' ? { body: { description: 'Wider' } } : {}) };
+        const tried = await operate(agentCtx, { ...base, dryRun: true });
+        expect(tried, `${o.id} ${spelled}`).toMatchObject({ outcome: 'refused' });
+        expect(tried.note).toMatch(HELD);
+        const asked = await operate(agentCtx, { ...base, requestId: rid(), reason: 'Tidy the roles' });
+        expect(asked, `${o.id} ${spelled}`).toMatchObject({ outcome: 'refused' });
+        expect(asked.note).toMatch(HELD);
+      }
+    }
+    // Its own role too (Robo holds the built-in Bookkeeper role), spelled in any case.
+    const own = await operate(agentCtx, { operation: 'roles.update', params: { id: 'Bookkeeper' }, body: {}, requestId: rid(), reason: 'x' });
+    expect(own.note).toMatch(HELD);
+    expect(m.runOperation).not.toHaveBeenCalled();
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
+
+    // Standing permission names no role, so it could cover one an agent holds: never asked for.
+    const ahead = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'roles.rename', reason: 'Tidy the roles', requestId: rid() })) as Out;
+    expect(ahead).toMatchObject({ outcome: 'refused' });
+    expect(ahead.note).toMatch(/cannot be given for changing or deleting roles/);
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
+
+    // A role no agent holds, or only a removed agent held: asked as before.
+    const free = randomUUID();
+    const leftBehind = randomUUID();
+    await agentHolding([leftBehind], true);
+    for (const id of [free, leftBehind]) {
+      const a = await operate(agentCtx, { operation: 'roles.update', params: { id }, body: { description: 'x' }, requestId: rid(), reason: 'Tidy the roles' });
+      expect(a, id).toMatchObject({ outcome: 'asked' });
+    }
+  });
+
+  it('a run under standing permission is refused on a role an agent holds, and the grant is not listed as one that lets anything run', async () => {
+    usePolicy('ask_every_change');
+    const held = randomUUID();
+    await agentHolding([held]);
+    const grantId = randomUUID();
+    grants = [grantOf({ id: grantId, operation: 'roles.rename' })];
+    const under = await operate(agentCtx, { operation: 'roles.rename', params: { id: held }, body: { name: 'Clerk 2' }, requestId: rid() });
+    expect(under).toMatchObject({ outcome: 'refused' });
+    expect(under.note).toMatch(/because an agent holds it/);
+    expect(under.grantId).toBeUndefined();
+    expect(m.runOperation).not.toHaveBeenCalled();
+    // The same grant on a role no agent holds does run under it (the grant itself is fine).
+    const free = await operate(agentCtx, { operation: 'roles.rename', params: { id: randomUUID() }, body: { name: 'Clerk 3' }, requestId: rid() });
+    expect(free).toMatchObject({ grantId });
+    expect(callsOf('commit')).toHaveLength(1);
+    const p = (await handleVerb(agentCtx, 'get_my_permissions', {})) as Out;
+    expect((p.grants as AgentGrant[]).map((g) => g.id)).not.toContain(grantId);
+  });
+
+  it('runApproved looks again: a role that became one an agent holds since the ask is refused, nothing run', async () => {
+    usePolicy('full_with_asks');
+    const role = randomUUID();
+    const input = { params: { id: role }, body: { description: 'Wider' } };
+    // Asked while no agent held it: it runs.
+    const first = await storedRequest(null, 'roles.update', { amount: null });
+    const ran = await runApproved(approver, { id: first, agentId, operation: 'roles.update', input }, {}, { atHost: true });
+    expect(ran, JSON.stringify(ran.error)).toMatchObject({ mode: 'commit', outcome: 'ok' });
+
+    // An agent was given the role in between.
+    await agentHolding([role]);
+    m.runOperation.mockClear();
+    const second = await storedRequest(null, 'roles.update', { amount: null });
+    await expectError(runApproved(approver, { id: second, agentId, operation: 'roles.update', input }, {}, { atHost: true }), 'FORBIDDEN', /^Nothing was done\. No agent may change or delete role/);
+    await expectError(
+      runApproved(approver, { id: second, agentId, operation: 'roles.delete', input: { params: { id: role.toUpperCase() } } }, {}, { atHost: true }),
+      'FORBIDDEN',
+      /because an agent holds it/,
+    );
+    expect(m.runOperation).not.toHaveBeenCalled();
+  });
+
+  it('the one line names a role as a person knows it, not by its id', async () => {
+    usePolicy('full_with_asks');
+    const [r] = await db.insert(companyRoles).values({ companyId, name: 'Night Clerk', permissions: {}, flags: {} }).returning();
+    const asked = await operate(agentCtx, { operation: 'roles.delete', params: { id: r.id }, requestId: rid(), reason: 'Nobody uses it' });
+    expect(asked.outcome).toBe('asked');
+    expect(m.describeRequest.mock.calls.some((c) => (c[3] as Out | undefined)?.[r.id] === 'Night Clerk')).toBe(true);
+    // A built-in role by its own name; another company's role, or none, is named by nothing.
+    await operate(agentCtx, { operation: 'roles.delete', params: { id: 'accountant' }, dryRun: true });
+    expect(m.describeRequest.mock.calls.some((c) => (c[3] as Out | undefined)?.accountant === 'Accountant')).toBe(true);
+    m.describeRequest.mockClear();
+    await operate(agentCtx, { operation: 'roles.delete', params: { id: randomUUID() }, dryRun: true });
+    await operate(agentCtx, { operation: 'invoices.create', body: { total: '1' }, dryRun: true });
+    expect(m.describeRequest.mock.calls.every((c) => c.length <= 3)).toBe(true);
+  });
+
+  it('the hard-floor note names the role as a person knows it, and by the id sent when it has no name here', async () => {
+    usePolicy('full_with_asks');
+    const [r] = await db.insert(companyRoles).values({ companyId, name: 'Day Clerk', permissions: {}, flags: {} }).returning();
+    await agentHolding([r.id]);
+    const tried = await operate(agentCtx, { operation: 'roles.delete', params: { id: r.id }, dryRun: true });
+    expect(tried).toMatchObject({ outcome: 'refused' });
+    expect(tried.note).toMatch(/^No agent may change or delete role "Day Clerk", because an agent holds it/);
+    // At approval too.
+    const id = await storedRequest(null, 'roles.update', { amount: null });
+    await expectError(
+      runApproved(approver, { id, agentId, operation: 'roles.update', input: { params: { id: r.id }, body: { description: 'Wider' } } }, {}, { atHost: true }),
+      'FORBIDDEN',
+      /^Nothing was done\. No agent may change or delete role "Day Clerk"/,
+    );
+    // Spelled another way, the stored name is not found: the id the agent sent is shown.
+    const braces = `{${r.id}}`;
+    const other = await operate(agentCtx, { operation: 'roles.delete', params: { id: braces }, dryRun: true });
+    expect(other.note).toContain(`role "${braces}"`);
+    expect(m.runOperation).not.toHaveBeenCalled();
+  });
+
+  it('doorDecision gives the same hard floor, before anything is run', async () => {
+    usePolicy('full_with_asks');
+    const held = randomUUID();
+    await agentHolding([held]);
+    const d = await doorDecision(agentCtx, 'roles.delete', { params: { id: held } });
+    expect(d.decision).toMatchObject({ outcome: 'refuse', code: 'hard_floor' });
+    expect(d.decision.outcome === 'refuse' && d.decision.message).toMatch(/because an agent holds it/);
+    expect(m.runOperation).not.toHaveBeenCalled();
+  });
+});
+
+describe('a stopped agent is refused every verb, checked once per call', () => {
+  const setAgent = (v: Partial<typeof agents.$inferInsert>) => db.update(agents).set(v).where(eq(agents.id, agentId));
+  const EVERY_VERB_BUT_FIND: Array<[Parameters<typeof handleVerb>[1], Record<string, unknown>]> = [
+    ['describe_operation', { operation: 'invoices.list' }],
+    ['run_operation', { operation: 'invoices.list' }],
+    ['list_my_requests', {}],
+    ['cancel_request', { requestId: 'my-key-1' }],
+    ['get_my_permissions', {}],
+    ['ask_for_permission', { operation: 'invoices.create', reason: 'x', requestId: 'ask-key-1' }],
+    ['upload_file', { name: 'x.txt', type: 'text/plain', chunkBase64: 'eA==', last: true }],
+    ['get_file', { fileId: 'a'.repeat(32) }],
+    ['save_file', { fileId: 'a'.repeat(32), folder: SAVE_DIR, requestId: 'save-key-1', reason: 'x' }],
+  ];
+
+  async function expectStopped(message: string | RegExp) {
+    for (const [verb, args] of EVERY_VERB_BUT_FIND) {
+      const err = await expectError(handleVerb(agentCtx, verb, args), 'FORBIDDEN');
+      if (typeof message === 'string') expect(err.message, verb).toBe(message);
+      else expect(err.message, verb).toMatch(message);
+      expect((err.details as Out)?.rateLimited, verb).toBeUndefined();
+    }
+    // find_operations reads only the list of operations: each is answered as refused, with why.
+    const found = (await handleVerb(agentCtx, 'find_operations', { query: 'invoices' })) as Out;
+    expect(found.operations.length).toBeGreaterThan(0);
+    for (const o of found.operations) expect(o, o.id).toMatchObject({ treatment: 'refused' });
+    for (const o of found.operations) {
+      if (typeof message === 'string') expect(o.why).toBe(message);
+      else expect(o.why).toMatch(message);
+    }
+    // Nothing was read of the policy, the books or the agent's files, and nothing was done.
+    for (const fn of [m.loadAgentPolicy, m.runOperation, m.createAgentRequest, m.listRequestsForAgent, m.cancelAgentRequest, m.uploadChunk, m.stagedFileInfo, m.readStagedFile]) {
+      expect(fn).not.toHaveBeenCalled();
+    }
+  }
+
+  it('paused since the context was taken: every verb but find_operations is refused, and find_operations answers each as refused', async () => {
+    await setAgent({ pausedAt: new Date() });
+    try {
+      await expectStopped(AGENT_PAUSED_MESSAGE);
+    } finally {
+      await setAgent({ pausedAt: null });
+    }
+    // Resumed: it answers again.
+    expect(((await handleVerb(agentCtx, 'run_operation', { operation: 'invoices.list' })) as Out).outcome).toBe('read');
+  });
+
+  it('every agent switched off (Integrated Applications), or this agent removed: the same', async () => {
+    await db.update(companies).set({ settings: { integratedAppsBlocked: true } }).where(eq(companies.id, companyId));
+    try {
+      await expectStopped(AGENTS_BLOCKED_MESSAGE);
+    } finally {
+      await db.update(companies).set({ settings: null }).where(eq(companies.id, companyId));
+    }
+    await setAgent({ revokedAt: new Date() });
+    try {
+      await expectStopped(/This agent has been removed/);
+    } finally {
+      await setAgent({ revokedAt: null });
+    }
+    // A context naming no agent of this company at all.
+    const stranger = { ...agentCtx, agent: { ...agentCtx.agent!, id: randomUUID() } };
+    await expectError(handleVerb(stranger, 'list_my_requests', {}), 'FORBIDDEN', /This agent has been removed/);
+  });
+
+  it('the call is counted first: an agent over its limit is told to slow down, paused or not, before anything is read', async () => {
+    await setAgent({ pausedAt: new Date() });
+    try {
+      for (let i = 0; i < AGENT_CALLS_PER_MINUTE; i++) await operate(agentCtx, { operation: 'nothing.here' });
+      const err = await expectError(handleVerb(agentCtx, 'list_my_requests', {}), 'FORBIDDEN', /more than 120 requests/);
+      expect(err).toBeInstanceOf(AgentRateLimited);
+    } finally {
+      await setAgent({ pausedAt: null });
+    }
+  });
+});
+
+describe("a desktop operation's paths are checked against the agent's folders before a person is asked", () => {
+  const COPY = op({ id: 'shell.company.saveCopyAs', kind: 'shell', route: 'saveCopyAsFlow', rule: null, action: 'view', class: 'file', dryRun: 'none', describe: 'Save a copy of the company file as {file}' });
+  const RESTORE = op({ id: 'shell.backup.restoreAsNew', kind: 'shell', route: 'restoreFlow', rule: null, action: 'view', class: 'file', dryRun: 'none', describe: 'Restore backup {file} as {target}' });
+
+  beforeEach(() => {
+    m.ops.set(COPY.id, COPY);
+    m.ops.set(RESTORE.id, RESTORE);
+    m.shellOps.push(
+      shellDef({ id: COPY.id, flow: 'saveCopyAsFlow', class: 'file', input: { file: { type: 'path', required: true, describe: 'Where the copy goes.' } } }),
+      shellDef({
+        id: RESTORE.id,
+        flow: 'restoreFlow',
+        class: 'file',
+        input: {
+          file: { type: 'path', required: true, describe: 'The backup.' },
+          target: { type: 'path', required: false, describe: 'Where the new company file goes.' },
+        },
+      }),
+    );
+    m.allowedFolder.mockImplementation(async (allowed: string[], folder: string) => (allowed.includes(folder) ? folder : null));
+    usePolicy('full_with_asks', { folders: [SAVE_DIR] });
+  });
+
+  it('inside an allowed folder it is asked; anywhere else, or not a full path, it is refused and nobody is asked', async () => {
+    const inside = path.join(SAVE_DIR, 'Books copy.ironbooks');
+    const ok = await operate(agentCtx, { operation: COPY.id, body: { file: inside }, requestId: rid(), reason: 'Keep a copy before year end' });
+    expect(ok).toMatchObject({ outcome: 'asked' });
+    expect(m.allowedFolder).toHaveBeenLastCalledWith([SAVE_DIR], SAVE_DIR);
+    expect(m.createAgentRequest).toHaveBeenCalledTimes(1);
+
+    const outside = path.join(ROOT, 'not-allowed', 'Books copy.ironbooks');
+    for (const file of [outside, 'Books copy.ironbooks', ` ${inside}`, SAVE_DIR, 42, null]) {
+      const no = await operate(agentCtx, { operation: COPY.id, body: { file }, requestId: rid(), reason: 'Keep a copy' });
+      expect(no, String(file)).toMatchObject({ outcome: 'refused' });
+      expect(no.note).toMatch(/"file" must be the full path of a file in a folder this agent may use.*Nobody was asked\./);
+      // A dry run says the same.
+      expect(await operate(agentCtx, { operation: COPY.id, body: { file }, dryRun: true })).toMatchObject({ outcome: 'refused' });
+    }
+    // The folder itself is not a file in it.
+    expect(m.allowedFolder.mock.calls.some((c) => c[1] === path.dirname(SAVE_DIR))).toBe(true);
+    expect(m.createAgentRequest).toHaveBeenCalledTimes(1);
+    expect(m.runShellOperation).not.toHaveBeenCalled();
+  });
+
+  it('every path field is checked; one left out may be, unless the operation needs it', async () => {
+    const backup = path.join(SAVE_DIR, 'Books.bka');
+    expect(await operate(agentCtx, { operation: RESTORE.id, body: { file: backup }, requestId: rid(), reason: 'Restore it' })).toMatchObject({ outcome: 'asked' });
+    const bad = await operate(agentCtx, { operation: RESTORE.id, body: { file: backup, target: path.join(ROOT, 'elsewhere', 'New.ironbooks') }, requestId: rid(), reason: 'Restore it' });
+    expect(bad).toMatchObject({ outcome: 'refused' });
+    expect(bad.note).toMatch(/^"target" must be/);
+    const none = await operate(agentCtx, { operation: RESTORE.id, body: {}, requestId: rid(), reason: 'Restore it' });
+    expect(none.note).toMatch(/^"file" must be/);
+    expect(m.createAgentRequest).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('doorRun and doorDecision (the curated actions share the door\'s count, places and first look)', () => {
+  it("doorDecision is the door's first look: the registry's operation, the guarded input, the decision; nothing runs", async () => {
+    usePolicy('ask_every_change');
+    m.guardInput.mockImplementation((_op: Operation, input: OperationInput) => ({ input: { ...input, body: { total: '10' } }, refused: null, stripped: ['body.password'] }));
+    const copy = { ...OPS.find((o) => o.id === 'invoices.create')!, class: 'read' as const };
+    const d = await doorDecision(agentCtx, copy, { body: { total: '10', password: 'x' } });
+    // The caller's copy of the operation is never what is judged.
+    expect(d.operation).toBe(m.ops.get('invoices.create'));
+    expect(d).toMatchObject({ input: { body: { total: '10' } }, stripped: ['body.password'], facts: { amount: '10' }, decision: { outcome: 'ask', effectiveClass: 'enter' } });
+    m.guardInput.mockImplementation(() => ({ input: {}, refused: 'Agents can never set the audit trail.', stripped: [] }));
+    const g = await doorDecision(agentCtx, 'invoices.create', {});
+    expect(g.decision).toMatchObject({ outcome: 'refuse', code: 'hard_floor', message: 'Agents can never set the audit trail.' });
+    await expectError(doorDecision(agentCtx, 'nothing.here', {}), 'VALIDATION', /find_operations/);
+    await expectError(doorDecision({ ...agentCtx, agent: undefined }, 'invoices.create'), 'FORBIDDEN', 'This is for agents.');
+    expect(m.runOperation).not.toHaveBeenCalled();
+  });
+
+  it('doorDecision counts as a call, before anything is read', async () => {
+    for (let i = 0; i < AGENT_CALLS_PER_MINUTE; i++) await operate(agentCtx, { operation: 'nothing.here' });
+    m.loadAgentPolicy.mockClear();
+    const err = await expectError(doorDecision(agentCtx, 'invoices.create', {}), 'FORBIDDEN', /more than 120 requests/);
+    expect(err).toBeInstanceOf(AgentRateLimited);
+    expect(m.loadAgentPolicy).not.toHaveBeenCalled();
+  });
+
+  it('doorRun is one call in one place, however many times its work goes through the door', async () => {
+    const inside = await doorRun(agentCtx, async () => {
+      const out: string[] = [];
+      for (let i = 0; i < 10; i++) {
+        out.push(((await handleVerb(agentCtx, 'run_operation', { operation: 'invoices.list' })) as Out).outcome);
+        out.push((await doorDecision(agentCtx, 'invoices.list')).decision.outcome);
+        out.push((await operate(agentCtx, { operation: 'invoices.list' })).outcome);
+      }
+      return out;
+    });
+    expect(new Set(inside)).toEqual(new Set(['read', 'run']));
+    // Thirty door calls inside were one: the rest of the minute is still there.
+    for (let i = 0; i < AGENT_CALLS_PER_MINUTE - 1; i++) expect((await operate(agentCtx, { operation: 'nothing.here' })).note).toMatch(/find_operations/);
+    const over = await operate(agentCtx, { operation: 'nothing.here' });
+    expect(over).toMatchObject({ outcome: 'refused' });
+    expect(over.retryAfterSeconds).toBeGreaterThanOrEqual(1);
+    await expectError(doorRun(agentCtx, async () => 'never'), 'FORBIDDEN', /more than 120 requests/);
+  });
+
+  it('doorRun holds one of the agent\'s places: a fifth at once is told to wait, and its own door calls need no second place', async () => {
+    const gates: Array<() => void> = [];
+    const held = Array.from({ length: AGENT_RUNS_AT_ONCE }, () =>
+      doorRun(agentCtx, async () => {
+        await new Promise<void>((resolve) => gates.push(resolve));
+        // Every place is taken, yet the action's own read through the door goes on in its place.
+        return ((await handleVerb(agentCtx, 'run_operation', { operation: 'invoices.list' })) as Out).outcome;
+      }),
+    );
+    await vi.waitFor(() => expect(gates).toHaveLength(AGENT_RUNS_AT_ONCE));
+    const busy = await expectError(doorRun(agentCtx, async () => 'never'), 'FORBIDDEN', /already has 4 requests under way/);
+    expect(agentRetryAfter(busy)).toBe(2);
+    await expectError(handleVerb(agentCtx, 'run_operation', { operation: 'invoices.list' }), 'FORBIDDEN', /already has 4 requests under way/);
+    for (const open of gates) open();
+    expect(await Promise.all(held)).toEqual(Array(AGENT_RUNS_AT_ONCE).fill('read'));
+    // The places came back.
+    expect(await doorRun(agentCtx, async () => 'again')).toBe('again');
+    await expect(doorRun(agentCtx, async () => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
+    expect(await doorRun(agentCtx, async () => 'and again')).toBe('and again');
+  });
+});
+
+describe('ask_for_permission never asks a person for standing permission that could not cover anything', () => {
+  it('limited by amount on work whose amount is never seen ahead, or any grant while the two-person limit holds it: refused, saying why', async () => {
+    usePolicy('ask_every_change');
+    const byAmount = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'bills.receive', constraints: { maxAmount: '500' }, reason: 'Deliveries', requestId: rid() })) as Out;
+    expect(byAmount).toMatchObject({ outcome: 'refused' });
+    expect(byAmount.note).toMatch(/limited by amount could never cover this.*without constraints\.max_amount/);
+
+    usePolicy('ask_every_change', { twoPersonOver: '1000' });
+    const twoPeople = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'bills.receive', reason: 'Deliveries', requestId: rid() })) as Out;
+    expect(twoPeople).toMatchObject({ outcome: 'refused' });
+    expect(twoPeople.note).toMatch(/could never cover this while the two-person limit \(1000\) is set/);
+    expect(twoPeople.note).not.toMatch(/max_amount at or below/);
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
+
+    // Work that is tried first: the amount limit is still the way to stay with one person.
+    const tried = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'invoices.create', constraints: { maxAmount: '5000' }, reason: 'x', requestId: rid() })) as Out;
+    expect(tried.note).toMatch(/max_amount at or below 1000/);
+    // Without the limit, and without an amount, it can cover a request: asked.
+    usePolicy('ask_every_change');
+    const open = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'bills.receive', reason: 'Deliveries', requestId: rid() })) as Out;
+    expect(open).toMatchObject({ outcome: 'asked' });
+    expect(m.createAgentRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('limited by amount on work never seen ahead while the two-person limit is set: the two-person reason, not "ask again without max_amount"', async () => {
+    usePolicy('ask_every_change', { twoPersonOver: '1000' });
+    const a = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'bills.receive', constraints: { maxAmount: '500' }, reason: 'Deliveries', requestId: rid() })) as Out;
+    expect(a).toMatchObject({ outcome: 'refused' });
+    expect(a.note).toMatch(/could never cover this while the two-person limit \(1000\) is set/);
+    expect(a.note).not.toMatch(/without constraints\.max_amount/);
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
+  });
+
+  it('work tried first whose amount may still stay unknown (no amount field, not only new records): told that max_amount may never cover it', async () => {
+    // customers.update: an edit of a customer that posts nothing has an unknown amount after its dry run.
+    m.ops.set(
+      'customers.update',
+      op({ id: 'customers.update', route: '/api/customers/[id]', method: 'PATCH', params: ['id'], rule: { area: 'customers', action: 'modify' }, action: 'modify', class: 'change', describe: 'Edit customer {id}' }),
+    );
+    usePolicy('ask_every_change', { twoPersonOver: '1000' });
+    const plain = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'customers.update', reason: 'Fix the addresses', requestId: rid() })) as Out;
+    expect(plain).toMatchObject({ outcome: 'refused' });
+    expect(plain.note).toMatch(/max_amount at or below 1000/);
+    expect(plain.note).toMatch(/has no amount that can be checked, so each such request still needs two people, and standing permission never covers it/);
+    // Asked within the limit: asked, and told the same.
+    const within = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'customers.update', constraints: { maxAmount: '900' }, reason: 'Fix the addresses', requestId: rid() })) as Out;
+    expect(within).toMatchObject({ outcome: 'asked' });
+    expect(within.note).toMatch(/standing permission never covers it/);
+    // Work with an amount field, or that only makes new records, is not warned.
+    const named = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'invoices.create', reason: 'x', requestId: rid() })) as Out;
+    expect(named.note).toMatch(/max_amount at or below 1000/);
+    expect(named.note).not.toMatch(/standing permission never covers it/);
+    // Without the two-person limit, nothing to warn about.
+    usePolicy('ask_every_change');
+    const free = (await handleVerb(agentCtx, 'ask_for_permission', { operation: 'customers.update', reason: 'Fix the addresses', requestId: rid() })) as Out;
+    expect(free).toMatchObject({ outcome: 'asked' });
+    expect(free.note ?? '').not.toMatch(/standing permission never covers it/);
+  });
+
+  it('limited by records on work that never counts them, host-only work and company-file work: refused for everyone', async () => {
+    usePolicy('full_with_asks');
+    m.ops.set('lines.accept', op({ id: 'lines.accept', route: '/api/bank-lines/accept', class: 'bulk', countField: null, describe: 'Accept the waiting lines' }));
+    m.ops.set('bills.lock', op({ id: 'bills.lock', route: '/api/bills/lock', class: 'enter', fileAdmin: true, describe: 'Lock the bills' }));
+    m.ops.set('mail.sendTest', op({ id: 'mail.sendTest', route: '/api/mail/test', class: 'enter', hostOnly: true, describe: 'Send a test' }));
+    const ask = async (operation: string, constraints: Record<string, unknown> = {}) =>
+      (await handleVerb(agentCtx, 'ask_for_permission', { operation, constraints, reason: 'x', requestId: rid() })) as Out;
+    expect((await ask('lines.accept', { maxCount: 10 })).note).toMatch(/never says ahead of time how many it changes/);
+    const file = await ask('bills.lock');
+    expect(file.note).toMatch(/company-file work.*nobody can give standing permission/);
+    expect(file.note).not.toMatch(/ask an Admin/i);
+    const host = await ask('mail.sendTest');
+    expect(host.note).toMatch(/computer that holds the company file.*nobody can give standing permission/);
+    expect(m.createAgentRequest).not.toHaveBeenCalled();
+    // Nor is such a grant listed as one that lets anything run.
+    grants = [grantOf({ operation: 'lines.accept', constraints: { maxCount: 10 } })];
+    expect(((await handleVerb(agentCtx, 'get_my_permissions', {})) as Out).grants).toEqual([]);
+  });
+});
+
+describe("describe_operation's notes match how the door treats it", () => {
+  it('a route that needs something only the approver types is not tried ahead, and says so; its amount counts as unknown', async () => {
+    m.ops.set('company.closing', op({ id: 'company.closing', route: '/api/company/closing-date', method: 'PATCH', class: 'period', needsSecret: ['closing_password'], describe: 'Move the closing date' }));
+    const d = (await handleVerb(agentCtx, 'describe_operation', { operation: 'company.closing' })) as Out;
+    const notes = d.notes.join(' ');
+    expect(notes).toMatch(/cannot be tried ahead of time, because it needs the closing-date password, which only the person approving it types/);
+    expect(notes).not.toMatch(/dry_run: true first/);
+    expect(notes).not.toMatch(/Before it runs or asks, it is tried/);
+    expect(notes).toMatch(/its amount counts as unknown/);
+    expect(notes).toMatch(/A person types the closing-date password on the approval card\. Never send it yourself\./);
+    // A dry run agrees: nothing is tried.
+    const tried = await operate(agentCtx, { operation: 'company.closing', body: { closingDate: '2026-06-30' }, dryRun: true });
+    expect(tried.note).toMatch(/cannot be tried without really doing it/);
+    expect(m.runOperation).not.toHaveBeenCalled();
+  });
+
+  it('the operations of the registry that need a typed secret say a person types it on the card, never the agent', async () => {
+    const realRegistry = await vi.importActual<typeof import('./operations/registry')>('./operations/registry');
+    for (const id of ['users.create', 'users.reset-password', 'email.settings.update', 'email.test', 'company.closing-date.update']) {
+      const real = realRegistry.operationById(id);
+      expect(real, id).toBeTruthy();
+      m.ops.set(id, real!);
+      const d = (await handleVerb(agentCtx, 'describe_operation', { operation: id })) as Out;
+      const notes = d.notes.join(' ');
+      expect(notes, id).toMatch(/A person types .+ on the approval card\. Never send it yourself\./);
+      expect(notes, id).not.toMatch(/dry_run: true first/);
+      expect(notes, id).not.toMatch(/Before it runs or asks, it is tried/);
+    }
+  });
+});
+
+describe('the version of the record the agent last read (OperationInput.expectedUpdatedAt)', () => {
+  it('goes with every run of the request, an approved one included; the guards keeping only what they know do not drop it', async () => {
+    const VERSION = '2026-11-22T14:05:09.123Z';
+    // The guards build a new input of the parts they know, as the real ones do.
+    m.guardInput.mockImplementation((_op: Operation, input: OperationInput) => ({ input: { ...(input.params ? { params: input.params } : {}), ...(input.body !== undefined ? { body: input.body } : {}) }, refused: null, stripped: [] }));
+    const key = rid();
+    const a = (await handleVerb(agentCtx, 'run_operation', { operation: 'employees.update', params: { id: 'emp-1' }, body: { memo: 'x' }, expectedUpdatedAt: VERSION, requestId: key })) as Out;
+    expect(a.outcome).toBe('posted');
+    expect(m.runOperation.mock.calls.map((c) => [c[3], (c[2] as OperationInput).expectedUpdatedAt])).toEqual([
+      ['dry_run', VERSION],
+      ['commit', VERSION],
+    ]);
+    // Part of the request: the same request id with another version is another request.
+    await expectError(
+      handleVerb(agentCtx, 'run_operation', { operation: 'employees.update', params: { id: 'emp-1' }, body: { memo: 'x' }, expectedUpdatedAt: '2026-11-22T15:00:00.000Z', requestId: key }),
+      'CONFLICT',
+      /already used for a different request/,
+    );
+    await expectError(handleVerb(agentCtx, 'run_operation', { operation: 'employees.update', params: { id: 'emp-1' }, body: {}, expectedUpdatedAt: 5, requestId: rid() }), 'VALIDATION');
+
+    m.runOperation.mockClear();
+    const id = await storedRequest(null, 'employees.update', { amount: null });
+    const r = await runApproved(approver, { id, agentId, operation: 'employees.update', input: { params: { id: 'emp-1' }, body: { memo: 'x' }, expectedUpdatedAt: VERSION } }, {}, { atHost: true });
+    expect(r.mode).toBe('commit');
+    expect(m.runOperation.mock.calls.every((c) => (c[2] as OperationInput).expectedUpdatedAt === VERSION)).toBe(true);
+  });
+});
+
+describe('what a run moved, and the warnings an agent accepted', () => {
+  /** A ledger preview of one entry that was there before, which the run voided, deleted or changed. */
+  function touched(how: 'voided' | 'deleted' | 'changed', id = 'je-old'): OperationPreview {
+    const p = preview(1);
+    p.ledger!.entries = [{ ...p.ledger!.entries[0], journalEntryId: id, touched: how } as never];
+    return p;
+  }
+
+  it("posted or done: a void or delete posted, an entry only retitled did not, unless the run counted money", async () => {
+    const commitWith = async (p: OperationPreview, amount: string | null) => {
+      bridgeAnswers({ dry_run: () => ({ preview: p, facts: facts({ amount }) }), commit: () => ({ preview: p, facts: facts({ amount }) }) });
+      return (await operate(agentCtx, { operation: 'customers.create', body: {}, requestId: rid() })).outcome;
+    };
+    expect(await commitWith(touched('voided'), '50.00')).toBe('posted');
+    expect(await commitWith(touched('deleted'), '50.00')).toBe('posted');
+    expect(await commitWith(touched('changed'), '0.00')).toBe('done');
+    expect(await commitWith(touched('changed'), '50.00')).toBe('posted');
+    expect(await commitWith(preview(1), '0.00')).toBe('posted');
+    // Where the bridge marks a changed entry (counted, as TouchedEntry.counted), the mark decides,
+    // not the amount: work with an amount field carries that field's figure even when it only retitled.
+    const marked = (counted: unknown, truncated = false) => {
+      const p = touched('changed');
+      (p.ledger!.entries[0] as unknown as Record<string, unknown>).counted = counted;
+      p.truncated = truncated;
+      return p;
+    };
+    expect(await commitWith(marked(null), '50.00')).toBe('done');
+    expect(await commitWith(marked('50.00'), '0.00')).toBe('posted');
+    expect(await commitWith(marked({ odd: true }), '0.00')).toBe('posted');
+    // A preview that was cut may have left out an entry voided: the amount decides then.
+    expect(await commitWith(marked(null, true), '50.00')).toBe('posted');
+    // An approved request asked again, from a row older than AgentRequestView.posted: the same rule.
+    usePolicy('ask_every_change');
+    const key = rid();
+    bridgeAnswers({ dry_run: () => ({ preview: touched('changed'), facts: facts({ amount: '0.00' }) }) });
+    await operate(agentCtx, { operation: 'customers.create', body: {}, requestId: key, reason: 'Retitle it' });
+    Object.assign(m.views.get(`key:${key}`)!, { status: 'executed', result: {}, amount: '0.00', posted: undefined });
+    expect((await operate(agentCtx, { operation: 'customers.create', body: {}, requestId: key, reason: 'Retitle it' })).outcome).toBe('done');
+  });
+
+  it('a void, delete or edit of a record that was there before, touching no ledger entry, has an unknown amount: never "0.00"', async () => {
+    usePolicy('trusted_bookkeeper', { twoPersonOver: '1000' });
+    const outside = (action: string, kind: string): OperationPreview => ({
+      ...preview(0),
+      ledger: { entries: [], changes: [{ action, kind, id: 'r-1' }] },
+      records: [{ action, kind, id: 'r-1', fields: [] }],
+    });
+    for (const [action, kind] of [['void', 'payroll_adjustment'], ['delete', 'item'], ['update', 'customer']]) {
+      // Whatever the bridge said ("0.00" included), the amount is unknown: two people, so it asks.
+      bridgeAnswers({ dry_run: () => ({ preview: outside(action, kind), facts: facts({ amount: '0.00' }) }) });
+      const a = await operate(agentCtx, { operation: 'customers.create', body: {}, requestId: rid(), reason: `A ${action}` });
+      expect(a, `${action} ${kind}`).toMatchObject({ outcome: 'asked', needs: { twoPerson: true } });
+      expect((m.createAgentRequest.mock.calls.at(-1)?.[1] as Out).facts.amount).toBeNull();
+    }
+    // A preview cut short with no entries cannot rule it out either.
+    bridgeAnswers({ dry_run: () => ({ preview: { ...outside('create', 'customer'), truncated: true }, facts: facts({ amount: '0.00' }) }) });
+    expect(await operate(agentCtx, { operation: 'customers.create', body: {}, requestId: rid(), reason: 'Many' })).toMatchObject({ outcome: 'asked' });
+    // Only new records: "0.00", it runs. An entry only retitled, with its own audit row: not money either.
+    const created = outside('create', 'customer');
+    bridgeAnswers({ dry_run: () => ({ preview: created, facts: facts({ amount: '0.00' }) }), commit: () => ({ preview: created, facts: facts({ amount: '0.00' }) }) });
+    expect((await operate(agentCtx, { operation: 'customers.create', body: {}, requestId: rid() })).outcome).toBe('done');
+    const retitled: OperationPreview = { ...touched('changed', 'je-9'), records: [{ action: 'update', kind: 'journal_entry', id: 'je-9', fields: [] }] };
+    retitled.ledger!.changes = [{ action: 'update', kind: 'journal_entry', id: 'je-9' }];
+    bridgeAnswers({ dry_run: () => ({ preview: retitled, facts: facts({ amount: null }) }), commit: () => ({ preview: retitled, facts: facts({ amount: '0.00' }) }) });
+    expect((await operate(agentCtx, { operation: 'customers.create', body: {}, requestId: rid() })).outcome).toBe('done');
+  });
+
+  it('a request sent with confirmation flags shows a person the warnings those flags silenced', async () => {
+    usePolicy('ask_every_change');
+    const DUP = { flag: 'allowDuplicateNumber', message: 'Invoice 1001 is already used.' };
+    const OVER = { flag: 'allowOverBilling', message: 'This bills more than the estimate.' };
+    m.ops.set('invoices.create', op({ id: 'invoices.create', amountField: 'total', confirmFlags: ['allowDuplicateNumber', 'allowOverBilling'] }));
+    // The route raises one warning at a time, each until its flag is sent.
+    bridgeAnswers({
+      dry_run: (input) =>
+        !input.confirm?.includes('allowDuplicateNumber')
+          ? { outcome: 'needs_confirmation', httpStatus: 409, preview: null, warnings: [DUP] }
+          : !input.confirm?.includes('allowOverBilling')
+            ? { outcome: 'needs_confirmation', httpStatus: 409, preview: null, warnings: [OVER] }
+            : {},
+    });
+    const body = { total: '10', number: '1001' };
+    const a = await operate(agentCtx, { operation: 'invoices.create', body, confirm: ['allowOverBilling', 'allowDuplicateNumber'], requestId: rid(), reason: 'The customer agreed' });
+    expect(a.outcome).toBe('asked');
+    const req = m.createAgentRequest.mock.calls[0][1] as Out;
+    expect(req.preview.warnings).toEqual([DUP, OVER]);
+    // The tries were dry runs as the agent, the first without any flag; the stored input keeps the flags.
+    const dries = callsOf('dry_run');
+    expect(dries.map((c) => c.input.confirm ?? [])).toEqual([['allowOverBilling', 'allowDuplicateNumber'], [], ['allowDuplicateNumber']]);
+    expect(req.input.confirm).toEqual(['allowOverBilling', 'allowDuplicateNumber']);
+    expect(callsOf('commit')).toHaveLength(0);
+
+    // One flag: one try without it. None at all for a request without flags.
+    bridgeAnswers({ dry_run: (input) => (input.confirm?.includes('allowDuplicateNumber') ? {} : { outcome: 'needs_confirmation', httpStatus: 409, preview: null, warnings: [DUP] }) });
+    m.createAgentRequest.mockClear();
+    m.runOperation.mockClear();
+    await operate(agentCtx, { operation: 'invoices.create', body, confirm: ['allowDuplicateNumber'], requestId: rid(), reason: 'Sent twice on purpose' });
+    expect((m.createAgentRequest.mock.calls[0][1] as Out).preview.warnings).toEqual([DUP]);
+    expect(callsOf('dry_run')).toHaveLength(2);
+    bridgeAnswers({});
+    m.runOperation.mockClear();
+    await operate(agentCtx, { operation: 'invoices.create', body: { total: '11' }, requestId: rid(), reason: 'Plain' });
+    expect(callsOf('dry_run')).toHaveLength(1);
+  });
+
+  it('a new preview shown at approval carries the silenced warnings too', async () => {
+    const DUP = { flag: 'allowDuplicateNumber', message: 'Invoice 1001 is already used.' };
+    bridgeAnswers({
+      dry_run: (input) => (input.confirm?.includes('allowDuplicateNumber') ? { stalenessKey: 'books-now' } : { outcome: 'needs_confirmation', httpStatus: 409, preview: null, warnings: [DUP] }),
+    });
+    const id = await storedRequest('books-then');
+    const r = await runApproved(approver, { id, agentId, operation: 'invoices.create', input: { body: { total: '10' }, confirm: ['allowDuplicateNumber'] } }, {}, { atHost: true });
+    expect(r).toMatchObject({ mode: 'dry_run', outcome: 'ok', stalenessKey: 'books-now' });
+    expect(r.preview?.warnings).toEqual([DUP]);
+    expect(callsOf('commit')).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The real bridge: journal entries through the app's own route, on this PGlite company
 // ---------------------------------------------------------------------------
 
@@ -2287,5 +2951,31 @@ describe('POST /api/agent/actions', () => {
     resetAgentRateLimits();
     const unknown = await post({ verb: 'make_me_admin' });
     expect(unknown.status).toBe(400);
+  });
+
+  it('answers 429 with Retry-After for a curated action too, thrown or answered as a refusal with the wait', async () => {
+    m.getServerContext.mockResolvedValue(agentCtx);
+    // A curated action that went through the door after the agent used up its calls: thrown.
+    for (let i = 0; i < AGENT_CALLS_PER_MINUTE; i++) await operate(agentCtx, { operation: 'nothing.here' });
+    const thrown = await post({ action: 'list_my_proposals', input: {} });
+    expect(thrown.status).toBe(429);
+    expect(thrown.json).toMatchObject({ code: 'RATE_LIMITED' });
+    resetAgentRateLimits();
+
+    // A refusal that carries the wait (the door's `operate`, called directly): 429, as for a thrown one.
+    m.runAgentAction.mockResolvedValueOnce({ action: 'add_customer', outcome: 'refused', note: 'Wait about 7 seconds, then carry on.', retryAfterSeconds: 7 });
+    const res = await actionsPOST(
+      new NextRequest('http://localhost:45123/api/agent/actions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'add_customer', input: {} }) }),
+    );
+    expect(res.status).toBe(429);
+    expect(res.headers.get('retry-after')).toBe('7');
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(await res.json()).toEqual({ error: 'Wait about 7 seconds, then carry on.', code: 'RATE_LIMITED', details: { retryAfterSeconds: 7 } });
+
+    // Any other refusal is an ordinary answer.
+    m.runAgentAction.mockResolvedValueOnce({ action: 'add_customer', outcome: 'refused', note: 'Not allowed.' });
+    const plain = await post({ action: 'add_customer', input: {} });
+    expect(plain.status).toBe(200);
+    expect(plain.json).toMatchObject({ outcome: 'refused', note: 'Not allowed.' });
   });
 });

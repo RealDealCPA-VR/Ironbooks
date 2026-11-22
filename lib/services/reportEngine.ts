@@ -1561,7 +1561,19 @@ export async function fetchGlLines(
   // Name / number / job / item filters (and a memo filter matched as shown) are applied after
   // resolution, so read a larger window first.
   const postFilter = !!(f.nameId || f.number || f.jobCustomerId || f.itemId || shownMemoSearch);
-  const fetchCap = postFilter ? GL_LIMITS.postFilterScan : limit + 1;
+  let fetchCap = postFilter ? GL_LIMITS.postFilterScan : limit + 1;
+  if (shownMemoSearch && !(f.nameId || f.number || f.jobCustomerId || f.itemId)) {
+    // Only the memo check below drops lines, and only a line whose memo the mask may change and
+    // whose description did not match: read that many lines past the limit (at most the scan cap),
+    // so a memo filter reads about what it read before the mask, not the whole cap every time.
+    const [counted] = await ctx.db
+      .select({ n: sql<number>`COUNT(*)` })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .leftJoin(classes, eq(journalEntryLines.classId, classes.id))
+      .where(and(...conds, memoMayHoldAccountNumber(), sql`NOT COALESCE(${descriptionHit}, false)`));
+    fetchCap = Math.min(limit + 1 + Number(counted?.n ?? 0), GL_LIMITS.postFilterScan);
+  }
 
   const read = await ctx.db
     .select({

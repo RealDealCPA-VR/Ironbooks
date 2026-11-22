@@ -16,8 +16,9 @@
  *    route is refused;
  *  - through the door, an Admin-role agent on the widest preset is asked about every operation of
  *    Users & Roles and File Utilities, except a short list of GETs the registry classes 'read' on
- *    purpose, each with its reason (pinned here so it can only shrink), and every read of Users &
- *    Roles is among the asked ones.
+ *    purpose, each with its reason (pinned here exactly), and every read of Users & Roles is among
+ *    the asked ones; a person's own reads of the company file are not offered, the file's name is
+ *    asked about, and the raw transaction log is refused.
  */
 import { describe, expect, it, vi } from 'vitest';
 
@@ -35,13 +36,12 @@ vi.mock('./routes', async (importOriginal) => {
   };
 });
 
+import * as agentAccessModule from './agentAccess';
 import {
   AGENT_ACTION_ROUTE,
-  AGENT_DENIED_AREAS,
   AGENT_DOOR_ONLY_AREAS,
   AGENT_HARD_FLOOR_ROUTES,
   AGENT_OWN_ROUTES,
-  AGENT_READ_ROUTES,
   agentDirectAccess,
   agentDirectReadAllowed,
   agentRouteAllowed,
@@ -276,9 +276,11 @@ describe("what an agent's own request reaches (agentRouteAllowed)", () => {
     }
   });
 
-  it('keeps the old names only as the new lists (until the tests that import them are rewritten)', () => {
-    expect(AGENT_READ_ROUTES).toBe(AGENT_OWN_ROUTES);
-    expect(AGENT_DENIED_AREAS).toBe(AGENT_DOOR_ONLY_AREAS);
+  it('no longer has the old names of the lists: nothing imports them', () => {
+    // AGENT_READ_ROUTES (the fixed list of 38 reads) and AGENT_DENIED_AREAS (areas the clamp took
+    // away) described rules that are gone; their last importers were rewritten, so they went too.
+    expect('AGENT_READ_ROUTES' in agentAccessModule).toBe(false);
+    expect('AGENT_DENIED_AREAS' in agentAccessModule).toBe(false);
   });
 
   it('refuses the agent, approval and grant routes outright, whatever the registry says', () => {
@@ -360,26 +362,19 @@ describe('Users & Roles and File Utilities through the door (the policy, with an
    * by class, not by area, so these are the GETs the registry (lib/agent/operations/classes/*.ts)
    * classes 'read'. Plan 4.2 files the reads of Users & Roles under admin and the File Utilities
    * reads that show file names, folders or backups, or produce a file, under file; what is left
-   * here is left on purpose, each with its reason. The list may only shrink: a new operation of
-   * these areas that runs unasked fails the test below.
+   * here is left on purpose, each with its reason. The list is exact both ways: a new operation of
+   * these areas that runs unasked fails the test below, and so does an entry here that no longer
+   * runs unasked (take it off).
    */
   const KNOWN_UNASKED: Readonly<Record<string, string>> = {
     // classes/admin.ts: pure checks of the books (plan 4.2 lets them stay read). They answer pass
-    // or fail per check and show no file name, folder or backup. Deliberate: an entry here that no
-    // longer runs unasked fails too, so the list says what really happens.
+    // or fail per check and show no file name, folder or backup.
     integrity: 'a pure check of the books',
     'integrity.books-in-balance': 'a pure check of the books',
-  };
-  /**
-   * Still unasked in a classification file another unit owns, waiting on its owner. Allowed to run
-   * unasked here, but never required to: classing it file just takes it out of the way.
-   */
-  const OTHERS_OPEN: Readonly<Record<string, string>> = {
-    // classes/lists.ts: Clean Up Company Data's preview (GET /api/cleanup). Its owner has classed
-    // it read, with the reason written there (it lists inactive, unused list entries, never a file,
-    // folder or backup). It moves to KNOWN_UNASKED once that file settles; until then this list
-    // tolerates either class, so this test does not break while another unit edits its own file.
-    cleanup: "classed read in classes/lists.ts: lists unused list entries, no file",
+    // classes/lists.ts: Clean Up Company Data's preview (GET /api/cleanup), classed read there with
+    // its reason: it lists inactive, unused list entries of the books, never a file, folder or
+    // backup, and produces no file.
+    cleanup: 'lists unused list entries of the books, no file',
   };
 
   const PLAIN: RequestFacts = { confirm: [], reveal: false, amount: null, count: null, entityIds: [], accountIds: [], date: null, closedPeriod: false };
@@ -411,7 +406,7 @@ describe('Users & Roles and File Utilities through the door (the policy, with an
       expect(op.kind === 'route' ? op.method : 'GET', op.id).toBe('GET');
     }
     expect(
-      unasked.filter((id) => !(id in KNOWN_UNASKED) && !(id in OTHERS_OPEN)),
+      unasked.filter((id) => !(id in KNOWN_UNASKED)),
       'operations of Users & Roles or File Utilities that run without asking',
     ).toEqual([]);
     // What is deliberately left is still what happens: an entry asked about now, or gone, comes out.
@@ -426,7 +421,12 @@ describe('Users & Roles and File Utilities through the door (the policy, with an
     const reads = allOperations().filter((op) => op.kind === 'route' && op.method === 'GET' && doorOnly(op));
     expect(reads.length).toBeGreaterThan(10);
     for (const op of reads) {
-      if (op.id in KNOWN_UNASKED || op.id in OTHERS_OPEN) continue;
+      if (op.id in KNOWN_UNASKED) {
+        // What is left read is a plain read of File Utilities, never of Users & Roles.
+        expect(op.class, op.id).toBe('read');
+        expect(op.area, op.id).toBe('file_utilities');
+        continue;
+      }
       const users = op.area === 'users' || (typeof op.rule === 'object' && op.rule?.area === 'users');
       expect(op.class, op.id).toBe(users ? 'admin' : 'file');
       expect(['ask', 'refuse'], op.id).toContain(outcome(op));
@@ -438,5 +438,22 @@ describe('Users & Roles and File Utilities through the door (the policy, with an
     for (const id of ['backups', 'backups.status', 'condense.archives', 'export.get', 'import.rebuild', 'portable.shareable', 'qb-import.gl', 'qb-import.open-items', 'report-schedules.list', 'sandbox']) {
       expect(operationById(id)?.class, id).toBe('file');
     }
+  });
+
+  it("the company file's own reads: a person's own are not offered, the file's name asks an Admin, the raw log is refused", () => {
+    // A person's own account ('self'): the route refuses every agent, so the door does not offer it.
+    for (const id of ['companies.list', 'file-protection.status']) {
+      const op = operationById(id)!;
+      expect(op, id).toMatchObject({ method: 'GET', rule: 'self', availability: 'person_only' });
+      expect(outcome(op), id).toBe('refuse');
+    }
+    // The sign-in screen's read of the company file's name (a 'public' route): class file, asked.
+    const info = operationById('company-file.info')!;
+    expect(info).toMatchObject({ method: 'GET', class: 'file', availability: 'agent', dryRun: 'none' });
+    expect(outcome(info)).toBe('ask');
+    // The raw transaction log cannot be masked: never for an agent, approval or not.
+    const raw = operationById('transaction-log.download')!;
+    expect(raw).toMatchObject({ method: 'GET', area: 'file_utilities', availability: 'hard_floor' });
+    expect(outcome(raw)).toBe('refuse');
   });
 });

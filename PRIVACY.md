@@ -16,7 +16,7 @@ This document lists everything that can leave the machine, and what controls it.
 | Emailing an invoice | Only the message and PDF you send, to your SMTP server | Privacy & Network → Email |
 | Bank transactions | **Nothing.** Ironbooks never connects to your bank or a feed service; transactions come only from statement files you import. | — |
 | Vendor lookup (new vendors only) | Only the vendor's name (store numbers and long digit runs removed), to **your own** SearXNG, which searches public engines. **Off by default**; needs your OK even when SearXNG is on your tailnet; never in Offline mode. | Privacy & Network → Vendor lookup (your SearXNG) |
-| AI agents you connect (agent access) | Ironbooks sends nothing by itself. An agent an Admin lets in works in the books on this computer (reading, and entering if the Admin allowed it), and what it reads goes to the AI service that runs that agent, **not redacted**. Nothing leaves when the agent runs on a model on your own computer or network. **Off until an Admin makes an agent.** | Users & Roles → Agents; Preferences → Integrated Applications |
+| AI agents you connect (agent access) | Ironbooks sends nothing to the agent's AI service itself. An agent an Admin lets in works in the books on this computer, and what it reads goes to whoever runs that agent's model, **not redacted** (full SSNs and account numbers stay masked unless a person approves a reveal). Anything an agent asks to send out (an email, a 1099 file, a call to the app's AI) goes only after a person approves it. Nothing leaves when the agent runs on a model on your own computer or network. **Off until an Admin makes an agent.** | Users & Roles → Agents; Agent requests; Preferences → Integrated Applications |
 | Update checks | App version and platform only (no company data); **on by default** | Privacy & Network → App updates |
 | Telemetry / analytics / crash reports | **None.** | — |
 | Web fonts / CDNs | **None.** Fonts are bundled at build time. | — |
@@ -195,9 +195,74 @@ at once (further sign-ins over the network are refused until someone logs out).
 
 ## Agent access
 
-An Admin can let an AI agent work in one company's books ([`AGENT_ACCESS.md`](./AGENT_ACCESS.md)):
-read only, proposing entries for a person to approve, or entering them itself.
+An Admin can let an AI agent work in one company's books ([`AGENT_ACCESS.md`](./AGENT_ACCESS.md)).
+What it does by itself, what it must ask a person for and what it may never do are set per agent.
 A company file with no agents behaves exactly as before.
+
+### What leaves the computer when an agent is connected
+
+- **What the agent reads goes to whoever runs the agent's model.** The agent is a program of your
+  choosing (Claude Code, Claude Desktop, another client) talking to an AI model. Everything it reads
+  from the books (names, addresses, amounts, memos, reports) goes to that model as it is. The
+  redaction Ironbooks applies to its own cloud AI calls does not apply to an outside agent. Run the
+  agent on a model on your own computer or network to keep everything local. Choose the agent's
+  role with this in mind: it sees what a person with that role sees.
+- **Ironbooks itself sends nothing for the agent.** The connector talks only to the Ironbooks app
+  on this computer (`127.0.0.1`). Ironbooks does not call the agent's AI service, does not know
+  which one it is, and sends no copy of anything anywhere because an agent is connected.
+- **One thing Ironbooks may send by itself, if an Admin turns it on:** the email notice for an agent
+  that works while nobody is signed in. When such an agent asks for approval and nobody is signed
+  in, the company's Admins get a short email through the company's own mail server, naming the
+  agent and what it asks, with links removed (at most one every ten minutes per agent). It is off
+  unless an Admin ticks it under Users & Roles → Agents → the agent → Limits.
+
+### Masked by default, revealed one request at a time
+
+- Full Social Security numbers and tax IDs, and full bank and account numbers, are masked in
+  everything an agent reads ("\*\*\*-\*\*-6789", "••••6789"), including labelled numbers inside memos
+  ("Acct # ••••1234"). The text read off a receipt is not given to an agent unless a reveal is
+  approved. Masking finds numbers by their field and by their label: a number typed into a note
+  with no label can still reach the agent.
+- An agent may ask to see the full values for one request (a reveal). A person who may see them
+  (the matching View right) must approve it, one request at a time, never as standing permission.
+  The approval card says that what the agent reads is sent to the AI service that runs it.
+- The agent can read the revealed answer again for 15 minutes after the run; after that it is
+  masked for good. The audit trail records which kinds of values of which record or report were
+  revealed, to which agent, approved by whom.
+
+### Sends an agent asks for
+
+- **Email** (invoices and other forms, statements, reports, purchase orders), **the app's own AI
+  features** (statement assist, AI suggestions for bank lines), **update downloads** and
+  **installing Ollama** are all "send outside this computer". A person approves each one; an Admin
+  may give a standing permission of at most 30 minutes for a batch, such as month-end statements.
+- The 1099 e-file file holds every recipient's full tax ID, so getting it is a reveal that someone
+  with "View sensitive payroll data" approves. It goes to the agent (and so to its AI service);
+  saving it to a folder is approved separately.
+- The approval card shows every recipient with their domain in full, the subject and the
+  attachments, or the computer a call goes to. An agent may only name plain email addresses: no
+  display names, quotes, brackets or comments that could hide where a message really goes.
+- An approved send goes through the same gates as a person's: the company's own mail server, its AI
+  settings and the Privacy & Network rules on this page. A dry run sends nothing, and a run that
+  fails sends nothing.
+- An agent can never change where this computer connects by itself: AI servers, the mail server and
+  Privacy & Network are settings a person approves, at the computer that holds the company file.
+
+### Files an agent may read or save
+
+- An agent may hand Ironbooks a file it holds (an upload), or ask the connector to read a file on
+  this computer. The connector reads only inside folders an Admin opened to that agent, never inside
+  Ironbooks' own folders (settings, working copies of company files, staged agent files), never
+  through a network share of this same computer, and never a whole drive or share. Every refused
+  read is written to the connector's own log.
+- Files an agent works with are kept on this computer, outside the company file (next to the
+  company file's working copy, in `agent-files`), so they never travel with the books. They are
+  removed after 24 hours and when the file closes.
+- Saving a file to a folder is approved by an Admin at the computer that holds the company file,
+  only into the company file's folder, `Documents\Ironbooks`, its `Agent Outbox` or a folder the
+  Admin added, and never over a file that is already there.
+
+### How an agent reaches the books
 
 - The agent reaches the books through the app's own server on this computer (`127.0.0.1`). Nothing
   new listens on the network, and an agent does not work through multi-user hosting.
@@ -205,9 +270,8 @@ A company file with no agents behaves exactly as before.
   file in your own profile folder (`%LOCALAPPDATA%\Ironbooks\agent-endpoints`) so the agent's
   connector can find the app. It holds the app's local port and a check value for that run, nothing
   from the books, and is removed when the app closes or the last agent is removed.
-- An agent sees and does only what its role and its mode allow. It never sees full Social
-  Security numbers or full account numbers, and it cannot change where this computer connects.
-  What it enters is recorded under its own name in the audit trail.
+- What an agent does is recorded under its own name in the audit trail, with the person who
+  approved it.
 - An agent works only while a person has the company file open and has signed in, unless an Admin
   ticked **May work while nobody is signed in** for it. Then Ironbooks may open the company file
   by itself, with no window, while that agent is working, and closes it again. It never does this
@@ -216,9 +280,6 @@ A company file with no agents behaves exactly as before.
 - Only a keyed digest of the agent's access token is stored, tied to this computer and this company
   file. A copy of the file, a backup or a portable file carries no agent that works elsewhere, and
   restoring a backup removes every agent's access.
-- **What the agent reads is sent to whatever AI service runs it, as it is.** The redaction Ironbooks
-  applies to its own cloud AI calls does not apply to an outside agent. Run the agent on a model on
-  your own computer or network to keep everything local.
 
 ## Receipts (photos and PDFs)
 

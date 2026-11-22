@@ -13,7 +13,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { recordFxAdjustment } from '@/lib/services/currencies';
 import { routeError, requireJsonObject } from '@/lib/routeErrors';
-import { parseDateInput } from '@/lib/validation/helpers';
+import { bodyValidationError, parseDateInput } from '@/lib/validation/helpers';
+import { fxAdjustmentSchema } from '@/lib/validation/currencies';
 
 const bad = (error: string) => NextResponse.json({ error, code: 'VALIDATION' }, { status: 400 });
 
@@ -39,6 +40,10 @@ export async function POST(req: NextRequest) {
     const when = parseDateInput(date);
     if (!when) return bad(`"${date}" is not a valid date`);
     if (memo != null && typeof memo !== 'string') return bad('memo must be text');
+    // The body as agents read it described (lib/validation/currencies.ts). Every field is checked
+    // above, so this refuses nothing those checks let through.
+    const checked = fxAdjustmentSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const result = await recordFxAdjustment(ctx, {
       accountId,

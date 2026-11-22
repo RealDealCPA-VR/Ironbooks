@@ -111,8 +111,16 @@ describe('raw .bktlg download with its verification report', () => {
     await db.insert(userRoleAssignments).values({ userId: owner.userId!, companyId: otherCompanyId, roleKey: 'ar_clerk' });
     await expect(prepareRawLogDownload(owner)).rejects.toMatchObject({ code: 'FORBIDDEN' });
     await expect(transactionLogVerificationReport(owner)).rejects.toMatchObject({ code: 'FORBIDDEN' });
-    // The built-in Accountant role there (it may export the file): allowed.
+    // The built-in Accountant role there may export the file, but does not see full tax IDs and
+    // account numbers, which the raw log holds as recorded (it cannot be masked): refused.
     await db.update(userRoleAssignments).set({ roleKey: 'accountant' }).where(and(eq(userRoleAssignments.userId, owner.userId!), eq(userRoleAssignments.companyId, otherCompanyId)));
+    await expect(prepareRawLogDownload(owner)).rejects.toMatchObject({ code: 'FORBIDDEN', message: expect.stringContaining('View full bank / account numbers') });
+    // The verification report holds only sizes, fingerprints and the chain check: no View right needed.
+    const { report } = await transactionLogVerificationReport(owner);
+    expect(report.verification.chainIntact).toBe(true);
+    expect(JSON.stringify(report)).not.toContain('Otto vendor');
+    // Full Access there (the export right and both View rights, not an Admin): allowed.
+    await db.update(userRoleAssignments).set({ roleKey: 'full_access' }).where(and(eq(userRoleAssignments.userId, owner.userId!), eq(userRoleAssignments.companyId, otherCompanyId)));
     await expect(prepareRawLogDownload(owner)).resolves.toMatchObject({ bytes: expect.any(Number) });
     // Deactivated there: refused again.
     await db.update(userCompanies).set({ isActive: false }).where(and(eq(userCompanies.userId, owner.userId!), eq(userCompanies.companyId, otherCompanyId)));
@@ -123,8 +131,30 @@ describe('raw .bktlg download with its verification report', () => {
   it('in the current company too, the File Utilities export right is needed (not just any write right)', async () => {
     const clerk = unionRoles([builtinRole('ar_clerk')!]);
     await expect(prepareRawLogDownload({ ...owner, role: 'accountant', access: clerk })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    // The Accountant may export the file, but the raw log holds full tax IDs and account numbers,
+    // which that role does not see: refused, with the CSV offered instead.
     const accountant = unionRoles([builtinRole('accountant')!]);
-    await expect(prepareRawLogDownload({ ...owner, role: 'accountant', access: accountant })).resolves.toMatchObject({ bytes: expect.any(Number) });
+    await expect(prepareRawLogDownload({ ...owner, role: 'accountant', access: accountant })).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+      message: expect.stringContaining('export the log as CSV instead'),
+    });
+    // With both View rights as well: allowed.
+    const seesAll = { ...accountant, flags: { ...accountant.flags, sensitivePayroll: true, fullAccountNumbers: true } };
+    await expect(prepareRawLogDownload({ ...owner, role: 'accountant', access: seesAll })).resolves.toMatchObject({ bytes: expect.any(Number) });
+    // One of the two is not enough.
+    await expect(
+      prepareRawLogDownload({ ...owner, role: 'accountant', access: { ...seesAll, flags: { ...seesAll.flags, sensitivePayroll: false } } }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+
+  it('an agent never takes the raw log: its run has the View rights of an approved reveal only', async () => {
+    const admin = unionRoles([builtinRole('admin')!]);
+    const agent: NonNullable<ServiceContext['agent']> = { id: '00000000-0000-4000-8000-0000000000a1', name: 'Bot', mode: 'post' };
+    // An agent with the Admin role, its flags off as the route bridge runs it (no reveal).
+    const masked = { ...admin, flags: { ...admin.flags, sensitivePayroll: false, fullAccountNumbers: false } };
+    await expect(prepareRawLogDownload({ ...owner, role: 'admin', access: masked, agent })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    // Even with both flags: its reader leaves out File Utilities, so it may not export the file.
+    await expect(prepareRawLogDownload({ ...owner, role: 'admin', access: admin, agent })).rejects.toMatchObject({ code: 'FORBIDDEN' });
   });
 
   it("a deleted company's records go only to an Admin of every company in the file", async () => {

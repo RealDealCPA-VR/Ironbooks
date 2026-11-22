@@ -2,13 +2,18 @@
  * GET    /api/journal-entries/:id   — fetch a single entry with lines + account names.
  * PATCH  /api/journal-entries/:id   — edit a posted entry (void + repost atomically).
  * DELETE /api/journal-entries/:id   — void a posted entry (reverses balances).
+ *
+ * GET answers the entry as this caller may see it (getEntryForCaller): a line memo holding a
+ * payee's full account number ("Acct # 000123456789") reads masked to a person or agent without
+ * "view full account numbers", as it does in the registers and reports. The Save that follows sends
+ * the masked memo back; updateEntry keeps the stored text for it (journal.ts keepHiddenMemos).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { serviceErrorBody, serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
-import { getEntry, updateEntry, voidEntry } from '@/lib/services/journal';
+import { getEntryForCaller, updateEntry, voidEntry } from '@/lib/services/journal';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateJournalEntrySchema } from '@/lib/validation/journal';
 
@@ -18,7 +23,7 @@ export async function GET(_req: NextRequest, { params }: Params) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    const entry = await getEntry(ctx, id);
+    const entry = await getEntryForCaller(ctx, id);
     return NextResponse.json({ entry });
   } catch (err) {
     return mapError(err);

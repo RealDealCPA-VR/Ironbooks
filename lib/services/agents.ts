@@ -37,10 +37,10 @@ import { agentGrants, agentPolicies, agents, companies, users } from '@/lib/db/s
 import { companyFileId } from '@/lib/auth';
 import { deviceKey } from '@/lib/ai/keyVault';
 import { AGENT_TOKEN_RE } from '@/lib/net/agentToken';
-import { canActivity, unionRoles, type EffectiveAccess } from '@/lib/permissions/model';
+import { AREA_KEYS, canActivity, unionRoles, type Area, type EffectiveAccess } from '@/lib/permissions/model';
 import { AGENT_MODES, AGENT_MODE_LABELS, clampForAgent, isAgentMode, type AgentMode } from '@/lib/permissions/agentAccess';
-import { DEFAULT_PRESET, isAgentPreset, presetBulkCap, presetForMode } from '@/lib/agent/policy';
-import { AGENT_PRESET_LABELS, type AgentPreset } from '@/lib/agent/operations/types';
+import { DEFAULT_PRESET, isAgentPreset, isPolicySetting, presetBulkCap, presetForMode, resolvePolicy, settingFor } from '@/lib/agent/policy';
+import { AGENT_PRESET_LABELS, isRiskClass, type AgentPreset, type PolicyOverride, type PolicySetting, type RiskClass } from '@/lib/agent/operations/types';
 import { endpointPublished, personSignedIn, publishEndpoint, withdrawEndpoint } from '@/lib/agent/endpointFile';
 // The scope module, not lib/context.ts: it holds no database or service imports (no cycle).
 import { inServiceScope } from '@/lib/serviceScope';
@@ -80,8 +80,9 @@ export interface AgentView {
   /** May work while nobody is signed in (never in a file with passwords or a file password). */
   unattended: boolean;
   /**
-   * How many adjustments it has on top of its preset (stored agent_policies rows), so the list can
-   * say "adjusted" next to the preset's name (contract section 11, GET /api/agents).
+   * How many adjustments it has on top of its preset, so the list can say "adjusted" next to the
+   * preset's name (contract section 11, GET /api/agents): stored agent_policies rows that change
+   * what their cell would otherwise follow (adjustmentCount). A row that only repeats it is not one.
    */
   overrideCount: number;
 }
@@ -259,14 +260,53 @@ async function roleNameMap(db: DB, companyId: string): Promise<Map<string, strin
   return new Map((await listRoleDefinitions(db, companyId)).map((r) => [r.key, r.name]));
 }
 
-/** Stored adjustments (agent_policies rows) per agent of this company; an agent with none is absent. */
-async function overrideCounts(db: DB, companyId: string, agentId?: string): Promise<Map<string, number>> {
+const isArea = (v: unknown): v is Area => typeof v === 'string' && (AREA_KEYS as string[]).includes(v);
+
+/**
+ * How many of an agent's stored adjustments change what their cell would otherwise follow, read
+ * through the policy engine (the rule keptAsChosen in app/users/agents/policyDraft.ts uses on the
+ * screen): a row for everywhere counts when it differs from the preset's own setting, a row for one
+ * area when it differs from what everywhere says without it. So a setting clicked back to what the
+ * cell follows anyway ("kept as chosen") is no adjustment, and an agent whose policy is exactly its
+ * preset is never listed as adjusted. A row the engine ignores (an unknown class, area or setting)
+ * counts for nothing, a cell stored twice counts once, and an Allow the engine never gives is read
+ * as the Ask it becomes.
+ */
+export function adjustmentCount(preset: AgentPreset, rows: readonly PolicyOverride[]): number {
+  const known = rows.filter(
+    (o): o is PolicyOverride => !!o && isRiskClass(o.class) && (o.area === null || o.area === undefined || isArea(o.area)) && isPolicySetting(o.setting),
+  );
+  const policy = resolvePolicy(preset, known);
+  const cells = new Map<string, { cls: RiskClass; area: Area | null }>();
+  for (const o of known) cells.set(`${o.area ?? ''}|${o.class}`, { cls: o.class, area: o.area ?? null });
+  let n = 0;
+  for (const { cls, area } of cells.values()) {
+    const rest = known.filter((o) => !(o.class === cls && (o.area ?? null) === area));
+    const followed: PolicySetting = settingFor(resolvePolicy(preset, rest), null, cls);
+    if (settingFor(policy, area, cls) !== followed) n += 1;
+  }
+  return n;
+}
+
+/** Stored adjustments (agent_policies rows) per agent of this company, as stored; an agent with none is absent. */
+async function storedAdjustments(db: DB, companyId: string, agentId?: string): Promise<Map<string, PolicyOverride[]>> {
   const rows = await db
-    .select({ agentId: agentPolicies.agentId, n: sql<number>`count(*)::int` })
+    .select({ agentId: agentPolicies.agentId, class: agentPolicies.class, area: agentPolicies.area, setting: agentPolicies.setting })
     .from(agentPolicies)
-    .where(agentId ? and(eq(agentPolicies.companyId, companyId), eq(agentPolicies.agentId, agentId)) : eq(agentPolicies.companyId, companyId))
-    .groupBy(agentPolicies.agentId);
-  return new Map(rows.map((r) => [r.agentId, Number(r.n)]));
+    .where(agentId ? and(eq(agentPolicies.companyId, companyId), eq(agentPolicies.agentId, agentId)) : eq(agentPolicies.companyId, companyId));
+  const out = new Map<string, PolicyOverride[]>();
+  for (const r of rows) {
+    const list = out.get(r.agentId) ?? [];
+    list.push({ class: r.class as RiskClass, area: (r.area ?? null) as Area | null, setting: r.setting as PolicySetting });
+    out.set(r.agentId, list);
+  }
+  return out;
+}
+
+/** The agent's adjustmentCount from the rows storedAdjustments read. */
+function adjustmentsOf(row: AgentRow, stored: Map<string, PolicyOverride[]>): number {
+  const rows = stored.get(row.id);
+  return rows?.length ? adjustmentCount(presetOfRow(row), rows) : 0;
 }
 
 /**
@@ -347,8 +387,8 @@ export async function listAgents(ctx: ServiceContext): Promise<AgentView[]> {
     .where(eq(agents.companyId, ctx.companyId))
     .orderBy(desc(agents.createdAt));
   const names = await roleNameMap(ctx.db, ctx.companyId);
-  const adjusted = await overrideCounts(ctx.db, ctx.companyId);
-  return rows.map((r) => toView(r.agent, names, r.createdByName ?? null, lastUsedOf(r.agent), adjusted.get(r.agent.id) ?? 0));
+  const adjusted = await storedAdjustments(ctx.db, ctx.companyId);
+  return rows.map((r) => toView(r.agent, names, r.createdByName ?? null, lastUsedOf(r.agent), adjustmentsOf(r.agent, adjusted)));
 }
 
 /**
@@ -415,8 +455,8 @@ export async function revokeAgent(ctx: ServiceContext, id: string): Promise<Agen
     return updated;
   });
   syncAgentEndpoint(ctx.db).catch(() => undefined);
-  const adjusted = await overrideCounts(ctx.db, ctx.companyId, row.id);
-  return toView(row, await roleNameMap(ctx.db, ctx.companyId), null, lastUsedOf(row), adjusted.get(row.id) ?? 0);
+  const adjusted = await storedAdjustments(ctx.db, ctx.companyId, row.id);
+  return toView(row, await roleNameMap(ctx.db, ctx.companyId), null, lastUsedOf(row), adjustmentsOf(row, adjusted));
 }
 
 /**

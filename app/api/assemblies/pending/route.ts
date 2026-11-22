@@ -10,6 +10,8 @@ import { createPendingBuild, listPendingBuilds } from '@/lib/services/assemblies
 import { inventoryDate } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { createPendingBuildSchema } from '@/lib/validation/assemblies';
 
 function serviceErrorToResponse(err: ServiceError): NextResponse {
   const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
@@ -51,6 +53,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     if (!body.date) {
       return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/assemblies.ts). The checks above answer
+    // first; it refuses only what the service could not use anyway.
+    const checked = createPendingBuildSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
 
     const build = await createPendingBuild(ctx, {
       assemblyItemId: body.assemblyItemId,

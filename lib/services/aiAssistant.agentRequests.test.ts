@@ -7,7 +7,11 @@
  *    Ask AI row too.
  *  - listProposals gives each agent row its request (link and state) and writes nothing. A
  *    withdrawn or expired request reads as rejected, with why. The agent's input is not part of the
- *    list. A status filter answers by the state shown.
+ *    list. A status filter answers by the state shown, and agent rows that read otherwise never
+ *    push real matches out of it. An agent reading the list is given only the proposals it made
+ *    itself.
+ *  - The refusal reaches the client with its "Open in Agent requests" fix (app/api/ai/_errors.ts),
+ *    and, when the row moved on since the list was read, with the row as it stands now.
  *  - One with no request cannot be approved (refused with what to do instead) but can be declined,
  *    which enters nothing. An agent never approves or declines anything.
  *  - The app's own proposals are approved here as before.
@@ -37,6 +41,7 @@ import { resolveAccess } from './access';
 import { createManualEntry } from './journal';
 import { approveAgentRequest, denyAgentRequest } from './agentRequests';
 import { ServiceError, type ServiceContext } from './_base';
+import { aiErrorResponse } from '@/app/api/ai/_errors';
 import {
   AGENT_DECIDES_NOTHING_MESSAGE,
   AGENT_PROPOSAL_ELSEWHERE_MESSAGE,
@@ -173,7 +178,13 @@ describe("an agent's proposal is decided in Agent requests, not in Ask AI", () =
     const r = await copiedRequest(p.id, 'Refused Here LLC');
     const err = await expectError(approveProposal(owner, p.id), 'FORBIDDEN');
     expect(err.message).toBe(AGENT_PROPOSAL_ELSEWHERE_MESSAGE);
-    expect(err.details).toEqual({ agentRequests: true, agentRequestId: r.id, href: `/agent-requests?id=${r.id}` });
+    expect(err.details).toEqual({
+      agentRequests: true,
+      agentRequestId: r.id,
+      href: `/agent-requests?id=${r.id}`,
+      // The row as the list shows it now, so the panel can show where it stands.
+      proposal: await viewOf(p.id),
+    });
     expect(err.fixes).toEqual([{ id: 'open-agent-request', label: 'Open in Agent requests', kind: 'navigate', href: `/agent-requests?id=${r.id}` }]);
     expect((await proposalOf(p.id)).status).toBe('pending');
     expect((await requestsFor(p.id))[0].status).toBe('pending');
@@ -308,6 +319,28 @@ describe("Ask AI's list of an agent's proposals", () => {
     expect((await proposalOf(p.id)).status).toBe('pending');
   });
 
+  it('a Decline refused because the row moved on carries the row as it stands now, without what the agent sent', async () => {
+    // Copied into Agent requests and denied there since the panel read its list; the Ask AI row
+    // is not settled yet.
+    const there = await agentProposal('Moved On LLC', {}, { displayName: 'Moved On LLC', taxId: '111-22-3333' });
+    const r = await copiedRequest(there.id, 'Moved On LLC', { status: 'denied' });
+    const refused = await expectError(rejectProposal(owner, there.id), 'FORBIDDEN');
+    const shown = (refused.details as { proposal: Record<string, unknown> }).proposal;
+    expect(shown).toMatchObject({ id: there.id, kind: 'agent_action', status: 'rejected', agentRequest: { id: r.id, status: 'denied' } });
+    expect(shown.payload).not.toHaveProperty('input');
+    expect(JSON.stringify(refused.details)).not.toContain('111-22-3333');
+
+    // Declined by someone else first: a conflict, with the row settled.
+    const leftover = await agentProposal('Declined First LLC', {}, { displayName: 'Declined First LLC', taxId: '444-55-6666' });
+    await rejectProposal(owner, leftover.id);
+    const second = await expectError(rejectProposal(person, leftover.id), 'CONFLICT');
+    expect(second.details).toMatchObject({ agentRequests: true, agentRequestId: null, proposal: { id: leftover.id, status: 'rejected', agentRequest: null } });
+    expect(JSON.stringify(second.details)).not.toContain('444-55-6666');
+    // The body the panel reads (app/api/ai/_errors.ts).
+    const body = await aiErrorResponse(second, 'test').json();
+    expect(body).toMatchObject({ code: 'CONFLICT', details: { proposal: { id: leftover.id, status: 'rejected' } } });
+  });
+
   it('an agent never approves or declines a proposal, its own kind or the assistant\'s', async () => {
     const leftover = await agentProposal('Agent Declines LLC');
     const listed = await agentProposal('Agent Approves LLC');
@@ -333,6 +366,26 @@ describe("Ask AI's list of an agent's proposals", () => {
     await expectError(approveProposal(onBehalf, mine.id), 'FORBIDDEN');
     await expectError(rejectProposal(onBehalf, mine.id), 'FORBIDDEN');
     expect((await proposalOf(mine.id)).status).toBe('pending');
+  });
+
+  it('the refusal reaches the client with its link to Agent requests (app/api/ai/_errors.ts)', async () => {
+    const p = await agentProposal('Error Body LLC');
+    const r = await copiedRequest(p.id, 'Error Body LLC');
+    const href = `/agent-requests?id=${r.id}`;
+    const res = aiErrorResponse(await expectError(approveProposal(owner, p.id), 'FORBIDDEN'), 'test');
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      error: AGENT_PROPOSAL_ELSEWHERE_MESSAGE,
+      code: 'FORBIDDEN',
+      details: { agentRequests: true, agentRequestId: r.id, href, proposal: JSON.parse(JSON.stringify(await viewOf(p.id))) },
+      fixes: [{ id: 'open-agent-request', label: 'Open in Agent requests', kind: 'navigate', href }],
+    });
+    // An error with no details and no fixes is answered as these routes always answered it.
+    expect(await aiErrorResponse(new ServiceError('VALIDATION', 'Ask a question.'), 'test').json()).toEqual({
+      error: 'Ask a question.',
+      code: 'VALIDATION',
+      details: null,
+    });
   });
 
   it('listing is a read, also for an agent: nothing is written', async () => {
@@ -383,6 +436,112 @@ describe("Ask AI's list of an agent's proposals", () => {
     }
     // Still a read: nothing settled by listing.
     expect((await proposalOf(done.id)).status).toBe('pending');
+  });
+
+  it('many agent rows that read otherwise never push real matches out of a filtered list', async () => {
+    // Dated in the past, so what later tests make is still the newest.
+    const hourAgo = Date.now() - 3_600_000;
+    const payload = { date: '2026-03-01', description: 'Older', lines: [], totalDebit: '0.00' };
+    const own = { companyId, createdBy: owner.userId, kind: 'journal_entry', payload };
+    const [ownWaiting] = await db.insert(aiProposals).values({ ...own, summary: 'Own, waiting', status: 'pending', createdAt: new Date(hourAgo) }).returning();
+    const [ownRejected] = await db.insert(aiProposals).values({ ...own, summary: 'Own, rejected', status: 'rejected', createdAt: new Date(hourAgo + 1) }).returning();
+    // Newer than both: agents' rows still 'pending' in this table, already done in Agent requests.
+    const stale = await db
+      .insert(aiProposals)
+      .values(
+        Array.from({ length: 105 }, (_, i) => ({
+          companyId,
+          createdBy: null,
+          agentId: agent.id,
+          kind: 'agent_action',
+          summary: `Done there ${i}`,
+          payload,
+          status: 'pending',
+          createdAt: new Date(hourAgo + 60_000 + i * 10),
+        })),
+      )
+      .returning();
+    await db.insert(agentPermissionRequests).values(
+      stale.map((p) => ({
+        companyId,
+        agentId: agent.id,
+        requestKey: `proposal:${p.id}`,
+        operation: 'action:add_customer',
+        class: 'change',
+        input: {},
+        summary: p.summary,
+        status: 'executed',
+        expiresAt: new Date(Date.now() + DAY),
+        proposalId: p.id,
+      })),
+    );
+
+    const waiting = await listProposals(owner, 'pending');
+    expect(waiting.map((x) => x.id)).toContain(ownWaiting.id);
+    expect(waiting.every((x) => x.status === 'pending')).toBe(true);
+    expect((await listProposals(owner, 'rejected')).map((x) => x.id)).toContain(ownRejected.id);
+    // Full of real matches: at most 100, each once, newest first.
+    const approved = await listProposals(owner, 'approved');
+    expect(approved).toHaveLength(100);
+    expect(new Set(approved.map((x) => x.id)).size).toBe(100);
+    expect(approved.every((x) => x.status === 'approved')).toBe(true);
+    const times = approved.map((x) => x.createdAt.getTime());
+    expect(times).toEqual([...times].sort((a, b) => b - a));
+    // Unfiltered, the 100 newest as before.
+    expect(await listProposals(owner)).toHaveLength(100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An agent reading the list (GET /api/ai/proposals, class 'read')
+// ---------------------------------------------------------------------------
+
+describe('an agent reading the list', () => {
+  it('is given only the proposals it made itself', async () => {
+    const mine = await agentProposal('Own Row LLC');
+    await copiedRequest(mine.id, 'Own Row LLC');
+    const other = await createAgent(owner, { name: 'Agent Elsewhere', roleKeys: ['bookkeeper'], mode: 'propose' });
+    const theirs = await agentProposal('Their Row LLC', { agentId: other.agent.id });
+    // Left over by the upgrade with no agent it could tell: no agent's.
+    const nobodys = await agentProposal('Nobody Row LLC', { agentId: null });
+    const all = await db.select().from(accounts).where(eq(accounts.companyId, companyId));
+    const persons = await createProposal(
+      owner,
+      {
+        type: 'journal_entry',
+        date: '2026-03-05',
+        description: 'A person asked Ask AI for this',
+        lines: [
+          { accountCode: all.find((a) => a.type === 'expense' && a.isActive)!.code, debit: '7.00' },
+          { accountCode: '1000', credit: '7.00' },
+        ],
+      },
+      'Assistant proposal for: "what did I spend on lunch with my lawyer?"',
+    );
+
+    for (const status of [undefined, 'pending']) {
+      const seen = await listProposals(agentCtx, status);
+      const ids = seen.map((p) => p.id);
+      expect(ids).toContain(mine.id);
+      expect(ids).not.toContain(theirs.id);
+      expect(ids).not.toContain(nobodys.id);
+      expect(ids).not.toContain(persons.id);
+      expect(seen.every((p) => p.kind === 'agent_action')).toBe(true);
+      expect(JSON.stringify(seen)).not.toContain('lawyer');
+    }
+    // A person still sees every one of them.
+    const shown = (await listProposals(owner)).map((p) => p.id);
+    for (const id of [mine.id, theirs.id, nobodys.id, persons.id]) expect(shown).toContain(id);
+    // The other agent is given its own and not this one's.
+    const otherCtx: ServiceContext = { ...agentCtx, agent: { id: other.agent.id, name: other.agent.name, mode: 'propose' } };
+    const theirView = (await listProposals(otherCtx)).map((p) => p.id);
+    expect(theirView).toContain(theirs.id);
+    expect(theirView).not.toContain(mine.id);
+  });
+
+  it('an agent id that cannot name an agent is given nothing', async () => {
+    const odd: ServiceContext = { ...agentCtx, agent: { id: 'not-an-id', name: 'Odd', mode: 'propose' } };
+    expect(await listProposals(odd)).toEqual([]);
   });
 });
 
@@ -492,6 +651,39 @@ describe('search_transactions and account numbers in line memos', () => {
       expect(((await runTool(masked, 'search_transactions', { query })) as Found).entries).toEqual([]);
     }
     expect(((await runTool(full, 'search_transactions', { query: '0009876' })) as Found).entries).toHaveLength(1);
+  });
+
+  it('also with the other spaces the mask reads as spaces (pasted or imported text)', async () => {
+    const all = await db.select().from(accounts).where(eq(accounts.companyId, companyId));
+    const liability = all.find((a) => a.code === '2200')!;
+    const bank = all.find((a) => a.code === '1000')!;
+    // An ideographic space, a figure space, a narrow no-break space and a zero-width no-break space.
+    const stored = [
+      'Account　No. 000222111999 quarterly rent',
+      'Acct #000333222111',
+      'A/C Number: 000444555666',
+      'Acct﻿# 000777888999',
+    ];
+    await createManualEntry(owner, {
+      date: new Date('2026-04-18T00:00:00Z'),
+      description: 'Unicode spaces',
+      lines: [
+        { accountId: liability.id, debit: '4.00', memo: stored[0] },
+        { accountId: liability.id, debit: '3.00', memo: stored[1] },
+        { accountId: liability.id, debit: '2.00', memo: stored[2] },
+        { accountId: liability.id, debit: '1.00', memo: stored[3] },
+        { accountId: bank.id, credit: '10.00' },
+      ],
+    });
+    const shown = memos(await runTool(masked, 'search_transactions', { query: 'Unicode spaces' }), 'Unicode spaces');
+    for (const s of stored) expect(shown).not.toContain(s);
+    expect(JSON.stringify(shown)).not.toMatch(/000222111999|000333222111|000444555666|000777888999/);
+    for (const query of ['0002221', '0003332', '0004445', '0007778', '000%999']) {
+      expect(((await runTool(masked, 'search_transactions', { query })) as Found).entries).toEqual([]);
+    }
+    // Still found by the words it shows; and by its digits by a caller who may see them.
+    expect(((await runTool(masked, 'search_transactions', { query: 'quarterly rent' })) as Found).entries.map((e) => e.description)).toEqual(['Unicode spaces']);
+    expect(((await runTool(full, 'search_transactions', { query: '0004445' })) as Found).entries).toHaveLength(1);
   });
 
   it('without the flag, such a memo is still found by what it shows', async () => {

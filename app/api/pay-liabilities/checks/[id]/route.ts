@@ -4,6 +4,8 @@ import { getServerContext } from '@/lib/context';
 import { routeError, requireJsonObject } from '@/lib/routeErrors';
 import { getPaymentCheck, voidPaymentCheck } from '@/lib/services/liabilityPayments';
 import { notFound } from '@/lib/services/_base';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { voidLiabilityCheckSchema } from '@/lib/validation/liabilities';
 
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -13,6 +15,9 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     if (body.action !== 'void') {
       return NextResponse.json({ error: 'action must be "void".', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/liabilities.ts); the check above answers first.
+    const checked = voidLiabilityCheckSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     const check = await getPaymentCheck(ctx, id);
     if (check.kind !== 'payroll_liability') throw notFound('Liability check');
     return NextResponse.json(await voidPaymentCheck(ctx, id));

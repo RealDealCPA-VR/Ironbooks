@@ -23,8 +23,9 @@
  * The shell checks everything again on its side (ticket, replay, input, folders) before it runs.
  *
  * Folders: the company file's folder counts only when it is not the top of a drive or share (a USB
- * stick's E:\, a mapped Q:\, \\server\share): then only Documents\Ironbooks and its Agent Outbox
- * apply. A folder the Admin added that is such a top, or leads to one, is never used either.
+ * stick's E:\, a mapped Q:\, \\server\share, a mounted volume's /Volumes/USB) nor reached through a
+ * share of this very computer (\\localhost\c$\…): then only Documents\Ironbooks and its Agent Outbox
+ * apply. A folder the Admin added that is such a place, or leads to one, is never used either.
  *
  * 'files.save' (runner 'server') is done here: one of the agent's staged files saved into a folder
  * agents may use, made new on the disk (an exclusive create: never over a file that is there, even
@@ -44,7 +45,7 @@ import { loadAgentPolicy } from '@/lib/services/agentPolicies';
 import { setPrintHandler, type PrintHandler } from '@/lib/effects';
 import { currentServiceScope } from '@/lib/serviceScope';
 import type { ShellOperationDef } from './contract';
-import { allowedFolder, readStagedFile } from './files';
+import { allowedFolder, isThisComputerShare, readStagedFile } from './files';
 import { SHELL_OPERATIONS } from './operations/shell';
 import { makeShellTicket, sealShellPrivate, shellAnswerChecks, shellFileRef, type ShellPrivate } from './shellTicket';
 
@@ -143,22 +144,49 @@ function cleanSecrets(secrets: Record<string, string> | null | undefined): Recor
 }
 
 /**
- * `p` is the top of a drive or a share ("E:\", "\\server\share", "/"): never a folder agents may
- * use, which would hand them the whole drive or share (electron/agentShell.js driveOrShareRoot).
+ * On macOS and Linux, by the words: the top folder of a mounted volume, or a folder that holds
+ * mounted volumes (/Volumes/<name>, /System/Volumes/Data, /media/<user>/<name>, /run/media/<user>/
+ * <name>, /mnt/<name>), compared without regard to case (electron/agentShell.js posixVolumeTop: the
+ * same rule, the same words).
  */
-export function isDriveOrShareRoot(p: string): boolean {
-  if (typeof p !== 'string' || !p.trim()) return false;
-  const resolved = path.resolve(p);
-  return resolved === path.parse(resolved).root;
+function posixVolumeTop(resolved: string): boolean {
+  const parts = resolved.split('/').filter(Boolean).map((s) => s.toLowerCase());
+  if (!parts.length) return true;
+  if (parts[0] === 'volumes' || parts[0] === 'mnt') return parts.length <= 2;
+  if (parts[0] === 'media') return parts.length <= 3;
+  if (parts[0] === 'run' && parts[1] === 'media') return parts.length <= 4;
+  if (parts[0] === 'system' && parts[1] === 'volumes') return parts.length <= 3;
+  return false;
 }
 
-/** The folders of `list` agents may use: never the top of a drive or share, as written or on the disk. */
+/**
+ * `p` is the top of a drive or a share ("E:\", "\\server\share", "/"), or on macOS and Linux a
+ * mounted volume's top folder (/Volumes/USB, /media/pat/USB, /mnt/c): never a folder agents may
+ * use, which would hand them the whole drive, share or volume (electron/agentShell.js
+ * driveOrShareRoot). By the words; lib/agent/files.ts allowedFolder also asks the disk.
+ * `platform`: this computer's, unless a test says another.
+ */
+export function isDriveOrShareRoot(p: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (typeof p !== 'string' || !p.trim()) return false;
+  const P = platform === 'win32' ? path.win32 : path.posix;
+  const resolved = P.resolve(p);
+  if (resolved === P.parse(resolved).root) return true;
+  return platform !== 'win32' && posixVolumeTop(resolved);
+}
+
+/**
+ * The folders of `list` agents may use: never the top of a drive or share, as written or on the
+ * disk, and never a share of this very computer (isThisComputerShare: \\localhost\c$\…), which is
+ * judged by the words before the disk is looked at.
+ */
 function usableFolders(list: readonly string[]): string[] {
   return list.filter((f) => {
-    if (isDriveOrShareRoot(f)) return false;
+    if (isDriveOrShareRoot(f) || isThisComputerShare(f)) return false;
     try {
-      // A folder that is a link to the top of a drive or share is refused like the top itself.
-      return !isDriveOrShareRoot(fs.realpathSync.native(f));
+      // A folder that is a link to the top of a drive or share, or to a share of this computer, is
+      // refused like those themselves.
+      const real = fs.realpathSync.native(f);
+      return !isDriveOrShareRoot(real) && !isThisComputerShare(real);
     } catch {
       return true; // not there (yet): allowedFolder refuses a folder that is not there
     }
@@ -179,14 +207,15 @@ async function policyFolders(approver: ServiceContext, agentId: string): Promise
  * The folders agents may use without the Admin naming them: the open company file's folder, and
  * Documents\Ironbooks with its Agent Outbox. Documents is the one the desktop shell told this
  * server (the same the shell's own check uses); without the shell, the one in this account's home.
- * A company file at the top of a drive or share adds no folder of its own: only Documents applies.
+ * A company file at the top of a drive or share, or opened through a share of this very computer,
+ * adds no folder of its own: only Documents applies.
  */
 export function defaultAgentFolders(): string[] {
   const out: string[] = [];
   const companyFile = process.env.BKA_COMPANY_FILE?.trim();
   if (companyFile) {
     const dir = path.dirname(path.resolve(companyFile));
-    if (!isDriveOrShareRoot(dir)) out.push(dir);
+    if (!isDriveOrShareRoot(dir) && !isThisComputerShare(dir)) out.push(dir);
   }
   const told = process.env[SHELL_DOCUMENTS_ENV]?.trim();
   const docs = told && path.isAbsolute(told) ? told : path.join(os.homedir(), 'Documents');

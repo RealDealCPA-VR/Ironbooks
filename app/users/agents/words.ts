@@ -30,37 +30,51 @@ export const PRESET_HELP: Record<AgentPreset, string> = {
 export const NEW_AGENT_PRESET: AgentPreset = DEFAULT_PRESET;
 
 /**
- * The preset as the list and the detail page name it, with how many settings the agent has of its
- * own (stored adjustments, AgentView.overrideCount): "Read only (adjusted: 2)". So an agent
- * switched to "Read only" that still has looser changes is never shown as plain "Read only".
+ * The preset as the list and the detail page name it, with how many of the agent's settings
+ * differ from the preset: "Read only (adjusted: 2)". So an agent switched to "Read only" that
+ * still has looser changes is never shown as plain "Read only".
+ *
+ * N counts only settings that change what the cell would otherwise follow. A setting kept as
+ * chosen (the preset's own, clicked, so a later change of preset cannot move it) changes nothing
+ * today and is not counted. The list takes N from the server (AgentView.overrideCount, which counts
+ * that way); the detail page works it out from the agent's own settings (differingCount), so its
+ * header is right whatever the server counts.
  */
-export function presetSummary(label: string, changes: number | null | undefined): string {
-  if (!label || !changes || changes < 1) return label;
-  return `${label} (adjusted: ${changes})`;
+export function presetSummary(label: string, differing: number | null | undefined): string {
+  if (!label || !differing || differing < 1) return label;
+  return `${label} (adjusted: ${differing})`;
 }
 
 /**
- * What "(adjusted: N)" means, for its tooltip. N counts every setting of the agent's own, and one
- * may only keep the setting its cell would follow anyway ("Kept as chosen", so a later change of
- * preset cannot move it): an adjusted agent does not always do other than its preset. The list
- * cannot tell (it has the count only), so it says so; the detail page passes `kept`, how many of
- * them change nothing today (policyDraft.ts keptAsChosen), and says it exactly.
+ * What "(adjusted: N)" means, for its tooltip: N settings differ from the preset. The list has the
+ * count only (`kept` left out) and sends the person to the agent for the detail; the detail page
+ * passes `kept`, how many more settings only keep what the preset says (policyDraft.ts
+ * keptAsChosen), and says that too. With nothing that differs and nothing kept: no tooltip.
  */
-export function adjustedTitle(changes: number | null | undefined, kept?: number): string | undefined {
-  if (!changes || changes < 1) return undefined;
-  const head = `${changes === 1 ? 'One kind of work is' : `${changes} kinds of work are`} set for this agent itself, everywhere or in an area.`;
-  if (kept === undefined) {
-    return `${head} Some may only keep the setting they would have anyway, so a later change cannot move them. Open the agent to see what it may do.`;
+export function adjustedTitle(differing: number | null | undefined, kept?: number): string | undefined {
+  const n = differing && differing > 0 ? differing : 0;
+  const k = kept && kept > 0 ? kept : 0;
+  if (n === 0) {
+    if (k === 0) return undefined;
+    return `No setting differs from the preset. ${keptWords(k)} Today the agent may do just what the preset says.`;
   }
-  if (kept <= 0) return `${head} ${changes === 1 ? 'It changes' : 'Each one changes'} what the agent may do.`;
-  if (kept >= changes) {
-    return `${head} ${keptWords(changes, changes)} Today the agent may do just what the preset says.`;
-  }
-  return `${head} ${keptWords(kept, changes)}`;
+  const head = `${n === 1 ? 'One setting differs' : `${n} settings differ`} from the preset, everywhere or in an area.`;
+  if (kept === undefined) return `${head} Open the agent to see what it may do.`;
+  return k === 0 ? head : `${head} ${keptWords(k, true)}`;
 }
 
-/** How many of the agent's own settings only keep the setting they would have anyway. */
-function keptWords(kept: number, changes: number): string {
+/**
+ * How many of the agent's own settings only keep the setting they would have anyway (the preset's
+ * everywhere, everywhere's in an area). `more`: said after the ones that differ.
+ */
+function keptWords(kept: number, more = false): string {
+  const which = kept === 1 ? (more ? 'One more setting is' : 'One setting is') : `${kept} ${more ? 'more ' : ''}settings are`;
+  const it = kept === 1 ? 'it' : 'them';
+  return `${which} kept as chosen: ${kept === 1 ? 'it changes' : 'they change'} nothing today, and a later change of the preset or of everywhere cannot move ${it}.`;
+}
+
+/** The same, for the note under the preset (adjustedPresetNote), out of all `changes` of its own. */
+function keptNoteWords(kept: number, changes: number): string {
   if (kept >= changes) {
     return changes === 1
       ? 'It only keeps the setting it would have anyway, so a later change cannot move it.'
@@ -83,7 +97,7 @@ export function adjustedPresetNote(changes: number, looserChanges: string[], kep
   if (looserChanges.length > 0) {
     note += ` ${looserChanges.length === 1 ? 'One of them lets' : `${looserChanges.length} of them let`} it do more by itself than the preset says: ${looserChanges.join('; ')}.`;
   }
-  if (kept > 0) note += ` ${keptWords(kept, changes)}`;
+  if (kept > 0) note += ` ${keptNoteWords(kept, changes)}`;
   return note;
 }
 
@@ -96,10 +110,38 @@ export const ADMIN_TO_LOOSEN = 'Only an Admin can let an agent do more by itself
 
 /** At the top of the detail page for a person who manages agents but is not an Admin. */
 export const NOT_ADMIN_NOTE =
-  'You can make this agent stricter, pause it and take back its standing permissions. Only an Admin can let it do more by itself: a looser preset, Allow or Ask where it is stricter now, a higher limit on records per request, another folder, a higher two-person amount, a longer wait for requests, or the email notice.';
+  'You can make this agent stricter, pause it, give it a folder inside one it already has, and take back its standing permissions. Only an Admin can let it do more by itself: a looser preset, Allow or Ask where it is stricter now, a higher limit on records per request, a folder outside the ones it has, a higher two-person amount, a longer wait for requests, or the email notice.';
 
-/** On the list for a person who is not an Admin. */
+/** On the list for a person who is not an Admin but may change Users & Roles > Users. */
 export const NOT_ADMIN_LIST_NOTE = 'Only an Admin can make or remove an agent. Open one to make it stricter or pause it.';
+
+/**
+ * Making an agent stricter, pausing it and taking back its standing permission need the right to
+ * change Users & Roles > Users (the server's personWhoManagesAgents). Someone who may only see
+ * that list sees the agents too, and is told this instead of being offered what the server refuses.
+ */
+export const VIEW_ONLY_LIST_NOTE =
+  'Only an Admin can make or remove an agent. To make one stricter or pause it, you need permission to change Users & Roles > Users: ask an Admin for it.';
+
+/** At the top of the detail page for someone who may see agents but not change them. */
+export const VIEW_ONLY_NOTE =
+  "You can look at this agent's settings. To make it stricter, pause it or take back a standing permission, you need permission to change Users & Roles > Users: ask an Admin for it.";
+
+/**
+ * Pause all agents is the company's Integrated Applications switch, which only an Admin turns
+ * (AgentRequestCount.canPauseAll). Said on the list to anyone the switch is not offered to, so
+ * nobody is left looking for it.
+ */
+export const ADMIN_TO_PAUSE_ALL = 'Only an Admin can pause or resume all agents at once.';
+
+/**
+ * Beside the server's "was not found" refusal when the folder it names is one the agent already
+ * has: it was moved or deleted after it was given, and a save sends the whole list, which the
+ * server checks folder by folder. Taking it off is open to anyone who may change the agent.
+ */
+export function storedFolderGone(folder: string): string {
+  return `"${folder}" is already on this agent's list. If it was moved or deleted, take it off the list under Limits, then save again.`;
+}
 
 /** Under the limits a person who is not an Admin may only lower. */
 export const ADMIN_TO_RAISE_CAP = 'Only an Admin can raise this limit or take it away. You can lower it.';
@@ -108,7 +150,10 @@ export function adminToRaiseUsualCap(usual: number): string {
   return `With no limit saved, standing permissions are still held to the usual ${usual.toLocaleString('en-US')} records a request. Only an Admin can set a limit above that. You can set one up to ${usual.toLocaleString('en-US')}.`;
 }
 export const ADMIN_TO_RAISE_TWO_PERSON = 'Only an Admin can raise this amount or turn two-person approval off. You can lower it, or turn it on.';
-export const ADMIN_TO_ADD_FOLDER = 'Only an Admin can give an agent another folder. You can take folders off the list.';
+export const ADMIN_TO_ADD_FOLDER =
+  'Only an Admin can give an agent a folder outside the ones it has. You can add a folder inside one of them, or take folders off the list.';
+/** The same, for an agent with no folder yet: there is nothing to add a folder inside. */
+export const ADMIN_TO_ADD_FIRST_FOLDER = 'Only an Admin can give an agent a folder.';
 export const ADMIN_TO_RAISE_DAYS = 'Only an Admin can let requests wait longer. You can shorten the wait.';
 export const ADMIN_TO_NOTIFY = 'Only an Admin can turn the email notice on, since it sends email outside this computer. You can turn it off.';
 /**

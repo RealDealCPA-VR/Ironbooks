@@ -390,6 +390,13 @@ describe('after a person signed in', () => {
       ['/api/reports/1099-xml', 'read_sensitive', 'agent'],
       ['/api/auth/me', 'read', 'person_only'],
       ['/api/handshake', 'read', 'person_only'],
+      // A person's own account ('self'): the company files they belong to, who can open the file.
+      ['/api/companies', 'read', 'person_only'],
+      ['/api/file-protection', 'read', 'person_only'],
+      // The sign-in screen's read of the company file's name: through the door, where an Admin is asked.
+      ['/api/company-file/info', 'file', 'agent'],
+      // The raw transaction log cannot be masked: never for an agent.
+      ['/api/transaction-log/download', 'file', 'hard_floor'],
       ['/api/agents', 'admin', 'hard_floor'],
       ['/api/agent-requests', 'read', 'hard_floor'],
     ];

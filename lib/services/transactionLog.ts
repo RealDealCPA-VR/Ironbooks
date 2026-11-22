@@ -760,6 +760,13 @@ export interface TransactionLogFilter {
   /** Only one agent's changes (the record's `agentId`). */
   agentId?: string;
   search?: string;
+  /**
+   * The record's summary as the reader is shown it (auditTrail.ts logSummaryFor). The search
+   * matches that text, never the stored one: matching stored text the reader sees masked would let
+   * them test guesses at the hidden digits ("Acct # 0001…"), the line coming back only when the
+   * guess was right. Left out, the stored summary (a trusted reader's).
+   */
+  shownSummary?: (record: TransactionLogRecord) => string;
   /** Include the log_started/system records (default true). */
   includeSystem?: boolean;
   /**
@@ -800,6 +807,7 @@ function matchRecords(scoped: TransactionLogRecord[], filter: TransactionLogFilt
   const fromIso = filter.from?.toISOString();
   const toIso = filter.to?.toISOString();
   const q = filter.search?.trim().toLowerCase();
+  const summaryOf = filter.shownSummary ?? ((r: TransactionLogRecord) => r.summary);
   const matches = scoped.filter((r) => {
     if (fromIso && r.ts < fromIso) return false;
     if (toIso && r.ts > toIso) return false;
@@ -809,7 +817,7 @@ function matchRecords(scoped: TransactionLogRecord[], filter: TransactionLogFilt
     if (filter.entityId && r.entityId !== filter.entityId) return false;
     if (filter.agentId && r.agentId !== filter.agentId) return false;
     if (filter.includeSystem === false && r.entityType === 'transaction_log') return false;
-    if (q && !`${r.summary} ${r.userName ?? ''} ${r.entityType} ${r.entityId ?? ''}`.toLowerCase().includes(q)) {
+    if (q && !`${summaryOf(r)} ${r.userName ?? ''} ${r.entityType} ${r.entityId ?? ''}`.toLowerCase().includes(q)) {
       return false;
     }
     return true;

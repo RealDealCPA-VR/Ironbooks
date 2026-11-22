@@ -21,9 +21,9 @@ import WindowTitleBar from '@/components/WindowTitleBar';
 import { openCommandBar } from '@/components/CommandPalette';
 import { AGENT_REQUESTS_HIDDEN_POLL_MS, AGENT_REQUESTS_POLL_MS, agentRequestsChanged } from '@/components/AgentRequestsBadge';
 import ShortcutsHelp from '@/components/ShortcutsHelp';
-import { Help } from '@/components/Help';
 import { Toaster } from '@/components/ui';
 import ScheduledReportsPage from '@/app/reports/schedules/page';
+import AgentsTab from '@/app/users/AgentsTab';
 import type { AgentRequestCount } from '@/lib/agent/contract';
 
 let inFront = true;
@@ -77,7 +77,9 @@ const notices: Array<{ title: string; body: string; href: string }> = [];
 function counted(over: Partial<AgentRequestCount> = {}): AgentRequestCount {
   return { pending: 0, newest: null, agents: 1, allPaused: false, canPauseAll: true, ...over };
 }
-const newest = (id: string, agentName: string, summary: string) => ({ id, agentName, summary, createdAt: '2026-11-20T10:00:00.000Z' });
+/** Each request the tests make is asked a minute after the one before, as in the app. */
+let askedAt = Date.parse('2026-11-20T10:00:00.000Z');
+const newest = (id: string, agentName: string, summary: string) => ({ id, agentName, summary, createdAt: new Date((askedAt += 60_000)).toISOString() });
 
 /** What GET /api/agent-requests/count answers next (a function may throw or answer an error). */
 let answer: unknown = counted();
@@ -231,7 +233,7 @@ domTest('a failed poll changes nothing on screen', async () => {
   }
 });
 
-domTest('the notice is raised once per rise, and only when the window is not in front', async () => {
+domTest('the notice is raised once per new request, and only when the window is not in front', async () => {
   try {
     inFront = false;
     answer = counted({ pending: 1, newest: newest('n1', 'Month-end helper', 'Enter a bill from Acme Supply for $120.00') });
@@ -272,6 +274,19 @@ domTest('the notice is raised once per rise, and only when the window is not in 
     await until(() => notices.length === 2, 'the next rise behind other windows raises one more');
     check(notices[1].title.includes('Payroll helper'), 'naming the newest request’s agent');
     check(notices[1].body.includes('(and 1 more)'), `and saying more arrived (got "${notices[1].body}")`);
+
+    // Someone decided n4 and n5 arrived between two asks: the same number, a new request.
+    answer = counted({ pending: 5, newest: newest('n5', 'Payroll helper', 'Enter a paycheck for Sam Ortiz') });
+    await poke();
+    await until(() => notices.length === 3, 'a new request raises one, though the number is the same');
+    check(notices[2].body.includes('Enter a paycheck for Sam Ortiz'), `naming it (got "${notices[2].body}")`);
+    // n5 is decided: n4 is the newest again, and later the number rises with n4 still the newest.
+    answer = counted({ pending: 4, newest: newest('n4', 'Payroll helper', 'Enter a paycheck for Dana Lee') });
+    await poke();
+    answer = counted({ pending: 6, newest: newest('n4', 'Payroll helper', 'Enter a paycheck for Dana Lee') });
+    await poke();
+    await until(() => textOf(titleBadge()).includes('6'), 'the number rose');
+    equal(notices.length, 3, 'never a second notice for the same request');
   } finally {
     resetWindow();
   }
@@ -504,8 +519,8 @@ domTest('the command bar: a server answer leading to a hidden Agent requests say
 function checkAgentHelp(text: string, where: string) {
   check(/On its own an agent does only what its settings allow/.test(text), `${where}: what an agent does on its own (got "${text}")`);
   check(text.includes('Approve once') && text.includes('Approve similar… (standing permission)'), `${where}: approve once or give standing permission`);
-  // The Agents tab shows to Admins only (app/users/page.tsx), so pausing is said as an Admin's.
-  check(text.includes('An Admin can pause one agent (Users & Roles > Agents) or all'), `${where}: who pauses one agent or all, and where`);
+  // Pausing one agent is for whoever may change users (the Agents tab), all of them for an Admin.
+  check(text.includes('Whoever manages users can pause an agent; an Admin can pause all.'), `${where}: who pauses one agent or all`);
   check(text.includes('The Audit Trail and Agent Activity report keep the record'), `${where}: where the record is`);
 }
 
@@ -554,22 +569,24 @@ domTest('page help: the "What is this page?" bubble on Agent requests says the s
   }
 });
 
-domTest('page help: the Agents tab’s help entry, in a Help bubble, says what a person needs', async () => {
-  // This proves the entry renders, not that the tab shows it: app/users/AgentsTab.tsx does not
-  // render <Help page="/users/agents"> yet (HANDOFF to its owner), and the tab lives in /users'
-  // state, so the shell's bubble and F1 there show the Users & Roles help. Once the tab renders it,
-  // this is to mount the tab instead.
-  await mount(
-    <p>
-      <Help page="/users/agents">What is this tab?</Help>
-    </p>,
-  );
-  await click(await until(() => button('What is the Agents page?'), 'the help button'), 'the help button');
-  const text = textOf(await until(() => $('[role="tooltip"]'), 'the bubble opens'));
-  for (const w of ['Allow (does it alone)', 'Ask (waits in Agent requests', 'approves once', 'standing permission', 'or Never', 'Pause this agent stops it', 'an Admin can pause all', 'The Audit Trail and Agent Activity report keep the record']) {
-    check(text.includes(w), `the bubble says "${w}" (got "${text}")`);
+domTest('page help: the Agents tab’s own header bubble says what a person needs, to someone who is not an Admin too', async () => {
+  // The tab renders its own help (app/users/AgentsTab.tsx, <Help page="/users/agents">); the tab
+  // lives in /users' state, so the shell's bubble and F1 there show the Users & Roles help. It is
+  // shown to anyone who may view Users & Roles > Users (app/users/page.tsx): here a person who is
+  // not an Admin, with no agent to list yet.
+  try {
+    stubRoutes({ 'GET /api/agents': { agents: [], allPaused: false, hostOnly: false, unattendedPossible: true } });
+    await mount(<AgentsTab roles={[]} viewerIsAdmin={false} />);
+    const trigger = await until(() => $<HTMLButtonElement>('[data-tab-help] button[aria-label="What is the Agents page?"]'), 'the help button in the tab header');
+    await click(trigger, 'What is this tab?');
+    const text = textOf(await until(() => $('[data-tab-help] [role="tooltip"]'), 'the bubble opens'));
+    for (const w of ['Allow (does it alone)', 'Ask (waits in Agent requests', 'approves once', 'standing permission', 'or Never', 'Pause this agent stops it', 'an Admin can pause all', 'The Audit Trail and Agent Activity report keep the record']) {
+      check(text.includes(w), `the bubble says "${w}" (got "${text}")`);
+    }
+    await press('Escape');
+  } finally {
+    resetWindow();
   }
-  await press('Escape');
 });
 
 // ---------------------------------------------------------------------------
@@ -587,12 +604,9 @@ const RELEASED = 'A person confirmed this schedule after an agent changed it.';
 
 type ScheduleRow = Record<string, unknown>;
 /**
- * A row as GET /api/report-schedules is TO answer it: the stored columns plus `waitingForAPerson`,
- * the server's answer from the audit trail each time the list loads. Today's server does not send
- * that field (listReportSchedules is a plain select of the stored rows) and never replaces a stored
- * agent hold with the internet reason (runDueSchedules writes it only when not already held):
- * HANDOFF to lib/services/memorizedReports.ts. The tests that use this flag check the page is ready
- * for that answer; "with today's server" below feeds what the server really returns. By default:
+ * A row as GET /api/report-schedules answers it: the stored columns plus `waitingForAPerson`, the
+ * server's answer from the audit trail each time the list loads (lib/services/memorizedReports.ts
+ * listReportSchedules; runDueSchedules rewrites a stored hold whose reason changed). By default:
  * an emailing schedule an agent set up, held by the timer for that reason.
  */
 function scheduleRow(over: ScheduleRow = {}): ScheduleRow {
@@ -706,11 +720,10 @@ domTest('Scheduled Reports: an agent’s schedule waits for you, and only Confir
 });
 
 domTest('Scheduled Reports: with the server’s answer, a changed hold reason shows the current one', async () => {
-  // The sequence as the server is to answer it once it sends waitingForAPerson and rewrites a hold
-  // whose reason changed (neither happens today: HANDOFF; the test "with today's server" below
-  // pins what the page shows now). An agent sets up an emailing schedule in a file whose internet
-  // services are off; the timer holds it for the agent; a person confirms it; the timer holds it
-  // for internet services; an agent changes it again; the timer holds it for the agent again.
+  // The sequence with the listing set by hand at each step (the test "with today's server" below
+  // works it out as the service does). An agent sets up an emailing schedule in a file whose
+  // internet services are off; the timer holds it for the agent; a person confirms it; the timer
+  // holds it for internet services; an agent changes it again; the timer holds it for the agent again.
   let row = scheduleRow();
   const calls = stubSchedules(
     () => row,
@@ -728,8 +741,8 @@ domTest('Scheduled Reports: with the server’s answer, a changed hold reason sh
   check(body().includes(RELEASED) && !body().includes(AGENT_HOLD), 'the agent reason is not shown as if it still held');
   check(!/runs at its next due time|It runs at/.test(body()), 'and nothing says it will run: internet services may still hold it');
 
-  // The timer holds it because internet services are off, and stores that reason (the service is
-  // to rewrite a hold whose reason changed; today it keeps the agent message).
+  // The timer holds it because internet services are off, and stores that reason (runDueSchedules
+  // rewrites a hold whose reason changed).
   row = { ...row, lastMessage: INTERNET_HOLD };
   await reloadSchedules();
   await until(() => body().includes(INTERNET_HOLD), 'the internet hold is shown');
@@ -758,8 +771,8 @@ domTest('Scheduled Reports: with the server’s answer, a changed hold reason sh
 });
 
 domTest('Scheduled Reports: after a reload, or for another person, the server’s answer decides', async () => {
-  // With a listing that carries waitingForAPerson (not sent yet: HANDOFF). Confirmed elsewhere
-  // (another window, another person): the stored message is still the agent's.
+  // Confirmed elsewhere (another window, another person): the stored message is still the agent's,
+  // and the listing's waitingForAPerson says it no longer waits.
   let row = scheduleRow({ waitingForAPerson: false });
   stubSchedules(() => row);
   await mount(<ScheduledReportsPage />);
@@ -774,7 +787,7 @@ domTest('Scheduled Reports: after a reload, or for another person, the server’
   check(body().includes(AGENT_HOLD) && !body().includes(RELEASED), 'with the agent reason, not the earlier confirmation');
 });
 
-/** A row as today's server lists it: the stored columns only, no waitingForAPerson. */
+/** A row as an older server listed it: the stored columns only, no waitingForAPerson. */
 function storedRow(over: ScheduleRow = {}): ScheduleRow {
   const row = scheduleRow(over);
   delete row.waitingForAPerson;
@@ -782,7 +795,7 @@ function storedRow(over: ScheduleRow = {}): ScheduleRow {
 }
 
 domTest('Scheduled Reports: a listing without the server’s answer errs towards waiting and promises nothing', async () => {
-  // GET /api/report-schedules does not carry waitingForAPerson yet: the stored message is all there is.
+  // A listing without waitingForAPerson (an older server): the stored message is all there is.
   let row = storedRow();
   const calls = stubSchedules(
     () => row,
@@ -809,20 +822,27 @@ domTest('Scheduled Reports: a listing without the server’s answer errs towards
   await until(() => body().includes(INTERNET_HOLD) && !agentHold(), 'a stored internet hold is not an agent hold');
 });
 
-domTest('Scheduled Reports: with today’s server, a confirmed agent hold still shows until the schedule runs', async () => {
-  // What GET /api/report-schedules really returns today for this sequence: an emailing schedule an
-  // agent set up, in a file whose internet services are off. No waitingForAPerson, and the stored
-  // agent message is kept through the later internet hold (runDueSchedules writes its message
-  // only when the schedule is not already held). This pins the gap the page cannot close alone;
-  // once lib/services/memorizedReports.ts sends the answer and rewrites the reason (HANDOFF), the
-  // test "with the server’s answer, a changed hold reason…" above is what the page shows instead.
-  let row = storedRow();
-  const calls = stubSchedules(
-    () => row,
-    (b) => {
-      row = asTheServiceDoes(row, b); // the service stores the recipients; the listing is unchanged otherwise
-    },
-  );
+domTest('Scheduled Reports: with today’s server, a confirmed agent hold gives way to the current reason', async () => {
+  // What GET /api/report-schedules returns for this sequence (lib/services/memorizedReports.ts:
+  // listReportSchedules adds waitingForAPerson from the audit trail on every listing, and
+  // runDueSchedules rewrites a hold whose reason changed): an emailing schedule an agent set up, in
+  // a file whose internet services are off. The listing is worked out here as the service does it:
+  // `waiting` is the audit trail's answer, `stored` what the timer last wrote.
+  let waiting = true;
+  let stored: ScheduleRow = { lastRunAt: '2026-11-01T09:00:00.000Z', lastStatus: 'held', lastMessage: AGENT_HOLD };
+  let emailTo: string | null = 'owner@example.com';
+  const listing = (): ScheduleRow => ({ ...scheduleRow({ emailTo, ...stored }), waitingForAPerson: waiting });
+  /** The timer runs the due schedules (runDueSchedules): the agent hold first, then the internet hold. */
+  const timerRuns = () => {
+    const reason = waiting ? AGENT_HOLD : emailTo ? INTERNET_HOLD : null;
+    if (reason && stored.lastMessage !== reason) stored = { lastRunAt: '2026-11-02T09:00:00.000Z', lastStatus: 'held', lastMessage: reason };
+  };
+  const calls = stubSchedules(listing, (b) => {
+    if ('emailTo' in b) {
+      emailTo = (b.emailTo as string | null) ?? null;
+      waiting = false; // a person's recipients Save confirms it (updateReportSchedule)
+    }
+  });
   await mount(
     <>
       <Toaster />
@@ -833,29 +853,37 @@ domTest('Scheduled Reports: with today’s server, a confirmed agent hold still 
   await until(agentHold, 'held for the agent');
   check(body().includes(AGENT_HOLD), 'with the agent reason');
 
-  // 2. A person confirms its recipients: the server records the confirmation, but its listing
-  //    still carries the agent message, so the row still says it waits. The toast says why.
+  // 2. A person confirms its recipients: the listing right after says it no longer waits, though
+  //    the stored message is still the agent's until the timer runs again.
   await confirmRecipients(calls);
-  await until(() => toasts().some((t) => t.includes('Recipients confirmed.')), 'the save says what it did');
-  check(
-    toasts().some((t) => t.includes('This row shows the schedule’s last run, so it may still say it waits for you.')),
-    `and why the row may not change (got ${JSON.stringify(toasts())})`,
-  );
-  check(agentHold() && button('Confirm recipients of Month-end pack'), 'today the row still shows the agent wait');
-  check(body().includes(AGENT_HOLD) && !body().includes(RELEASED), 'with the stored agent reason');
+  await until(() => toasts().some((t) => t.includes('Recipients confirmed. It no longer waits for you.')), 'the save says what it did');
+  await until(() => !agentHold(), 'no longer waiting for you');
+  check(!button('Confirm recipients of Month-end pack'), 'and Confirm recipients is gone');
+  check(body().includes(RELEASED) && !body().includes(AGENT_HOLD), 'the stored agent reason is not shown as if it still held');
+  check(!/runs at its next due time|It runs at/.test(body()), 'and nothing says it will run: internet services may still hold it');
 
-  // 3. The timer holds it for internet services and leaves the stored message alone: the listing
-  //    is the same, so the internet reason is not shown (the gap the HANDOFF closes).
+  // 3. The timer holds it for internet services and stores that reason: the row gives it.
+  timerRuns();
   await reloadSchedules();
-  check(agentHold() && body().includes(AGENT_HOLD), 'today: still the agent reason');
-  check(!body().includes(INTERNET_HOLD), 'today: the internet reason is not shown');
+  await until(() => body().includes(INTERNET_HOLD), 'the internet reason is shown');
+  check(!agentHold() && !body().includes(AGENT_HOLD) && !body().includes(RELEASED), 'and no older reason');
 
-  // 4. A schedule an agent made that has not reached its first run: nothing is stored yet, so
-  //    today's listing gives the page nothing to show.
-  row = storedRow({ lastRunAt: null, lastStatus: null, lastMessage: null });
+  // 4. An agent changes it again: waiting for a person, over the stored internet message, then
+  //    the timer's agent hold again.
+  waiting = true;
+  await reloadSchedules();
+  await until(agentHold, 'waiting for you again');
+  check(!body().includes(INTERNET_HOLD) && /choose Confirm recipients and Save/.test(body()), 'with the agent hold as the reason, and what to do');
+  timerRuns();
+  await reloadSchedules();
+  await until(() => agentHold() && body().includes(AGENT_HOLD), 'the timer’s agent hold, with its stored reason');
+
+  // 5. A schedule an agent made that has not reached its first run: nothing is stored yet, and the
+  //    server's answer is enough to wait.
+  stored = { lastRunAt: null, lastStatus: null, lastMessage: null };
   await reloadSchedules();
   await until(() => !body().includes(AGENT_HOLD), 'the listing is the new one');
-  check(!agentHold() && !button('Confirm recipients of Month-end pack'), 'today: no badge before its first run');
+  check(agentHold() && button('Confirm recipients of Month-end pack'), 'waiting for you before its first run, with Confirm recipients');
 });
 
 void runDomTests();

@@ -13,25 +13,27 @@
  * tightening stays open to them all. DELETE, an Admin.
  *
  * Changing an agent's permissions or removing it is done on the computer that holds the company
- * file, like making one (app/api/agents/route.ts; 403 with details { hostOnly: true } from a
- * teammate's window): the policy decides what may reach the books from outside the app's own
- * window, and its folders are folders of that computer. Pausing works from any person's window
- * (./pause). An agent never sees or changes agents (plan 4.6, D9; app/api/agent-requests/_guards.ts).
+ * file, like making one (agentsHostOnly, app/api/agent-requests/_guards.ts; 403 with details
+ * { hostOnly: true } from a teammate's window or another program): the policy decides what may
+ * reach the books from outside the app's own window, and its folders are folders of that computer.
+ * Pausing works from any person's window (./pause). An agent never sees or changes agents (plan
+ * 4.6, D9; app/api/agent-requests/_guards.ts).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { revokeAgent } from '@/lib/services/agents';
 import { getAgentDetail, saveAgentPolicy } from '@/lib/services/agentPolicies';
-import { hostOnlyResponse, isRemoteRequest, HOST_ONLY_ACTION_MESSAGE } from '@/lib/net/hostOnly';
-import { routeError, requireJsonObject } from '@/lib/routeErrors';
+import { requireJsonObject } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { agentPolicySchema } from '@/lib/validation/agentAccess';
-import { NO_STORE, badId, refuseAgent } from '@/app/api/agent-requests/_guards';
+import { NO_STORE, agentsHostOnly, badId, refuseAgent, refuseAgentRequest, routeErrorPlain } from '@/app/api/agent-requests/_guards';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const early = refuseAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
     const refused = refuseAgent(ctx, req);
     if (refused) return refused;
@@ -40,16 +42,17 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     if (bad) return bad;
     return NextResponse.json(await getAgentDetail(ctx, id), { headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agents/[id]/route');
+    return routeErrorPlain(err, 'agents/[id]/route');
   }
 }
 
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const early = refuseAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
-    const refused = refuseAgent(ctx, req);
+    const refused = refuseAgent(ctx, req) ?? agentsHostOnly(req);
     if (refused) return refused;
-    if (isRemoteRequest(req)) return hostOnlyResponse(HOST_ONLY_ACTION_MESSAGE);
     const { id } = await params;
     const bad = badId(id, 'That agent');
     if (bad) return bad;
@@ -58,19 +61,22 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     await saveAgentPolicy(ctx, id, parsed.data);
     return NextResponse.json(await getAgentDetail(ctx, id), { headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agents/[id]/route');
+    return routeErrorPlain(err, 'agents/[id]/route');
   }
 }
 
 export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const early = refuseAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
-    const refused = refuseAgent(ctx, req);
+    const refused = refuseAgent(ctx, req) ?? agentsHostOnly(req);
     if (refused) return refused;
-    if (isRemoteRequest(req)) return hostOnlyResponse(HOST_ONLY_ACTION_MESSAGE);
     const { id } = await params;
+    const bad = badId(id, 'That agent');
+    if (bad) return bad;
     return NextResponse.json({ agent: await revokeAgent(ctx, id) }, { headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agents/[id]/route');
+    return routeErrorPlain(err, 'agents/[id]/route');
   }
 }

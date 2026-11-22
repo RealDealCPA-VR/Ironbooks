@@ -17,11 +17,14 @@
  *    name would go. In an agent's real run the lookup is made and recorded for the audit trail.
  *  - Answers (including "no results") are cached per company + name for a day (at most 500
  *    names, least recently used forgotten first); a failure
- *    (blocked, unreachable, timeout) is just "nothing known" and is retried next time.
+ *    (blocked, unreachable, timeout) is just "nothing known" and is retried next time. An agent's
+ *    preview never answers from the cache: it stops as above, because the approved run may find
+ *    the answer forgotten and send the name after all.
  *
  * The returned summary is untrusted web text: callers pass it to the AI as reference data only.
  */
 import { hostOf, isNotRunInPreview, outboundCall } from '@/lib/ai/outbound';
+import { currentEffectsMode } from '@/lib/effects';
 import { policyFetch } from '@/lib/net/guard';
 import type { ServiceContext } from './_base';
 import { getNetworkPolicy } from './networkPolicy';
@@ -101,7 +104,11 @@ export async function lookupVendor(
 
   const key = `${ctx.companyId}|${query.toLowerCase()}`;
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < CACHE_TTL_MS) {
+  // Never in an agent's preview: the approved run may come after the answer is forgotten (a day,
+  // or a restart) and then sends the name, so the preview stops at the call (outboundCall below)
+  // and the approval card says which computer the name may go to, as it does for a name not looked
+  // up yet. Nothing is sent from a preview either way.
+  if (hit && Date.now() - hit.at < CACHE_TTL_MS && currentEffectsMode() !== 'capture') {
     // Most recently used moves to the end, so trimming forgets the names not looked up lately.
     cache.delete(key);
     cache.set(key, hit);

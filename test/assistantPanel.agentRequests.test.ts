@@ -10,7 +10,10 @@
  *  - A withdrawn or expired request reads as not done, with why; the app's own proposals keep
  *    their Approve and Reject buttons.
  *  - One left over with no request in Agent requests has a single button, Decline (it enters
- *    nothing), so it does not wait in the panel for good.
+ *    nothing), so it does not wait in the panel for good. When Decline is refused because the row
+ *    moved on since the list was read, the row shows where it stands now, from the refusal: the
+ *    link to Agent requests (its request still waiting there), or settled and gone from the
+ *    waiting list (its request decided, or someone else declined it first).
  */
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
@@ -22,9 +25,14 @@ import {
   agentRequestState,
   agentRequestsHref,
   canOnlyDecline,
+  declineAgentProposal,
   isAgentProposal,
+  requestFromRefusal,
+  shownAfterRefusal,
+  updatePending,
   type Proposal,
 } from '@/components/AssistantPanel';
+import { ApiError } from '@/lib/client';
 
 const textOf = (html: string) =>
   html
@@ -143,6 +151,88 @@ describe("an agent's request in Ask AI", () => {
     }
     // The app's own proposal is never "decline only": it keeps Approve and Reject.
     expect(canOnlyDecline(own({ agentRequest: null }))).toBe(false);
+  });
+
+  it('a Decline refused because it is in Agent requests after all names the request to link to', () => {
+    const href = `/agent-requests?id=${REQUEST_ID}`;
+    // The body app/api/ai/_errors.ts sends for that refusal, as lib/client.ts reads it.
+    const refused = new ApiError(403, 'An agent asked for this, so it is approved or denied in Agent requests.', 'FORBIDDEN', { agentRequests: true, agentRequestId: REQUEST_ID, href }, [
+      { id: 'open-agent-request', label: 'Open in Agent requests', kind: 'navigate', href },
+    ]);
+    expect(requestFromRefusal(refused)).toEqual({ id: REQUEST_ID, status: 'pending', href });
+    // The row then shows the link, and no Decline button any more.
+    const linked = render(createElement(ProposalItem, { p: asked({ agentRequest: requestFromRefusal(refused) }), onChange: () => {} }));
+    expect(linked).toContain(`href="${href}"`);
+    expect(linked).not.toContain('<button');
+    // Any other failure names no request: the row stays as it is.
+    expect(requestFromRefusal(new ApiError(409, 'Proposal is already rejected.', 'CONFLICT'))).toBeNull();
+    expect(requestFromRefusal(new ApiError(403, 'Not one.', 'FORBIDDEN', { agentRequests: true, agentRequestId: null }))).toBeNull();
+    expect(requestFromRefusal(new Error('offline'))).toBeNull();
+  });
+
+  describe('clicking Decline', () => {
+    const leftover = () => asked({ agentRequest: null });
+    const refusedWith = (status: number, code: string, details: unknown) => async () => {
+      throw new ApiError(status, status === 409 ? 'Proposal is already rejected.' : 'An agent asked for this, so it is approved or denied in Agent requests.', code, details);
+    };
+
+    it('declined: the row the server answers, settled, and gone from the waiting list', async () => {
+      const calls: Array<[string, unknown]> = [];
+      const r = await declineAgentProposal(leftover(), async (url, body) => {
+        calls.push([url, body]);
+        return { proposal: asked({ status: 'rejected', agentRequest: null }) };
+      });
+      expect(calls).toEqual([['/api/ai/proposals/agent-1', { action: 'reject' }]]);
+      expect(r).toMatchObject({ ok: true, message: 'Declined. Nothing was entered.', shown: { id: 'agent-1', status: 'rejected' } });
+      expect(updatePending([own(), leftover()], r.shown!).map((x) => x.id)).toEqual(['own-1']);
+    });
+
+    it('in Agent requests after all and still waiting there: the row shows the link, not the button', async () => {
+      const href = `/agent-requests?id=${REQUEST_ID}`;
+      const now = asked({ agentRequest: { id: REQUEST_ID, status: 'pending', href } });
+      const r = await declineAgentProposal(leftover(), refusedWith(403, 'FORBIDDEN', { agentRequests: true, agentRequestId: REQUEST_ID, href, proposal: now }));
+      expect(r.ok).toBe(false);
+      expect(r.message).toMatch(/Agent requests/);
+      expect(r.shown).toEqual(now);
+      const pending = updatePending([leftover()], r.shown!);
+      const html = render(createElement(WaitingProposals, { pending, onChange: () => {} }));
+      expect(html).toContain(`href="${href}"`);
+      expect(html).not.toContain('<button');
+      expect(textOf(html)).toContain('Waiting in Agent requests');
+    });
+
+    it('in Agent requests after all and already denied there: it no longer reads as waiting', async () => {
+      const now = asked({ status: 'rejected', error: null, agentRequest: { id: REQUEST_ID, status: 'denied', href: `/agent-requests?id=${REQUEST_ID}` } });
+      const r = await declineAgentProposal(leftover(), refusedWith(403, 'FORBIDDEN', { agentRequests: true, agentRequestId: REQUEST_ID, proposal: now }));
+      expect(r.shown).toEqual(now);
+      expect(updatePending([own(), leftover()], r.shown!).map((x) => x.id)).toEqual(['own-1']);
+      const text = textOf(render(createElement(AgentRequestRow, { p: r.shown!, onChange: () => {} })));
+      expect(text).toContain('Denied');
+      expect(text).not.toContain('Waiting in Agent requests');
+      expect(text).not.toContain('Decline');
+    });
+
+    it('declined by someone else first (a conflict): settled, its Decline button gone', async () => {
+      const now = asked({ status: 'rejected', error: null, agentRequest: null });
+      const r = await declineAgentProposal(leftover(), refusedWith(409, 'CONFLICT', { agentRequests: true, agentRequestId: null, proposal: now }));
+      expect(r).toMatchObject({ ok: false, message: 'Proposal is already rejected.' });
+      expect(r.shown).toEqual(now);
+      expect(updatePending([leftover()], r.shown!)).toEqual([]);
+      expect(render(createElement(AgentRequestRow, { p: r.shown!, onChange: () => {} }))).not.toContain('<button');
+    });
+
+    it('a refusal without the row still links a named request; anything else leaves the row as it is', async () => {
+      const r = await declineAgentProposal(leftover(), refusedWith(403, 'FORBIDDEN', { agentRequests: true, agentRequestId: REQUEST_ID }));
+      expect(r.shown).toMatchObject({ id: 'agent-1', agentRequest: { id: REQUEST_ID, href: `/agent-requests?id=${REQUEST_ID}` } });
+      // Not taken from the refusal: another proposal, the app's own kind, or something that is not a row.
+      for (const proposal of [asked({ id: 'agent-2', status: 'rejected' }), own({ id: 'agent-1' }), { id: 'agent-1' }, 'agent-1']) {
+        expect(shownAfterRefusal(leftover(), new ApiError(409, 'Proposal is already rejected.', 'CONFLICT', { proposal }))).toBeNull();
+      }
+      const offline = await declineAgentProposal(leftover(), async () => {
+        throw new TypeError('Failed to fetch');
+      });
+      expect(offline).toEqual({ shown: null, message: 'It could not be declined. Try again.', ok: false });
+    });
   });
 
   it('links by the request id, made safe for a URL', () => {

@@ -17,9 +17,14 @@
  * yet changes the ledger: the ledger part names what it voids or deletes, with the amounts. Each
  * entry says what the run does to it (posts it, or voids, deletes or changes one already in the
  * books) from the bridge's own `touched` mark, never from its description, which an agent may
- * have written. Voided or deleted records that post nothing (an estimate line, a list entry) are
- * named with the record changes, not the ledger. A file that would be saved is shown with its
- * whole path.
+ * have written; an entry the run makes is labelled New. Each line names who it is for and its
+ * class when the preview has them. Voided or deleted records that post nothing (an estimate line,
+ * a list entry) are named with the record changes, not the ledger. A file that would be saved is
+ * shown with its whole path, its folder and its file name each readable on its own.
+ *
+ * Warnings (plan 5.6): the ones the route raised, in its own words, each marked when the agent
+ * sent the flag that goes past it, and any flag the agent sent that no warning shown names, said in
+ * Ironbooks' words, so the person sees every question the agent answered for them.
  */
 import { AlertTriangle, FileDown, Globe, Mail, Printer } from 'lucide-react';
 import { Badge } from '@/components/ui';
@@ -37,15 +42,19 @@ import {
   isDeclaredEffect,
   isUnusualDomain,
   ledgerRemovals,
+  lineNameAndClass,
   needsLabels,
   networkHost,
   notTriedNote,
+  notTriedText,
+  pathParts,
   plain,
   recordHeading,
   recordRemovals,
   removalText,
   replyToDomains,
   valueText,
+  warningLines,
   type LedgerRemoval,
 } from './words';
 
@@ -139,18 +148,27 @@ function Ledger({ preview }: { preview: OperationPreview }) {
                 </tr>
               </thead>
               <tbody>
-                {e.lines.map((l, j) => (
-                  <tr key={j} className="text-navy">
-                    <td className="px-3 py-1">
-                      {l.accountCode ? `${plain(l.accountCode)} ` : ''}
-                      {plain(l.accountName)}
-                      {l.entityName ? <span className="text-navy/50"> · {plain(l.entityName)}</span> : null}
-                      {l.memo ? <span className="block text-xs text-navy/50">{plain(l.memo)}</span> : null}
-                    </td>
-                    <td className="px-3 py-1 text-right tabular-nums">{l.debit ? amountText(l.debit) : ''}</td>
-                    <td className="px-3 py-1 text-right tabular-nums">{l.credit ? amountText(l.credit) : ''}</td>
-                  </tr>
-                ))}
+                {e.lines.map((l, j) => {
+                  const { name, className } = lineNameAndClass(l);
+                  return (
+                    <tr key={j} className="align-top text-navy">
+                      <td className="px-3 py-1">
+                        {l.accountCode ? `${plain(l.accountCode)} ` : ''}
+                        {plain(l.accountName)}
+                        {name || className ? (
+                          <span data-line-who="" className="block text-xs text-navy/60">
+                            {name ? <span data-line-name="">Name: {name}</span> : null}
+                            {name && className ? ' · ' : null}
+                            {className ? <span data-line-class="">Class: {className}</span> : null}
+                          </span>
+                        ) : null}
+                        {l.memo ? <span className="block text-xs text-navy/50">{plain(l.memo)}</span> : null}
+                      </td>
+                      <td className="px-3 py-1 text-right tabular-nums">{l.debit ? amountText(l.debit) : ''}</td>
+                      <td className="px-3 py-1 text-right tabular-nums">{l.credit ? amountText(l.credit) : ''}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -236,6 +254,36 @@ const NOT_KNOWN: Record<EffectPreview['kind'], string> = {
   network: 'Which computer it contacts is not known ahead of time.',
 };
 
+/**
+ * A whole path, as its file name and its folder, each in full and readable on its own (words.ts
+ * pathParts): a long folder wraps, and the name is never lost at the end of a line. The element
+ * carries the whole path too, as written.
+ */
+export function PathParts({ path, attr }: { path: string; attr: 'data-file-path' | 'data-desktop-path' }) {
+  const { folder, name } = pathParts(path);
+  const code = 'block break-all rounded border border-slate-200 bg-slate-50 px-2 py-1 font-mono text-xs text-navy';
+  return (
+    <div {...{ [attr]: plain(path).trim() }} className="mt-0.5 space-y-1">
+      {name !== null && (
+        <div>
+          <span className="text-xs text-navy/60">File name</span>
+          <code data-path-name="" className={`${code} font-semibold`}>
+            {name}
+          </code>
+        </div>
+      )}
+      {folder !== null && (
+        <div>
+          <span className="text-xs text-navy/60">{name !== null ? 'In the folder' : 'Folder'}</span>
+          <code data-path-folder="" className={code}>
+            {folder}
+          </code>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** One thing that would leave the computer. The recipient's domain and the host stand out (plan 11.2). */
 export function EffectLine({ effect }: { effect: EffectPreview }) {
   const Icon = effect.kind === 'email' ? Mail : effect.kind === 'file' ? FileDown : effect.kind === 'print' ? Printer : Globe;
@@ -255,10 +303,8 @@ export function EffectLine({ effect }: { effect: EffectPreview }) {
       </div>
       {filePath && (
         <div className="mt-1.5 pl-6">
-          <span className="text-xs text-navy/60">Written to</span>
-          <code data-file-path="" className="mt-0.5 block break-all rounded border border-slate-200 bg-slate-50 px-2 py-1 font-mono text-xs text-navy">
-            {filePath}
-          </code>
+          <span className="text-xs font-medium text-navy/70">Written to</span>
+          <PathParts path={filePath} attr="data-file-path" />
           {replaces && <p className="mt-1 text-xs font-semibold text-red-700">It replaces the file that is already there.</p>}
         </div>
       )}
@@ -291,18 +337,66 @@ export function EffectLine({ effect }: { effect: EffectPreview }) {
   );
 }
 
-/** The whole preview of a request: ledger, record changes, effects, warnings, loss. */
-export default function RequestPreview({ preview }: { preview: OperationPreview | null }) {
+/**
+ * The warnings a person would have been asked about in the window, and what the agent said to
+ * them (plan 5.6, words.ts warningLines). Approving is the person's own yes to each.
+ */
+function Warnings({ preview, confirm }: { preview: OperationPreview | null; confirm: unknown }) {
+  const { warnings, acceptedAhead } = warningLines(preview, confirm);
+  if (warnings.length === 0 && acceptedAhead.length === 0) return null;
+  return (
+    <div data-warnings="" className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+      <div className="flex items-center gap-1.5 font-semibold">
+        <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+        {warnings.length > 0 ? 'Ironbooks would normally ask about this' : 'The agent said to go ahead past a warning'}
+      </div>
+      {warnings.length > 0 && (
+        <ul className="mt-1 list-disc space-y-0.5 pl-5">
+          {warnings.map((w, i) => (
+            <li key={i} data-warning={w.accepted ? 'accepted' : ''}>
+              {w.message}
+              {w.accepted && <span className="font-semibold"> The agent said to go ahead anyway.</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {acceptedAhead.length > 0 && (
+        <div data-accepted-ahead="" className="mt-1">
+          <p>
+            {warnings.length > 0
+              ? 'The agent also said to go ahead if Ironbooks warns that:'
+              : 'The agent said to go ahead if Ironbooks warns that:'}
+          </p>
+          <ul className="mt-0.5 list-disc space-y-0.5 pl-5">
+            {acceptedAhead.map((t) => (
+              <li key={t}>{t}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <p className="mt-1 text-xs">Read these before you approve: approving is your own yes to each of them.</p>
+    </div>
+  );
+}
+
+/**
+ * The whole preview of a request: ledger, record changes, effects, warnings, loss. `confirm` is the
+ * agent's own list of warnings it said yes to (OperationInput.confirm).
+ */
+export default function RequestPreview({ preview, confirm }: { preview: OperationPreview | null; confirm?: unknown }) {
   if (!preview) {
     return (
-      <p className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-navy/70">
-        Ironbooks could not try this ahead of time, so there is no preview. Read the summary above carefully before you approve.
-      </p>
+      <div className="space-y-4">
+        <p className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-navy/70">
+          Ironbooks could not try this ahead of time, so there is no preview. Read the summary above carefully before you approve.
+        </p>
+        <Warnings preview={null} confirm={confirm} />
+      </div>
     );
   }
   const effects = preview.effects ?? [];
-  const warnings = preview.warnings ?? [];
   const notTried = notTriedNote(preview);
+  const note = notTriedText(notTried);
   return (
     <div className="space-y-4">
       {preview.loss && (
@@ -314,12 +408,17 @@ export default function RequestPreview({ preview }: { preview: OperationPreview 
       {notTried !== null ? (
         // Described, not tried: nothing below the summary is known about the ledger or the records.
         <div role="note" data-not-tried="" className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
-          <div className="font-semibold">Ironbooks did not try this ahead of time</div>
+          <div className="font-semibold">What this does is not shown ahead of time</div>
           <p className="mt-0.5">
-            So what it posts to the ledger, which records it changes and what it may remove are not known. Read the summary above carefully, and
+            What it posts to the ledger, which records it changes and what it may remove are not known here. Read the summary above carefully, and
             approve only if you are sure of what it does.
           </p>
-          {notTried && <p className="mt-1 text-xs">Ironbooks&apos; note: {notTried}</p>}
+          {note && (
+            <p data-not-tried-note="" className="mt-1 whitespace-pre-wrap break-words">
+              <span className="font-semibold">Why: </span>
+              {note}
+            </p>
+          )}
         </div>
       ) : (
         <>
@@ -340,19 +439,7 @@ export default function RequestPreview({ preview }: { preview: OperationPreview 
           </ul>
         </div>
       )}
-      {warnings.length > 0 && (
-        <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
-          <div className="flex items-center gap-1.5 font-semibold">
-            <AlertTriangle className="h-4 w-4" aria-hidden="true" /> Ironbooks would normally ask about this
-          </div>
-          <ul className="mt-1 list-disc space-y-0.5 pl-5">
-            {warnings.map((w, i) => (
-              <li key={i}>{plain(w.message)}</li>
-            ))}
-          </ul>
-          <p className="mt-1 text-xs">Read these before you approve.</p>
-        </div>
-      )}
+      <Warnings preview={preview} confirm={confirm} />
       {preview.truncated && <p className="text-xs text-navy/50">The preview is long, so only part of it is shown.</p>}
     </div>
   );

@@ -5,7 +5,7 @@
  * tools (opening stock, change prices, POs from the reorder list).
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zUuid } from './helpers';
+import { zDate, zDecimal, zLenient, zUuid } from './helpers';
 
 const zName = (max: number, what = 'Name') =>
   z.string({ required_error: `${what} is required.` }).trim().min(1, `${what} is required.`).max(max, `${what} is too long (max ${max} characters).`);
@@ -82,6 +82,68 @@ export const vehicleSchema = z.object({
   description: zOptText(255),
   isActive: z.boolean().optional(),
 });
+
+/** Every field of the eight simple lists above, by name (the same name means the same thing). */
+const SIMPLE_LIST_FIELDS = {
+  ...otherNameSchema.shape,
+  ...jobTypeSchema.shape,
+  ...termsSchema.shape,
+  ...shipViaSchema.shape,
+  ...paymentMethodSchema.shape,
+  ...customerMessageSchema.shape,
+  ...salesTaxCodeSchema.shape,
+  ...vehicleSchema.shape,
+  // The longest any list takes: shipViaSchema's 100 above would be stricter than Other Names (255).
+  name: z.string().trim().max(255),
+};
+
+/** What an agent reads for each field. Typed by the fields, so a new one fails the typecheck until it is described. */
+const SIMPLE_LIST_FIELD_TEXTS: { readonly [K in keyof typeof SIMPLE_LIST_FIELDS]: string } = {
+  name: 'Name of the entry, unique in its list: at most 255 characters on Other Names and Job Types, 100 on the others. Every list but Customer Messages and Sales Tax Codes needs it.',
+  companyName: 'Other Names only: company name; leave out for none.',
+  email: 'Other Names only: email address; leave out for none.',
+  phone: 'Other Names only: phone number (at most 50 characters); leave out for none.',
+  address: 'Other Names only: address as named lines line1, line2, city, state, zip and country; leave out for none.',
+  accountNumber: 'Other Names only: your account number with them (at most 100 characters); leave out for none. A masked number such as "••••6789" cannot be saved.',
+  notes: 'Other Names only: notes; leave out for none.',
+  billingRateLevelId: 'Other Names only: id of the billing rate level (billing rate level list) their time is billed at; leave out for none.',
+  parentId: 'Job Types only: id of the job type this one is a sub-type of; leave out for a top-level type.',
+  kind: 'Terms only: standard (due a number of days after the invoice date) or date_driven (due on a day of the month); leave out for standard.',
+  netDays: 'Standard terms only: days after the invoice date payment is due, 0 to 999.',
+  discountPercent: 'Terms only: early-payment discount in percent, as decimal text such as "2"; leave out for none.',
+  discountDays: 'Standard terms only: days after the invoice date the discount applies within, 0 to 999.',
+  dueDayOfMonth: 'Date-driven terms only: day of the month payment is due, 1 to 31.',
+  dueNextMonthWithinDays: 'Date-driven terms only: an invoice dated this many days or fewer before the due day is due the month after, 0 to 30.',
+  discountDayOfMonth: 'Date-driven terms only: day of the month the discount applies until, 1 to 31.',
+  type: 'Payment Methods only: cash, check, credit_card, ach, bank_transfer or other; leave out for other.',
+  message: 'Customer Messages only, and needed there: the message printed on sales forms (at most 500 characters).',
+  code: 'Sales Tax Codes only, and needed there: the code, at most 3 characters, such as "Tax" or "Non".',
+  description: 'Sales Tax Codes and Vehicles only: a description (at most 255 characters); leave out for none.',
+  taxable: 'Sales Tax Codes only: true for a taxable code, false for a non-taxable one; leave out for taxable.',
+  isActive: 'false adds the entry as inactive; leave out for active.',
+};
+
+/**
+ * POST /api/lists/:list — add an entry to a simple list. Which fields count depends on the list
+ * in the path, and the service checks the body with that list's own schema above (and its own
+ * messages), so here every field is zLenient and anything that is not an object reads as {}: the
+ * check refuses nothing, and says what each field is, for agents (describe_operation, plan §6.3).
+ */
+export const simpleListEntrySchema = z
+  .preprocess(
+    (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {}),
+    z.object(
+      Object.fromEntries(
+        (Object.keys(SIMPLE_LIST_FIELDS) as Array<keyof typeof SIMPLE_LIST_FIELDS>).map((k) => [
+          k,
+          zLenient(SIMPLE_LIST_FIELDS[k] as z.ZodTypeAny).describe(SIMPLE_LIST_FIELD_TEXTS[k]),
+        ]),
+      ),
+    ),
+  )
+  .describe(
+    'Send the fields of the list named in the path: other-names, job-types, terms, ship-via, payment-methods, customer-messages, sales-tax-codes or vehicles. Each field says which lists use it; a field another list uses is ignored.',
+  );
 
 // ---- To Do + Notes ----
 export const TODO_TYPES = ['call', 'fax', 'email', 'meeting', 'appointment', 'task'] as const;

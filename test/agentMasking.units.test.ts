@@ -21,6 +21,15 @@
  *      list, and the memo filters let a caller test guesses at the hidden digits. The books keep
  *      the stored text: a save as shown, Undo and a reversal never write the masked text;
  *   6. the vendor lookup sent a payee's name to the company's SearXNG in an agent's preview.
+ *
+ * The fourth wave closed the places the third left (_vr_tmp/WAVE3-NOTES.md, masking, audit,
+ * tests-reads, classes-a):
+ *
+ *   5. the journal entry window (GET /api/journal-entries/[id]) answered the stored memo;
+ *   6. a preview of a payee already looked up said nothing about the lookup server;
+ *   7. the shareable ledger's Journal sheet, a receipt's text (a W-9 dropped into the inbox), the
+ *      transaction log's records and search, the audit-based accountant reports, and the words of
+ *      an approved reveal; and Transaction Detail read the whole scan cap for every search.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
@@ -30,17 +39,19 @@ import { NextRequest } from 'next/server';
 import { closeDb, getDb, type DB } from '@/lib/db';
 import {
   accounts,
+  agentPermissionRequests,
   bankAccounts,
   bankTransactions,
   journalEntries,
   journalEntryLines,
   paymentChecks,
+  receiptScans,
   users,
   vendors,
 } from '@/lib/db/schema';
 import { effectsOfFailedRun, runWithEffects } from '@/lib/effects';
 import { isNotRunInPreview } from '@/lib/ai/outbound';
-import { fullAccess, type EffectiveAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas, type EffectiveAccess } from '@/lib/permissions/model';
 import type { ServiceContext } from '@/lib/services/_base';
 import { createCompany } from '@/lib/services/company';
 import { createExpense } from '@/lib/services/expenses';
@@ -74,7 +85,8 @@ import {
 } from '@/lib/services/journal';
 import { listJournalOpenItems } from '@/lib/services/journalApplications';
 import { commitUndo, performUndo, prepareUndo } from '@/lib/services/undo';
-import { fetchGlLines, loadAccountMeta } from '@/lib/services/reportEngine';
+import { PgSelectQueryBuilderBase } from 'drizzle-orm/pg-core';
+import { fetchGlLines, GL_LIMITS, loadAccountMeta } from '@/lib/services/reportEngine';
 import { checkDetail, transactionDetail } from '@/lib/services/reportsExtra';
 import { checkPrintData, listPrintQueue, markPrinted } from '@/lib/services/printQueue';
 import { assignVendorType, createType } from '@/lib/services/typeLists';
@@ -84,10 +96,20 @@ import { setNetworkPolicy } from '@/lib/services/networkPolicy';
 import { clearVendorLookupCache, lookupVendor, VENDOR_LOOKUP_PURPOSE } from '@/lib/services/vendorLookup';
 import { llmSuggestBankCategory, suggestAccountForPayee } from '@/lib/services/aiCategorizer';
 
-/** The caller GET /api/journal-entries/[id] runs for in the route test (section 5). */
+import AdmZip from 'adm-zip';
+import type { ReportParams } from '@/lib/validation/reports';
+import { writeAudit } from '@/lib/services/_base';
+import { appendTransactionLog } from '@/lib/services/transactionLog';
+import { buildShareableLedgerXlsx } from '@/lib/services/shareableLedger';
+import { getReceipt, listReceipts, receiptTextFor, uploadReceipt } from '@/lib/services/receipts';
+import { agentActivityReport, getAuditLog, listAuditLogs } from '@/lib/services/auditTrail';
+import { voidedDeletedTransactions } from '@/lib/services/accountant/auditReports';
+
+/** The caller the routes under test run for (GET /api/journal-entries/[id], GET /api/transaction-log). */
 let routeCtx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) }));
 import { GET as entryGET } from '@/app/api/journal-entries/[id]/route';
+import { GET as logGET } from '@/app/api/transaction-log/route';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-agent-masking-units');
 let db: DB;
@@ -524,8 +546,8 @@ describe('5. line memos already in the books', () => {
     expect((await getEntryForCaller(full, legacyEntryId)).lines.map((l) => l.memo)).toContain(MEMO);
     expect((await getEntryForCaller(ctx, legacyEntryId)).lines.map((l) => l.memo)).toContain(MEMO);
     // getEntry is the stored read for work that keeps or copies the entry (Undo snapshots it):
-    // whoever it runs for, it holds the memo as stored. GET /api/journal-entries/[id] still answers
-    // it (the route is not this unit's; see the route test below).
+    // whoever it runs for, it holds the memo as stored. GET /api/journal-entries/[id] answers
+    // getEntryForCaller (see the route test below).
     expect((await getEntry(masked, legacyEntryId)).lines.map((l) => l.memo)).toContain(MEMO);
     // The stored line is not touched by reading it.
     const stored = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, legacyEntryId));
@@ -547,14 +569,32 @@ describe('5. line memos already in the books', () => {
       expect((await fromRoute(full)).memos).toContain(MEMO);
     });
 
-    // The route still answers getEntry (the stored read): app/api/journal-entries/[id]/route.ts is
-    // not this unit's file, so switching its GET to getEntryForCaller is handed off. `it.fails`
-    // keeps the gap visible here; once the route is switched this reports "expected to fail":
-    // then make it `it`. The test above proves the route itself answers under this mock.
-    it.fails('a caller without the right reads it masked (fails until the route answers getEntryForCaller)', async () => {
+    // The route answers getEntryForCaller: the window shows the memo the way the registers and the
+    // reports do. The test above proves the route itself answers under this mock.
+    it('a caller without the right reads it masked (the route answers getEntryForCaller)', async () => {
       const { memos, text } = await fromRoute(masked);
       expect(memos).toContain(SHOWN);
       expect(text).not.toContain(FULL_NUMBER);
+    });
+
+    it('saving the entry as the window showed it keeps the stored memo', async () => {
+      // The window sends back what GET answered; the books must keep the full number.
+      const created = await createManualEntry(ctx, {
+        date: d('2027-04-02'),
+        description: 'Gas deposit',
+        lines: [
+          { accountId: acct['6600'], debit: '12.00', memo: MEMO },
+          { accountId: acct['1000'], credit: '12.00', memo: 'Paid' },
+        ],
+      });
+      routeCtx = masked;
+      const res = await entryGET(new NextRequest(`http://localhost/api/journal-entries/${created.id}`), {
+        params: Promise.resolve({ id: created.id }),
+      });
+      const { entry } = (await res.json()) as { entry: JournalEntryDetail };
+      expect(entry.lines.map((l) => l.memo).sort()).toEqual([SHOWN, 'Paid']);
+      await updateEntry(masked, created.id, { ...asShownOnSave(entry), date: new Date(entry.date), description: 'Gas deposit (refundable)' });
+      expect(await storedMemos(created.id)).toEqual([MEMO, 'Paid']);
     });
   });
 
@@ -929,10 +969,27 @@ describe('6. the vendor lookup in an agent preview', () => {
       { kind: 'network', summary: `Contact ${HOST} for ${VENDOR_LOOKUP_PURPOSE}`, detail: { host: HOST, purpose: VENDOR_LOOKUP_PURPOSE, ran: true } },
     ]);
     expect(await run.release()).toEqual([expect.objectContaining({ status: 'sent', error: null, ranDuringOperation: true })]);
-    // A name already looked up is answered from memory: a preview then contacts nothing either.
-    const cached = await runWithEffects('capture', () => lookupVendor(ctx, 'ferguson supply', { fetchImpl }));
-    expect(cached.value).toEqual(run.value);
-    expect(cached.effects).toEqual([]);
+    // A name already looked up is answered from memory for a person, and in a real run.
+    expect(await lookupVendor(ctx, 'ferguson supply', { fetchImpl })).toEqual(run.value);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('a preview of a name already looked up still says the approved run may contact the lookup server', async () => {
+    // The answer is remembered for a day and forgotten on a restart: the approved run may then send
+    // the name after all, so the card must say so in advance. Nothing is sent from the preview.
+    const first = await lookupVendor(ctx, 'Ferguson Supply', { fetchImpl });
+    expect(first?.summary).toContain('plumbing supplies');
+    expect(calls).toHaveLength(1);
+    const err = await runWithEffects('capture', () => lookupVendor(ctx, 'ferguson supply', { fetchImpl })).catch((e: unknown) => e);
+    expect(isNotRunInPreview(err)).toBe(true);
+    expect(effectsOfFailedRun(err)?.effects).toEqual([
+      { kind: 'network', summary: `Contact ${HOST} for ${VENDOR_LOOKUP_PURPOSE}`, detail: { host: HOST, purpose: VENDOR_LOOKUP_PURPOSE, ran: false } },
+    ]);
+    expect(calls).toHaveLength(1);
+    // The approved run (defer) uses what is remembered: nothing sent, nothing to report.
+    const approved = await runWithEffects('defer', () => lookupVendor(ctx, 'ferguson supply', { fetchImpl }));
+    expect(approved.value).toEqual(first);
+    expect(approved.effects).toEqual([]);
     expect(calls).toHaveLength(1);
   });
 
@@ -962,6 +1019,351 @@ describe('6. the vendor lookup in an agent preview', () => {
       expect(fetchSpy).not.toHaveBeenCalled();
     } finally {
       fetchSpy.mockRestore();
+    }
+  });
+});
+
+describe('7. the shareable ledger, receipts, the transaction log, the audit reports and reveals', () => {
+  const MEMO = `Acct # ${FULL_NUMBER}`;
+  const SHOWN = 'Acct # ••••6789';
+  // September 2027 holds only this section's lines.
+  const from = d('2027-09-01');
+  const to = d('2027-09-30');
+  const AGENT_ID = '00000000-0000-4000-8000-00000000a9e1';
+  const agentOf = { id: AGENT_ID, name: 'Bot', mode: 'post' as const };
+  /** May manage agents (Users & Roles > Users) but not see payroll; both View rights. */
+  let userManager: ServiceContext;
+
+  beforeAll(async () => {
+    await createManualEntry(ctx, {
+      date: d('2027-09-03'),
+      description: 'Water bill',
+      lines: [
+        { accountId: acct['6600'], debit: '30.00', memo: MEMO },
+        { accountId: acct['1000'], credit: '30.00', memo: 'Paid by check' },
+      ],
+    });
+    userManager = { ...ctx, access: { ...withoutAreas(accessWithFlags(true), ['payroll', 'reports_payroll']), isAdmin: false } };
+  });
+
+  it('the shareable ledger: the Journal sheet writes each memo as the caller may see it', async () => {
+    const text = async (c: ServiceContext) =>
+      new AdmZip((await buildShareableLedgerXlsx(c)).buffer)
+        .getEntries()
+        .filter((e) => e.entryName.endsWith('.xml'))
+        .map((e) => e.getData().toString('utf8'))
+        .join('\n');
+    const hidden = await text(masked);
+    expect(hidden).not.toContain(FULL_NUMBER);
+    expect(hidden).toContain(SHOWN);
+    expect(await text(full)).toContain(MEMO);
+  });
+
+  describe("a receipt's text", () => {
+    const TEXT = [
+      'Form W-9',
+      'Name: Pat Contractor',
+      'Social security number 123-45-6789',
+      'EIN: 12-3456789',
+      'Account No. 4471234567 for ACH',
+      `Bank ${MEMO}`,
+      'Also on file 987-65-4321',
+      'Total 22.79',
+    ].join('\n');
+    const HIDDEN = /123-45-6789|12-3456789|4471234567|000123456789|987-65-4321/;
+    let receiptId: string;
+
+    beforeAll(async () => {
+      const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(64, 1)]);
+      receiptId = (await uploadReceipt(ctx, { filename: 'w9.jpg', bytes: jpeg })).id;
+      await db.update(receiptScans).set({ rawText: TEXT, status: 'ready' }).where(eq(receiptScans.id, receiptId));
+    });
+
+    it('one receipt: masked without the View rights, line by line; as stored with them', async () => {
+      const shown = (await getReceipt(masked, receiptId)).rawText!;
+      expect(shown).not.toMatch(HIDDEN);
+      expect(shown.split('\n')).toEqual([
+        'Form W-9',
+        'Name: Pat Contractor',
+        'Social security number ***-**-6789',
+        'EIN: ***-**-6789',
+        'Account No. ••••4567 for ACH',
+        `Bank ${SHOWN}`,
+        'Also on file ***-**-4321',
+        'Total 22.79',
+      ]);
+      expect((await getReceipt(full, receiptId)).rawText).toBe(TEXT);
+      expect((await getReceipt(ctx, receiptId)).rawText).toBe(TEXT);
+    });
+
+    it('each View right shows its own kind only', () => {
+      const flags = (sensitivePayroll: boolean, fullAccountNumbers: boolean) => ({
+        access: { ...fullAccess(), flags: { ...fullAccess().flags, sensitivePayroll, fullAccountNumbers } },
+      });
+      const ssnOnly = receiptTextFor(flags(true, false), TEXT)!;
+      expect(ssnOnly).toContain('123-45-6789');
+      expect(ssnOnly).not.toContain(FULL_NUMBER);
+      const accountsOnly = receiptTextFor(flags(false, true), TEXT)!;
+      expect(accountsOnly).toContain(FULL_NUMBER);
+      expect(accountsOnly).not.toContain('123-45-6789');
+    });
+
+    it('the inbox list leaves the text out for everyone', async () => {
+      for (const c of [masked, full]) {
+        expect((await listReceipts(c, { status: 'all' })).find((r) => r.id === receiptId)?.rawText).toBeNull();
+      }
+    });
+
+    it('an agent gets no text unless a person approved a reveal for its run', async () => {
+      expect((await getReceipt({ ...masked, agent: agentOf }, receiptId)).rawText).toBeNull();
+      expect((await getReceipt({ ...ctx, agent: agentOf }, receiptId)).rawText).toBeNull();
+      // A reveal of SSNs turns that one View right on for the run: the account numbers stay masked.
+      const ssnRevealed = { ...ctx, agent: agentOf, access: { ...masked.access!, flags: { ...masked.access!.flags, sensitivePayroll: true } } };
+      const text = (await getReceipt(ssnRevealed, receiptId)).rawText!;
+      expect(text).toContain('123-45-6789');
+      expect(text).not.toContain(FULL_NUMBER);
+    });
+
+    it('a labelled SSN or EIN split oddly by the reading (OCR) is masked too; amounts and longer numbers are not', () => {
+      const shown = (line: string) => receiptTextFor(masked, line);
+      expect(shown('SSN: 1234-56789')).toBe('SSN: ***-**-6789');
+      expect(shown('Tax ID 12 345 6789')).toBe('Tax ID ***-**-6789');
+      expect(shown('SSN 1234 5678 9')).toBe('SSN ***-**-6789');
+      expect(shown('Social Security Number 123 - 45 - 6789')).toBe('Social Security Number ***-**-6789');
+      expect(shown('EIN #12 . 3456789, dependents 2')).toBe('EIN #***-**-6789, dependents 2');
+      // Not a tax ID: an amount after the label, a number of ten digits, a short one.
+      expect(shown('EIN 1234567.89 paid')).toBe('EIN 1234567.89 paid');
+      expect(shown('SSN 1234 5678 90')).toBe('SSN 1234 5678 90');
+      expect(shown('TIN 1234 567')).toBe('TIN 1234 567');
+      // With the right, as read.
+      expect(receiptTextFor(full, 'SSN 1234 5678 9')).toBe('SSN 1234 5678 9');
+    });
+
+    it('the text masks match in linear time, however long a run of spaces or digits', () => {
+      const started = performance.now();
+      receiptTextFor(masked, `SSN${' '.repeat(20_000)}x tax${'-'.repeat(20_000)}id ${'1'.repeat(20_000)}`);
+      receiptTextFor(masked, `EIN #${' '.repeat(5_000)}:${' '.repeat(5_000)}1`.repeat(3));
+      // Runs of the gaps a loosely grouped number may hold between its digits.
+      receiptTextFor(masked, `SSN 1${' - 1'.repeat(10_000)} SSN ${'1 .'.repeat(10_000)} ${'SSN '.repeat(5_000)}1`);
+      expect(performance.now() - started).toBeLessThan(2000);
+    });
+  });
+
+  describe('GET /api/transaction-log', () => {
+    const read = async (c: ServiceContext, q = '') => {
+      routeCtx = { ...c, role: 'accountant' };
+      const res = await logGET(new NextRequest(`http://localhost/api/transaction-log?limit=5000${q ? `&q=${encodeURIComponent(q)}` : ''}`));
+      expect(res.status).toBe(200);
+      return (await res.json()) as { rows: Array<{ entityType: string; summary: string; data: unknown }>; total: number };
+    };
+
+    const SUMMARY = `Paid the county, ${MEMO}`;
+
+    beforeAll(() => {
+      // A record whose own summary holds the number (logTransaction callers may write their own).
+      appendTransactionLog(TEST_DIR, [
+        { userId: ctx.userId!, userName: 'Masking', companyId: ctx.companyId, action: 'create', entityType: 'sales_tax_payment_note', entityId: null, summary: SUMMARY, data: null },
+      ]);
+    });
+
+    it('records are answered the way the audit trail answers them: memo text and summaries masked without the right', async () => {
+      const hidden = await read(masked);
+      expect(JSON.stringify(hidden)).not.toContain(FULL_NUMBER);
+      // The memo of a check or a journal line in a record's values, and a summary.
+      expect(JSON.stringify(hidden.rows.map((r) => r.data))).toContain(SHOWN);
+      expect(hidden.rows.map((r) => r.summary)).toContain(`Paid the county, ${SHOWN}`);
+      const shown = await read(full);
+      expect(JSON.stringify(shown.rows.map((r) => r.data))).toContain(MEMO);
+      expect(shown.rows.map((r) => r.summary)).toContain(SUMMARY);
+    });
+
+    it('its search matches what the reader is shown, so a guess at hidden digits finds nothing', async () => {
+      expect((await read(masked, '0001234')).total).toBe(0);
+      expect((await read(full, '0001234')).rows.map((r) => r.summary)).toContain(SUMMARY);
+      expect((await read(masked, 'county, Acct # ••••')).rows.map((r) => r.summary)).toEqual([`Paid the county, ${SHOWN}`]);
+    });
+
+    describe('Users & Roles records and an agent request', () => {
+      const REQUEST_ID = '00000000-0000-4000-8000-00000000a9e3';
+      const NOTE = 'Dana Lee is on leave until March';
+
+      beforeAll(async () => {
+        await writeAudit(ctx, { action: 'update', entityType: 'user', entityId: ctx.userId!, oldValues: { name: 'M' }, newValues: { name: 'Masking' } });
+        // A person's denial of an agent's payroll request, with the reason in their note.
+        await writeAudit(ctx, {
+          action: 'update',
+          entityType: 'agent_permission_request',
+          entityId: REQUEST_ID,
+          oldValues: { status: 'pending' },
+          newValues: { operation: 'employees.get', agentId: AGENT_ID, status: 'denied', note: NOTE },
+        });
+      });
+
+      type LogPage = { rows: Array<{ entityType: string; entityId: string | null; data: { new?: Record<string, unknown> } | null }>; entityTypes: string[] };
+      const kindsOf = (page: LogPage) => new Set(page.rows.map((r) => r.entityType));
+
+      it('an agent with the Admin role reads no Users & Roles records, nor an agent request (auditReaderFor)', async () => {
+        const asAdmin = (await read(full)) as unknown as LogPage;
+        expect(kindsOf(asAdmin)).toContain('user');
+        expect(kindsOf(asAdmin)).toContain('agent_permission_request');
+        expect(JSON.stringify(asAdmin)).toContain(NOTE);
+
+        // Both View rights on, as after an approved reveal: still no Users & Roles records.
+        for (const agentCtx of [{ ...full, agent: agentOf }, { ...masked, agent: agentOf }]) {
+          const asAgent = (await read(agentCtx)) as unknown as LogPage;
+          expect(asAgent.rows.length).toBeGreaterThan(0);
+          for (const kind of ['user', 'agent_permission_request', 'agent_grant']) {
+            expect(kindsOf(asAgent).has(kind)).toBe(false);
+            expect(asAgent.entityTypes).not.toContain(kind);
+          }
+          expect(JSON.stringify(asAgent)).not.toContain(NOTE);
+        }
+        // Its flags off: the memo text masked, as for a person without the right.
+        expect(JSON.stringify(await read({ ...masked, agent: agentOf }))).not.toContain(FULL_NUMBER);
+      });
+
+      it("someone who manages agents but not payroll sees the request, its note hidden", async () => {
+        const page = (await read(userManager)) as unknown as LogPage;
+        const record = page.rows.find((r) => r.entityType === 'agent_permission_request' && r.entityId === REQUEST_ID);
+        expect(record).toBeDefined();
+        expect(record!.data?.new).toMatchObject({
+          status: 'denied',
+          note: 'Details hidden. An Admin, or someone who may view Employees & Payroll, can see them.',
+        });
+        expect(JSON.stringify(page)).not.toContain(NOTE);
+        // An Admin reads the note as written.
+        const asAdmin = (await read(full)) as unknown as LogPage;
+        expect(asAdmin.rows.find((r) => r.entityId === REQUEST_ID)?.data?.new?.note).toBe(NOTE);
+      });
+    });
+  });
+
+  it('Voided/Deleted Transactions Detail: the original values masked as the audit trail masks them', async () => {
+    const entityId = '00000000-0000-4000-8000-00000000de1e';
+    await writeAudit(ctx, {
+      action: 'delete',
+      entityType: 'journal_entry',
+      entityId,
+      oldValues: { entryNumber: 9001, description: 'Gas bill', lines: [{ debit: '8.00', memo: MEMO }, { credit: '8.00', memo: null }] },
+    });
+    const original = async (c: ServiceContext) =>
+      JSON.stringify((await voidedDeletedTransactions(c, { detail: true })).rows.find((r) => r.entityId === entityId)?.original ?? null);
+    expect(await original(masked)).not.toContain(FULL_NUMBER);
+    expect(await original(masked)).toContain(SHOWN);
+    expect(await original(full)).toContain(MEMO);
+  });
+
+  describe('an approved reveal in words', () => {
+    const SENTENCE = 'Revealed full SSNs and tax IDs of "Show employee Dana Lee" to agent "Bot", approved by Masking.';
+    const HIDDEN = 'Revealed full SSNs and tax IDs to an agent. Details hidden. An Admin, or someone who may view Employees & Payroll, can see them.';
+    let requestId: string;
+
+    beforeAll(async () => {
+      const [req] = await db
+        .insert(agentPermissionRequests)
+        .values({
+          companyId: ctx.companyId,
+          agentId: AGENT_ID,
+          requestKey: 'reveal-in-words',
+          operation: 'employees.get',
+          class: 'read_sensitive',
+          summary: 'Show employee Dana Lee',
+          status: 'executed',
+          decidedBy: ctx.userId,
+          expiresAt: new Date(Date.now() + 86_400_000),
+        })
+        .returning();
+      requestId = req.id;
+      // What agentRequests.ts writes on the decision's record of an approved reveal (revealAudit).
+      await writeAudit(ctx, {
+        action: 'update',
+        entityType: 'agent_permission_request',
+        entityId: requestId,
+        oldValues: { status: 'pending' },
+        newValues: {
+          operation: 'employees.get',
+          agentId: AGENT_ID,
+          status: 'executed',
+          approvedBy: ctx.userId,
+          revealed: SENTENCE,
+          revealedFields: 'full SSNs and tax IDs',
+        },
+      });
+    });
+
+    it('the audit trail: the sentence on the entry, for who may view the work; the kinds only for anyone else', async () => {
+      const rowOf = async (c: ServiceContext) =>
+        (await listAuditLogs(c, { entityType: 'agent_permission_request', limit: 500 })).rows.find((r) => r.entityId === requestId)!;
+      const listed = await rowOf(full);
+      expect(listed.summary).toBe(SENTENCE);
+      expect((await getAuditLog(full, listed.id)).summary).toBe(SENTENCE);
+      const managed = await rowOf(userManager);
+      expect(managed.summary).toBe(HIDDEN);
+      const one = await getAuditLog(userManager, managed.id);
+      expect(one.summary).toBe(HIDDEN);
+      expect(one.newValues).toMatchObject({ revealedFields: 'full SSNs and tax IDs', revealed: expect.stringMatching(/^Details hidden\./) });
+      expect(JSON.stringify(one)).not.toContain('Dana Lee');
+      // Every other entry keeps its shape: no summary.
+      const others = (await listAuditLogs(full, { entityType: 'journal_entry', limit: 5 })).rows;
+      expect(others.every((r) => !('summary' in r))).toBe(true);
+    });
+
+    it('the Agent Activity report says what was revealed in place of the bare summary', async () => {
+      const what = async (c: ServiceContext) =>
+        (await agentActivityReport(c, {} as ReportParams)).rows.find((r) => r.id === `aa:${requestId}`)?.cells.what;
+      expect(await what(full)).toBe(SENTENCE);
+      expect(await what(userManager)).toBe(HIDDEN);
+    });
+  });
+
+  it('Transaction Detail and the General Ledger memo filter: the limit and "more lines" hold when the mask drops lines', async () => {
+    const td = async (c: ServiceContext, search: string, limit: number) => {
+      const r = await transactionDetail(c, { from, to, search, limit });
+      return { memos: r.rows.map((x) => x.memo).sort(), truncated: r.truncated };
+    };
+    // "0001" matches the stored memo only; the caller sees it masked, so nothing, and nothing more.
+    expect(await td(masked, '0001', 1)).toEqual({ memos: [], truncated: false });
+    expect(await td(full, '0001', 1)).toEqual({ memos: [MEMO], truncated: false });
+    expect(await td(masked, '6789', 1)).toEqual({ memos: [SHOWN], truncated: false });
+    // Both lines match the description: one shown, and the report says there is more.
+    expect(await td(masked, 'Water', 1)).toMatchObject({ truncated: true });
+    expect((await td(masked, 'Water', 1)).memos).toHaveLength(1);
+    expect(await td(masked, 'Water', 5)).toEqual({ memos: [SHOWN, 'Paid by check'], truncated: false });
+
+    const gl = async (c: ServiceContext, memo: string, limit: number) => {
+      const r = await fetchGlLines(c, await loadAccountMeta(c), { from, to, memo, limit });
+      return { memos: r.lines.map((l) => l.memo).sort(), truncated: r.truncated };
+    };
+    expect(await gl(masked, '0001', 1)).toEqual({ memos: [], truncated: false });
+    expect(await gl(masked, '6789', 1)).toEqual({ memos: [SHOWN], truncated: false });
+    expect(await gl(masked, 'Water', 1)).toMatchObject({ truncated: true });
+    expect(await gl(masked, 'Water', 5)).toEqual({ memos: [SHOWN, 'Paid by check'], truncated: false });
+  });
+
+  it('Transaction Detail and the General Ledger memo filter read only as far past the limit as the mask may drop lines', async () => {
+    // Every row cap a query of the run asks the database for (drizzle's .limit()).
+    const limits = vi.spyOn(PgSelectQueryBuilderBase.prototype, 'limit');
+    const largestRead = async (run: () => Promise<unknown>) => {
+      limits.mockClear();
+      await run();
+      return Math.max(...limits.mock.calls.map(([n]) => Number(n)));
+    };
+    try {
+      // "Water" matches both lines by their description: no line can drop, so the limit and one more.
+      expect(await largestRead(() => transactionDetail(masked, { from, to, search: 'Water', limit: 1 }))).toBe(2);
+      // "6789" matches nothing else on the line whose memo the mask may change: one line more.
+      expect(await largestRead(() => transactionDetail(masked, { from, to, search: '6789', limit: 1 }))).toBe(3);
+      // A caller who sees memos as stored is matched by the database: the limit and one more.
+      expect(await largestRead(() => transactionDetail(full, { from, to, search: '6789', limit: 1 }))).toBe(2);
+      // Never the General Ledger's whole scan cap.
+      expect(await largestRead(() => transactionDetail(masked, { from, to, search: 'a', limit: 10 }))).toBeLessThan(GL_LIMITS.postFilterScan);
+
+      const meta = await loadAccountMeta(masked);
+      expect(await largestRead(() => fetchGlLines(masked, meta, { from, to, memo: 'Water', limit: 1 }))).toBe(2);
+      expect(await largestRead(() => fetchGlLines(masked, meta, { from, to, memo: '6789', limit: 1 }))).toBe(3);
+      expect(await largestRead(() => fetchGlLines(masked, meta, { from, to, memo: 'a', limit: 10 }))).toBeLessThan(GL_LIMITS.postFilterScan);
+    } finally {
+      limits.mockRestore();
     }
   });
 });

@@ -3,6 +3,10 @@
  * paused agent is refused everything until a person resumes it; an agent that asked too often in
  * an hour is paused this way too (plan 11.2). Answers AgentDetail.
  *
+ * Who may (the service checks): pausing, anyone who may change Users & Roles > Users. Resuming lets
+ * the agent work again, so only an Admin may resume an agent that holds the Admin role or has more
+ * access than the person resuming it.
+ *
  * A person's window only (app/api/agent-requests/_guards.ts): pausing and resuming stay with people.
  * Allowed from any person's window (the host's, or a teammate's through the multi-user proxy), so
  * stopping an agent is never more than a click away; not from another program on this computer.
@@ -10,15 +14,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getAgentDetail, pauseAgent } from '@/lib/services/agentPolicies';
-import { routeError, requireJsonObject } from '@/lib/routeErrors';
+import { requireJsonObject } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { pauseAgentsSchema } from '@/lib/validation/agentAccess';
-import { NO_STORE, badId, refuseAgent, refuseOutsideWindow } from '@/app/api/agent-requests/_guards';
+import { NO_STORE, badId, refuseAgent, refuseAgentRequest, refuseOutsideWindow, routeErrorPlain } from '@/app/api/agent-requests/_guards';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const early = refuseAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
     const refused = refuseAgent(ctx, req) ?? refuseOutsideWindow(req);
     if (refused) return refused;
@@ -30,6 +36,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     await pauseAgent(ctx, id, parsed.data.paused);
     return NextResponse.json(await getAgentDetail(ctx, id), { headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agents/[id]/pause/route');
+    return routeErrorPlain(err, 'agents/[id]/pause/route');
   }
 }

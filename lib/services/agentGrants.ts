@@ -18,9 +18,12 @@
  *    sends: is no longer an Admin), since approving never widens anything (plan 4.5). The Agents
  *    tab's live list (listGrants with `live`) shows exactly these.
  *  - Nothing running inside an agent's bridged run reads, lists, gives, uses or takes back a grant.
- *  - useGrant: counts one use in the run's own transaction with ONE update that checks everything
- *    again, so a run that rolls back gives the use back, and two runs racing for the last use cannot
- *    both have it.
+ *  - useGrant: checks the giver again and counts one use in the run's own transaction with ONE
+ *    update that checks everything else again, so a run that rolls back gives the use back, two
+ *    runs racing for the last use cannot both have it, and a giver who lost the right since the
+ *    grant was looked up lends nothing to the run.
+ *  - grantWindowReader / grantMinutesFor: the longest window a person may give with a request,
+ *    every rule createGrant applies, the company's day read once for many requests.
  *  - revokeGrant: the person who gave it, or anyone who may manage agents (Users & Roles > Users,
  *    modify: the same right that pauses or removes one). Never an agent.
  *
@@ -260,11 +263,18 @@ function grantRules(ctx: ServiceContext, operationId: unknown, facts: RequestFac
     );
   }
   // Approvable only at the host's own window, or only by the file's Admin: a grant would let later
-  // requests run with no such approval, and nothing here can show where the person is.
-  if (operation.hostOnly || operation.fileAdmin) {
+  // requests run with no such approval, and nothing here can show where the person is. Refused for
+  // everyone, Admins included, so the words never send the person to an Admin for it.
+  if (operation.hostOnly) {
     throw new ServiceError(
       'FORBIDDEN',
-      'This can only be approved at the computer that holds the company file, one request at a time, so standing permission cannot be given for it.',
+      'This can only be approved at the computer that holds the company file, one request at a time, so nobody can give standing permission for it, an Admin included.',
+    );
+  }
+  if (operation.fileAdmin) {
+    throw new ServiceError(
+      'FORBIDDEN',
+      "This is company-file work, which the file's Admin approves one request at a time, so nobody can give standing permission for it, an Admin included.",
     );
   }
   if (grantNeedsAdmin(operation, facts) && !access.isAdmin) {
@@ -295,12 +305,39 @@ function grantRules(ctx: ServiceContext, operationId: unknown, facts: RequestFac
   };
 }
 
+/** The longest standing permission, in minutes, for one request (an operation id and its facts); 0 for none. */
+export type GrantWindow = (operationId: string, facts: RequestFacts) => number;
+
+/**
+ * Reads the company's day from the company file ONCE, at `now`, and answers the standing window
+ * for as many requests as the caller has (a list of approvable requests, the badge): the same
+ * answer grantMinutesFor gives each of them, without a read per request.
+ *
+ * The answer applies every rule createGrant applies (the company's own day, host-only and
+ * file-Admin work, the Admin rule for outside sends, the person's own role, what the request's
+ * facts raise it to), so a window from here is never one createGrant would refuse. The count limit
+ * of bulk work is checked when the grant is given. Whatever cannot be worked out for a request
+ * answers 0 (fail closed: that request can still be approved once). The person is `ctx`, judged
+ * when each window is asked for. A failure to read the company file itself is thrown.
+ */
+export async function grantWindowReader(ctx: ServiceContext, now: Date = new Date()): Promise<GrantWindow> {
+  const left = minutesLeftToday(await companyState(ctx), now);
+  return (operationId, facts) => {
+    try {
+      const minutes = grantRules(ctx, operationId, facts, left).maxMinutes;
+      return Number.isSafeInteger(minutes) && minutes > 0 ? minutes : 0;
+    } catch {
+      return 0;
+    }
+  };
+}
+
 /**
  * The longest standing permission (in minutes) this person may give while approving this request;
- * 0 when they may give none. It applies every rule createGrant applies (the company's own day,
- * host-only and file-Admin work, the Admin rule for outside sends, the person's own role), so the
- * approval card (AgentRequestForPerson.grantMinutesMax) should take its window from here to never
- * offer one createGrant would refuse. The count limit of bulk work is checked when the grant is given.
+ * 0 when they may give none. It applies every rule createGrant applies (grantWindowReader, which a
+ * caller judging many requests should use instead), so the approval card
+ * (AgentRequestForPerson.grantMinutesMax) should take its window from here to never offer one
+ * createGrant would refuse.
  */
 export async function grantMinutesFor(
   ctx: ServiceContext,
@@ -308,13 +345,7 @@ export async function grantMinutesFor(
   facts: RequestFacts,
   now: Date = new Date(),
 ): Promise<number> {
-  try {
-    const state = await companyState(ctx);
-    return grantRules(ctx, operationId, facts, minutesLeftToday(state, now)).maxMinutes;
-  } catch (e) {
-    if (e instanceof ServiceError) return 0;
-    throw e;
-  }
+  return (await grantWindowReader(ctx, now))(operationId, facts);
 }
 
 // ---------------------------------------------------------------------------
@@ -623,21 +654,29 @@ export const createGrant: CreateGrant = async (ctx, facts, grant) => {
 // ---------------------------------------------------------------------------
 
 const GRANT_GONE =
-  'The standing permission this request was to run under has ended: it expired, was used up or was taken back. ' +
-  'Send the request again to ask a person.';
+  'The standing permission this request was to run under has ended: it expired, was used up or was taken back, ' +
+  'or the person who gave it may no longer do this work. Send the request again to ask a person.';
 
 /**
  * Count one use inside the run's transaction (`tx.db`), so a run that rolls back gives it back.
- * One UPDATE checks everything again at the moment of use: the grant is this company's, unrevoked,
- * unexpired, not used up, its agent is neither removed nor paused, nor every agent of the company,
- * and the person who gave it is still an active member. When the run's context names an agent, the
- * grant must be that agent's. (The giver's role was checked when liveGrants handed the grant to the
- * engine, moments before, in the same request.) The bridge counts the use before the handler runs,
- * outside its service scope; nothing inside the scope may count one.
+ * The person who gave it must still be able to give it (giverStillMay: an active member whose own
+ * role allows the work, and an Admin for outside sends), read again here in the run's transaction:
+ * liveGrants checked it when it handed the grant to the engine, but the run's dry run comes in
+ * between, and a giver who lost the right meanwhile lends nothing. Then one UPDATE checks the rest
+ * again at the moment of use: the grant is this company's, unrevoked, unexpired, not used up, its
+ * agent is neither removed nor paused, nor every agent of the company, and the giver is still an
+ * active member. When the run's context names an agent, the grant must be that agent's. The bridge
+ * counts the use before the handler runs, outside its service scope; nothing inside the scope may
+ * count one.
  */
 export const useGrant: UseGrant = async (tx, grantId) => {
   refuseInsideAgentWork(INSIDE_USE);
   if (!isUuid(grantId)) throw new ServiceError('FORBIDDEN', GRANT_GONE);
+  const [found] = await tx.db
+    .select()
+    .from(agentGrants)
+    .where(and(eq(agentGrants.id, grantId), eq(agentGrants.companyId, tx.companyId)));
+  if (!found || !(await giverStillMay(tx, found, new Map()))) throw new ServiceError('FORBIDDEN', GRANT_GONE);
   const now = new Date();
   const c = agentGrants.constraints;
   const conditions: SQL[] = [
@@ -740,7 +779,9 @@ export const revokeGrant: RevokeGrant = async (ctx, grantId) => {
  * company, Integrated Applications off), and the giver still able to give it (giverStillMay). So a
  * screen never shows as standing a grant the next request could not run under. Without `live`
  * every grant is listed, those that stand again once an agent or a person is turned back on
- * included, so a person can still find them and take them back.
+ * included, so a person can still find them and take them back. (The contract's AgentGrantView has
+ * no field that says whether a grant is in effect, so "not in effect" is said by leaving a grant out
+ * of the live list, never by a mark on the full one.)
  */
 export const listGrants: ListGrants = async (ctx, opts = {}) => {
   refuseInsideAgentWork(INSIDE_READ);

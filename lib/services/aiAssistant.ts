@@ -1070,18 +1070,26 @@ function agentProposalView(row: ProposalRow, request: CopiedRequest | null, now:
  * Declining it is let through (returns): it enters nothing, so it is not a second place where an
  * agent's work is approved, and without it the row would wait in every person's Ask AI for good.
  *
+ * Both refusals that mean "this has moved on since your list was read" (it is in Agent requests
+ * after all, or someone already settled it) carry the proposal as the list shows it now
+ * (`details.proposal`, agentProposalView: without the agent's input), so the panel shows where it
+ * really stands instead of a row that still reads as waiting.
+ *
  * An agent never decides either way: refused before anything else.
  */
 async function refuseAgentProposal(ctx: ServiceContext, row: ProposalRow, decision: 'approve' | 'reject'): Promise<void> {
   refuseAgentCaller(ctx);
-  const request = (await copiedRequests(ctx, [row.id])).get(row.id);
+  const request = (await copiedRequests(ctx, [row.id])).get(row.id) ?? null;
+  const proposal = agentProposalView(row, request, new Date());
   if (request) {
     const href = agentRequestHref(request.id);
-    throw new ServiceError('FORBIDDEN', AGENT_PROPOSAL_ELSEWHERE_MESSAGE, { agentRequests: true, agentRequestId: request.id, href }, [
+    throw new ServiceError('FORBIDDEN', AGENT_PROPOSAL_ELSEWHERE_MESSAGE, { agentRequests: true, agentRequestId: request.id, href, proposal }, [
       { id: 'open-agent-request', label: 'Open in Agent requests', kind: 'navigate', href },
     ]);
   }
-  if (row.status !== 'pending') throw new ServiceError('CONFLICT', `Proposal is already ${row.status}.`);
+  if (row.status !== 'pending') {
+    throw new ServiceError('CONFLICT', `Proposal is already ${row.status}.`, { agentRequests: true, agentRequestId: null, proposal });
+  }
   if (decision === 'reject') return;
   throw new ServiceError('FORBIDDEN', AGENT_PROPOSAL_UNLISTED_MESSAGE, { agentRequests: true, agentRequestId: null });
 }
@@ -1100,6 +1108,11 @@ async function refuseIfAgentProposal(ctx: ServiceContext, id: string, decision: 
   if (row?.kind === AGENT_PROPOSAL_KIND) await refuseAgentProposal(ctx, row, decision);
 }
 
+/** The most proposals one list gives (and how many rows are read at a time). */
+const LIST_MAX = 100;
+/** The most rows read to fill a list filtered by status. */
+const LIST_READ_MAX = 1000;
+
 /**
  * The proposals of this company, newest first. An agent's proposal comes with the request it was
  * copied into (`agentRequest`), and its state is that request's. A read only: nothing is written.
@@ -1108,10 +1121,24 @@ async function refuseIfAgentProposal(ctx: ServiceContext, id: string, decision: 
  * the stored one. An agent's proposal still 'pending' in this table can read otherwise (its request
  * was decided, withdrawn or expired and the row is not settled yet), so those are read too and
  * kept only when they read as asked: '?status=pending' leaves out one already done there, and
- * '?status=rejected' includes one that expired. At most 100 rows are read before that filter.
+ * '?status=rejected' includes one that expired. The list holds at most LIST_MAX proposals. Rows
+ * are read LIST_MAX at a time and, with a status, read on while that filter left the list short,
+ * up to LIST_READ_MAX rows: many agent rows that read otherwise never push real matches out.
+ *
+ * An agent calling (GET /api/ai/proposals is class 'read', lib/agent/operations/classes/
+ * documents.ts, so it runs without asking anyone) is given only the proposals it made itself, by
+ * its agent id: the way list_my_requests gives it only its own requests. The rest of the list is
+ * not its to read: the people's own Ask AI proposals carry the question they asked (`rationale`)
+ * and their ledger lines, and another agent's carry what that agent asked for. A proposal with no
+ * agent id (one the upgrade could not tie to an agent) is no agent's, so none is given it.
  */
 export async function listProposals(ctx: ServiceContext, status?: string): Promise<ProposalView[]> {
   const conds = [eq(aiProposals.companyId, ctx.companyId)];
+  if (ctx.agent) {
+    // An id that cannot be an agent's names no proposal (and would only make the query fail).
+    if (!UUID_RE.test(ctx.agent.id)) return [];
+    conds.push(eq(aiProposals.kind, AGENT_PROPOSAL_KIND), eq(aiProposals.agentId, ctx.agent.id));
+  }
   if (status) {
     conds.push(
       status === 'pending'
@@ -1119,13 +1146,32 @@ export async function listProposals(ctx: ServiceContext, status?: string): Promi
         : or(eq(aiProposals.status, status), and(eq(aiProposals.kind, AGENT_PROPOSAL_KIND), eq(aiProposals.status, 'pending')))!,
     );
   }
-  const rows = await ctx.db.select().from(aiProposals).where(and(...conds)).orderBy(desc(aiProposals.createdAt)).limit(100);
-  const asked = rows.filter((r) => r.kind === AGENT_PROPOSAL_KIND);
-  if (asked.length === 0) return rows.map(toView);
-  const requests = await copiedRequests(ctx, asked.map((r) => r.id));
+  const where = and(...conds);
   const now = new Date();
-  const views = rows.map((r) => (r.kind === AGENT_PROPOSAL_KIND ? agentProposalView(r, requests.get(r.id) ?? null, now) : toView(r)));
-  return status ? views.filter((v) => v.status === status) : views;
+  const shown: ProposalView[] = [];
+  const seen = new Set<string>();
+  for (let offset = 0; offset < LIST_READ_MAX; offset += LIST_MAX) {
+    // The id breaks ties of the same moment, so reading on neither skips nor repeats a row.
+    const rows = await ctx.db
+      .select()
+      .from(aiProposals)
+      .where(where)
+      .orderBy(desc(aiProposals.createdAt), desc(aiProposals.id))
+      .limit(LIST_MAX)
+      .offset(offset);
+    const asked = rows.filter((r) => r.kind === AGENT_PROPOSAL_KIND);
+    const requests = await copiedRequests(ctx, asked.map((r) => r.id));
+    for (const r of rows) {
+      // One made while reading on moves the rest down a place: never listed twice.
+      if (seen.has(r.id)) continue;
+      seen.add(r.id);
+      const view = r.kind === AGENT_PROPOSAL_KIND ? agentProposalView(r, requests.get(r.id) ?? null, now) : toView(r);
+      if (!status || view.status === status) shown.push(view);
+    }
+    // Unfiltered, nothing is left out after the read: one read is the list.
+    if (!status || rows.length < LIST_MAX || shown.length >= LIST_MAX) break;
+  }
+  return shown.slice(0, LIST_MAX);
 }
 
 /**

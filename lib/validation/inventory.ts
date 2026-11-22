@@ -1,16 +1,17 @@
 /**
  * Zod schemas for the inventory quantity and value changes (/api/inventory adjust and cogs,
- * /api/inventory/physical-count, /api/inventory/value-adjust; lib/services/inventorySiteOps.ts and
- * inventoryOps.ts).
+ * /api/inventory/physical-count, /api/inventory/value-adjust, /api/fifo receive and consume;
+ * lib/services/inventorySiteOps.ts and inventoryOps.ts).
  *
  * These routes read their body by hand, and their own checks answer first with the messages they
  * always gave. The schema is checked after them: it says what each field is, for agents
  * (describe_operation, plan §6.3), and refuses only a value the service could not use anyway (an
  * id or a date that is not text, a quantity that is not a number). A field the handler ignores or
- * converts when it has another type is zLenient, so what each route accepts is unchanged.
+ * converts when it has another type is zLenient, and one it turns into text is zAsText, so what
+ * each route accepts is unchanged.
  */
 import { z } from 'zod';
-import { zLenient, zUuid } from './helpers';
+import { zAsText, zLenient, zUuid } from './helpers';
 
 const itemId = z
   .string({ invalid_type_error: 'must be the id of an item' })
@@ -56,7 +57,8 @@ export const inventoryActionSchema = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('cogs').describe('cogs: take stock out at cost and post it to Cost of Goods Sold (Dr COGS, Cr Inventory Asset).'),
     itemId,
-    quantity: quantity.describe('Quantity taken out, as decimal text such as "3" (a minus sign is ignored).'),
+    // The route reads it as String(quantity), so whatever it is sent is checked as that text.
+    quantity: zAsText(quantity).describe('Quantity taken out, as decimal text such as "3" (a minus sign is ignored).'),
     date: day('Date the stock is taken out'),
     memo: zLenient(z.string().nullable()).describe('Note saved with the entry; leave out for "Cost of goods sold".'),
     ...adjustmentEntryFields,
@@ -85,3 +87,41 @@ export const valueAdjustSchema = z.object({
   reason: zLenient(z.string().nullable()).describe('Why the value changes, saved with the entry; leave out for none.'),
   ...adjustmentEntryFields,
 });
+
+/**
+ * POST /api/fifo — receive stock as a new FIFO cost layer, or take stock out at FIFO cost
+ * (lib/services/inventorySiteOps.ts adjustQuantityAtSite, costing 'fifo'). The route checks the
+ * action, the item, the quantity, the cost and the date itself; the site and entry fields it reads
+ * by type, as POST /api/inventory does.
+ */
+export const fifoActionSchema = z.discriminatedUnion('action', [
+  z.object({
+    action: z
+      .literal('receive')
+      .describe(
+        'receive: add stock as a new FIFO cost layer at unitCost (Dr Inventory Asset, Cr the adjustment account). The first receive starts FIFO costing for the item.',
+      ),
+    itemId,
+    quantity: quantity.describe('Quantity added, as decimal text such as "10".'),
+    unitCost: quantity.describe('Cost per unit of the stock added, as decimal text such as "4.25"; it is the cost of the new layer.'),
+    date: day('Date the stock is received'),
+    memo: zLenient(z.string().nullable()).describe('Note saved with the entry; leave out for "Inventory adjustment (add)".'),
+    ...adjustmentEntryFields,
+    ...siteFields,
+  }),
+  z.object({
+    action: z
+      .literal('consume')
+      .describe('consume: take stock out at FIFO cost, oldest layers first, and post that cost (Dr Cost of Goods Sold, Cr Inventory Asset).'),
+    itemId,
+    // The route reads it as String(quantity), so whatever it is sent is checked as that text.
+    quantity: zAsText(quantity).describe('Quantity taken out, as decimal text such as "3" (a minus sign is ignored).'),
+    date: day('Date the stock is taken out'),
+    memo: zLenient(z.string().nullable()).describe('Note saved with the entry; leave out for "Inventory adjustment (remove)".'),
+    ...adjustmentEntryFields,
+    adjustmentAccountId: adjustmentEntryFields.adjustmentAccountId.describe(
+      "Id of the account the cost of the stock taken out posts to (chart of accounts); leave out for the item's Cost of Goods Sold account.",
+    ),
+    ...siteFields,
+  }),
+]);

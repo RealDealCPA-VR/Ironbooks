@@ -30,6 +30,7 @@ import { requireAnyReportAccess } from './reportsAccess';
 import { assertNotSandbox } from './sandboxState';
 import { internetHeldHere } from '@/lib/net/fileTrust';
 import { sendMail } from './email';
+import { SEND_JUST_THE_ADDRESSES, isEmailAddress, isPlainAddress } from './emailSettings';
 import { getCompany, getPreferences } from './company';
 import { fillMergeFields } from '@/lib/preferences';
 import { can, canActivity, type Area, type EffectiveAccess } from '@/lib/permissions/model';
@@ -476,14 +477,21 @@ function safeSegment(s: string, fallback: string): string {
 
 /** Most recipients one schedule may email (QB keeps a short To list on a report email). */
 export const MAX_SCHEDULE_RECIPIENTS = 20;
-const EMAIL_RE = /^[^\s@,;<>"()]+@[^\s@,;<>"()]+\.[^\s@,;<>"()]+$/;
 
 /**
  * A schedule's recipients: comma / semicolon / space separated addresses, trimmed, duplicates
- * (any case) dropped, joined with ", ". Empty → null (files only). Anything that is not a plain
- * email address (a name, a header injection, a list of 21) is refused.
+ * (any case) dropped, joined with ", ". Empty → null (files only). Anything that is not one email
+ * address each (a name, a header injection, a list of 21) is refused, by the app's one address
+ * rule (lib/services/emailSettings.ts isEmailAddress: none of the characters the mailer reads as a
+ * comment, a quoted name, an address literal, an escape or a group, so "acme.com:x@evil.example"
+ * cannot reach another mailbox). With `ctx` of an agent each must be a plain address
+ * (isPlainAddress), and the message says to send just the addresses. Recipients saved before keep
+ * working: a schedule's saved list is not checked again when it runs.
  */
-export function normalizeRecipients(input: string | null | undefined): string | null {
+export function normalizeRecipients(
+  input: string | null | undefined,
+  ctx?: Pick<ServiceContext, 'agent'>,
+): string | null {
   if (input === undefined || input === null) return null;
   if (typeof input !== 'string') throw validation('Recipients must be email addresses.');
   if (/[\r\n]/.test(input)) throw validation('Recipients must be email addresses, one after another.');
@@ -492,7 +500,8 @@ export function normalizeRecipients(input: string | null | undefined): string | 
   for (const raw of input.split(/[,;\s]+/)) {
     const a = raw.trim();
     if (!a) continue;
-    if (a.length > 254 || !EMAIL_RE.test(a)) throw validation(`"${a.slice(0, 60)}" is not a valid email address.`);
+    if (ctx?.agent && !(a.length <= 254 && isPlainAddress(a))) throw validation(`Recipients: ${SEND_JUST_THE_ADDRESSES}`);
+    if (a.length > 254 || !isEmailAddress(a)) throw validation(`"${a.slice(0, 60)}" is not a valid email address.`);
     if (seen.has(a.toLowerCase())) continue;
     seen.add(a.toLowerCase());
     out.push(a);
@@ -664,13 +673,21 @@ async function emailScheduledReport(
 
 // Scheduled reports are their own File Utilities activity (prefsperms): another File Utilities
 // activity (Back Up, Import, ...) gives no right to them.
+//
+// Each row also says whether it waits for a person now (`waitingForAPerson`: an agent set it up
+// or changed it, or what it runs, since a person last confirmed it), decided from the audit trail
+// on every listing exactly as runDueSchedules decides it. The stored lastMessage is only what its
+// last run said, and stays until the next run; the Scheduled Reports page shows the current reason
+// from this (app/reports/schedules/page.tsx).
 export async function listReportSchedules(ctx: ServiceContext) {
   requireActivity(ctx, 'file_utilities.schedules', 'view');
-  return ctx.db
+  const rows = await ctx.db
     .select()
     .from(reportSchedules)
     .where(eq(reportSchedules.companyId, ctx.companyId))
     .orderBy(asc(reportSchedules.nextRunAt));
+  const waiting = await schedulesWaitingForAPerson(ctx, rows);
+  return rows.map((r) => ({ ...r, waitingForAPerson: waiting.has(r.id) }));
 }
 
 export async function createReportSchedule(
@@ -689,7 +706,7 @@ export async function createReportSchedule(
   },
 ) {
   requireActivity(ctx, 'file_utilities.schedules', 'create');
-  const emailTo = normalizeRecipients(input.emailTo);
+  const emailTo = normalizeRecipients(input.emailTo, ctx);
   if (!!input.memorizedReportId === !!input.groupId) throw validation('Choose either one memorized report or one report group.');
   if (input.memorizedReportId) {
     // A schedule later runs unattended and writes the report to disk, so the person setting it up
@@ -739,7 +756,7 @@ export async function updateReportSchedule(
   patch: { name?: string; frequency?: ScheduleFrequency; isActive?: boolean; format?: 'csv' | 'xlsx'; emailTo?: string | null },
 ) {
   requireActivity(ctx, 'file_utilities.schedules', 'modify');
-  const emailTo = patch.emailTo !== undefined ? normalizeRecipients(patch.emailTo) : undefined;
+  const emailTo = patch.emailTo !== undefined ? normalizeRecipients(patch.emailTo, ctx) : undefined;
   const [before] = await ctx.db.select().from(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.companyId, ctx.companyId)));
   if (!before) throw notFound('Report schedule');
   // The unattended run uses its creator's access and mails the reports to these addresses: only
@@ -851,7 +868,8 @@ export const SCHEDULE_HELD_MESSAGE =
  * In a company file this computer has not approved (lib/net/fileTrust.ts: it came from another
  * computer), a schedule that emails is held: its recipients were chosen wherever the file came
  * from, and it runs with nobody at the keyboard. It is not run and stays due (nextRunAt unchanged),
- * "held" is recorded once (not rewritten every time the timer asks), and the first run after an
+ * "held" is recorded once (not rewritten every time the timer asks, only when the reason it is held
+ * for changes), and the first run after an
  * Admin here allows the file runs it like any other. Schedules that only save files run as before.
  *
  * A schedule an agent set up or changed, or whose report or group an agent changed, is held the
@@ -907,7 +925,9 @@ export async function runDueSchedules(
       continue;
     }
     if (s.emailTo && (heldHere ??= await internetHeldHere(ctx.db))) {
-      if (s.lastStatus !== 'held') {
+      // Recorded once, and again when the stored reason is another one (an agent hold a person
+      // has since confirmed): the row always gives the reason it waits now.
+      if (s.lastStatus !== 'held' || s.lastMessage !== SCHEDULE_HELD_MESSAGE) {
         await inTransaction(ctx, async (tx) => {
           await tx.db
             .update(reportSchedules)

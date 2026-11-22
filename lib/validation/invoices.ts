@@ -3,7 +3,7 @@
  * (lib/services/invoices.ts) and BillableSelection (lib/services/billables.ts).
  */
 import { z } from 'zod';
-import { zDate, zDecimal, zDocNumber, zLines, zMoney, zUuid } from './helpers';
+import { zDate, zDecimal, zDocNumber, zLenient, zLines, zMoney, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
 import { creditLimitOverrideField, sendFlagFields, customerMessageField, shippingFields } from './sales';
 
@@ -236,3 +236,21 @@ export const batchInvoicesSchema = z.object({
     .optional()
     .describe('True also invoices customers this puts over their credit limit; without it they are skipped and listed in the answer.'),
 });
+
+/**
+ * POST /api/invoices/:id/post — post a draft (pending) invoice to the books. The route reads the
+ * body loosely (anything that is not an object, or no body, means no flags) and takes each flag
+ * only when it is exactly true, so both are zLenient and the check refuses nothing it did not
+ * take before. It says what the flags mean, for agents (describe_operation, plan §6.3).
+ */
+export const postDraftInvoiceSchema = z.preprocess(
+  (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {}),
+  z.object({
+    overrideCreditLimit: zLenient(z.boolean()).describe(
+      'Send true only after the app warned that posting this invoice puts the customer over their credit limit, to post it anyway.',
+    ),
+    allowOverBilling: zLenient(z.boolean()).describe(
+      'Send true only after the app warned that a line bills more than 100% of its estimate line, to post it anyway.',
+    ),
+  }),
+);

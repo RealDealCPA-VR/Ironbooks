@@ -22,14 +22,19 @@ import { FILE_TOOLS, STAGED_FILE_HOURS, UPLOAD_CHUNK_BYTES, UPLOAD_MAX_BYTES } f
 import {
   ADMIN_GIVES_STANDING,
   CLASS_MEANINGS,
+  FIND_EXAMPLES,
   GUIDE_PROMPT_NAME,
   GUIDE_TEXT,
   GUIDE_URI,
+  NAMED_ENTRY_TOOLS,
+  NAMED_FIX_TOOLS,
+  NAMED_REPORT_TOOLS,
   SHORT_GRANT_MINUTES,
   STANDING,
   STANDING_TEXT,
 } from '../../mcp/guide.mjs';
 import * as contract from '@/lib/agent/contract';
+import * as registry from '@/lib/agent/operations/registry';
 import * as policy from '@/lib/agent/policy';
 import * as types from '@/lib/agent/operations/types';
 import { AREA_KEYS } from '@/lib/permissions/model';
@@ -166,7 +171,7 @@ describe('the connector and the app agree', () => {
     expect(ask.description).toContain(STANDING_TEXT);
     expect(GUIDE_TEXT).toContain(STANDING_TEXT);
     expect(STANDING_TEXT).toBe(
-      'Standing permission can be given for prepare, enter and change (until the end of the day at most); bulk (the same, and each request still within the most records one request may change); outside and print (at most 30 minutes; for outside, only an Admin can give it). It is never given for read_sensitive (protected data), remove (deleting), period (closed-period work), settings, admin (users and security), file (the company file) and secret (passwords and keys): each of those is asked one request at a time, so do not ask ahead for them. Nor does standing permission ever cover a request dated on or before the closing date (that is closed-period work, whatever the operation), one with reveal, or one sent with a confirm flag: each of those asks a person.',
+      'Standing permission can be given for prepare, enter and change (until the end of the day at most); bulk (the same, and each request still within the most records one request may change); outside and print (at most 30 minutes; for outside, only an Admin can give it). It is never given for read_sensitive (protected data), remove (deleting), period (closed-period work), settings, admin (users and security), file (the company file) and secret (passwords and keys): each of those is asked one request at a time, so do not ask ahead for them. Nor does standing permission ever cover a request dated on or before the closing date (that is closed-period work, whatever the operation), one with reveal, or one sent with a confirm flag: each of those asks a person. Whatever its class, work that can only be approved at the computer that holds the company file (a test email, a download or install, printing a file), or that only the company file\'s Admin may approve, never gets standing permission, not even from an Admin: send each such request with run_operation.',
     );
     expect(ask.inputSchema.properties.minutes.description).toBe('How long it should last, in minutes. The person may shorten it. It ends at the end of the day at the latest; outside and print at most 30.');
   });
@@ -281,6 +286,38 @@ describe('finding and describing operations', () => {
     expect((await call(client, 'describe_operation', { operation: '../users' })).isError).toBe(true);
     expect((await call(client, 'describe_operation', {})).text).toMatch(/"operation" is required/);
     expect(acted).toHaveLength(1);
+    // No examples given: none shown, and nothing said about them.
+    expect(r.data).not.toHaveProperty('examples');
+    expect(r.data).not.toHaveProperty('examples_mean');
+  });
+
+  it('describe_operation passes on the worked examples (contract wave 4) as requests run_operation takes', async () => {
+    const examples: unknown[] = [
+      { title: 'A bill for one vendor', body: { vendorId: ID, lines: [{ accountId: ID2, amount: '120.00' }] } },
+      { note: 'Its pay stub', params: { id: ID }, query: { format: 'pdf' }, reveal: true },
+      { describe: 'With a warning accepted', body: { refNumber: '1001' }, confirm: ['allowDuplicateNumber', 5] },
+      'not a request',
+      { title: 'Words only' },
+      ...Array.from({ length: 12 }, (_, i) => ({ body: { n: i } })),
+    ];
+    const { client } = fake({ act: () => ({ id: 'bills.create', describe: 'Enter a bill', class: 'enter', params: [], treatment: 'ask', body: 'json', confirmFlags: [], examples }) });
+    const r = await call(client, 'describe_operation', { operation: 'bills.create' });
+    expect(r.data.examples.slice(0, 3)).toEqual([
+      { title: 'A bill for one vendor', body: { vendorId: ID, lines: [{ accountId: ID2, amount: '120.00' }] } },
+      { note: 'Its pay stub', params: { id: ID }, query: { format: 'pdf' }, reveal: true },
+      { title: 'With a warning accepted', body: { refNumber: '1001' }, confirm: ['allowDuplicateNumber'] },
+    ]);
+    // What is not a request is left out, and there are never more than ten.
+    expect(r.data.examples).toHaveLength(10);
+    expect(r.data.examples_mean).toBe(
+      'Each example is a whole request: call run_operation with operation "bills.create" and its params, query, body, confirm and reveal as shown (dry_run true first). Put in your own ids, dates and amounts; send a confirm flag only after a warning named it.',
+    );
+    // Each one, sent as it is with the operation, is a request run_operation's own schema takes.
+    const run = (OPERATION_TOOLS as Any[]).find((t) => t.name === 'run_operation')!;
+    for (const ex of r.data.examples as Any[]) {
+      const { title: _t, note: _n, ...request } = ex;
+      expect(argumentProblem(run.inputSchema, { operation: 'bills.create', ...request, dry_run: true }), JSON.stringify(ex)).toBeNull();
+    }
   });
 });
 
@@ -312,7 +349,7 @@ describe('run_operation', () => {
       { operation: 'bills.create', outcome: 'needs_confirmation', warnings: [{ flag: 'allowDuplicateNumber', message: 'Already entered.' }] },
       { operation: 'users.create', outcome: 'refused', note: 'Agents may never manage users.' },
     ];
-    const { client } = fake({ act: () => answers.shift() });
+    const { client } = fake({ act: (r) => (r.verb === 'describe_operation' ? { id: r.operation, confirmFlags: ['allowDuplicateNumber'] } : answers.shift()) });
     const asked = await call(client, 'run_operation', { operation: 'estimates.create', body: {}, request_id: 'e-1', reason: 'Quote.' });
     expect(asked.data).toMatchObject({ outcome: 'asked', request_id: ID, said: 'Not done yet. A person must approve it in Ironbooks first.' });
     expect(asked.data.next).toMatch(`wait_for_decision with request_id "${ID}"`);
@@ -322,6 +359,102 @@ describe('run_operation', () => {
     const refused = await call(client, 'run_operation', { operation: 'users.create', body: {}, request_id: 'u-1' });
     expect(refused.isError).toBe(true);
     expect(refused.text).toMatch(/^Refused: Agents may never manage users\. Nothing was done\. Do not send it again as it is\./);
+  });
+
+  it('a warning is offered for sending again only with a flag the operation lists (the door accepts no other)', async () => {
+    const warnings = [
+      { flag: 'allowDuplicateNumber', message: 'Already entered.' },
+      { flag: 'allowNegativeStock', message: 'Not enough on hand.' },
+    ];
+    const described: string[] = [];
+    const answer = { operation: 'bills.create', outcome: 'needs_confirmation', warnings, note: 'Nothing was done.' };
+    const { client, acted } = fake({
+      act: (r) => {
+        if (r.verb !== 'describe_operation') return answer;
+        described.push(r.operation);
+        return { id: r.operation, describe: 'Enter a bill', class: 'enter', params: [], treatment: 'run', confirmFlags: ['allowDuplicateNumber'] };
+      },
+    });
+    const r = await call(client, 'run_operation', { operation: 'bills.create', body: {}, request_id: 'b-1' });
+    expect(r.data.warnings).toEqual([
+      { flag: 'allowDuplicateNumber', message: 'Already entered.', resend_with: 'confirm: ["allowDuplicateNumber"]' },
+      { flag: 'allowNegativeStock', message: 'Not enough on hand.', instead: expect.stringMatching(/cannot be accepted with a flag/) },
+    ]);
+    // Asked for once, then known while the same run of Ironbooks answers.
+    await call(client, 'run_operation', { operation: 'bills.create', body: {}, request_id: 'b-2' });
+    expect(described).toEqual(['bills.create']);
+    expect(acted.filter((a) => a.verb === 'describe_operation')).toEqual([{ verb: 'describe_operation', operation: 'bills.create' }]);
+    // Ironbooks restarted (an update may list other flags): the flags are asked for again, and the
+    // new run's are the ones offered.
+    const ironbooks: { run: string } = { run: 'run-1' };
+    const updated = fake({
+      act: (r) =>
+        r.verb === 'describe_operation'
+          ? { id: r.operation, describe: 'Enter a bill', class: 'enter', params: [], treatment: 'run', confirmFlags: ironbooks.run === 'run-2' ? ['allowNegativeStock'] : ['allowDuplicateNumber'] }
+          : answer,
+    });
+    // The client's run, as mcp/client.mjs keeps it (the endpoint file's value of the run that answered).
+    const restarting = Object.assign(updated.client, { run: ironbooks.run });
+    const before = await call(restarting, 'run_operation', { operation: 'bills.create', body: {}, request_id: 'b-6' });
+    expect(before.data.warnings.map((w: Any) => [w.flag, 'resend_with' in w])).toEqual([['allowDuplicateNumber', true], ['allowNegativeStock', false]]);
+    restarting.run = ironbooks.run = 'run-2';
+    const after = await call(restarting, 'run_operation', { operation: 'bills.create', body: {}, request_id: 'b-7' });
+    expect(after.data.warnings.map((w: Any) => [w.flag, 'resend_with' in w])).toEqual([['allowDuplicateNumber', false], ['allowNegativeStock', true]]);
+    expect(updated.acted.filter((a) => a.verb === 'describe_operation')).toHaveLength(2);
+    // None of the warnings can be accepted: the next step says to change the request.
+    const none = fake({ act: (r) => (r.verb === 'describe_operation' ? { id: r.operation, confirmFlags: [] } : { ...answer, warnings: [warnings[1]] }) });
+    const n = await call(none.client, 'run_operation', { operation: 'bills.create', body: {}, request_id: 'b-3' });
+    expect(n.data.warnings[0]).not.toHaveProperty('resend_with');
+    expect(n.data.next).toMatch(/^No flag accepts these warnings\. Change the request/);
+    // Read from describe_operation earlier: not asked for again.
+    const known = fake({
+      act: (r) =>
+        r.verb === 'describe_operation'
+          ? { id: 'bills.create', describe: 'Enter a bill', class: 'enter', params: [], treatment: 'run', confirmFlags: ['allowNegativeStock'] }
+          : answer,
+    });
+    await call(known.client, 'describe_operation', { operation: 'bills.create' });
+    const k = await call(known.client, 'run_operation', { operation: 'bills.create', body: {}, request_id: 'b-4' });
+    expect(k.data.warnings.map((w: Any) => [w.flag, 'resend_with' in w])).toEqual([['allowDuplicateNumber', false], ['allowNegativeStock', true]]);
+    expect(known.acted.filter((a) => a.verb === 'describe_operation')).toHaveLength(1);
+    // When the flags cannot be learnt, the advice is what it was, and the door's own note still says whether it can be accepted.
+    const blind = fake({ act: (r) => (r.verb === 'describe_operation' ? new IronbooksError('Ironbooks could not answer that.', { status: 500 }) : answer) });
+    const b = await call(blind.client, 'run_operation', { operation: 'bills.create', body: {}, request_id: 'b-5' });
+    expect(b.isError).toBe(false);
+    expect(b.data.warnings[0].resend_with).toBe('confirm: ["allowDuplicateNumber"]');
+    expect(b.data.note).toBe('Nothing was done.');
+  });
+
+  it('"slow down" is not a refusal of the work: nothing was done, wait the seconds given, then send it again as it was', async () => {
+    const slow = { operation: 'bills.create', outcome: 'refused', note: 'This agent already has 4 requests under way. Wait about 5 seconds for one to finish, then send this again.', retryAfterSeconds: 5 };
+    const r = await call(fake({ act: () => slow }).client, 'run_operation', { operation: 'bills.create', body: {}, request_id: 'b-1' });
+    expect(r.isError).toBe(true);
+    expect(r.text).toBe(
+      'Not now: This agent already has 4 requests under way. Wait about 5 seconds for one to finish, then send this again. Nothing was done. Wait 5 seconds, then send it again as it was (with the same request_id, if it had one: it is never done twice).',
+    );
+    expect(r.text).not.toMatch(/Refused|Do not send it again/);
+    // The same for ask_for_permission and save_file, and with no words from the door.
+    const quiet = { outcome: 'refused', retryAfterSeconds: 1 };
+    const a = await call(fake({ act: () => quiet }).client, 'ask_for_permission', { operation: 'x.y', reason: 'Because.', request_id: 'g-1' });
+    expect(a.text).toBe('Not now: Ironbooks is busy with your other requests. Nothing was done. Wait 1 second, then send it again as it was (with the same request_id, if it had one: it is never done twice).');
+    const s = await call(fake({ act: () => quiet }).client, 'save_file', { file_id: FILE, folder: 'C:\\Books', request_id: 's-1' });
+    expect(s.text).toMatch(/^Not now: .* Wait 1 second, then send it again as it was/);
+    // A refusal without a wait is still a refusal.
+    const no = await call(fake({ act: () => ({ outcome: 'refused', note: 'Agents may never manage users.', retryAfterSeconds: 0 }) }).client, 'run_operation', { operation: 'users.create' });
+    expect(no.text).toMatch(/^Refused: /);
+    // Ironbooks' 429 (the route's answer to the same): the wait it gave, and the same advice, for every tool.
+    const busy = new IronbooksError('This agent has sent more than 60 requests in the last minute.', { status: 429, code: 'RATE_LIMITED', retryAfter: 12 });
+    for (const [tool, args] of [
+      ['run_operation', { operation: 'x.y' }],
+      ['find_operations', {}],
+      ['list_accounts', {}],
+    ] as const) {
+      const t = await call(fake({ act: () => busy, get: () => busy }).client, tool, args);
+      expect(t, tool).toMatchObject({
+        isError: true,
+        text: 'This agent has sent more than 60 requests in the last minute. Nothing was done. Wait 12 seconds, then send it again as it was (with the same request_id, if it had one: it is never done twice).',
+      });
+    }
   });
 
   it('a very long answer is cut, and says so', async () => {
@@ -643,9 +776,10 @@ describe('waiting for a decision', () => {
     expect(d.data).not.toHaveProperty('check_again_after_seconds');
     expect(d.data.next).toBe('It is done. Do not send it again.');
     expect(told.map((m) => m.method)).toEqual(['notifications/message']);
-    // A 429 on a read without waiting is passed on as it is (Ironbooks never limits those).
+    // A 429 on a read without waiting is passed on in Ironbooks' words (it never limits those), with
+    // what every "slow down" means: nothing was done, wait, then ask again.
     const plain = await call(fake({ get: () => new IronbooksError('Busy.', { status: 429 }) }).client, 'wait_for_decision', { request_id: ID, timeout_seconds: 0 });
-    expect(plain).toMatchObject({ isError: true, text: 'Busy.' });
+    expect(plain).toMatchObject({ isError: true, text: 'Busy. Nothing was done. Wait a little while, then send it again as it was (with the same request_id, if it had one: it is never done twice).' });
   });
 
   it('when this connector already holds its waits open, a third is read now, with advice to check it later', async () => {
@@ -910,6 +1044,17 @@ describe('the guide', () => {
     expect(GUIDE_TEXT).toMatch(/It is never given for [^.]*period \(closed-period work\)/);
     expect(GUIDE_TEXT).toContain('Nor does standing permission ever cover a request dated on or before the closing date');
     expect(GUIDE_TEXT).toMatch(/Go by what you were given, never by what you asked for/);
+    // Host-only and file-Admin work is refused standing permission for everyone (lib/agent/operate.ts
+    // HOST_ONLY_GRANT_NOTE, FILE_ADMIN_GRANT_NOTE), whatever its class: the guide says so, and the
+    // registry has such operations among the classes that may otherwise get a window.
+    expect(GUIDE_TEXT).toContain(
+      "Whatever its class, work that can only be approved at the computer that holds the company file (a test email, a download or install, printing a file), or that only the company file's Admin may approve, never gets standing permission, not even from an Admin: send each such request with run_operation.",
+    );
+    const hostOnlyShort = registry
+      .allOperations()
+      .filter((o) => o.availability === 'agent' && o.hostOnly && types.GRANTABLE[o.class] === 'short')
+      .map((o) => o.id);
+    for (const id of ['email.test', 'shell.print.file']) expect(hostOnlyShort, id).toContain(id);
   });
 
   it('says what a stale request is, and that the person decides again', () => {
@@ -920,6 +1065,48 @@ describe('the guide', () => {
     expect(GUIDE_TEXT).toMatch(/That holds for a stale request too: once one person approves the new preview, the answer still says stale, names that person \(first_approved_by\), and says a second person must also approve it\./);
     // And what a wait that cannot be held open means.
     expect(GUIDE_TEXT).toMatch(/says to check it later/);
+  });
+
+  it('says what to search for to find 1099s, pay stubs, the audit trail, the transaction log and why a number changed, and each is found', () => {
+    expect(FIND_EXAMPLES.map((e) => e.work)).toEqual(['1099s', 'Pay stubs', 'The audit trail (who changed what, and when)', 'The transaction log', 'Why a number changed']);
+    for (const e of FIND_EXAMPLES) {
+      expect(GUIDE_TEXT).toContain(`- ${e.work}: find_operations with query "${e.query}". ${e.finds}`);
+      const found = registry.findOperations({ query: e.query, limit: 30 }).map((o) => o.id);
+      for (const id of e.operations) {
+        // A real operation, found by the words the guide gives, and named in what the guide says.
+        expect(registry.operationById(id), id).not.toBeNull();
+        expect(found, `${e.query} finds ${id}`).toContain(id);
+        expect(e.finds).toContain(`"${id}"`);
+      }
+    }
+  });
+
+  it('names the report and entry tools, each a real one, and says the tools that change the books take a reason', () => {
+    const names = new Set((TOOLS as Any[]).map((t) => t.name));
+    for (const n of [...NAMED_ENTRY_TOOLS, ...NAMED_FIX_TOOLS, ...NAMED_REPORT_TOOLS]) {
+      expect(names.has(n), n).toBe(true);
+      expect(GUIDE_TEXT).toContain(n);
+    }
+    for (const n of ['list_reports', 'run_report', 'report_drilldown', 'export_report', 'enter_estimate', 'convert_estimate', 'enter_purchase_order', 'receive_items', 'enter_credit_memo', 'enter_vendor_credit', 'enter_time', 'adjust_inventory', 'pay_sales_tax']) {
+      expect(GUIDE_TEXT, n).toContain(n);
+    }
+    expect(GUIDE_TEXT).toContain('Every named tool that changes the books takes dry_run, request_id and a reason, like run_operation.');
+    // As the guide says: every named tool that changes something takes all three.
+    const generic = new Set([...OPERATION_TOOLS, ...FILE_TOOLS].map((t: Any) => t.name));
+    for (const t of (TOOLS as Any[]).filter((x) => x.changes === true && !generic.has(x.name))) {
+      for (const k of ['dry_run', 'request_id', 'reason']) expect(t.inputSchema.properties, `${t.name} takes ${k}`).toHaveProperty(k);
+    }
+  });
+
+  it('says what an answer that is out of date, and a "slow down" (429), mean and what to do', () => {
+    expect(GUIDE_TEXT).toMatch(/stale: true on a request[^\n]*Nothing was done, and the person decides again\. Keep waiting; do not send the request again\./);
+    expect(GUIDE_TEXT).toMatch(/A change refused because the record changed since you read it[^\n]*Read the record again[^\n]*send it with a NEW request_id\./);
+    expect(GUIDE_TEXT).toMatch(/"Not now", or Ironbooks answering 429[^\n]*nothing was done\. Wait the number of seconds the answer gives, then send the same request again exactly as it was, with the same request_id/);
+    // A warning that cannot be accepted with a flag, the role floor, plain email addresses and the reveal window.
+    expect(GUIDE_TEXT).toMatch(/Only a warning that gives resend_with can be accepted/);
+    expect(GUIDE_TEXT).toContain('- change or delete a role that any agent holds;');
+    expect(GUIDE_TEXT).toMatch(/An email address you send is the plain address only/);
+    expect(GUIDE_TEXT).toMatch(/for 15 minutes after it ran; after that it is masked for good/);
   });
 });
 
@@ -954,7 +1141,16 @@ describe.skipIf(!Ajv2020)(`every input schema is real JSON Schema, and says what
           { operation: 'x', body: [1, 2], request_id: 'r-1', reason: 'why', confirm: ['allowZero'], reveal: true },
           { operation: 'x', body: 'text' },
         ],
-        bad: [{}, { operation: 'x', params: { id: 1 } }, { operation: 'x', query: { a: 1 } }, { operation: 'x', confirm: ['1x'] }, { operation: 'x', dry_run: 'yes' }, { operation: 'x', extra: 1 }],
+        bad: [
+          {},
+          { operation: 'x', params: { id: 1 } },
+          { operation: 'x', query: { a: 1 } },
+          // More values for one query name than the door takes (lib/agent/operate.ts: at most 100).
+          { operation: 'x', query: { a: Array.from({ length: 101 }, () => 'v') } },
+          { operation: 'x', confirm: ['1x'] },
+          { operation: 'x', dry_run: 'yes' },
+          { operation: 'x', extra: 1 },
+        ],
       },
       wait_for_decision: { good: [{ request_id: ID }, { request_id: 'mine-1', timeout_seconds: 0 }, { request_id: ID, timeout_seconds: 50 }], bad: [{}, { request_id: ID, timeout_seconds: 51 }, { request_id: 'a/b' }, { request_id: ID, timeout_seconds: 1.5 }] },
       list_my_requests: { good: [{}, { status: 'executed', limit: 200 }], bad: [{ status: 'done' }, { limit: 201 }] },
@@ -965,10 +1161,17 @@ describe.skipIf(!Ajv2020)(`every input schema is real JSON Schema, and says what
         good: [{ operation: 'bills.create', reason: 'r', request_id: 'g-1', minutes: 60, constraints: { entity_ids: [ID], max_amount: '10.00', date_from: '2026-01-01', max_uses: 3 } }],
         bad: [{ operation: 'bills.create', reason: 'r' }, { operation: 'b', reason: 'r', request_id: 'g-1', minutes: 1441 }, { operation: 'b', reason: 'r', request_id: 'g-1', constraints: { entity_ids: ['x'] } }],
       },
-      upload_file: { good: [{ name: 'a.pdf', type: 'application/pdf', base64: 'YWJj' }], bad: [{ name: 'a/b.pdf', type: 'application/pdf', base64: 'x' }, { name: 'a.pdf', type: 'pdf', base64: 'x' }, { name: 'a.pdf', type: 'application/pdf' }] },
+      upload_file: {
+        good: [{ name: 'a.pdf', type: 'application/pdf', base64: 'YWJj' }],
+        bad: [{ name: 'a/b.pdf', type: 'application/pdf', base64: 'x' }, { name: 'a.pdf', type: 'pdf', base64: 'x' }, { name: 'a.pdf', type: 'application/pdf' }, { name: 'a.pdf', type: `application/${'x'.repeat(200)}`, base64: 'x' }],
+      },
       attach_local_file: { good: [{ path: 'C:\\Books\\a.pdf' }, { path: '/home/pat/a.pdf', name: 'a.pdf', type: 'application/pdf' }], bad: [{}, { path: 'x', name: '..\\a' }, { path: 5 }] },
-      get_file: { good: [{ file_id: FILE }], bad: [{}, { file_id: '../x' }, { file_id: 'short' }] },
-      save_file: { good: [{ file_id: FILE, folder: 'C:\\Books', request_id: 's-1' }, { file_id: FILE, folder: '/x', name: 'b.pdf', request_id: 's-1', reason: 'r' }], bad: [{ file_id: FILE, folder: 'C:\\Books' }, { file_id: FILE, request_id: 's-1' }] },
+      // No longer than the door takes a file id (64), a media type (200) or a folder (1000).
+      get_file: { good: [{ file_id: FILE }, { file_id: 'a'.repeat(64) }], bad: [{}, { file_id: '../x' }, { file_id: 'short' }, { file_id: 'a'.repeat(65) }] },
+      save_file: {
+        good: [{ file_id: FILE, folder: 'C:\\Books', request_id: 's-1' }, { file_id: FILE, folder: '/x', name: 'b.pdf', request_id: 's-1', reason: 'r' }],
+        bad: [{ file_id: FILE, folder: 'C:\\Books' }, { file_id: FILE, request_id: 's-1' }, { file_id: FILE, folder: `C:\\${'a'.repeat(1_000)}`, request_id: 's-1' }],
+      },
     };
     const byName = new Map((TOOLS as Any[]).map((t) => [t.name, t]));
     expect(Object.keys(cases).sort()).toEqual([...OPERATION_TOOLS, ...FILE_TOOLS].map((t: Any) => t.name).sort());

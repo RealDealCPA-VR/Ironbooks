@@ -20,12 +20,19 @@
  * permission shows the person's note, the app's message and the grant's limits only to someone
  * who may view the work it was about (auditEntryValuesFor), as the Agent Activity report does.
  *
+ * A person's approval of an agent's reveal (plan 5.9, D6) is worded on its entry and in the Agent
+ * Activity report: "Revealed <which kinds of values> of "<record or report>" to agent "<name>",
+ * approved by <person>." (revealSummary; the words agentRequests.ts writes on the decision's record).
+ *
+ * The transaction log's records are read by the same rules (logRecordFor, logSummaryFor).
+ *
  * agentActivityReport: the "Agent Activity" standard report (Reports > Accountant & Taxes): every
  * permission request an agent made, whatever became of it.
  */
-import { and, asc, desc, eq, gte, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lte, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { agentPermissionRequests, agents, auditLogs, users } from '@/lib/db/schema';
+import { maskAccountsInText } from '@/lib/agent/guards';
 import { AGENT_DOOR_ONLY_AREAS, maskedForAgent } from '@/lib/permissions/agentAccess';
 import { areaLabel, canRef, fullAccess, withoutAreas, type Area, type EffectiveAccess } from '@/lib/permissions/model';
 import { RISK_CLASS_LABELS, isRiskClass, type RequestStatus } from '@/lib/agent/operations/types';
@@ -100,6 +107,12 @@ export interface AuditLogRow {
   agentRequestId: string | null;
   /** The standing permission the change ran under, or that a person's decision gave (agent_grants.id). */
   agentGrantId: string | null;
+  /**
+   * The entry in words, where its record carries words of its own: a person's approval of an
+   * agent's reveal reads "Revealed full SSNs and tax IDs of "Show employee …" to agent "…", approved
+   * by …." (revealSummary). Left out of every other entry.
+   */
+  summary?: string;
 }
 
 export interface ListAuditLogsOptions {
@@ -189,9 +202,35 @@ const AGENT_REQUEST_KINDS = new Set(['agent_permission_request', 'agent_grant'])
 /**
  * What those records hold about the work itself, beyond the operation and the agent: the person's
  * note (a denial's reason), the app's message (it names the records the run touched), why standing
- * permission was not given, and a grant's limits (which customers or accounts, how much).
+ * permission was not given, a grant's limits (which customers or accounts, how much), and an
+ * approved reveal's words (they name the record or report revealed; revealedFields, the kinds of
+ * values, stays: see revealSummary).
  */
-const REQUEST_DETAIL_FIELDS = ['note', 'error', 'grantNotGiven', 'constraints'] as const;
+const REQUEST_DETAIL_FIELDS = ['note', 'error', 'grantNotGiven', 'constraints', 'revealed'] as const;
+
+/**
+ * An approved reveal in words (plan 5.9, D6), from its decision's record (agentRequests.ts
+ * revealAudit writes `revealed`, "Revealed <which kinds of values> of "<record or report>" to agent
+ * "<name>", approved by <person>.", and `revealedFields`, the kinds alone). The sentence names the
+ * record, so it is shown only to a reader who may view the operation's work (requestDetails); any
+ * other reader is told the kinds of values and who may see the rest. Null for any other record.
+ */
+function revealSummary(
+  access: EffectiveAccess | null | undefined,
+  values: { revealed: unknown; revealedFields: unknown; operation: unknown },
+): string | null {
+  if (typeof values.revealed !== 'string' || !values.revealed.trim()) return null;
+  const { visible, area } = requestDetails(access ?? undefined, typeof values.operation === 'string' ? values.operation : '');
+  if (visible) return values.revealed;
+  const kinds = typeof values.revealedFields === 'string' && values.revealedFields.trim() ? values.revealedFields.trim() : 'protected values';
+  return `Revealed ${kinds} to an agent. ${hiddenDetails(area)}`;
+}
+
+/** revealSummary of a decision's record, from its after-values (null for other records). */
+function revealSummaryOf(access: EffectiveAccess | null | undefined, entityType: string, newValues: unknown): string | null {
+  if (entityType !== 'agent_permission_request' || !isPlainRecord(newValues)) return null;
+  return revealSummary(access, { revealed: newValues.revealed, revealedFields: newValues.revealedFields, operation: newValues.operation });
+}
 
 function isPlainRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
@@ -249,6 +288,37 @@ export function logRecordDataFor(access: EffectiveAccess | null | undefined, rec
   return { ...masked, ...('old' in masked ? { old } : {}), ...('new' in masked ? { new: next } : {}) };
 }
 
+/**
+ * A transaction-log record's one-line summary as `access` may read it. Most summaries are written
+ * from the record's own values (transactionLog.ts describeChange: a number, a name or description,
+ * an amount); a caller of logTransaction may also write its own words, memo text included ("Paid
+ * the county, Acct # …"). Without "view full account numbers" an account number after its label
+ * reads masked, as a memo does (maskAccountsInText). The CSV export writes this, and the log's
+ * search matches this (TransactionLogFilter.shownSummary), never the stored text, so the search
+ * cannot answer guesses at digits the summary hides.
+ *
+ * What this does not do: the app protects memos (auditValuesFor masks memo fields), not names or
+ * descriptions. A number someone typed into a description reads masked in the summary but still
+ * reads as typed in the record's data (data.new.description), as it does on every screen that
+ * shows the description; the mask here keeps the summary in step with memos, it does not make a
+ * description a protected value.
+ */
+export function logSummaryFor(access: EffectiveAccess | null | undefined, summary: string): string {
+  if (!access || access.flags.fullAccountNumbers) return summary;
+  return maskAccountsInText(summary);
+}
+
+/**
+ * A transaction-log record as `access` may read it: its data through logRecordDataFor and its
+ * summary through logSummaryFor. For GET /api/transaction-log, with the access of auditReaderFor.
+ */
+export function logRecordFor<R extends { entityType: string; summary: string; data: unknown }>(
+  access: EffectiveAccess | null | undefined,
+  record: R,
+): R {
+  return { ...record, summary: logSummaryFor(access, record.summary), data: logRecordDataFor(access, record) };
+}
+
 /** Return paginated audit log rows for the company, newest first. */
 export async function listAuditLogs(
   ctx: ServiceContext,
@@ -266,6 +336,9 @@ export async function listAuditLogs(
   if (visible) conds.push(visible);
 
   const where = and(...conds);
+  // Only a decision about an agent's request carries a reveal's words (revealSummary).
+  const decision = sql`${auditLogs.entityType} = 'agent_permission_request'`;
+  const decisionValue = (key: string) => sql<string | null>`CASE WHEN ${decision} THEN ${auditLogs.newValues} ->> ${key} END`;
 
   // Count query for pagination metadata.
   const [countRow] = await ctx.db
@@ -282,6 +355,9 @@ export async function listAuditLogs(
       entityId: auditLogs.entityId,
       ...actorColumns,
       createdAt: auditLogs.createdAt,
+      revealed: decisionValue('revealed'),
+      revealedFields: decisionValue('revealedFields'),
+      revealOperation: decisionValue('operation'),
     })
     .from(auditLogs)
     .leftJoin(users, eq(auditLogs.userId, users.id))
@@ -293,15 +369,21 @@ export async function listAuditLogs(
     .offset(offset);
 
   const grants = await grantsOf(ctx, rows.map(factsOf));
+  const reader = auditReaderFor(ctx);
   return {
-    rows: rows.map((r) => ({
-      id: r.id,
-      action: r.action,
-      entityType: r.entityType,
-      entityId: r.entityId,
-      ...actorFields(r, grants),
-      createdAt: r.createdAt.toISOString(),
-    })),
+    rows: rows.map((r) => {
+      const summary = revealSummary(reader, { revealed: r.revealed, revealedFields: r.revealedFields, operation: r.revealOperation });
+      return {
+        id: r.id,
+        action: r.action,
+        entityType: r.entityType,
+        entityId: r.entityId,
+        ...actorFields(r, grants),
+        createdAt: r.createdAt.toISOString(),
+        // Only on the entries that have words of their own, so every other row keeps its shape.
+        ...(summary ? { summary } : {}),
+      };
+    }),
     total,
   };
 }
@@ -337,6 +419,7 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
   // settings snapshots, whoever asks (auditValuesFor, lib/services/auditVisibility.ts). A request's
   // note and message only for someone who may view its work (auditEntryValuesFor).
   const values = auditEntryValuesFor(reader, row.entityType, row.oldValues, row.newValues);
+  const summary = revealSummaryOf(reader, row.entityType, row.newValues);
   return {
     id: row.id,
     action: row.action,
@@ -347,6 +430,7 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     oldValues: values.oldValues,
     newValues: values.newValues,
     llmReasoning: row.llmReasoning ?? null,
+    ...(summary ? { summary } : {}),
   };
 }
 
@@ -388,8 +472,9 @@ export const FIRST_OF_TWO = '(first of two)';
 /**
  * The words of the status a person sees: `shown` is the approval center's own reading of the row
  * (agentRequests.ts shownStatus: a waiting request past its time is expired whether or not anything
- * has marked it yet), so the two never disagree. One the first of two people approved is still
- * waiting, for a second person.
+ * has marked it yet), so the two agree on where a request stands. Their words differ on purpose
+ * for some states (the center says "Waiting", "Did not go through"; a report says "Waiting for
+ * approval", "Failed"). One the first of two people approved is still waiting, for a second person.
  */
 export function requestStatusWords(shown: RequestStatus, decidedBy: string | null): string {
   if (shown === 'pending' && decidedBy) return WAITING_FOR_SECOND_PERSON;
@@ -500,6 +585,29 @@ export async function agentActivityReport(ctx: ServiceContext, p: ReportParams):
   const truncated = fetched.length > AGENT_ACTIVITY_LIMIT;
   const list = truncated ? fetched.slice(0, AGENT_ACTIVITY_LIMIT) : fetched;
 
+  // An approved reveal says what it revealed, to which agent, approved by whom: the words its
+  // decision's record holds (revealSummary), in place of the bare summary.
+  const revealedOf = new Map<string, { revealed: string | null; revealedFields: string | null }>();
+  const done = list.filter((r) => r.status === 'executed').map((r) => r.id);
+  for (let i = 0; i < done.length; i += 1000) {
+    const found = await ctx.db
+      .select({
+        entityId: auditLogs.entityId,
+        revealed: sql<string | null>`${auditLogs.newValues} ->> 'revealed'`,
+        revealedFields: sql<string | null>`${auditLogs.newValues} ->> 'revealedFields'`,
+      })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, ctx.companyId),
+          eq(auditLogs.entityType, 'agent_permission_request'),
+          inArray(auditLogs.entityId, done.slice(i, i + 1000)),
+          sql`(${auditLogs.newValues} ->> 'revealed') IS NOT NULL`,
+        ),
+      );
+    for (const f of found) revealedOf.set(f.entityId, f);
+  }
+
   const personName = (id: string | null, name: string | null, email: string | null) =>
     id ? name || email || REMOVED_PERSON : null;
   const now = new Date();
@@ -512,6 +620,8 @@ export async function agentActivityReport(ctx: ServiceContext, p: ReportParams):
       copied: !!r.proposalId,
     });
     const note = [r.note, r.error].filter((t): t is string => !!t && !!t.trim()).join(' · ');
+    const rv = revealedOf.get(r.id);
+    const revealed = rv ? revealSummary(ctx.access, { revealed: rv.revealed, revealedFields: rv.revealedFields, operation: r.operation }) : null;
     return {
       id: `aa:${r.id}`,
       depth: 0,
@@ -519,7 +629,7 @@ export async function agentActivityReport(ctx: ServiceContext, p: ReportParams):
       cells: {
         when: localDateTime(r.createdAt, timezone),
         agent: r.agentName ?? REMOVED_AGENT,
-        what: visible ? r.summary : hiddenDetails(area),
+        what: revealed ?? (visible ? r.summary : hiddenDetails(area)),
         class: isRiskClass(r.class) ? RISK_CLASS_LABELS[r.class] : r.class,
         status: requestStatusWords(shownStatus(r, now), r.decidedBy),
         decidedBy,

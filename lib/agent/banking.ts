@@ -15,9 +15,13 @@
  *      … finish_reconciliation the statement shows; finishing is only possible at a difference of 0.00.
  *
  * Whether the agent does each itself or asks a person is the policy's answer for the route's
- * operation (lib/agent/operations/classes/banking.ts): starting a reconciliation is prepare work;
- * ticking lines, matching, setting a line aside and finishing are changes; importing lines is
- * bulk work; cancelling a reconciliation and undoing the last one are removals, which always ask.
+ * operation (lib/agent/operations/classes/banking.ts, and documents.ts for the import), exactly
+ * as run_operation gets it for the same request: the class is the registry's, not this file's.
+ * Starting a reconciliation is prepare work, and cancelling one or undoing the last one are
+ * removals, which always ask. Ticking lines and correcting the statement go with finishing (one
+ * request of the Reconcile window, classed by its riskiest work until the policy can class it by
+ * body.action), and the classes of setting a line aside and of importing lines are the
+ * registry's to say; lib/agentTools.contract.test.ts holds the tools to run_operation's answer.
  *
  * Two actions do less than their route and keep their own run (`runs: 'own'`):
  *  - bank_feed_suggestions reads the company's own rules and history only. Its route
@@ -122,9 +126,9 @@ export const AGENT_BANKING_ACTIONS: AgentActionDef<Any>[] = [
     kind: 'read',
     // Decided as the read of the bank feed it is: see the top of this file. It is the one action
     // decided by another route than the one a person's window uses for it (the suggestions route
-    // is class 'outside', because it may ask an AI service); what it answers comes from the rules
-    // and the history an agent may read through the feed anyway (lib/agent/actions.test.ts pins it
-    // to the operation "bank-transactions").
+    // is classed by its riskiest form, which may ask an AI service, and refreshes the learned
+    // model); what it answers comes from the rules and the history an agent may read through the
+    // feed anyway (lib/agent/actions.test.ts pins it to the operation "bank-transactions").
     route: { path: '/api/bank-transactions', method: 'GET' },
     runs: 'own',
     schema: z.object({ bankAccountId: zUuid }).strict(),

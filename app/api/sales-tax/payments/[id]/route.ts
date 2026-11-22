@@ -7,6 +7,8 @@ import { getServerContext } from '@/lib/context';
 import { routeError, requireJsonObject } from '@/lib/routeErrors';
 import { getPaymentCheck, voidPaymentCheck } from '@/lib/services/liabilityPayments';
 import { type ServiceContext, notFound } from '@/lib/services/_base';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { voidSalesTaxPaymentSchema } from '@/lib/validation/liabilities';
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -34,6 +36,9 @@ export async function POST(req: NextRequest, { params }: Params) {
     if (body.action !== 'void') {
       return NextResponse.json({ error: 'action must be "void".', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/liabilities.ts); the check above answers first.
+    const checked = voidSalesTaxPaymentSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     await salesTaxCheck(ctx, id);
     return NextResponse.json(await voidPaymentCheck(ctx, id));
   } catch (err) {

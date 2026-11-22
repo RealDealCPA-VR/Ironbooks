@@ -1,6 +1,7 @@
 /**
  * Zod schemas for Advanced Inventory (team inventory): sites, bins, per-site reorder points,
- * inventory transfers, site adjustments, landed cost, plus `inventoryLineFields` — the optional
+ * inventory transfers (and their void), site adjustments, landed cost (and its void), plus
+ * `inventoryLineFields` — the optional
  * site/bin/serial/lot fields every inventory-affecting document line accepts (spread into the
  * invoice / sales receipt / credit memo / bill / item receipt line schemas).
  */
@@ -153,4 +154,28 @@ export const buildSiteFieldsSchema = z.object({
     .nullish()
     .describe('Bin, serial and lot detail for the components used, one entry per component item.'),
   date: zDate.nullish().describe('Date of the build, YYYY-MM-DD.'),
+});
+
+/**
+ * POST /api/inventory-transfers/:id — void a transfer between sites. The route checks the action
+ * itself; this says what it does, for agents (describe_operation, plan §6.3).
+ */
+export const voidInventoryTransferSchema = z.object({
+  action: z
+    .literal('void')
+    .describe(
+      'void: put the stock back at the site it came from. The transfer stays on file marked void; refused once the receiving site no longer holds the stock.',
+    ),
+});
+
+/**
+ * POST /api/landed-cost/:id — void a landed-cost allocation. The route checks the action itself;
+ * this says what it does, for agents.
+ */
+export const voidLandedCostSchema = z.object({
+  action: z
+    .literal('void')
+    .describe(
+      "void: reverse the allocation's entries and cost changes exactly. The allocation stays on file marked void; refused once the stock it revalued has been sold or moved since (record a value adjustment instead).",
+    ),
 });

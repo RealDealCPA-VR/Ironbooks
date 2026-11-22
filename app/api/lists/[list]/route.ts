@@ -9,6 +9,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { routeError } from '@/lib/routeErrors';
 import { createEntry, isSimpleListKey, listEntries } from '@/lib/services/lists/simpleLists';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { simpleListEntrySchema } from '@/lib/validation/lists';
 
 type RouteContext = { params: Promise<{ list: string }> };
 
@@ -30,6 +32,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     if (!isSimpleListKey(list)) return NextResponse.json({ error: 'Unknown list' }, { status: 404 });
     const ctx = await getServerContext();
     const body = await req.json().catch(() => ({}));
+    // The body as agents read it described (lib/validation/lists.ts). It refuses nothing: the
+    // service checks it with the list's own schema and messages.
+    const checked = simpleListEntrySchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     return NextResponse.json(await createEntry(ctx, list, body), { status: 201 });
   } catch (err) {
     return routeError(err, 'POST /api/lists/:list');

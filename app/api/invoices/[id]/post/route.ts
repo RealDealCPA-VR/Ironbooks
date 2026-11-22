@@ -11,6 +11,8 @@ import { getServerContext } from '@/lib/context';
 import { postDraftInvoice } from '@/lib/services/invoices';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { routeErrorWithWarnings } from '@/lib/salesRouteErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { postDraftInvoiceSchema } from '@/lib/validation/invoices';
 
 function errorResponse(err: unknown) {
   return routeErrorWithWarnings(err, 'invoices/[id]/post/route.ts');
@@ -26,6 +28,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       overrideCreditLimit?: unknown;
       allowOverBilling?: unknown;
     };
+    // The body as agents read it described (lib/validation/invoices.ts). It refuses nothing: the
+    // flags count only when they are exactly true, as below.
+    const checked = postDraftInvoiceSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     // The draft as the user opened it (version header): an edit saved since is a 409, not posted unseen.
     const posted = await withVersionCheck(ctx, 'invoice', id, expectedVersion(req), (c) =>
       postDraftInvoice(c, id, {

@@ -46,6 +46,12 @@ export const paySalesTaxSchema = z.object({
   ),
 });
 
+/** Who a payroll Liability Check is made out to. */
+const payeeFields = {
+  vendorId: zLenient(zUuid.nullable()).describe('Id of the vendor the check is made out to, such as the tax agency (vendor list); leave out to use payeeName.'),
+  payeeName: zLenient(z.string().nullable()).describe('Name the check is made out to when no vendorId is given.'),
+};
+
 /** POST /api/pay-liabilities — pay payroll liabilities with a Liability Check. */
 export const payPayrollLiabilitiesSchema = z.object({
   type: z
@@ -58,7 +64,45 @@ export const payPayrollLiabilitiesSchema = z.object({
     .describe('Amount paid, as decimal text such as "1200.00".'),
   date: z.string().min(1).describe('Date of the check, YYYY-MM-DD.'),
   paymentAccountId: z.string().min(1).describe('Id of the bank account the check is written from (chart of accounts).'),
-  vendorId: zLenient(zUuid.nullable()).describe('Id of the vendor the check is made out to, such as the tax agency (vendor list); leave out to use payeeName.'),
-  payeeName: zLenient(z.string().nullable()).describe('Name the check is made out to when no vendorId is given.'),
+  ...payeeFields,
   ...checkFields,
+});
+
+/**
+ * POST /api/pay-liabilities/by-item — QB Pay Scheduled Liabilities by payroll item: one Liability
+ * Check for the total, one line per item. The route checks the date, the bank account and that
+ * there is at least one item; the service checks each item.
+ */
+export const payLiabilitiesByItemSchema = z.object({
+  date: z.string().describe('Date of the check, YYYY-MM-DD.'),
+  paymentAccountId: z.string().min(1).describe('Id of the bank account the check is written from (chart of accounts).'),
+  items: z
+    .array(
+      zLenient(
+        z.object({
+          name: z
+            .string()
+            .describe('Name of the payroll item paid, as GET /api/pay-liabilities/by-item lists it (items), such as "Federal Withholding"; it is the memo of its line.'),
+          amount: z.union([z.string(), z.number()]).describe('Amount paid for that item, as decimal text above zero such as "412.50".'),
+        }),
+      ),
+    )
+    .min(1)
+    .describe('The payroll items paid and how much each; the check is for their total.'),
+  ...payeeFields,
+  ...checkFields,
+});
+
+/** POST /api/sales-tax/payments/:id — void a Sales Tax Payment check. */
+export const voidSalesTaxPaymentSchema = z.object({
+  action: z
+    .literal('void')
+    .describe('void: void the check. It stays on file marked void, its entry is voided (the bank gets the money back) and the tax is owed again.'),
+});
+
+/** POST /api/pay-liabilities/checks/:id — void a payroll Liability Check. */
+export const voidLiabilityCheckSchema = z.object({
+  action: z
+    .literal('void')
+    .describe('void: void the check. It stays on file marked void, its entry is voided (the bank gets the money back) and the liabilities it paid are owed again.'),
 });

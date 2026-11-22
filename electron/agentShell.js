@@ -23,8 +23,12 @@
 //    replay is refused); the input must be what the operation takes; every path in it must be
 //    inside a folder agents may use (the open company file's folder, Documents\Ironbooks and its
 //    Agent Outbox, plus the folders the Admin added for the agent, which the line carries from the
-//    policy). A drive or share root (a USB stick's E:\, a mapped drive's Q:\, \\server\share) is
-//    never such a folder: a company file kept there leaves only the Documents folders. Anything
+//    policy). A drive or share root (a USB stick's E:\, a mapped drive's Q:\, \\server\share, on
+//    macOS and Linux a mounted volume's top folder such as /Volumes/USB or /media/pat/USB, and a
+//    disk mounted into a folder) is never such a folder: a company file kept there leaves only the
+//    Documents folders. Neither is a share of this very computer (\\localhost\c$, a loopback
+//    address, its own name: isThisComputerShare), through which Ironbooks' own folders are there
+//    under another name. Anything
 //    unexpected is refused: fail closed. A path is a file strictly inside such a folder (never the
 //    folder itself), checked as the disk has it (links followed, names exactly as the disk spells
 //    them); the company file a flow will write (".ironbooks" added) is checked too, and must not be
@@ -36,7 +40,8 @@
 //    the input's paths (checked again as the dialog gives them), questions the approver's answers
 //    from the approval card, a password prompt what the approver typed there. A question with no
 //    answer is answered the way Cancel would answer it, and the request fails naming the question.
-//    Nothing ever waits on screen. The script follows the flow's own async work (AsyncLocalStorage)
+//    A button that would switch to a company file nobody approved by its path ("Save a Copy and
+//    Open It") is never pressed for an agent, whatever the answer says. Nothing ever waits on screen. The script follows the flow's own async work (AsyncLocalStorage)
 //    and ends with it: a dialog shown by anything else, at any other moment, goes to the person
 //    exactly as before.
 //  - One JSON line goes back: { ok, result, error, restarting, mac }. Never a secret, never the
@@ -306,16 +311,190 @@ const DEVICE_PATH = /^(?:[\\/]{2}[?.](?:[\\/]|$)|\\\?\?\\)/;
 const DEVICE_NAME = /^(con|prn|aux|nul|conin\$|conout\$|clock\$|com[0-9¹²³]|lpt[0-9¹²³]) *(\.|$)/iu;
 const PATH_MAX = 1024;
 
+// ---- A share of this very computer (lib/agent/files.ts isThisComputerShare, ported: the shell
+// cannot import TypeScript; test/agentShell.test.ts holds the port to that rule's own table of
+// cases, lib/agent/thisComputerShares.json) ----
+
+/** "\\?\UNC\server\share\…", "\\.\UNC\…" and "\??\UNC\…": a share written as a device path (lib/agent/files.ts DEVICE_UNC). */
+const DEVICE_UNC = /^(?:[\\/]{2}[?.][\\/]|\\\?\?\\)UNC(?=[\\/]|$)/i;
+
+/**
+ * The server a UNC path names ("\\SERVER\share\…" gives "SERVER"), as written, also when it is
+ * written as a device path ("\\?\UNC\SERVER\share\…"); null for any other path (lib/agent/files.ts
+ * uncServer; the caller says whether this is Windows).
+ */
+function uncServer(p) {
+  const s = DEVICE_UNC.test(p) ? `\\\\${p.replace(DEVICE_UNC, '').replace(/^[\\/]+/, '')}` : p;
+  if (DEVICE_PATH.test(s)) return null;
+  const m = /^[\\/]{2}([^\\/]*)/.exec(s);
+  return m ? m[1] : null;
+}
+
+/**
+ * A server name as the name service may take it, for a refusal only: compatibility forms folded
+ * (a full-width "ｌｏｃａｌｈｏｓｔ" is "localhost" once the system maps it), the other full stops a
+ * name may be written with as ".", lower case.
+ */
+function looseHost(s) {
+  return String(s).normalize('NFKC').replace(/[。．｡]/g, '.').toLowerCase();
+}
+
+/**
+ * An IPv4 address in any spelling the system takes ("127.0.0.1", "127.1", "0x7f.1", "0177.0.0.1",
+ * "2130706433"), as its 32-bit number; null for anything else.
+ */
+function ipv4Number(s) {
+  const parts = s.split('.');
+  if (parts.length > 4) return null;
+  const nums = [];
+  for (const part of parts) {
+    let n;
+    if (/^0x[0-9a-f]*$/i.test(part)) n = part.length === 2 ? 0 : parseInt(part.slice(2), 16);
+    else if (/^0[0-7]*$/.test(part)) n = part.length === 1 ? 0 : parseInt(part.slice(1), 8);
+    else if (/^[1-9][0-9]*$/.test(part)) n = parseInt(part, 10);
+    else return null;
+    if (!Number.isSafeInteger(n)) return null;
+    nums.push(n);
+  }
+  const last = nums.pop();
+  if (nums.some((n) => n > 255)) return null;
+  const room = 2 ** (8 * (4 - nums.length));
+  if (last >= room) return null;
+  return nums.reduce((v, n) => v * 256 + n, 0) * room + last;
+}
+
+/**
+ * An IPv6 address as its eight 16-bit groups: "::1", "[::1]", "0:0:0:0:0:0:0:1", with a zone or an
+ * IPv4 tail, and Windows' own UNC spelling of one ("0--1.ipv6-literal.net"). Null for anything else.
+ */
+function ipv6Groups(s) {
+  let h = s.startsWith('[') && s.endsWith(']') ? s.slice(1, -1) : s;
+  const literal = /^(.+)\.ipv6-literal\.net$/.exec(h);
+  if (literal) h = literal[1].replace(/-/g, ':').replace(/s/g, '%');
+  h = h.replace(/%.*$/, '');
+  if (!h.includes(':')) return null;
+  const tail = /^(.*:)([^:]*\.[^:]*)$/.exec(h);
+  if (tail) {
+    const v4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(tail[2]) ? ipv4Number(tail[2].replace(/(^|\.)0+(?=\d)/g, '$1')) : null;
+    if (v4 === null) return null;
+    h = `${tail[1]}${Math.floor(v4 / 65536).toString(16)}:${(v4 % 65536).toString(16)}`;
+  }
+  const halves = h.split('::');
+  if (halves.length > 2) return null;
+  const groups = (x) => (x === '' ? [] : x.split(':'));
+  const head = groups(halves[0]);
+  const rest = halves.length === 2 ? groups(halves[1]) : [];
+  if (![...head, ...rest].every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  const missing = 8 - head.length - rest.length;
+  if (missing < 0 || (halves.length === 1 && missing !== 0)) return null;
+  return [...head, ...Array(missing).fill('0'), ...rest].map((g) => parseInt(g, 16));
+}
+
+/** An address in one spelling for comparing ("v4:2130706433", "v6:0:0:0:0:0:0:0:1"), or null for a name. */
+function addressKey(host) {
+  const v4 = ipv4Number(host);
+  if (v4 !== null) return `v4:${v4}`;
+  const g = ipv6Groups(host);
+  if (!g) return null;
+  if (g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || (g[5] === 0 && g[6] !== 0))) return `v4:${g[6] * 65536 + g[7]}`;
+  return `v6:${g.join(':')}`;
+}
+
+/** This computer itself: 127.0.0.0/8, 0.0.0.0/8 (the system connects 0.0.0.0 here), ::1 and ::. */
+function isLoopbackKey(k) {
+  if (k.startsWith('v4:')) {
+    const first = Math.floor(Number(k.slice(3)) / 2 ** 24);
+    return first === 127 || first === 0;
+  }
+  return k === 'v6:0:0:0:0:0:0:0:1' || k === 'v6:0:0:0:0:0:0:0:0';
+}
+
+/** This computer's own addresses (every network adapter's), as addressKey spells them. Nothing is sent. */
+function ownAddressKeys(interfaces) {
+  const out = new Set();
+  try {
+    for (const list of Object.values(interfaces() || {})) {
+      for (const a of Array.isArray(list) ? list : []) {
+        const k = a && a.address ? addressKey(looseHost(a.address)) : null;
+        if (k) out.add(k);
+      }
+    }
+  } catch {
+    /* none known: names and loopback still count */
+  }
+  return out;
+}
+
+/** This computer's own names (its host name and its Windows computer name), first label only. */
+function ownNames(env, hostname) {
+  const names = [env && env.COMPUTERNAME];
+  try {
+    names.push(hostname());
+  } catch {
+    /* the computer name from the environment still counts */
+  }
+  return names.map((n) => looseHost(typeof n === 'string' ? n.trim() : '').split('.')[0]).filter((n) => !!n);
+}
+
+/**
+ * On Windows, a UNC path whose server is this very computer: "localhost" and every name under
+ * ".localhost" (WSL's "wsl.localhost" too), "wsl$", a loopback address in any spelling (127.1,
+ * 0x7f000001, ::1, [::1], 0--1.ipv6-literal.net), one of this computer's own addresses, or its own
+ * name (with any domain after it). Through such a share Ironbooks' own folders, the books and the
+ * agents' staged files are there under another name (\\localhost\c$\Users\…\AppData), so it is
+ * never a folder agents may use, whoever named it: the same rule as the company server's
+ * (lib/agent/files.ts) and the connector's (mcp/files-tools.mjs). Judged by the words alone:
+ * nothing is looked up and nothing is looked at. The share may be written as a device path
+ * ("\\?\UNC\localhost\c$", which cleanPath refuses anyway), and the server with spaces or dots
+ * around it. False for every path that is no UNC path, and on other systems. `opts` are for tests:
+ * another system, environment, adapters or host name.
+ */
+function isThisComputerShare(p, { platform = process.platform, env = process.env, interfaces = () => os.networkInterfaces(), hostname = () => os.hostname() } = {}) {
+  if (typeof p !== 'string' || platform !== 'win32') return false;
+  const raw = uncServer(p.trim());
+  if (raw === null) return false;
+  // "server@SSL@443" (a WebDAV share) is on that same server; trailing dots, and spaces either
+  // side, leave the same name (a refusal errs on the side of refusing).
+  const host = looseHost(raw.split('@')[0]).trim().replace(/[.\s]+$/, '');
+  // No server at all is no share anyone can name: refused as well.
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.localhost') || host === 'wsl$') return true;
+  const k = addressKey(host);
+  if (k) return isLoopbackKey(k) || ownAddressKeys(interfaces).has(k);
+  return ownNames(env, hostname).includes(host.split('.')[0]);
+}
+
+/**
+ * On macOS and Linux, by the words: the top folder of a mounted volume, or a folder that holds
+ * mounted volumes. macOS mounts a USB stick or an office share at /Volumes/<name> (and its own data
+ * volume at /System/Volumes/Data); Linux at /media/<user>/<name> (older systems /media/<name>),
+ * /run/media/<user>/<name> or /mnt/<name> (WSL's /mnt/c is the whole C: drive). Compared without
+ * regard to case, as macOS's disks mostly are. A folder one level further down /media is refused
+ * too (on a system that mounts at /media/<name> it is a folder on the stick): that only ever refuses
+ * more.
+ */
+function posixVolumeTop(resolved) {
+  const parts = resolved.split('/').filter(Boolean).map((s) => s.toLowerCase());
+  if (!parts.length) return true;
+  if (parts[0] === 'volumes' || parts[0] === 'mnt') return parts.length <= 2;
+  if (parts[0] === 'media') return parts.length <= 3;
+  if (parts[0] === 'run' && parts[1] === 'media') return parts.length <= 4;
+  if (parts[0] === 'system' && parts[1] === 'volumes') return parts.length <= 3;
+  return false;
+}
+
 /**
  * `p` is the top of a drive or a share: "E:\" (a USB stick, a mapped drive letter, C:\ itself),
- * "\\server\share", or "/". Such a folder is never one agents may use: it would hand them the whole
- * drive or share.
+ * "\\server\share", "/", or on macOS and Linux a mounted volume's top folder (posixVolumeTop:
+ * /Volumes/USB, /media/pat/USB, /mnt/c). Such a folder is never one agents may use: it would hand
+ * them the whole drive, share or volume.
  */
 function driveOrShareRoot(p, platform = process.platform) {
   if (typeof p !== 'string' || !p) return false;
   const P = platform === 'win32' ? path.win32 : path.posix;
   const resolved = P.resolve(p);
-  return resolved === P.parse(resolved).root;
+  if (resolved === P.parse(resolved).root) return true;
+  return platform !== 'win32' && posixVolumeTop(resolved);
 }
 
 /**
@@ -375,10 +554,14 @@ function windowsFold(s) {
  * `child` is inside `parent`: below it, never the folder itself (every path an agent names is a
  * file, and a "file" that is an allowed folder becomes "<folder>.ironbooks" beside it). By the
  * words: without regard to case on Windows. `exact`: names as written, for paths that come from
- * the disk itself (realpath spells every existing name as the disk does).
+ * the disk itself (realpath spells every existing name as the disk does). Never when either is on
+ * a share of this very computer (isThisComputerShare; `share` are its options): through one, a
+ * folder "inside" an allowed share can be any folder on this computer.
  */
-function insideFolder(child, parent, platform, { exact = false } = {}) {
+function insideFolder(child, parent, platform, { exact = false, share = {} } = {}) {
   const P = platform === 'win32' ? path.win32 : path.posix;
+  const shareOpts = { ...share, platform };
+  if (isThisComputerShare(child, shareOpts) || isThisComputerShare(parent, shareOpts)) return false;
   const key = (p) => (platform === 'win32' && !exact ? windowsFold(p) : p);
   const c = key(child);
   let p = key(parent);
@@ -389,7 +572,34 @@ function insideFolder(child, parent, platform, { exact = false } = {}) {
 const REAL_FS = {
   lstat: (p) => fs.lstatSync(p),
   realpath: (p) => fs.realpathSync.native(p),
+  stat: (p) => fs.statSync(p),
 };
+
+/**
+ * `real` (a real path) is a volume mounted as a folder: on another device than the folder it sits
+ * in (a disk mounted into a folder, /Volumes/USB, a share mounted under a name of its own). The top
+ * of such a volume is never a folder agents may use, as the top of a drive is not (lib/agent/files.ts
+ * isVolumeRoot does the same). A folder that is not there yet is no mount point; one the disk will
+ * not say anything about counts as one (fail closed). Without `stat` (a test's own disk), nothing.
+ */
+function mountedVolumeTop(real, platform, fsx) {
+  if (!fsx || typeof fsx.stat !== 'function') return false;
+  const P = platform === 'win32' ? path.win32 : path.posix;
+  const parent = P.dirname(real);
+  if (parent === real) return true;
+  let here;
+  try {
+    here = fsx.stat(real);
+  } catch (err) {
+    return !(err && (err.code === 'ENOENT' || err.code === 'ENOTDIR'));
+  }
+  try {
+    const up = fsx.stat(parent);
+    return Boolean(here && up && here.dev && up.dev && here.dev !== up.dev);
+  } catch {
+    return true;
+  }
+}
 
 /**
  * Where `p` is on the disk: the real path of its nearest part that exists (every link followed,
@@ -434,32 +644,57 @@ function onDisk(p, platform, fsx) {
  * only), as the disk has it: links followed and names compared exactly as the disk spells them, so
  * neither a shortcut inside an allowed folder nor a name that only looks like the folder's (one
  * that differs in a way Windows does not fold, like the Kelvin sign) leads out of it. A part that
- * does not exist yet must then be spelled exactly as the allowed folder is.
+ * does not exist yet must then be spelled exactly as the allowed folder is. A share of this very
+ * computer (\\localhost\c$\…, \\127.0.0.1\…, \\<its own name>\…) is never such a place, as typed or
+ * as the disk has it (a drive mapped to one): refused before it is looked at. `env`, `interfaces`
+ * and `hostname` are isThisComputerShare's (tests pass their own).
  */
-function pathProblem(raw, allowed, { platform = process.platform, fs: fsx = REAL_FS } = {}) {
+function pathProblem(raw, allowed, { platform = process.platform, fs: fsx = REAL_FS, env, interfaces, hostname } = {}) {
   const shown = oneLine(raw, 200);
   const want = cleanPath(raw, platform);
   if (!want) {
     const start = platform === 'win32' ? 'with the drive (C:\\…)' : 'with /';
     return `"${shown}" is not a full path to a place on this computer. Give the whole path, starting ${start}.`;
   }
-  // The top of a drive or a share is never a folder agents may use, whoever named it.
+  const share = { platform, ...(env ? { env } : {}), ...(interfaces ? { interfaces } : {}), ...(hostname ? { hostname } : {}) };
+  const thisComputer =
+    `"${shown}" reaches this computer through one of its own network shares, so it was refused: through such a share, ` +
+    "Ironbooks' own folders are there under another name. Give the file's own path on this computer instead (starting with " +
+    'the drive, like C:\\…), in a folder agents may use.';
+  if (isThisComputerShare(want, share)) return thisComputer;
+  // The top of a drive or a share is never a folder agents may use, whoever named it; nor is a
+  // share of this very computer.
   const bases = (Array.isArray(allowed) ? allowed : [])
     .map((a) => cleanPath(a, platform))
-    .filter((b) => b && !driveOrShareRoot(b, platform));
+    .filter((b) => b && !driveOrShareRoot(b, platform) && !isThisComputerShare(b, share));
   const outside =
     `"${shown}" is not in a folder agents may use on this computer. Use the company file's folder, Documents\\Ironbooks, ` +
     "or a folder the Admin added in the agent's settings, and name a file inside it.";
-  const candidates = bases.filter((b) => insideFolder(want, b, platform));
+  const candidates = bases.filter((b) => insideFolder(want, b, platform, { share }));
   if (!candidates.length) return outside;
   if (!fsx) return null;
   const real = onDisk(want, platform, fsx);
+  // As the disk has it, the place may be on a share of this computer (a link to \\localhost\c$).
+  if (real && isThisComputerShare(real, share)) return thisComputer;
+  let wholeDisk = false;
   if (real && candidates.some((b) => {
     const base = onDisk(b, platform, fsx);
-    // A folder that is a link to the top of a drive or share is refused like the top itself.
-    return base && !driveOrShareRoot(base, platform) && insideFolder(real, base, platform, { exact: true });
+    if (!base || isThisComputerShare(base, share) || !insideFolder(real, base, platform, { exact: true, share })) return false;
+    // A folder that is a link to the top of a drive or share, or that is the top of a volume
+    // mounted as a folder, is refused like the top itself.
+    if (driveOrShareRoot(base, platform) || mountedVolumeTop(base, platform, fsx)) {
+      wholeDisk = true;
+      return false;
+    }
+    return true;
   })) {
     return null;
+  }
+  if (wholeDisk) {
+    return (
+      `"${shown}" is in a folder that is the top of a whole drive, share or disk (on the disk it is one, or leads to one), which ` +
+      "agents never use, so it was refused. Use the company file's folder, Documents\\Ironbooks, or a folder inside that drive the Admin added."
+    );
   }
   return `"${shown}" leads outside the folders agents may use (through a shortcut, a link, or a name that only looks like the folder's), so it was refused. Spell the folder exactly as it is on the disk.`;
 }
@@ -705,7 +940,7 @@ const PATH_FIELD = { type: 'path', required: true };
 
 const OPERATIONS = Object.freeze({
   'shell.company.new': { fields: { file: PATH_FIELD }, saveDialog: 'file', newFile: 'file', questions: ['temporaryFolder', 'cloudFolder'] },
-  'shell.company.open': { fields: { file: PATH_FIELD }, openDialog: 'file', questions: ['temporaryFolder', 'readOnlyFile', 'cloudFolder'] },
+  'shell.company.open': { fields: { file: PATH_FIELD }, openDialog: 'file', questions: ['temporaryFolder', 'cloudFolder'] },
   'shell.company.switch': { fields: { file: PATH_FIELD }, questions: [] },
   'shell.company.close': { fields: {}, questions: ['closeWhileHosting'] },
   'shell.company.saveCopyAs': { fields: { file: PATH_FIELD }, saveDialog: 'file', newFile: 'file', questions: [], fixedAnswers: ['savedCopy'] },
@@ -727,7 +962,7 @@ const OPERATIONS = Object.freeze({
     fields: { file: PATH_FIELD, target: PATH_FIELD },
     saveDialog: 'target',
     newFile: 'target',
-    questions: ['openNow', 'temporaryFolder', 'readOnlyFile', 'cloudFolder'],
+    questions: ['openNow', 'temporaryFolder', 'cloudFolder'],
   },
   'shell.sandbox.enter': { fields: {}, questions: [] },
   'shell.sandbox.leave': { fields: {}, questions: [] },
@@ -749,15 +984,32 @@ const OPERATIONS = Object.freeze({
 });
 
 /**
+ * "Save a Copy and Open It" copies the company file into Documents under a name the window picks
+ * and switches to that copy: a company file nobody approved by its path. An agent's request never
+ * switches the open company file by itself, so that button is never pressed for one.
+ */
+const SAVE_A_COPY = 'Save a Copy and Open It';
+
+/**
  * The message boxes the flows can show with more than one button, known by their buttons (the
  * message itself names files and people). `id`: the flow question the approver answers
- * (lib/agent/operations/shell.ts). `approval`: the operation's own "do it?", answered yes by the
+ * (lib/agent/operations/shell.ts); `refused`: its buttons an agent's request never presses, even
+ * when the answer names one. `approval`: the operation's own "do it?", answered yes by the
  * approval. `fixed`: a notice whose second button is never the agent's to press ("Show in Folder").
- * Yes is always the first button; no and Cancel are the box's own cancel button.
+ * `stop`: a box whose only way on is a button an agent's request never presses: answered with its
+ * cancel button, and the request fails with `why`. Yes is always the first button; no and Cancel
+ * are the box's own cancel button.
  */
 const QUESTIONS = Object.freeze([
-  { id: 'temporaryFolder', kind: 'choice', buttons: ['Save a Copy and Open It', 'Open It Here Anyway', 'Cancel'] },
-  { id: 'readOnlyFile', kind: 'choice', buttons: ['Save a Copy and Open It', 'Cancel'] },
+  { id: 'temporaryFolder', kind: 'choice', buttons: [SAVE_A_COPY, 'Open It Here Anyway', 'Cancel'], refused: [SAVE_A_COPY] },
+  {
+    stop: 'readOnlyFile',
+    buttons: [SAVE_A_COPY, 'Cancel'],
+    why:
+      'Ironbooks cannot work in a read-only company file, and for an agent it never makes a copy somewhere else and opens that, ' +
+      'so nothing was opened. A person can open it from File > Open or Restore Company and choose "Save a Copy and Open It", ' +
+      'or make the file writable and have the agent ask again.',
+  },
   { id: 'cloudFolder', kind: 'yes_no', buttons: ['Open It', 'Cancel'] },
   { id: 'openNow', kind: 'yes_no', buttons: ['Open It Now', 'Later'] },
   { id: 'openNow', kind: 'yes_no', buttons: ['Open it now', 'Later'] },
@@ -917,6 +1169,10 @@ class ShellScript {
     }
     const spec = this.spec || {};
     const q = QUESTIONS.find((x) => sameButtons(x.buttons, buttons));
+    if (q && q.stop) {
+      this.problem(`${said}${/[.!?]$/.test(said) ? '' : '.'} ${q.why}`);
+      return quiet;
+    }
     if (q && q.fixed && (spec.fixedAnswers || []).includes(q.fixed)) return { response: q.response, checkboxChecked: false };
     if (q && q.approval && (spec.confirmedByApproval || []).includes(q.approval)) return { response: 0, checkboxChecked: false };
     if (!q || !q.id || !(spec.questions || []).includes(q.id)) {
@@ -937,8 +1193,17 @@ class ShellScript {
       this.problem(`Ironbooks needed an answer to "${said}" and the approval gave none, so it stopped there. The agent can ask again; answer that question on the approval card.`);
       return quiet;
     }
+    const offered = buttons.filter((b) => !(q.refused || []).includes(b));
+    if (index >= 0 && (q.refused || []).includes(buttons[index])) {
+      this.problem(
+        `The answer to "${said}" was "${buttons[index]}", which an agent's request never chooses: it would switch to a copy of ` +
+          `the company file nobody approved. Nothing was opened. The agent can ask again; choose ${offered.map((b) => `"${b}"`).join(' or ')} ` +
+          'on the approval card, or a person can open the file from the Ironbooks window.',
+      );
+      return quiet;
+    }
     if (index < 0) {
-      this.problem(`The answer to "${said}" is not one of its choices (${buttons.join(', ')}), so Ironbooks stopped there. The agent can ask again; choose one of them on the approval card.`);
+      this.problem(`The answer to "${said}" is not one of its choices (${offered.join(', ')}), so Ironbooks stopped there. The agent can ask again; choose one of them on the approval card.`);
       return quiet;
     }
     this.asked.push({ id: q.id, answer: buttons[index] });
@@ -1632,6 +1897,7 @@ module.exports = {
   defaultFolders,
   cleanPath,
   windowsFold,
+  isThisComputerShare,
   insideFolder,
   pathProblem,
   companyFilePath,

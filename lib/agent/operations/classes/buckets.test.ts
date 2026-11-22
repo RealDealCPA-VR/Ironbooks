@@ -5,6 +5,7 @@ import { API_ROUTE_PERMISSIONS } from '@/lib/permissions/routes';
 import type { OperationInput } from '@/lib/agent/contract';
 import { describeRequest } from '@/lib/agent/describe';
 import { allOperations } from '../registry';
+import { describeSchemas } from '../schemas';
 import { operationKey, type Operation } from '../types';
 import { CLASS_BUCKETS, CLASS_BUCKET_NAMES, bucketOfRoute, routeSegment, type ClassBucket } from './buckets';
 
@@ -59,6 +60,18 @@ const EDIT_ONLY_FLAGS: ReadonlyArray<{ create: string; edits: string[]; flags: s
   { create: 'POST /api/vendor-credits', edits: ['PATCH /api/vendor-credits/[id]'], flags: ['allowReconciledEdit'], service: 'vendorCredits' },
 ];
 
+/** Every property name anywhere in a JSON Schema. */
+function propertyNames(schema: unknown, out = new Set<string>()): Set<string> {
+  if (Array.isArray(schema)) {
+    for (const s of schema) propertyNames(s, out);
+  } else if (schema && typeof schema === 'object') {
+    const props = (schema as { properties?: unknown }).properties;
+    if (props && typeof props === 'object') for (const k of Object.keys(props)) out.add(k);
+    for (const v of Object.values(schema)) propertyNames(v, out);
+  }
+  return out;
+}
+
 /** The function each line of `src` sits in, for every line that `needle` matches. */
 function enclosingFunctions(src: string, needle: RegExp): string[] {
   const out: string[] = [];
@@ -86,6 +99,24 @@ describe('everyday buckets: confirmation flags', () => {
     }
   });
 
+  it('list every flag a body schema carries, but the edit-only flags of a new record', async () => {
+    // describe_operation leaves an unlisted flag out of the schema it shows ("this operation does not
+    // take this confirmation") and the guards strip it from the body, so a flag the route really asks
+    // for and the entry does not list could never be confirmed by an agent.
+    const allowedUnlisted = new Map<string, string[]>(EDIT_ONLY_FLAGS.map((e) => [e.create, e.flags]));
+    const odd: string[] = [];
+    for (const o of everyday()) {
+      if (o.body === 'none' || !o.bodySchema) continue;
+      const shown = (await describeSchemas({ ...o, confirmFlags: FLAGS_THE_APP_ASKS })).body;
+      const carried = FLAGS_THE_APP_ASKS.filter((f) => propertyNames(shown).has(f));
+      const key = operationKey(o.method, o.route);
+      for (const f of carried) {
+        if (!o.confirmFlags.includes(f) && !(allowedUnlisted.get(key) ?? []).includes(f)) odd.push(`${o.id}: ${f}`);
+      }
+    }
+    expect(odd).toEqual([]);
+  }, 120_000);
+
   it('match the services: only an update function reads those flags (read off the source)', () => {
     // If a save of a new record starts asking for one, this fails: list the flag on that POST too.
     for (const { service, flags } of EDIT_ONLY_FLAGS) {
@@ -103,6 +134,24 @@ describe('everyday buckets: amounts', () => {
     // in place, and adds up every entry of an operation with no amountField.
     const stale = /ledger preview (?:cannot|does not) size|before and after the dry run|entries made in the run|see only the largest single/i;
     expect(everyday().filter((o) => stale.test(o.why ?? '')).map((o) => o.id)).toEqual([]);
+  });
+
+  it('never tell an agent that a void, delete or edit that touched no entry is 0.00 (it stays unknown)', () => {
+    // "0.00" is only for a run that made new records and posted nothing.
+    const zero = /(?:comes? out|counts? as|is) "?0\.00/i;
+    expect(everyday().filter((o) => zero.test(o.why ?? '')).map((o) => o.id)).toEqual([]);
+  });
+});
+
+describe('everyday buckets: previews', () => {
+  it('name the preview option of every operation that has its own preview mode', () => {
+    // The bridge does not run these ahead of time; its note tells the agent the operation has a
+    // preview option of its own, and describe_operation sends the why, which names it.
+    const option = /\bdryRun: true\b|\bpreview: true\b|\?preview=true\b/;
+    const unnamed = everyday()
+      .filter((o) => o.dryRun === 'preview' && !option.test(o.why ?? ''))
+      .map((o) => o.id);
+    expect(unnamed).toEqual([]);
   });
 });
 

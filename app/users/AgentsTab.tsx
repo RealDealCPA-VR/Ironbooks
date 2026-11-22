@@ -17,38 +17,56 @@
  * computer this tab lists, and an agent can still be paused from there. The rules are enforced in
  * lib/services/agents.ts, agentPolicies.ts and lib/agentContext.ts; this component only presents them.
  *
- * Only an Admin makes or removes an agent, or lets one do more by itself (plan 4.4). Someone else
- * who manages agents sees the list and each agent, and may make one stricter or pause it. The page
- * passes whether the person is an Admin (viewerIsAdmin) when it knows; otherwise the tab asks who
- * is signed in (GET /api/auth/me) itself. When that cannot be told, it shows only what they may do
- * without being an Admin. The server decides either way.
+ * Only an Admin makes or removes an agent, or lets one do more by itself (plan 4.4). Anyone else
+ * who may see Users & Roles > Users sees the list and each agent (app/users/page.tsx shows them the
+ * tab); whoever of them may also change Users & Roles > Users may make one stricter, pause it or
+ * take back its standing permission, as the server allows (personWhoManagesAgents). Someone who may
+ * only see that list gets the same screens to look at, with no control the server would refuse,
+ * and is told what they would need. The page passes whether the person is an Admin (viewerIsAdmin)
+ * and whether they may change users (viewerMayManage), null until it knows, so an Admin never first
+ * sees the other screen; left out, the tab asks who is signed in (GET /api/auth/me) itself. What
+ * cannot be told counts as no. The server decides either way.
+ *
+ * Pause all agents (the company's Integrated Applications switch) is offered at the top of the list
+ * exactly as in the window's title bar (components/PauseAllAgents.tsx): only when the window's one
+ * count poll says this person may use it (canPauseAll) and there is an agent to pause. Anyone else
+ * is told who can. When the switch moves, from here or the title bar, the list is asked for again;
+ * when an agent is made or removed here, the poll is asked again at once, so the switch follows.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Bot, Copy, Plus, Settings2, Trash2 } from 'lucide-react';
 import { Badge, Button, Card, ConfirmDialog, Input, Label, Modal, PageSkeleton, Table, Td, Th, Tr, toast } from '@/components/ui';
+import { Help } from '@/components/Help';
+import { agentRequestCountStore, useAgentRequestCount } from '@/components/AgentRequestsBadge';
+import PauseAllAgents from '@/components/PauseAllAgents';
 import { api } from '@/lib/client';
 import type { AgentMode } from '@/lib/permissions/agentAccess';
-import { ADMIN_ROLE_KEY } from '@/lib/permissions/model';
+import { ADMIN_ROLE_KEY, canActivity, type ActivitySet, type PermissionSet } from '@/lib/permissions/model';
 import type { AgentPreset } from '@/lib/agent/operations/types';
 import AgentDetailView from './agents/AgentDetailView';
 import PresetChoice from './agents/PresetChoice';
 import {
   ADMIN_ROLE_WARNING,
+  ADMIN_TO_PAUSE_ALL,
   ALL_PAUSED_NOTE,
   ALL_PAUSED_TITLE,
   NEW_AGENT_PRESET,
   NOT_ADMIN_LIST_NOTE,
   ROLE_AND_PRESET_NOTE,
   ROLE_HELP,
+  VIEW_ONLY_LIST_NOTE,
   adjustedTitle,
   presetLabelOf,
   presetSummary,
   when,
 } from './agents/words';
 
+/** One agent as GET /api/agents lists it: AgentView (lib/services/agents.ts) with overrideCount. */
 interface Agent {
   id: string;
   name: string;
+  /** Listed, not shown: the names below are what a person reads. */
+  roleKeys?: string[];
   roleNames: string[];
   /** What it may do without asking. An older server lists only the mode. */
   preset?: AgentPreset;
@@ -59,12 +77,15 @@ interface Agent {
   createdAt: string;
   createdByName: string | null;
   lastUsedAt: string | null;
+  /** When it was removed (status 'revoked'), or null. */
+  revokedAt?: string | null;
   status: 'active' | 'revoked';
   unattended?: boolean;
   /**
-   * How many Allow / Ask / Never settings of its own it has (stored overrides), so the list never
-   * shows an adjusted agent as its plain preset (contract §11). Left out by an older server: the
-   * list then shows the preset's name, and the detail page the count.
+   * How many of its Allow / Ask / Never settings differ from the preset (those that change what the
+   * cell would otherwise follow), so the list never shows an adjusted agent as its plain preset
+   * (contract §11). Left out by an older server: the list then shows the preset's name, and the
+   * detail page the count, which it works out itself.
    */
   overrideCount?: number;
 }
@@ -111,17 +132,29 @@ function errMsg(e: unknown) {
   return e instanceof Error ? e.message : 'Something went wrong';
 }
 
+/** Who is at this window, as far as this tab needs it. */
+interface Viewer {
+  /** An Admin: may make, remove and loosen agents. */
+  isAdmin: boolean;
+  /** May change Users & Roles > Users: tighten, pause, take back standing permission. */
+  mayManage: boolean;
+}
+
 /**
- * Whether the person at this window is an Admin (GET /api/auth/me). Anything else, a failed read
- * included, counts as not: the controls that would let an agent do more stay off. Cosmetic only:
- * the server holds the same rule (lib/services/agents.ts, agentPolicies.ts).
+ * The person at this window (GET /api/auth/me): an Admin, and whether they may change Users &
+ * Roles > Users (an Admin always may). Anything else, a failed read or no permissions included,
+ * counts as not: the controls stay off. Cosmetic only: the server holds the same rules
+ * (lib/services/agents.ts, agentPolicies.ts, agentGrants.ts).
  */
-async function readViewerIsAdmin(): Promise<boolean> {
+async function readViewer(): Promise<Viewer> {
   try {
-    const me = await api.get<{ isAdmin?: unknown } | null>('/api/auth/me');
-    return me?.isAdmin === true;
+    const me = await api.get<{ isAdmin?: unknown; permissions?: PermissionSet | null; activities?: ActivitySet | null } | null>('/api/auth/me');
+    const isAdmin = me?.isAdmin === true;
+    const mayManage =
+      isAdmin || (!!me?.permissions && canActivity({ permissions: me.permissions, activities: me.activities ?? undefined }, 'users.users', 'modify'));
+    return { isAdmin, mayManage };
   } catch {
-    return false;
+    return { isAdmin: false, mayManage: false };
   }
 }
 
@@ -325,6 +358,7 @@ function TokenOnce({
 export default function AgentsTab({
   roles,
   viewerIsAdmin: given,
+  viewerMayManage: givenManage,
 }: {
   roles: RoleOption[];
   /**
@@ -333,6 +367,13 @@ export default function AgentsTab({
    * Cosmetic either way: the server holds the same rule.
    */
   viewerIsAdmin?: boolean | null;
+  /**
+   * Whether the person may change Users & Roles > Users (make an agent stricter, pause it, take
+   * back its standing permission); null while the page is still asking. Left out while
+   * viewerIsAdmin is given: an Admin may, anyone else is taken not to (fail closed). Both left out,
+   * the tab asks on its own.
+   */
+  viewerMayManage?: boolean | null;
 }) {
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [hostOnly, setHostOnly] = useState(false);
@@ -347,15 +388,18 @@ export default function AgentsTab({
   /** The agent whose detail page is open, or null for the list. */
   const [openId, setOpenId] = useState<string | null>(null);
   /** What GET /api/auth/me said, when the page did not say it (null: not known yet). */
-  const [asked, setAsked] = useState<boolean | null>(null);
-  /** The person at this window is an Admin (null: not known yet). */
-  const viewerIsAdmin = given !== undefined ? given : asked;
+  const [asked, setAsked] = useState<Viewer | null>(null);
   const askSelf = given === undefined;
+  /** The person at this window is an Admin (null: not known yet). */
+  const viewerIsAdmin = askSelf ? (asked?.isAdmin ?? null) : given;
+  /** The person may tighten, pause and take back (null: not known yet). An Admin always may. */
+  const mayManage: boolean | null =
+    viewerIsAdmin === true ? true : givenManage !== undefined ? givenManage : askSelf ? (asked?.mayManage ?? null) : viewerIsAdmin;
 
   useEffect(() => {
     if (!askSelf) return;
     let live = true;
-    readViewerIsAdmin().then((v) => {
+    readViewer().then((v) => {
       if (live) setAsked(v);
     });
     return () => {
@@ -382,6 +426,37 @@ export default function AgentsTab({
     load();
   }, [load]);
 
+  // The window's one count poll (components/AgentRequestsBadge.tsx; the title bar reads the same):
+  // whether Pause all agents is offered to this person, and whether the switch is on. Null until
+  // its first good answer. The list's own allPaused stays what the list shows; when the poll's
+  // moves (Pause all agents or Resume, here or in the title bar), the list is asked for again.
+  const count = useAgentRequestCount();
+  const pollPaused = count ? count.allPaused : null;
+  const seenPaused = useRef<boolean | null>(null);
+  useEffect(() => {
+    if (pollPaused === null) return;
+    const before = seenPaused.current;
+    seenPaused.current = pollPaused;
+    if (before !== null && before !== pollPaused) void load();
+  }, [pollPaused, load]);
+  /**
+   * Pause all agents is offered (components/PauseAllAgents.tsx shows it): true, false, or null while
+   * not known. A poll that still counts no agent while the list holds one active (made a moment
+   * ago, here or elsewhere) is behind, not an answer: for this person the switch may be about to
+   * show, so nothing is said until the poll catches up (asked again at once after a make or remove).
+   */
+  const listsActive = (agents ?? []).some((a) => a.status === 'active');
+  const pauseAllOffered =
+    count === null ? null : count.canPauseAll !== true ? false : count.agents >= 1 ? true : listsActive ? null : false;
+  /** After an agent is made or removed: the count poll is asked now, so Pause all agents follows. */
+  const recount = () => {
+    void agentRequestCountStore()
+      .refresh()
+      .catch(() => {
+        /* the next poll brings it anyway */
+      });
+  };
+
   async function remove() {
     if (!removing) return;
     setBusy(true);
@@ -390,6 +465,7 @@ export default function AgentsTab({
       toast(`${removing.name} no longer has access.`, 'success');
       setRemoving(null);
       if (openId === removing.id) setOpenId(null);
+      recount();
       await load();
     } catch (e) {
       toast(errMsg(e), 'danger');
@@ -398,7 +474,7 @@ export default function AgentsTab({
     }
   }
 
-  if (agents === null || viewerIsAdmin === null) return <PageSkeleton />;
+  if (agents === null || viewerIsAdmin === null || mayManage === null) return <PageSkeleton />;
   /** Only an Admin makes or removes an agent, and only at the computer that holds the file. */
   const mayMake = viewerIsAdmin && !hostOnly;
 
@@ -423,6 +499,8 @@ export default function AgentsTab({
           agentId={openId}
           hostOnly={hostOnly}
           viewerIsAdmin={viewerIsAdmin}
+          viewerMayManage={mayManage}
+          pauseAllOffered={pauseAllOffered}
           onBack={() => {
             setOpenId(null);
             load();
@@ -442,21 +520,39 @@ export default function AgentsTab({
           <div className="min-w-0 flex-1 text-sm text-navy/70">
             <p>
               An agent is an AI assistant you let work in these books, the way you would add a bookkeeper: with a name and a role. It connects
-              through Ironbooks on this computer only, and everything it does is listed under its name.
+              through Ironbooks on this computer only, and everything it does is listed under its name.{' '}
+              {/* The tab's own help (lib/pageHelp.ts TAB_HELP['/users/agents']): the shell's F1 shows the page's. */}
+              <span data-tab-help="">
+                <Help page="/users/agents" side="bottom">
+                  What is this tab?
+                </Help>
+              </span>
             </p>
             <p className="mt-1 text-xs text-navy/50">{ROLE_AND_PRESET_NOTE}</p>
             <p className="mt-1 text-xs text-navy/50">{MODES_NOTE}</p>
           </div>
-          {mayMake && (
-            <Button onClick={() => setAdding(true)}>
-              <Plus className="mr-1 h-4 w-4" /> New agent
-            </Button>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Shown only when the count poll says this person may use the switch (canPauseAll). */}
+            <PauseAllAgents className="h-9 border border-slate-200 text-sm" />
+            {mayMake && (
+              <Button onClick={() => setAdding(true)}>
+                <Plus className="mr-1 h-4 w-4" /> New agent
+              </Button>
+            )}
+          </div>
         </div>
         {hostOnly && <p className="mt-3 text-sm text-amber-700">{HOST_ONLY_MESSAGE}</p>}
         {!viewerIsAdmin && (
-          <p className="mt-3 text-sm text-navy/60" data-not-admin="">
-            {NOT_ADMIN_LIST_NOTE}
+          // Someone who may only see Users & Roles > Users is not promised what the server refuses.
+          <p className="mt-3 text-sm text-navy/60" data-not-admin="" data-view-only={mayManage ? undefined : ''}>
+            {mayManage ? NOT_ADMIN_LIST_NOTE : VIEW_ONLY_LIST_NOTE}
+          </p>
+        )}
+        {/* Anyone the switch is not offered to is told who can use it; an Admin whose poll has not
+            answered yet (or is behind the list) is told nothing rather than something that may be wrong. */}
+        {listsActive && pauseAllOffered !== true && (pauseAllOffered === false || !viewerIsAdmin) && (
+          <p className="mt-1 text-sm text-navy/60" data-pause-all-admin-only="">
+            {ADMIN_TO_PAUSE_ALL}
           </p>
         )}
         {allPaused && (
@@ -548,6 +644,7 @@ export default function AgentsTab({
           onMade={(token, connection, name, unattended) => {
             setAdding(false);
             setMade({ name, token, connection, unattended });
+            recount();
             load();
           }}
         />

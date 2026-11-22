@@ -17,8 +17,10 @@ import {
   clearLooser,
   clearScope,
   clearSetting,
+  differingCount,
   draftFrom,
   inheritedSetting,
+  insideFolder,
   isChanged,
   keptAsChosen,
   lockedReason,
@@ -26,6 +28,7 @@ import {
   looserThanPreset,
   looseningsOf,
   neverAllowReason,
+  newFolders,
   overrideText,
   policyOf,
   presetLooser,
@@ -63,7 +66,7 @@ describe('the Agents tab', () => {
   // "New agent" changed on purpose with full access (plan D1, D2): the Admin role is offered with a
   // warning, and a preset is sent instead of the older mode.
   it('lists agents without tokens, makes one with a preset and shows its token once, opens its detail page, removes after asking, and only lists on another computer', async () => {
-    expectAllPassed(await runDomFile('test/dom/agentsTab.dom.tsx', 200_000), [
+    expectAllPassed(await runDomFile('test/dom/agentsTab.dom.tsx', 240_000), [
       'the list shows each agent, its role and last use, and never a token',
       'New agent: name, roles (Admin with a warning) and the chosen preset are sent, and the token is shown once',
       'working while nobody is signed in is off unless ticked, and says what it means',
@@ -87,8 +90,15 @@ describe('the Agents tab', () => {
       'a person who is not an Admin can make an agent stricter or pause it, and never let it do more',
       'a person who is not an Admin is not offered Resume for an agent with the Admin role',
       'the page can say whether the person is an Admin, and the tab then does not ask again',
+      'the tab header shows its own help (/users/agents)',
+      'Pause all agents in the tab follows canPauseAll, and the list follows the switch',
+      'Pause all agents follows at once when an Admin makes the first agent or removes the last',
+      'someone who may only see Users sees each agent, and is offered nothing the server would refuse',
+      "the server's folder refusals are shown beside Save as they come",
+      'Users & Roles shows the Agents tab to whoever may view Users, once it knows who is signed in',
       'the audit trail opens the entry its address names, expanded and scrolled to',
       'an audit trail entry that cannot be found is said once, and the whole trail is shown; another failure is said as it is, with Try again',
+      'an audit trail row whose details cannot be loaded stays closed and says why; a second click asks again',
     ]);
   }, 300_000);
 });
@@ -208,7 +218,7 @@ describe('the detail page: the unsaved policy and what a save sends', () => {
     expect(presetSummary('Read only', 1)).toBe('Read only (adjusted: 1)');
     expect(presetSummary('Read only', 2)).toBe('Read only (adjusted: 2)');
     expect(adjustedTitle(0)).toBeUndefined();
-    expect(adjustedTitle(2)).toMatch(/^2 kinds of work are set for this agent itself/);
+    expect(adjustedTitle(2)).toMatch(/^2 settings differ from the preset/);
   });
 
   it("the preset's line never claims more than is true for an adjusted agent", () => {
@@ -240,18 +250,28 @@ describe('the detail page: the unsaved policy and what a save sends', () => {
     // An Allow the engine never gives counts as the Ask it is.
     expect(keptAsChosen(draftFrom(view('ask_every_change', [{ class: 'remove', area: null, setting: 'allow' }]))).length).toBe(1);
 
-    // The list has the count only: it says some may change nothing.
-    expect(adjustedTitle(2)).toBe(
-      '2 kinds of work are set for this agent itself, everywhere or in an area. Some may only keep the setting they would have anyway, so a later change cannot move them. Open the agent to see what it may do.',
-    );
-    // The detail page knows exactly.
-    expect(adjustedTitle(4, 2)).toBe(
-      '4 kinds of work are set for this agent itself, everywhere or in an area. 2 of them only keep the setting they would have anyway, so a later change cannot move them.',
+    // Changed on purpose (wave 4): "(adjusted: N)" counts the settings that differ from the preset
+    // (the server's overrideCount counts the same way). The detail page works it out itself.
+    expect(differingCount(d)).toBe(2);
+    expect(differingCount(start())).toBe(0);
+    expect(presetSummary('Ask for every change', differingCount(d))).toBe('Ask for every change (adjusted: 2)');
+    // The list has the count only.
+    expect(adjustedTitle(2)).toBe('2 settings differ from the preset, everywhere or in an area. Open the agent to see what it may do.');
+    expect(adjustedTitle(1)).toBe('One setting differs from the preset, everywhere or in an area. Open the agent to see what it may do.');
+    // The detail page knows how many more are only kept as chosen.
+    expect(adjustedTitle(2, 2)).toBe(
+      '2 settings differ from the preset, everywhere or in an area. 2 more settings are kept as chosen: they change nothing today, and a later change of the preset or of everywhere cannot move them.',
     );
     expect(adjustedTitle(1, 1)).toBe(
-      'One kind of work is set for this agent itself, everywhere or in an area. It only keeps the setting it would have anyway, so a later change cannot move it. Today the agent may do just what the preset says.',
+      'One setting differs from the preset, everywhere or in an area. One more setting is kept as chosen: it changes nothing today, and a later change of the preset or of everywhere cannot move it.',
     );
-    expect(adjustedTitle(2, 0)).toBe('2 kinds of work are set for this agent itself, everywhere or in an area. Each one changes what the agent may do.');
+    expect(adjustedTitle(2, 0)).toBe('2 settings differ from the preset, everywhere or in an area.');
+    // Nothing differs: the header is the preset's name; its tooltip says what is kept, if anything.
+    expect(presetSummary('Read only', 0)).toBe('Read only');
+    expect(adjustedTitle(0, 1)).toBe(
+      'No setting differs from the preset. One setting is kept as chosen: it changes nothing today, and a later change of the preset or of everywhere cannot move it. Today the agent may do just what the preset says.',
+    );
+    expect(adjustedTitle(0, 0)).toBeUndefined();
     expect(adjustedPresetNote(2, [], 1)).toBe(
       'That is the preset as it comes. This agent has 2 settings of its own, so the grid below is what holds. One of them only keeps the setting it would have anyway, so a later change cannot move it.',
     );
@@ -384,13 +404,21 @@ describe('the detail page: the unsaved policy and what a save sends', () => {
     expect(looseningsOf(two, { ...two, twoPersonOver: '1000.01' })).toEqual(['two-person approval only above 1000.01 instead of 1000.00']);
 
     // Folders: another one is loosening, the same one in other letters is not, taking one off is fine.
-    // Deliberately stricter than the server (which takes a folder inside one that reaches something
-    // on the disk): a window cannot see the disk, so a folder inside one counts as another here.
-    expect(addedFolders(saved, { ...saved, folders: ['C:\\Receipts', 'C:\\Receipts\\2026'] })).toEqual(['C:\\Receipts\\2026']);
+    // Changed on purpose (wave 4): as the server counts it, a folder inside one the agent already
+    // has is not (the server also asks the disk, and refuses in its own words when that folder does
+    // not really reach the new one).
+    expect(addedFolders(saved, { ...saved, folders: ['C:\\Receipts', 'C:\\Receipts\\2026'] })).toEqual([]);
+    expect(addedFolders(saved, { ...saved, folders: ['C:\\Receipts', 'c:/receipts/2026/March'] })).toEqual([]);
     expect(addedFolders(saved, { ...saved, folders: ['C:\\Receipts', 'D:\\Scans'] })).toEqual(['D:\\Scans']);
+    expect(addedFolders(saved, { ...saved, folders: ['C:\\Receipts', 'C:\\Receipts2026'] })).toEqual(['C:\\Receipts2026']);
+    expect(addedFolders(saved, { ...saved, folders: ['C:\\Receipts', 'C:\\Receipts\\..\\Payroll'] })).toEqual(['C:\\Receipts\\..\\Payroll']);
     expect(addedFolders(saved, { ...saved, folders: ['c:\\receipts'] })).toEqual([]);
+    // Inside one only when the one it is inside is still saved: compared with what was saved.
+    expect(addedFolders({ ...saved, folders: [] }, { ...saved, folders: ['C:\\Receipts\\2026'] })).toEqual(['C:\\Receipts\\2026']);
     expect(looseningsOf(saved, { ...saved, folders: [] })).toEqual([]);
     expect(looseningsOf(saved, { ...saved, folders: ['C:\\Receipts', 'D:\\Scans'] })).toEqual(['another folder: D:\\Scans']);
+    expect(looseningsOf(saved, { ...saved, folders: ['C:\\Receipts', 'C:\\Receipts\\2026'] })).toEqual([]);
+    expect(newFolders(saved, { ...saved, folders: ['C:\\Receipts', 'C:\\Receipts\\2026'] })).toEqual(['C:\\Receipts\\2026']);
 
     // A longer wait and the email notice turned on are loosening too, as the server holds them;
     // a shorter wait and the notice turned off are not.
@@ -406,6 +434,30 @@ describe('the detail page: the unsaved policy and what a save sends', () => {
     expect(adminOnlyNote(['another folder: D:\\Scans'])).toBe(
       `${ADMIN_TO_LOOSEN} This change would give it: another folder: D:\\Scans. Put it back to save the rest, or ask an Admin.`,
     );
+  });
+
+  it('a folder inside another, by the words alone: full paths, never a whole drive or share, no "." or ".." parts', () => {
+    // Windows: either slash, any letter case.
+    expect(insideFolder('C:\\Receipts\\2026', 'C:\\Receipts')).toBe(true);
+    expect(insideFolder('c:/receipts/2026', 'C:\\Receipts\\')).toBe(true);
+    expect(insideFolder('C:\\Receipts', 'C:\\Receipts')).toBe(false); // the same folder is not inside it
+    expect(insideFolder('C:\\Receipts2026', 'C:\\Receipts')).toBe(false); // a name that only starts the same
+    expect(insideFolder('D:\\Receipts\\2026', 'C:\\Receipts')).toBe(false);
+    // A whole drive or share is never taken as the folder it is inside.
+    expect(insideFolder('C:\\Receipts', 'C:\\')).toBe(false);
+    expect(insideFolder('\\\\server\\share\\Scans', '\\\\server\\share')).toBe(false);
+    expect(insideFolder('\\\\server\\share\\Scans\\2026', '\\\\server\\share\\Scans')).toBe(true);
+    expect(insideFolder('\\\\other\\share\\Scans\\2026', '\\\\server\\share\\Scans')).toBe(false);
+    // "." and ".." cannot be placed by the words: never inside.
+    expect(insideFolder('C:\\Receipts\\..\\Payroll', 'C:\\Receipts')).toBe(false);
+    expect(insideFolder('C:\\Receipts\\.\\2026', 'C:\\Receipts')).toBe(false);
+    // Not full paths: never.
+    expect(insideFolder('Receipts\\2026', 'Receipts')).toBe(false);
+    expect(insideFolder('C:Receipts\\2026', 'C:Receipts')).toBe(false);
+    // Elsewhere: by letter case, from the root.
+    expect(insideFolder('/home/pat/Receipts/2026', '/home/pat/Receipts')).toBe(true);
+    expect(insideFolder('/home/pat/receipts/2026', '/home/pat/Receipts')).toBe(false);
+    expect(insideFolder('/home/pat', '/')).toBe(false);
   });
 
   it("Resume's reason for a person who is not an Admin is the server's own words", () => {

@@ -40,7 +40,11 @@
  *    'read_sensitive'. The 1099 account mapping is a company setting: 'settings'.
  *  - The quit-time automatic backup and the raw transaction log are copies of the company file:
  *    'file'. The desktop shell's own path of those routes (x-bka-internal) is never sent by the
- *    bridge, so only the signed-in path is classified.
+ *    bridge, so only the signed-in path is classified. The raw log is also on the hard floor: it
+ *    cannot be masked (its fingerprints cover every byte), so no approval could make it safe.
+ *  - The audit trail is read with the reader's access less Users & Roles and File Utilities for an
+ *    agent (lib/services/auditTrail.ts auditReaderFor): those areas' reads are 'admin' and 'file',
+ *    and a plain read of the audit trail must not get round that.
  */
 import type { ClassificationMap } from '../types';
 
@@ -324,11 +328,12 @@ export const REPORTS_CLASSES: ClassificationMap = {
   'GET /api/audit-trail': {
     class: 'read',
     describe: 'List audit trail entries: who changed what, and when',
+    why: "A plain read. For an agent, through the door or its own request, the service reads with the agent's access less Users & Roles and File Utilities, and never as an Admin (lib/services/auditTrail.ts auditReaderFor): no entry of those areas (who may sign in, the agents and their requests, backups and file names) and never the whole log.",
   },
   'GET /api/audit-trail/[id]': {
     class: 'read',
     describe: 'Show audit trail entry {id} with its before and after values',
-    why: 'The before and after values mask SSNs, tax IDs and account numbers unless revealed. A reveal shows SSNs and tax IDs only; account numbers stay masked.',
+    why: "The before and after values mask SSNs, tax IDs and account numbers unless revealed. A reveal shows SSNs and tax IDs only; account numbers stay masked. For an agent the service reads with its access less Users & Roles and File Utilities (auditReaderFor), so an entry of those areas is not found.",
     reveal: 'ssn',
     sensitiveFields: maskedUnder('oldValues', 'newValues'),
   },
@@ -354,7 +359,8 @@ export const REPORTS_CLASSES: ClassificationMap = {
   'GET /api/transaction-log/download': {
     class: 'file',
     describe: 'Download the raw transaction log file',
-    why: 'A byte-for-byte copy of part of the company file: every record with its full before and after data, nothing masked, for every company in the file. Records written by older builds can also carry the closing-date and file password hashes; the JSON log strips those, this file cannot without breaking its fingerprints. The route gives it only to someone who manages every company it records, and to an Admin of every company in the file (requireFileAdmin) when a company has been deleted since; fileAdmin is set for that stricter case. ?part=verification answers only the verification report. Read from disk, so no dry run.',
+    availability: 'hard_floor',
+    why: "Never for agents, with or without approval: the file cannot be masked. It is a byte-for-byte copy of part of the company file, every record with its full before and after data for every company in the file: full tax IDs (a sole proprietor's is their SSN), bank and account numbers, and in records written by older builds the closing-date and file password hashes. The JSON log strips and masks those; this file cannot without breaking its fingerprints, and no View flag covers a password hash or another company's books. An agent reads the log masked with GET /api/transaction-log (or the plain-language CSV, GET /api/transaction-log/export) and checks it with GET /api/transaction-log/verify. A person downloads the raw file in Ironbooks.",
     fileAdmin: true,
     output: 'file',
     dryRun: 'none',

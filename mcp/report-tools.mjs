@@ -22,10 +22,16 @@
  *
  * Also the report shaping the named report_* tools use (shapeReport): column headers once, then
  * each row as its cells in column order.
+ *
+ * When an Admin set reading reports to Ask, a person must approve the read first. These tools only
+ * look, so they take no request id or reason to ask with (test/mcp/protocol.test.ts holds every
+ * tool that only looks to that): the answer says to ask with run_operation, with the same input,
+ * then to wait_for_decision. What the agent then collects comes back as these tools give it
+ * (compactCollected, used by mcp/tools.mjs).
  */
 import { ToolError } from './protocol.mjs';
 import { fit, runOperation } from './entry-tools.mjs';
-import { settle } from './write-tools.mjs';
+import { askedReadCheck, settle } from './write-tools.mjs';
 
 const DATE = { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', patternHint: 'must be a date as YYYY-MM-DD' };
 const ID = { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', patternHint: 'must be an id returned by another tool' };
@@ -398,22 +404,25 @@ const OTHER_READS =
  * reports to Ask (a class or area override): the door then files the read for a person, and asks
  * for a request id and a reason as it does for a change (lib/agent/operate.ts change). That answer
  * would send the agent to an argument these tools do not have, so it is turned into the way that
- * works: run_operation, which takes both, with the same input. `instead` says how to send it.
+ * works: run_operation, which takes both, with the same input. It is told from any other error by
+ * the door's own answer to the same read as a dry run (write-tools.mjs askedReadCheck), not by the
+ * words of the error. `instead` says how to send the input; `collect` what wait_for_decision gives.
  * @param {any} client
  * @param {Parameters<typeof runOperation>[1]} req
  * @param {string} instead
+ * @param {string} collect
  */
-async function readThroughDoor(client, req, instead) {
+async function readThroughDoor(client, req, instead, collect) {
   try {
     return await runOperation(client, req);
   } catch (err) {
-    const e = /** @type {any} */ (err);
-    if (e && e.isIronbooksError === true && /\brequest_id\b/.test(String(e.message))) {
-      throw new ToolError(
-        `A person must approve this read before you see it, and this tool cannot ask for that. Ask with run_operation instead: operation "${req.operation}", ${instead}, a request_id of your own and a reason. Then call wait_for_decision with the request_id it gives.`,
-      );
-    }
-    throw err;
+    const tried = await askedReadCheck(err, () => runOperation(client, { ...req, dryRun: true }));
+    if (!tried) throw err;
+    // Read after all (the first error passed), or refused: answered as either is.
+    if (tried.outcome !== 'dry_run') return tried;
+    throw new ToolError(
+      `A person must approve this read before you see it, and this tool cannot ask for that. Ask with run_operation instead: operation "${req.operation}", ${instead}, a request_id of your own and a reason. Then call wait_for_decision with the request_id it gives: once a person approves it, ${collect}.`,
+    );
   }
 }
 
@@ -431,12 +440,148 @@ const inputWords = (/** @type {Record<string, unknown>} */ input) =>
  */
 async function readReport(/** @type {any} */ client, /** @type {string} */ key, /** @type {any} */ options) {
   const req = { operation: 'reports.std.get', params: { report: key }, query: reportQuery(key, options) };
-  const answer = await readThroughDoor(client, req, inputWords({ params: req.params, query: Object.keys(req.query).length ? req.query : undefined }));
+  const answer = await readThroughDoor(
+    client,
+    req,
+    inputWords({ params: req.params, query: Object.keys(req.query).length ? req.query : undefined }),
+    'it gives you the report as run_report does',
+  );
   if (answer?.outcome !== 'read') return { answer: fit(settle(answer, { fields: [] })) };
   const report = answer.result;
   if (!report || typeof report !== 'object' || !Array.isArray(report.columns)) throw new ToolError('Ironbooks answered without a report. Try again; if it keeps happening, tell the person.');
   return { report };
 }
+
+const DRILL_HINT = 'report_drilldown with this key, the same options, a row_id and a money column\'s key lists the transactions behind that amount.';
+
+/**
+ * One report as run_report gives it: the key, the compact report (shapeReport), and for a report
+ * whose amounts can be drilled, each row's id, each column's key and how to drill.
+ * @param {string} key @param {any} report @param {number | undefined} maxRows
+ */
+export function compactReport(key, report, maxRows) {
+  const drill = DRILLDOWN_KEYS.includes(key);
+  return { key, ...shapeReport(report, maxRows, { ids: drill }), ...(drill ? { drilldown: DRILL_HINT } : {}) };
+}
+
+/**
+ * The transactions behind one report amount as report_drilldown gives them (lib/reports/drilldown.ts
+ * DrillResult made into the tools' words). `key`: the report, when the answer does not name it.
+ * @param {any} d @param {string} key
+ */
+export function compactDrilldown(d, key) {
+  const list = Array.isArray(d?.transactions) ? d.transactions.map(drillRow) : [];
+  const notes = [];
+  if (d.incomplete) notes.push('There are too many transactions to add up here: the count and total do not cover everything. Run it again with a shorter date range.');
+  else if (d.ties === false) notes.push('The transactions do not add up to the amount shown: the books changed between the two reads. Run the report again.');
+  if (d.listTruncated) notes.push(`Only the first ${list.length} of ${d.count} transactions are listed. Raise max_transactions, or narrow the dates, to see more.`);
+  return {
+    report: d.report ?? key,
+    line: d.rowLabel ?? null,
+    column: d.columnLabel ?? null,
+    ...(d.scope ? { scope: d.scope } : {}),
+    ...(d.basis ? { basis: d.basis } : {}),
+    amount_shown: d.cell ?? null,
+    ...(d.kind === 'formula' && d.formula ? { worked_out_as: d.formula } : {}),
+    total: d.total ?? null,
+    count: d.count ?? list.length,
+    ...(d.largest ? { largest: drillRow(d.largest) } : {}),
+    ...(d.explanation ? { explanation: d.explanation } : {}),
+    transactions: list,
+    ...(notes.length ? { notes } : {}),
+  };
+}
+
+const isObject = (/** @type {unknown} */ v) => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/** A report as the route answers it (lib/reports/types.ts StdReport), not yet made compact. */
+function rawReport(/** @type {any} */ v) {
+  return isObject(v) && !('row_count' in v) && Array.isArray(v.columns) && Array.isArray(v.rows) && !v.rows.some((/** @type {any} */ r) => Array.isArray(r?.cells));
+}
+
+/** A drill-down as the route answers it (lib/reports/drilldown.ts), not yet in the tools' words. */
+function rawDrilldown(/** @type {any} */ v) {
+  return isObject(v) && Array.isArray(v.transactions) && !('amount_shown' in v);
+}
+
+/** A report already made compact (shapeReport). */
+function compactShape(/** @type {any} */ v) {
+  return isObject(v) && typeof v.row_count === 'number' && Array.isArray(v.rows);
+}
+
+/** A drill-down already in the tools' words (compactDrilldown). */
+function compactDrillShape(/** @type {any} */ v) {
+  return isObject(v) && 'amount_shown' in v && Array.isArray(v.transactions);
+}
+
+/** The connector held the answer to its size limit and cut its result (operations-tools.mjs holdToLimit). */
+const resultCut = (/** @type {any} */ answer) => isObject(answer.cut_short) && typeof answer.cut_short.result === 'string';
+
+const SEE_THE_REST = 'To see the rest, run it again with a shorter date range or a filter.';
+
+/**
+ * A collected report that was cut to fit one answer, saying so inside the result as run_report
+ * says it: `truncated`, and a note. When the report was made compact before it was held
+ * (mcp/tools.mjs collectingClient), row_count is the report's own and the note names how many of
+ * them are shown. `heldFirst`: it was held while still raw (its rows halved before they were
+ * counted), so the report's real count is not known any more, and the note says that row_count
+ * counts only the rows shown. Marked once: a result already marked is handed back as it is.
+ */
+function markCutReport(/** @type {any} */ r, /** @type {boolean} */ heldFirst) {
+  if (r.truncated === true) return r;
+  const shown = r.rows.length;
+  const why = 'the whole report was too long for one answer';
+  const note = heldFirst
+    ? `Part of the report was left out (${why}), so row_count counts only the ${shown} rows shown. ${SEE_THE_REST}`
+    : shown < r.row_count
+      ? `Showing the first ${shown} of ${r.row_count} rows: ${why}. ${SEE_THE_REST}`
+      : `Part of the report was left out: ${why}. ${SEE_THE_REST}`;
+  return { ...r, truncated: true, notes: [...(Array.isArray(r.notes) ? r.notes : []), note] };
+}
+
+/** The same for a drill-down whose list of transactions was cut to fit one answer. */
+function markCutDrill(/** @type {any} */ d) {
+  if (d.truncated === true) return d;
+  const note = `Only ${d.transactions.length} of the transactions are listed here: the whole list was too long for one answer. The count and the total still cover all of them. ${SEE_THE_REST}`;
+  return { ...d, truncated: true, notes: [...(Array.isArray(d.notes) ? d.notes : []), note] };
+}
+
+/**
+ * A report read a person approved, as the agent collects it: wait_for_decision's request, the
+ * request's resource, or run_operation sent again with the request id it was asked under. The
+ * result is made what run_report (or report_drilldown) would have given, had the read run at once,
+ * so the agent reads one shape whichever way the report came. Every row the answer still holds is
+ * kept. mcp/tools.mjs makes the result compact as it arrives, before operations-tools.mjs holds the
+ * answer to the connector's size limit, so the limit is spent on compact rows and row_count stays
+ * the report's own; this runs again on the held answer, where it only says what the limit cut
+ * (`truncated` and a note in the result, beside the answer's own cut_short). Anything else is
+ * handed back as it is.
+ * @param {any} answer  a request view (lib/agent/contract.ts AgentRequestView), or a shaped answer or request (mcp/operations-tools.mjs)
+ * @param {string} [operation]  the operation, when the answer does not name it (run_operation's)
+ */
+export function compactCollected(answer, operation) {
+  if (!isObject(answer)) return answer;
+  const op = typeof answer.operation === 'string' ? answer.operation : operation;
+  const result = answer.result;
+  const cut = resultCut(answer);
+  if (op === 'reports.std.get' && rawReport(result)) {
+    // A key this copy of the catalog does not know yet is kept, without the drill-down parts.
+    const key = typeof result.key === 'string' && result.key ? result.key : null;
+    const rows = Math.max(1, result.rows.length);
+    const shaped = key ? compactReport(key, result, rows) : shapeReport(result, rows);
+    return { ...answer, result: cut ? markCutReport(shaped, true) : shaped };
+  }
+  if (op === 'reports.std.get' && cut && compactShape(result)) return withResult(answer, markCutReport(result, false));
+  if (op === 'reports.drilldown.get' && rawDrilldown(result)) {
+    const shaped = compactDrilldown(result, typeof result.report === 'string' ? result.report : 'Report');
+    return { ...answer, result: cut ? markCutDrill(shaped) : shaped };
+  }
+  if (op === 'reports.drilldown.get' && cut && compactDrillShape(result)) return withResult(answer, markCutDrill(result));
+  return answer;
+}
+
+/** The answer with another result, or the answer itself when the result is the same. */
+const withResult = (/** @type {any} */ answer, /** @type {unknown} */ result) => (result === answer.result ? answer : { ...answer, result });
 
 /** The rows of a report as its Excel and PDF files show them (lib/reports/types.ts reportToTable). */
 export function reportTable(/** @type {any} */ report) {
@@ -520,7 +665,7 @@ export const REPORT_TOOLS = [
   {
     name: 'run_report',
     title: 'Run a report',
-    description: `Run any standard report by its key (list_reports finds it), with the options that report takes: a named period or dates (or an as-of date), cash or accrual basis, columns by month, quarter or year, a comparison, and filters (class, account, customer, vendor, item, transaction type, amount …). The answer is compact: the column headers once, then each row as its cells, with a row_id and the columns' keys for report_drilldown, and a journal_entry_id on transaction rows for get_journal_entry. Profit & Loss, Balance Sheet, Trial Balance, General Ledger and the agings also have named tools (report_*). Social Security numbers in employee-contact-list and voided-deleted-detail stay masked; to see them in full, a person must approve it: run_operation with operation "reports.std.get", reveal true and a reason. ${OTHER_READS}`,
+    description: `Run any standard report by its key (list_reports finds it), with the options that report takes: a named period or dates (or an as-of date), cash or accrual basis, columns by month, quarter or year, a comparison, and filters (class, account, customer, vendor, item, transaction type, amount …). The answer is compact: the column headers once, then each row as its cells, with a row_id and the columns' keys for report_drilldown, and a journal_entry_id on transaction rows for get_journal_entry. Profit & Loss, Balance Sheet, Trial Balance, General Ledger and the agings also have named tools (report_*). Social Security numbers in employee-contact-list and voided-deleted-detail stay masked; to see them in full, a person must approve it: run_operation with operation "reports.std.get", reveal true and a reason. If a person must approve reading the report itself, the answer says how to ask for it with run_operation; once approved, wait_for_decision gives the report in this same compact shape. ${OTHER_READS}`,
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -530,21 +675,14 @@ export const REPORT_TOOLS = [
     handler: async (a, c) => {
       const got = await readReport(c, a.key, a.options);
       if ('answer' in got) return got.answer;
-      const drill = DRILLDOWN_KEYS.includes(a.key);
-      return fit({
-        key: a.key,
-        ...shapeReport(got.report, a.max_rows, { ids: drill }),
-        ...(drill
-          ? { drilldown: 'report_drilldown with this key, the same options, a row_id and a money column\'s key lists the transactions behind that amount.' }
-          : {}),
-      });
+      return fit(compactReport(a.key, got.report, a.max_rows));
     },
   },
   {
     name: 'report_drilldown',
     title: 'Transactions behind a report amount',
     description:
-      'The transactions behind one amount of a report (QuickZoom): give the report key, the same options you ran it with, the row_id of the line and the key of the column, both from run_report. The answer says how many transactions there are, their total, the largest, and lists them (newest last) with their journal_entry_id. Works for the Profit & Loss and Balance Sheet reports, the Trial Balance, the General Ledger, the A/R and A/P agings, open invoices, collections, and the sales and expense summaries (list_reports marks them drilldown).',
+      'The transactions behind one amount of a report (QuickZoom): give the report key, the same options you ran it with, the row_id of the line and the key of the column, both from run_report. The answer says how many transactions there are, their total, the largest, and lists them (newest last) with their journal_entry_id. Works for the Profit & Loss and Balance Sheet reports, the Trial Balance, the General Ledger, the A/R and A/P agings, open invoices, collections, and the sales and expense summaries (list_reports marks them drilldown). If a person must approve reading it, the answer says how to ask for it with run_operation; once approved, wait_for_decision gives the transactions in this same shape.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -560,36 +698,16 @@ export const REPORT_TOOLS = [
     handler: async (a, c) => {
       const query = { ...reportQuery(a.key, a.options), row: a.row_id, col: a.column, limit: String(a.max_transactions ?? 200) };
       const req = { operation: 'reports.drilldown.get', params: { report: a.key }, query };
-      const answer = await readThroughDoor(c, req, inputWords({ params: req.params, query }));
+      const answer = await readThroughDoor(c, req, inputWords({ params: req.params, query }), 'it gives you the transactions as report_drilldown does');
       if (answer?.outcome !== 'read') return fit(settle(answer, { fields: [] }));
-      const d = answer.result ?? {};
-      const list = Array.isArray(d.transactions) ? d.transactions.map(drillRow) : [];
-      const notes = [];
-      if (d.incomplete) notes.push('There are too many transactions to add up here: the count and total do not cover everything. Run it again with a shorter date range.');
-      else if (d.ties === false) notes.push('The transactions do not add up to the amount shown: the books changed between the two reads. Run the report again.');
-      if (d.listTruncated) notes.push(`Only the first ${list.length} of ${d.count} transactions are listed. Raise max_transactions, or narrow the dates, to see more.`);
-      return fit({
-        report: d.report ?? a.key,
-        line: d.rowLabel ?? null,
-        column: d.columnLabel ?? null,
-        ...(d.scope ? { scope: d.scope } : {}),
-        ...(d.basis ? { basis: d.basis } : {}),
-        amount_shown: d.cell ?? null,
-        ...(d.kind === 'formula' && d.formula ? { worked_out_as: d.formula } : {}),
-        total: d.total ?? null,
-        count: d.count ?? list.length,
-        ...(d.largest ? { largest: drillRow(d.largest) } : {}),
-        ...(d.explanation ? { explanation: d.explanation } : {}),
-        transactions: list,
-        ...(notes.length ? { notes } : {}),
-      });
+      return fit(compactDrilldown(answer.result ?? {}, a.key));
     },
   },
   {
     name: 'export_report',
     title: 'Report as a PDF or Excel file',
     description:
-      'Make a standard report into a PDF or an Excel (.xlsx) file, the same file the report window\'s own buttons make, with the options run_report takes. Nothing in the books changes. The answer gives a file_id: get_file reads it, and save_file saves it in a folder you may use (a person approves each save). To send it to someone, find_operations "email" shows what can be emailed.',
+      'Make a standard report into a PDF or an Excel (.xlsx) file, the same file the report window\'s own buttons make, with the options run_report takes. Nothing in the books changes. The answer gives a file_id: get_file reads it, and save_file saves it in a folder you may use (a person approves each save). If a person must approve reading the report or making the file, the answer says how to ask for it with run_operation; once approved, wait_for_decision gives the file_id. To send it to someone, find_operations "email" shows what can be emailed.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -627,7 +745,8 @@ export const REPORT_TOOLS = [
       const answer = await readThroughDoor(
         c,
         { operation: 'export.reports', body },
-        'with the body describe_operation shows for it (the format, a title, and the report\'s columns and rows as run_report gives them)',
+        'with the body describe_operation shows for it (the format, a title, and the report\'s columns and rows in the shape it shows)',
+        'it gives you the file_id of the file it made',
       );
       if (answer?.outcome !== 'read') return fit(settle(answer, { fields: [] }));
       const f = answer.file;

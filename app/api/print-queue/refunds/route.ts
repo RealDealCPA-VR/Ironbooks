@@ -7,6 +7,8 @@ import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { routeError } from '@/lib/routeErrors';
 import { queueCustomerRefundCheck, unprintedRefunds } from '@/lib/services/liabilityPayments';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { queueRefundCheckSchema } from '@/lib/validation/purchases';
 
 export async function GET() {
   try {
@@ -25,6 +27,9 @@ export async function POST(req: NextRequest) {
     if (typeof body.entryId !== 'string') {
       return NextResponse.json({ error: 'Pick the refund to print.', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/purchases.ts); the check above answers first.
+    const checked = queueRefundCheckSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     const check = await queueCustomerRefundCheck(ctx, {
       entryId: body.entryId,
       memo: typeof body.memo === 'string' ? body.memo : null,

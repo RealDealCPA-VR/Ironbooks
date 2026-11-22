@@ -412,7 +412,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/ai#undoAiPostSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/ai/prefill': {
@@ -478,8 +478,8 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, aliasOf: 'PUT' },
+      PUT: { bodySchema: '@/lib/validation/assemblies#setBomSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PATCH: { bodySchema: '@/lib/validation/assemblies#setBomSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, aliasOf: 'PUT' },
     },
   },
   '/api/assemblies/build': {
@@ -494,7 +494,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/assemblies#createPendingBuildSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/assemblies/pending/[id]': {
@@ -727,7 +727,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/bankTransactions#createBankAccountSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/bank-rules': {
@@ -890,7 +890,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/billingGroups#createBillingGroupSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/billing-groups/[id]': {
@@ -898,7 +898,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['id'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PATCH: { bodySchema: '@/lib/validation/billingGroups#updateBillingGroupSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
       DELETE: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
     },
   },
@@ -1285,7 +1285,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/currencies/fx-adjustment/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/currencies#fxAdjustmentSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/currencies/home-currency-adjustment': {
@@ -1316,7 +1316,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/custom-fields/values/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/company#customFieldValuesSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/customer-prices': {
@@ -1324,7 +1324,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/pricing#setCustomerPriceSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/customer-prices/[id]': {
@@ -1377,7 +1377,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/demo-feed/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/bankTransactions#loadDemoFeedSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/deposits': {
@@ -1485,7 +1485,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/errors/[id]/apply/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/ai#applyCorrectionSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/estimates': {
@@ -1600,7 +1600,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/inventory#fifoActionSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/file-lock': {
@@ -1900,7 +1900,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['id'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/inventorySites#voidInventoryTransferSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/inventory/batch-count': {
@@ -2016,7 +2016,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/invoices/[id]/post/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/invoices#postDraftInvoiceSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/invoices/batch': {
@@ -2202,7 +2202,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['id'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/inventorySites#voidLandedCostSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/landed-cost/preview': {
@@ -2285,7 +2285,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['list'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/lists#simpleListEntrySchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/lists/[list]/[id]': {
@@ -2492,7 +2492,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/liabilities#payLiabilitiesByItemSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/pay-liabilities/checks': {
@@ -2506,7 +2506,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/pay-liabilities/checks/[id]/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/liabilities#voidLiabilityCheckSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/pay-liabilities/sales-tax': {
@@ -2875,7 +2875,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/purchases#queueRefundCheckSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/print-queue/reprint': {
@@ -3072,7 +3072,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/reconciliations/[id]/pay/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/reconciliations#payCreditCardBalanceSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/reconciliations/[id]/report': {
@@ -3539,7 +3539,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/sales-forms/[kind]/[id]/flags/route.ts',
     params: ['kind', 'id'],
     methods: {
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PATCH: { bodySchema: '@/lib/validation/sales#sendFlagsUpdateSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/sales-forms/[kind]/[id]/pdf': {
@@ -3613,7 +3613,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/salesReps#createSalesRepSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/sales-reps/[id]': {
@@ -3621,7 +3621,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['id'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PATCH: { bodySchema: '@/lib/validation/salesReps#updateSalesRepSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
       DELETE: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
     },
   },
@@ -3629,7 +3629,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/sales-reps/assign/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/salesReps#assignSalesRepSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/sales-tax/pay': {
@@ -3652,7 +3652,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['id'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: '@/lib/validation/liabilities#voidSalesTaxPaymentSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/sandbox': {

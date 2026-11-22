@@ -20,10 +20,11 @@
  * (preparing work). Entering a line, matching it, and finishing or undoing a reconciliation change
  * the books. Whether the agent does each step itself or a person approves it first is the agent's
  * policy, decided in Ironbooks: the answer says "done" or "posted", or "asked" with a request_id
- * for wait_for_decision (write-tools.mjs shapeAnswer words every answer).
+ * for wait_for_decision (write-tools.mjs shapeAnswer words every answer). Each step takes the
+ * agent's reason, which a person who must approve it reads on the approval card.
  */
 import { ToolError } from './protocol.mjs';
-import { camelize, settle, shapeRecord } from './write-tools.mjs';
+import { REASON, camelize, requestParts, settle, shapeRecord } from './write-tools.mjs';
 
 const DATE = { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', patternHint: 'must be a date as YYYY-MM-DD' };
 const ID = { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', patternHint: 'must be an id returned by another tool' };
@@ -38,7 +39,7 @@ const REQUEST_ID = {
 };
 
 function schema(properties, required = []) {
-  return { type: 'object', properties: { ...properties, dry_run: DRY_RUN, request_id: REQUEST_ID }, required, additionalProperties: false };
+  return { type: 'object', properties: { ...properties, dry_run: DRY_RUN, request_id: REQUEST_ID, reason: REASON }, required, additionalProperties: false };
 }
 const readSchema = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 
@@ -48,7 +49,7 @@ async function send(client, action, input, args, fields) {
     throw new ToolError('Give a request_id (your own name for this one change), or set dry_run to true to only check it.');
   }
   // A step that only prepares work posts nothing: its answer ('done') says so in its own words.
-  return settle(await client.act({ action, input, ...(args.dry_run === true ? { dryRun: true } : { requestId: args.request_id }) }), { fields });
+  return settle(await client.act({ action, input, ...requestParts(args) }), { fields });
 }
 
 function tool({ name, title, description, action, properties, required, destructive = false }) {
@@ -60,7 +61,7 @@ function tool({ name, title, description, action, properties, required, destruct
     destructive,
     inputSchema: schema(properties, required),
     handler: (args, client) => {
-      const { dry_run: _d, request_id: _r, ...rest } = args;
+      const { dry_run: _d, request_id: _r, reason: _why, ...rest } = args;
       return send(client, action, camelize(rest), args, Object.keys(properties));
     },
   };
@@ -68,6 +69,35 @@ function tool({ name, title, description, action, properties, required, destruct
 
 const asList = (v, key) => (Array.isArray(v) ? v : Array.isArray(v?.[key]) ? v[key] : []);
 const day = (v) => (typeof v === 'string' ? v.slice(0, 10) : null);
+
+/** Why the feed's lines come without suggested accounts, when they are not the agent's to read on its own. */
+const NOT_ON_YOUR_OWN = 'your permissions do not let you read them on your own.';
+
+/**
+ * The suggested accounts for the lines waiting in one bank account's feed, or why there are none.
+ * A read: only an answer that says it was read ('read', or 'done' from an older Ironbooks) gives
+ * suggestions; anything else that carries some (a dry run, say) is not taken as read. Anything else
+ * leaves the lines without suggestions, and says why: a refusal in the door's own words (when an
+ * Admin set this read to Ask, the door refuses it outright and says so: lib/agent/actions.ts
+ * OWN_READ_ASKS), an "asked", or any error. The read is sent once: an error is not tried again,
+ * because the door never asks this read for a request id. The lines themselves are still worth
+ * listing.
+ * @returns {Promise<{ list: any[], why: string | null }>}
+ */
+async function feedSuggestions(/** @type {any} */ c, /** @type {string} */ bankAccountId) {
+  let answer;
+  try {
+    answer = await c.act({ action: 'bank_feed_suggestions', input: { bankAccountId } });
+  } catch {
+    return { list: [], why: 'Ironbooks did not give them this time.' };
+  }
+  const outcome = answer?.outcome;
+  if (outcome === 'read' || outcome === 'done') return { list: Array.isArray(answer.result?.suggestions) ? answer.result.suggestions : [], why: null };
+  if (outcome === 'refused' && typeof answer.note === 'string' && answer.note.trim()) return { list: [], why: answer.note.trim() };
+  if (typeof outcome === 'string') return { list: [], why: NOT_ON_YOUR_OWN };
+  // No outcome at all: not an answer this tool can read.
+  return { list: [], why: 'Ironbooks did not give them this time.' };
+}
 
 const READS = [
   {
@@ -108,20 +138,9 @@ const READS = [
       /** Why the lines come without suggested accounts, when they do. */
       let noSuggestions = null;
       if (reviewing && lines.length) {
-        // A read: its answer is 'read' (or 'done' from an older Ironbooks) with the suggestions as
-        // the result. Anything else leaves the lines without suggestions, and says so: a refusal, an
-        // "asked" (an Admin set this read to Ask), or an error such as the door asking for a
-        // request_id this tool has no argument for. The lines themselves are still worth listing.
-        let s = [];
-        try {
-          const answer = await c.act({ action: 'bank_feed_suggestions', input: { bankAccountId: a.bank_account_id } });
-          if (Array.isArray(answer?.result?.suggestions)) s = answer.result.suggestions;
-          else if (answer?.outcome === 'refused' && typeof answer.note === 'string' && answer.note.trim()) noSuggestions = `No suggested accounts: ${answer.note.trim()}`;
-          else if (answer?.outcome && answer.outcome !== 'read' && answer.outcome !== 'done') noSuggestions = 'No suggested accounts: your permissions do not let you read them on your own.';
-        } catch {
-          noSuggestions = 'No suggested accounts: Ironbooks did not give them this time.';
-        }
-        suggestions = new Map(s.map((x) => [x.bank_transaction_id, x]));
+        const s = await feedSuggestions(c, a.bank_account_id);
+        if (s.why) noSuggestions = `No suggested accounts: ${s.why}`;
+        suggestions = new Map(s.list.map((x) => [x.bank_transaction_id, x]));
         matches = (await c.get('/api/bank-transactions/matches', { bankAccountId: a.bank_account_id }))?.matches ?? {};
       }
       const rows = lines.slice(0, limit).map((l) => {

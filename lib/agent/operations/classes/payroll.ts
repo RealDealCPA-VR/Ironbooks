@@ -23,23 +23,34 @@
  * deleted or changed in place. With an amountField the amount is the larger of that field and the
  * largest SINGLE one of those entries (an amountField it cannot read stays over every limit), so a
  * route that posts an entry per row names its rows with '*'. With none it is all of them added up,
- * and "0.00" for a run that posted and touched no entry at all. A void posts nothing new
+ * and "0.00" only for a run that made new records and posted no entry. A void posts nothing new
  * (voidJournalEntry only marks the entry void), but the bridge counts the voided entry at its
  * total: voiding a paycheck is sized by the paycheck's entry after its dry run. A void that touches
- * no entry (a payroll adjustment entered without affectsAccounts never posted one) comes out "0.00",
- * although its year-to-date figures leave the W-2, the 941 and the 940.
+ * no entry (a payroll adjustment entered without affectsAccounts never posted one) changed a
+ * record that was already there, so its amount stays unknown, over every limit: its year-to-date
+ * figures still leave the W-2, the 941 and the 940.
  *
  * Paychecks: writing or editing one pays a person, so both always ask, like a pay run. Their
  * amountField is the gross pay in the route's ANSWER (the preview or dry run), never the body:
  * the service ignores a typed grossPay whenever earnings lines are sent. A pay run adds up the gross
  * pay of every check it wrote (results.*.grossPay), never one check's. Voiding a liability check
- * names its amount (the void answers with the check, its amount as it was). An adjustment's money
- * sits in grossPay for a year-to-date one but in totalTaxes and totalDeductions for a liability one,
- * whose grossPay is 0. Entering one names its lines (lines.*.amount: the answer and the body list
- * them, whatever the kind). Voiding a paycheck (which takes an adjustment too) or an adjustment
- * answers the bare row, with no lines, so no field of it is right for every row: those set no
- * amountField rather than grossPay, which reads a liability adjustment as 0. Their amount is unknown
- * until the dry run and then the entry the void touched, at its total ("0.00" when there is none).
+ * names its amount (the void answers with the check, its amount as it was).
+ *
+ * Payroll adjustments change the W-2, the 941 and the 940 whether or not they post, so entering one
+ * and voiding one both always ask, and so does voiding a paycheck, since that route voids any
+ * payroll row, an adjustment too. Entering one names grossPay, and the bridge takes the larger of
+ * that and the entry the run posts. A year-to-date adjustment's grossPay is its gross wages; its
+ * entry, when affectsAccounts posts one, debits the wages and the employer taxes. So a posting one
+ * is sized by its entry, and one that posts nothing by its gross wages. A liability adjustment
+ * answers grossPay 0, so only its entry sizes it. One that posts no entry (entered without
+ * affectsAccounts, or whose lines net to nothing on every account, so netLines posts nothing)
+ * reads "0.00", and so does a year-to-date one that posts nothing and holds only employer
+ * contribution lines, although their lines still change the 941 and the 940. No single answer
+ * field is right for both kinds: adding up the lines (lines.*.amount, the field before) counted a
+ * year-to-date adjustment's withholding a second time. Every adjustment still asks a person
+ * (alwaysAsk, so no standing permission covers one); the lower figure reaches only the two-person
+ * rule and the amount the card shows. Voiding answers the bare row: no amountField, and the entry
+ * the void touched decides (unknown when there is none).
  *
  * Payroll items (the cross-bucket rule, with planning.ts): an item edit stays 'change', since plan
  * §8 lists payroll items with the list entries and an item's rate is not what paychecks charge. But
@@ -98,9 +109,8 @@ export const PAYROLL_CLASSES: ClassificationMap = {
     class: 'read',
     describe: 'List payroll items',
     why:
-      'Read only for an agent. When the company has no payroll items yet, this GET first adds the standard set (about 15 items, with audit rows) for any role but viewer (ensureDefaultPayrollItems has no read-only guard). ' +
-      'An agent\'s read runs on the read-only database handle (lib/agent/bridge.ts, mode \'read\'), which refuses that write: on such a company the read fails with "This connection can only read the books" until a person opens the payroll item list. Every later call only reads. ' +
-      'Classing it \'enter\' for that one write made every listing ask a person and kept a Read only agent from it.',
+      'Reads only. A person\'s first visit on a company with no payroll items adds the standard set (about 15 items, with audit rows) for any role but viewer, as it always has. ' +
+      'An agent\'s read never does: the route skips it for an agent, and ensureDefaultPayrollItems for any read-only context, so the read answers with what is there, an empty list on such a company.',
   },
   'POST /api/payroll-items': {
     class: 'enter',
@@ -144,7 +154,8 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   'DELETE /api/payroll/[id]': {
     class: 'change',
     describe: 'Void paycheck {id}',
-    why: "Voids the paycheck and its ledger entry; the check stays on file marked void. Nothing is deleted. No amountField: voidPaycheck takes any payroll row, a payroll adjustment too, and a liability adjustment's grossPay is 0, so the answer's grossPay could read a large void as 0. Until the dry run the amount is unknown and counts as over every amount limit. After it the bridge counts the paycheck's entry, which the void marks void (it posts nothing new), at its total, its debits added up. A payroll row that never posted an entry comes out 0.00.",
+    why: "Voids the paycheck and its ledger entry; the check stays on file marked void. Nothing is deleted. voidPaycheck takes any payroll row, a payroll adjustment too, and voiding one takes its figures off the W-2, the 941 and the 940, so this always asks, like entering an adjustment or writing a paycheck. No amountField: a liability adjustment's grossPay is 0, so the answer's grossPay could read a large void as 0. Until the dry run the amount is unknown and counts as over every amount limit. After it the bridge counts the paycheck's entry, which the void marks void (it posts nothing new), at its total, its debits added up. A payroll row that never posted an entry keeps the amount unknown, not 0.00.",
+    alwaysAsk: true,
   },
 
   // Pay runs: many paychecks in one request.
@@ -187,14 +198,15 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   'POST /api/payroll/adjustments': {
     class: 'enter',
     describe: 'Enter a payroll adjustment for employee {employeeId} dated {date} (type: {type})',
-    why: "Year-to-date amounts land on the employee's W-2, the 941 and 940, and the wage bases of later checks. With affectsAccounts, a year-to-date adjustment posts net pay out of a bank account like a paycheck, and a liability adjustment moves what payroll owes. So it always asks, like a paycheck. The amount adds up its lines (lines.*.amount, in the body and in the answer): grossPay alone would read a liability adjustment as 0 (its money is in totalTaxes and totalDeductions), and without affectsAccounts nothing is posted for the ledger preview to size. For a year-to-date adjustment the lines add the withholdings to the gross, so it reads high, never low.",
-    amountField: 'lines.*.amount',
+    why: "Year-to-date amounts land on the employee's W-2, the 941 and 940, and the wage bases of later checks. With affectsAccounts, a year-to-date adjustment posts net pay out of a bank account like a paycheck, and a liability adjustment moves what payroll owes. So it always asks, like a paycheck. The amount is the answer's grossPay, or the entry the dry run posts when that is larger, as it is for every posting adjustment (a year-to-date entry debits the wages and the employer taxes; a liability adjustment has grossPay 0, so only its entry counts). A year-to-date adjustment that posts nothing is sized by its gross wages, what the W-2 gains. A liability adjustment that posts nothing (no affectsAccounts, or lines that net to nothing on every account), and a year-to-date one that posts nothing and holds only employer contribution lines, read 0.00, although their lines still change the 941 and the 940; it still asks a person, and its lines are in the request. Adding up the lines instead would count a year-to-date adjustment's withholding a second time.",
+    amountField: 'grossPay',
     alwaysAsk: true,
   },
   'DELETE /api/payroll/adjustments/[id]': {
     class: 'change',
     describe: 'Void payroll adjustment {id}',
-    why: "Voids the adjustment (and its ledger entry when it has one); it stays on file marked void. Nothing is deleted. No amountField: the void answers the bare row, without the lines that entering it answers, and its grossPay is 0 for a liability adjustment. Until the dry run the amount is unknown and counts as over every amount limit. After it the bridge counts the adjustment's entry, which the void marks void, at its total. An adjustment entered without affectsAccounts has no entry, so its void comes out 0.00, although its year-to-date figures leave the W-2, the 941 and the 940.",
+    why: "Voids the adjustment (and its ledger entry when it has one); it stays on file marked void. Nothing is deleted. Its year-to-date figures leave the W-2, the 941 and the 940 whether or not it posted, so voiding always asks, as entering one does. No amountField: the void answers the bare row, without the lines that entering it answers, and its grossPay is 0 for a liability adjustment. Until the dry run the amount is unknown and counts as over every amount limit. After it the bridge counts the adjustment's entry, which the void marks void, at its total. An adjustment entered without affectsAccounts has no entry, so the amount of its void stays unknown, not 0.00.",
+    alwaysAsk: true,
   },
 
   // Payroll setup: state tax rates, workers' comp codes, sick and vacation accruals (plan §8).

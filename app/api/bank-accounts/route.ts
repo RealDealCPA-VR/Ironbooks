@@ -8,6 +8,8 @@ import { balancesForContext } from '@/lib/services/access';
 import { listBankAccounts, createBankAccount } from '@/lib/services/bankAccounts';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { createBankAccountSchema } from '@/lib/validation/bankTransactions';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -33,6 +35,10 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const body = await requireJsonObject(req);
+    // The body as agents read it described (lib/validation/bankTransactions.ts). It refuses nothing:
+    // the service checks every field with its own messages.
+    const checked = createBankAccountSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     return NextResponse.json(await createBankAccount(ctx, body as Parameters<typeof createBankAccount>[1]), { status: 201 });
   } catch (err) {
     return errorResponse(err);

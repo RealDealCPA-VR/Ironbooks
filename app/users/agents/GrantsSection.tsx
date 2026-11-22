@@ -38,11 +38,17 @@ export default function GrantsSection({
   agentId,
   agentName,
   paused = null,
+  mayRevoke = false,
 }: {
   agentId: string;
   agentName: string;
   /** The agent is paused itself ('agent'), or every agent is ('all'): no standing permission is in effect. */
   paused?: 'agent' | 'all' | null;
+  /**
+   * The person may take a standing permission back (Users & Roles > Users, Modify: the server's
+   * own rule). Anyone else sees the list without Revoke. Left out: not offered.
+   */
+  mayRevoke?: boolean;
 }) {
   const [grants, setGrants] = useState<AgentGrantView[] | null>(null);
   const [error, setError] = useState('');
@@ -138,7 +144,7 @@ export default function GrantsSection({
                       {st.why && <span className="mt-0.5 block max-w-xs text-xs text-navy/50">{st.why}</span>}
                     </Td>
                     <Td className="text-right whitespace-nowrap">
-                      {st.state !== 'taken_back' && st.state !== 'ended' && (
+                      {mayRevoke && st.state !== 'taken_back' && st.state !== 'ended' && (
                         <Button size="sm" variant="secondary" onClick={() => setAsking(g)} title="Take this standing permission back now">
                           Revoke
                         </Button>

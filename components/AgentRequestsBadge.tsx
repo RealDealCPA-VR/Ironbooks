@@ -19,11 +19,22 @@
  * throttling, so a hidden window's ask may come up to a minute later than that; it is a notice, not
  * a deadline.
  *
- * When the number goes up while the window is not in front, a desktop notice (lib/desktop/
+ * When a new request arrives while the window is not in front, a desktop notice (lib/desktop/
  * agentNotice.ts; nothing in a browser) names the agent and says what it asks in the app's own
- * words (AgentRequestCount.newest.summary, built from the operation), never the agent's own text,
- * and opens the approval center. Once per rise: the same number again, or a lower one, says nothing.
- * The first answer is where the window starts, never news.
+ * words (AgentRequestCount.newest.summary, built from the operation), never the agent's reason or
+ * its raw input, and opens the approval center. A value that summary names (a new customer's
+ * name) is shown as data, cleaned and cut short (test/agentInjection.test.ts). Once per new
+ * request, told by the newest request's id and time: a request that was already the newest one
+ * this window saw never raises one again (the same number again, a lower one, or an older request
+ * moving up when a newer one is decided says nothing), and one decided while another arrived
+ * between two asks still does. The first answer is where the window starts, never news.
+ *
+ * The desktop app words the notice itself from its own read of the count route (electron/main.js
+ * 'agent:notice'); the window only says when. That read comes a moment after the window's, and
+ * today it is not told which request the window found: if a request arrives or is decided in that
+ * moment, the notice can name another request than the one this window counted as new. Rare (a
+ * few milliseconds), and the fix is in the desktop app: pass newest.id over and word the notice
+ * only for that request.
  */
 import * as React from 'react';
 import { useRouter } from 'next/navigation';
@@ -204,12 +215,45 @@ export function createAgentRequestCountStore(env: AgentCountEnv): AgentCountStor
     );
   };
 
+  /**
+   * The requests that were ever the newest one in an answer this window took (a few hundred at
+   * most, oldest forgotten first), and the latest time among them: what is not news any more.
+   */
+  const seen = new Set<string>();
+  let latestSeenAt = -Infinity;
+  const SEEN_MAX = 500;
+  function markSeen(newest: AgentRequestCount['newest']) {
+    if (!newest) return;
+    seen.delete(newest.id);
+    seen.add(newest.id);
+    if (seen.size > SEEN_MAX) seen.delete(seen.values().next().value as string);
+    const at = Date.parse(newest.createdAt);
+    if (Number.isFinite(at) && at > latestSeenAt) latestSeenAt = at;
+  }
+
+  /**
+   * The answer's newest request arrived since the last answer: one this window never saw as the
+   * newest, and no older than every one it did see. Two at the same moment, or a time that cannot
+   * be read, count as new only when the number rose too. So a request decided while another
+   * arrived is news, and an older request that moves up when a newer one is decided is not.
+   */
+  function newRequest(before: AgentRequestCount, answer: AgentRequestCount): boolean {
+    const n = answer.newest;
+    if (!n || seen.has(n.id)) return false;
+    const rose = answer.pending > before.pending;
+    const at = Date.parse(n.createdAt);
+    if (!Number.isFinite(at) || !Number.isFinite(latestSeenAt)) return rose;
+    return at > latestSeenAt || (at === latestSeenAt && rose);
+  }
+
   function take(answer: AgentRequestCount) {
     const before = current;
     if (before && sameCount(before, answer)) return;
     current = answer;
-    // Once per rise, and only when the person is not already looking at the window.
-    if (before && answer.pending > before.pending && answer.newest) {
+    const news = !!before && newRequest(before, answer);
+    markSeen(answer.newest);
+    // Once per new request, and only when the person is not already looking at the window.
+    if (news && answer.newest) {
       let inFront = true;
       try {
         inFront = env.focused();
@@ -218,7 +262,7 @@ export function createAgentRequestCountStore(env: AgentCountEnv): AgentCountStor
       }
       if (!inFront) {
         try {
-          env.notice(agentRequestNotice(answer.newest, answer.pending - before.pending));
+          env.notice(agentRequestNotice(answer.newest, Math.max(1, answer.pending - (before?.pending ?? 0))));
         } catch {
           /* the window keeps working without the notice */
         }

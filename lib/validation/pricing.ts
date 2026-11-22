@@ -1,16 +1,30 @@
 /**
- * Zod schemas for advanced pricing (/api/pricing/*, /api/type-lists/*), the sales-order
- * fulfillment worksheet (/api/fulfillment) and enhanced receiving (/api/receiving/*).
+ * Zod schemas for advanced pricing (/api/pricing/*, /api/customer-prices, /api/type-lists/*), the
+ * sales-order fulfillment worksheet (/api/fulfillment) and enhanced receiving (/api/receiving/*).
  * Mirrors lib/services/pricing.ts, typeLists.ts, fulfillment.ts and receiving.ts inputs.
  */
 import { z } from 'zod';
 import { ROUNDING_MODES } from '@/lib/pricingShared';
-import { zDate, zDecimal, zLines, zUuid } from './helpers';
+import { zDate, zDecimal, zLenient, zLines, zUuid } from './helpers';
 
 const zDay = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be a YYYY-MM-DD date');
 const zRounding = z.enum(ROUNDING_MODES);
 
 // ---- Pricing -----------------------------------------------------------------
+
+/**
+ * POST /api/customer-prices — set the price of an item for one customer, replacing the one set
+ * before if any (lib/services/customerPricing.ts setCustomerPrice). The route passes the three
+ * fields to the service, which checks them with its own messages, so each is zLenient: the check
+ * refuses nothing and says what the fields are, for agents.
+ */
+export const setCustomerPriceSchema = z.object({
+  customerId: zLenient(zUuid).describe('Required. Id of the customer (customer list) the price is for.'),
+  itemId: zLenient(zUuid).describe('Required. Id of the item (item list) priced.'),
+  price: zLenient(z.union([z.string(), z.number()])).describe(
+    "Required. The customer's price per unit, as decimal text of zero or more such as \"18.50\" (kept to 4 decimals). It is one candidate the pricing rules weigh, next to the customer's price level and price rules.",
+  ),
+});
 
 /** POST /api/pricing/quote — looks prices up only; nothing is saved (the document re-prices on save). */
 export const quoteSchema = z.object({

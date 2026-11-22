@@ -57,9 +57,10 @@ export const SERVICE_SCOPE_CHANGED_MESSAGE =
  * The secrets a scope's synthetic set may carry (lower case): the closing-date password, and the
  * user name, password and recovery key that open a backup, a portable file or an Accountant's Copy
  * transfer file (lib/net/archiveCredentials.ts LOGIN_HEADER, PASSWORD_HEADER, RECOVERY_KEY_HEADER;
- * lib/agent/guards.ts SECRET_HEADERS names the same four). The bridge sets them only on a commit,
- * only from what the approving person typed on the card (lib/agent/guards.ts applySecrets), never
- * from the agent's input. Work a scope left running after it ended no longer reads any of them.
+ * lib/agent/guards.ts SECRET_HEADERS names the same four). The bridge sets them only from what the
+ * approving person typed on the card (lib/agent/guards.ts applySecrets), never from the agent's
+ * input: all of them on a commit, and the closing-date password alone on the rolled-back try an
+ * approval makes first. Work a scope left running after it ended no longer reads any of them.
  */
 export const SERVICE_SCOPE_SECRET_HEADERS: readonly string[] = Object.freeze([
   CLOSING_PASSWORD_HEADER,
@@ -73,7 +74,14 @@ export const SERVICE_SCOPE_SECRET_HEADERS: readonly string[] = Object.freeze([
  * refused before the work runs: a forwarded cookie, Authorization, launch pass, proxy secret,
  * remote address or Host would carry the trust of the request the bridge runs in (perhaps the
  * approving person's window) into the agent's work. x-expected-updated-at is
- * lib/services/concurrency.ts EXPECTED_VERSION_HEADER (record locking).
+ * lib/services/concurrency.ts EXPECTED_VERSION_HEADER (record locking): the version of the record
+ * the agent last read, which the route compares inside the committing transaction. The x-ironbooks-*
+ * names a route reads (lib/net/archiveCredentials.ts) are all in SERVICE_SCOPE_SECRET_HEADERS.
+ *
+ * (For a run a person approved at the host computer's own window, the bridge puts this launch's
+ * pass on the handler's own request object only, so a route's isRemoteRequest(req) answers as it
+ * would for that person. It is never in the scope's set: getRequestOrigin() inside a scope stays an
+ * agent's, and no helper that reads requestHeaders() ever sees the pass.)
  */
 export const SERVICE_SCOPE_HEADERS: readonly string[] = Object.freeze([
   ...SERVICE_SCOPE_SECRET_HEADERS,
@@ -103,6 +111,14 @@ export interface ServiceScopeOptions {
    * PERSON (their own 2FA, password, company files), so without an explicit value the gate refuses.
    */
   gate?: SessionGate;
+  /**
+   * The bridge checked the closing-date password these headers carry (x-closing-password) itself,
+   * once, before the work runs, through the closing-date password's limiter under the approving
+   * person's own keys, and it was right. Set Closing Date then takes that same password as the
+   * current one without counting it as a guess a second time, in the scope's realm
+   * (closingPasswordCheckedInScope, lib/services/company.ts).
+   */
+  closingPasswordChecked?: boolean;
 }
 
 /** What lib/context.ts reads of the open scope (currentServiceScope). Frozen. */
@@ -145,6 +161,8 @@ interface ScopeState {
   readonly headers: ReadonlyArray<readonly [string, string]>;
   /** The same set without any secret (SERVICE_SCOPE_SECRET_HEADERS): what work left running after the end reads. */
   readonly endedHeaders: ReadonlyArray<readonly [string, string]>;
+  /** ServiceScopeOptions.closingPasswordChecked, as the scope was opened. */
+  readonly closingPasswordChecked: boolean;
   /** False once fn has settled: anything it left running can no longer get the context. */
   open: boolean;
 }
@@ -238,6 +256,7 @@ export async function runWithServiceContext<T>(
     seal,
     headers: request.headers,
     endedHeaders: Object.freeze(request.headers.filter(([name]) => !SERVICE_SCOPE_SECRET_HEADERS.includes(name))),
+    closingPasswordChecked: opts.closingPasswordChecked === true,
     open: true,
   };
   try {
@@ -424,6 +443,29 @@ export function currentServiceScope(): ServiceScope | undefined {
   if (!state.open) throw new ServiceError('FORBIDDEN', SERVICE_SCOPE_ENDED_MESSAGE);
   if (!sealHolds(state.scope.ctx, state.seal)) throw new ServiceError('FORBIDDEN', SERVICE_SCOPE_CHANGED_MESSAGE);
   return state.scope;
+}
+
+/**
+ * True only inside an open service scope whose closing-date password the bridge already checked
+ * (ServiceScopeOptions.closingPasswordChecked), and only for that very password: the
+ * x-closing-password of the scope's own header set, compared in constant time. lib/services/
+ * company.ts Set Closing Date then compares `supplied` with the password in force without counting
+ * it as a second guess. Everywhere else (a person's own request, work a scope left running, a scope
+ * whose context changed) it is false, and the password is counted as it always is.
+ *
+ * Nothing a request carries can make it true: only the bridge opens a scope, it puts a closing-date
+ * password in the header set only from what the approving person typed, and the agent's own
+ * password fields are taken out before the request is built (lib/agent/guards.ts).
+ */
+export function closingPasswordCheckedInScope(supplied: string): boolean {
+  const state = serviceScope.getStore();
+  if (!state || !state.open || !state.closingPasswordChecked) return false;
+  if (!sealHolds(state.scope.ctx, state.seal)) return false;
+  const typed = state.headers.find(([name]) => name === CLOSING_PASSWORD_HEADER)?.[1];
+  if (typeof typed !== 'string' || typed === '' || typeof supplied !== 'string' || typed.length !== supplied.length) return false;
+  let diff = 0;
+  for (let i = 0; i < typed.length; i++) diff |= typed.charCodeAt(i) ^ supplied.charCodeAt(i);
+  return diff === 0;
 }
 
 export type RequestHeaders = Awaited<ReturnType<typeof headers>>;

@@ -8,7 +8,12 @@
  * Enterprise's Area and Activity tree (each activity None / Full / Partial: View, Create, Modify,
  * Delete, Print, View Balance; app/users/ActivityMatrix.tsx) and the sensitive-data flags, delete.
  * View Permissions (/users/permissions) prints the role and user permission reports.
- * Agents tab (Admins): AI agents let in to read the books (app/users/AgentsTab.tsx, AGENT_ACCESS.md).
+ * Agents tab: AI agents let in to work in the books (app/users/AgentsTab.tsx, AGENT_ACCESS.md), for
+ * anyone who may view Users & Roles > Users, the same people the server lists agents for. Only an
+ * Admin makes, removes or loosens an agent; anyone else there who may change Users & Roles > Users
+ * may make one stricter or pause it, and someone who may only see that list only looks. The tab
+ * appears once GET /api/auth/me has answered, and is told then whether the person is an Admin and
+ * may change users, so an Admin never first sees the screens for someone who is not.
  *
  * All rules (last active Admin, no privilege escalation, audit) are enforced server-side in
  * lib/services/users.ts; this page only presents them.
@@ -33,7 +38,16 @@ import {
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
-import type { Action, Area, Flag, PermissionGrant, PermissionSet, RoleFlags } from '@/lib/permissions/model';
+import {
+  canActivity,
+  type Action,
+  type ActivitySet,
+  type Area,
+  type Flag,
+  type PermissionGrant,
+  type PermissionSet,
+  type RoleFlags,
+} from '@/lib/permissions/model';
 import ActivityMatrix, { type ActivityGrant, type CatalogActivity } from './ActivityMatrix';
 import { PasswordRulesHint, meetsPolicy, usePasswordPolicy } from '@/components/PasswordRules';
 import PasswordPolicyEditor from './PasswordPolicyEditor';
@@ -78,20 +92,59 @@ function errMsg(e: unknown) {
   return e instanceof Error ? e.message : 'Something went wrong';
 }
 
+/** What this page reads of GET /api/auth/me (its permission fields are null when there is no company context). */
+interface Me {
+  id?: string;
+  isAdmin?: boolean;
+  permissions?: PermissionSet | null;
+  activities?: ActivitySet | null;
+}
+
+/**
+ * The person may view (or change) Users & Roles > Users. View is the right GET /api/agents asks for
+ * (lib/services/agents.ts), so the Agents tab is shown to exactly the people the server lists agents
+ * for; Modify is what making one stricter, pausing it and taking back its standing permission ask
+ * for (agentPolicies.ts, agentGrants.ts), so the tab offers those only to them. Cosmetic: every
+ * agents route checks again. Anything unclear (no answer, no permissions) is no.
+ */
+function mayOnUsers(m: Me | null, action: 'view' | 'modify'): boolean {
+  if (!m) return false;
+  if (m.isAdmin === true) return true;
+  if (!m.permissions) return false;
+  return canActivity({ permissions: m.permissions, activities: m.activities ?? undefined }, 'users.users', action);
+}
+
 export default function UsersAndRolesPage() {
   const [tab, setTab] = useState<'users' | 'roles' | 'passwords' | 'agents'>('users');
-  // gapsb K: the password-rules editor is for Admins only (the server checks too).
-  const [isAdmin, setIsAdmin] = useState(false);
+  // gapsb K: the password-rules editor is for Admins only (the server checks too). Null until
+  // GET /api/auth/me has answered, so the Agents tab is never shown with a guess.
+  const [admin, setAdmin] = useState<boolean | null>(null);
+  const isAdmin = admin === true;
+  const [seesAgents, setSeesAgents] = useState(false);
+  /** May change Users & Roles > Users: tighten, pause, take back on the Agents tab (null: not known yet). */
+  const [managesAgents, setManagesAgents] = useState<boolean | null>(null);
   const [meId, setMeId] = useState<string | null>(null);
   useEffect(() => {
     api
-      .get<{ id?: string; isAdmin?: boolean } | null>('/api/auth/me')
+      .get<Me | null>('/api/auth/me')
       .then((m) => {
-        setIsAdmin(Boolean(m?.isAdmin));
+        setAdmin(m?.isAdmin === true);
+        setSeesAgents(mayOnUsers(m, 'view'));
+        setManagesAgents(mayOnUsers(m, 'modify'));
         setMeId(m?.id ?? null);
       })
-      .catch(() => setIsAdmin(false));
+      .catch(() => {
+        setAdmin(false);
+        setSeesAgents(false);
+        setManagesAgents(false);
+      });
   }, []);
+  const tabs = [
+    'users' as const,
+    'roles' as const,
+    ...(isAdmin ? ['passwords' as const] : []),
+    ...(seesAgents ? ['agents' as const] : []),
+  ];
   const [users, setUsers] = useState<CompanyUser[] | null>(null);
   const [roles, setRoles] = useState<Role[]>([]);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
@@ -123,7 +176,7 @@ export default function UsersAndRolesPage() {
       {/* filecrypto: users whose password does not open the protected company file yet. */}
       <ProtectionUsersNotice />
       <div className="mb-4 flex flex-wrap items-center gap-2" role="tablist">
-        {(isAdmin ? (['users', 'roles', 'passwords', 'agents'] as const) : (['users', 'roles'] as const)).map((t) => (
+        {tabs.map((t) => (
           <button
             key={t}
             role="tab"
@@ -151,9 +204,11 @@ export default function UsersAndRolesPage() {
       )}
       {tab === 'passwords' && isAdmin ? (
         <PasswordPolicyEditor />
-      ) : tab === 'agents' && isAdmin ? (
-        // AI agents an Admin lets read these books (AGENT_ACCESS.md); made on this computer only.
-        <AgentsTab roles={roles} />
+      ) : tab === 'agents' && seesAgents ? (
+        // AI agents let into these books (AGENT_ACCESS.md); made on this computer only. The tab is
+        // told whether the person is an Admin and may change users (null would make it wait), so it
+        // does not ask again.
+        <AgentsTab roles={roles} viewerIsAdmin={admin} viewerMayManage={managesAgents} />
       ) : users === null || !catalog ? (
         error ? null : <PageSkeleton />
       ) : tab === 'users' ? (

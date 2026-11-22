@@ -10,6 +10,7 @@ import type { ServiceContext } from './_base';
 import { ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
 import { limitClosingPasswordGuess } from '@/lib/closingPasswordLimiter';
+import { closingPasswordCheckedInScope } from '@/lib/serviceScope';
 import { assertWrite } from './rbac';
 import { requireEffectivePermission, requirePermission } from './access';
 import { stripSecrets } from '@/lib/permissions/mask';
@@ -482,12 +483,19 @@ function closingChangeNeedsPassword(before: ClosingDateSettings, input: SetClosi
  * limiter and keys of the x-closing-password check in lib/context.ts and of an agent's approval
  * card (lib/closingPasswordLimiter.ts: per person in this company, plus the global cap), so they
  * can't be spread over the ways in.
+ *
+ * An agent's request a person approved (lib/agent/bridge.ts): the password that person typed on
+ * the card was already counted, once, under their own keys, before the route ran, and only a right
+ * one gets this far. It is still compared with the password in force now (it may have been changed
+ * a moment ago), but not counted as a second guess under the agent scope's keys.
  */
 async function assertCurrentClosingPassword(ctx: ServiceContext, hash: string, supplied: string | null | undefined): Promise<void> {
   if (typeof supplied !== 'string' || supplied === '') {
     throw new ServiceError('FORBIDDEN', CLOSING_CURRENT_PASSWORD_NEEDED, { currentPasswordRequired: true });
   }
-  const right = await limitClosingPasswordGuess(ctx, () => verifyPassword(supplied, hash));
+  const right = closingPasswordCheckedInScope(supplied)
+    ? await verifyPassword(supplied, hash)
+    : await limitClosingPasswordGuess(ctx, () => verifyPassword(supplied, hash));
   if (!right) throw new ServiceError('FORBIDDEN', CLOSING_CURRENT_PASSWORD_WRONG, { currentPasswordRequired: true });
 }
 

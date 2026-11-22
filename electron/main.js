@@ -4258,8 +4258,10 @@ function agentShellDocuments() {
 }
 
 /**
- * The company file (or older company folder) the restart a flow asked for opens: not always the
- * one asked for ("Save a Copy and Open It" opens a copy in Documents). Null when none is named.
+ * The company file (or older company folder) the restart a flow asked for opens, as the next
+ * launch's config says it: the answer says what really opens, never only what was asked for (for
+ * an agent the shell never presses "Save a Copy and Open It", which opens a copy in Documents).
+ * Null when none is named.
  */
 function agentShellOpening() {
   const next = configAfterClose || {};
@@ -4451,13 +4453,25 @@ function agentShellEnv() {
   return agentShellEndpoint.env;
 }
 
-app.on('will-quit', () => {
-  if (agentShellEndpoint) agentShellEndpoint.close().catch(() => {});
-  // The company file closes with the app: agents' staged files (statements, report PDFs) go with
-  // it (electron/companySession.js clearAgentFiles; opening a file clears any a crash left). With a
-  // company folder open they were kept in this computer's app data folder instead: those go too.
+/**
+ * Every file agents staged while this company file was open (statements, report PDFs: the server's
+ * lib/agent/files.ts clearStagedFiles({ all: true }), done from here, where the server cannot be
+ * asked any more). They never outlive the open company file: cleared as soon as it is saved and
+ * released (before-quit, before an update's installer may close the app without a will-quit), and
+ * again at will-quit for anything staged in the moment before the server stopped. In a working copy
+ * (electron/companySession.js clearAgentFiles; opening a file clears any a crash left); with a
+ * company folder open, in this computer's app data folder instead (not in client mode, where this
+ * computer ran no server of its own). The hourly clear of old files stays the server's own.
+ */
+function clearStagedAgentFiles() {
   if (openFile && openFile.workDir) companySession.clearAgentFiles(openFile.workDir);
   else if (!remoteHostOrigin) companySession.clearAppDataAgentFiles();
+}
+
+app.on('will-quit', () => {
+  if (agentShellEndpoint) agentShellEndpoint.close().catch(() => {});
+  // The company file closes with the app: agents' staged files go with it.
+  clearStagedAgentFiles();
 });
 
 /**
@@ -4567,6 +4581,8 @@ app.on('before-quit', (event) => {
           return;
         }
         quittingAfterBackup = true;
+        // The company file is saved and released: what agents staged while it was open goes now.
+        clearStagedAgentFiles();
         if (configAfterClose) {
           saveConfig(configAfterClose);
           configAfterClose = null;

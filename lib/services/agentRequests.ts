@@ -29,10 +29,20 @@
  * "***-**-6789"). It is masked in every view, and masked in the row itself once the request is
  * settled (done, failed, denied, expired or withdrawn).
  *
- * What an approved run answered is stored as the agent reads it, so an approved reveal (D6) keeps
- * the full values for the agent. A person reads that answer only through their own role: someone
- * without the View flag the request needed sees a note in its place, and everyone else sees it
- * masked by their own flags (lib/permissions/mask.ts).
+ * What an approved run answered is stored as the agent reads it. The answer of an approved reveal
+ * (D6, plan §5.9) holds the full values: the agent may read it again (its wait, its list, a replay
+ * of the same request id) for REVEAL_KEPT_MINUTES after the run, and from then on it is masked, in
+ * every view at once and in the row itself by the settle step, for good (like any other protected
+ * value a settled request kept); a file it answered with is removed from the agent's staged files
+ * then too, so get_file no longer hands it over. The settle step runs on a timer at the end of the
+ * time (endRevealOnTime) and on every read. When Ironbooks stops before the time is up, the staged
+ * files go as the company file closes, but the row keeps the full answer until the first read once
+ * the file is open again (at the latest the title bar's poll, once someone is signed in), and
+ * a backup made meanwhile holds it as it holds the records it came from. The audit trail words the
+ * reveal: which kinds of values of which record or report, to which agent, approved by whom. A
+ * person reads that answer only through their
+ * own role: someone without the View flag the request needed sees a note in its place, and everyone
+ * else sees it masked by their own flags (lib/permissions/mask.ts).
  *
  * The books may change between the ask and the approval (plan §7.4). The run then shows what would
  * happen now instead of doing it, and the request goes back to waiting with that new preview (a new
@@ -57,7 +67,7 @@
  *  - `grant` and `grantError`: the standing permission actually given with the approval, or why
  *    none was given when the approver asked for some (the run itself still counts as done);
  *  - for a person: whether THIS window may approve it (`atHost`: a teammate's window never may
- *    approve host-only work), a desktop flow's questions, and the standing window grantMinutesFor
+ *    approve host-only work), a desktop flow's questions, and the standing window grantWindowReader
  *    (lib/services/agentGrants.ts) allows, so the card never offers one createGrant then refuses.
  *
  * A desktop (shell) run that fails ends the request for good: it never goes back to waiting and is
@@ -116,13 +126,16 @@ import { operationById } from '@/lib/agent/operations/registry';
 import { SHELL_OPERATIONS } from '@/lib/agent/operations/shell';
 import {
   DEFAULT_REQUEST_EXPIRY_DAYS,
+  NO_RULE_FOR_APPROVER,
   SHORT_GRANT_MINUTES,
   approvalNeeds,
   classRank,
   effectiveClass as effectiveClassOf,
   roleProblem,
+  routeWithoutRule,
 } from '@/lib/agent/policy';
-import { guardInput } from '@/lib/agent/guards';
+import { removeStagedFile } from '@/lib/agent/files';
+import { guardInput, maskSensitiveFields } from '@/lib/agent/guards';
 import { describeRequest } from '@/lib/agent/describe';
 import { runApproved } from '@/lib/agent/operate';
 import { agentAction, agentInputHash, changesInTransaction, runApprovedAgentAction, type AnyAction } from '@/lib/agent/actions';
@@ -132,8 +145,10 @@ import '@/lib/agent/catalog';
 import { FLAGS, legacyRoleFor, type Area, type EffectiveAccess, type Flag } from '@/lib/permissions/model';
 import { maskAccountNumber, maskSensitive, maskSsn, stripSecrets } from '@/lib/permissions/mask';
 import { authorizeRequest } from '@/lib/permissions/enforce';
+import { BATCH_APPROVE_MAX } from '@/lib/validation/agentAccess';
+import { Money } from '@/lib/money';
 import { loadAgentPolicy } from './agentPolicies';
-import { createGrant, grantMinutesFor } from './agentGrants';
+import { createGrant, grantWindowReader, type GrantWindow } from './agentGrants';
 import { requireFileAdmin, resolveAccess } from './access';
 import { sendMail } from './email';
 import { listActiveSessions } from './sessions';
@@ -163,6 +178,15 @@ const NOTICE_EVERY_MS = 10 * 60_000;
  * was cut off by Ironbooks stopping between the claim and the record of how it ended.
  */
 const STUCK_AFTER_MS = 2 * 60 * 60_000;
+/**
+ * How long after an approved reveal's run the agent may read its full values again (D6): long
+ * enough for an agent that waited, or asked again with the same request id, to get the answer it
+ * was approved for; after that the stored answer is masked for good.
+ */
+export const REVEAL_KEPT_MINUTES = 15;
+const REVEAL_KEPT_MS = REVEAL_KEPT_MINUTES * 60_000;
+/** How long after a reveal's time is up its timer ends it (endRevealOnTime): past the end, never before. */
+const REVEAL_TIMER_SLACK_MS = 1_000;
 
 /** Settled for good: nothing more can happen to the request. */
 const SETTLED: readonly Status[] = ['denied', 'expired', 'cancelled', 'failed', 'executed'];
@@ -475,6 +499,13 @@ const UNEXPECTED_MESSAGE =
 const GRANT_NOT_GIVEN_MESSAGE =
   'Standing permission was not given because of an unexpected problem. The work itself was done, so do not ask for it again; the next request like it will ask a person.';
 /**
+ * A request FOR standing permission that could not be given for a reason nobody can name. Nothing
+ * else was asked, so nothing in the books changed: never UNEXPECTED_MESSAGE, which tells the person
+ * to check the books for work that may have been done.
+ */
+const GRANT_REQUEST_NOT_GIVEN_MESSAGE =
+  'Standing permission was not given because of an unexpected problem, so nothing changed. The agent can ask for it again.';
+/**
  * The approval claimed the request and then stopped on something unexpected after its run had
  * ended (its answer could not be kept, say): the work may or may not have been done.
  */
@@ -561,13 +592,15 @@ function isApproverFlag(v: unknown): v is ApproverFlag {
  * Needs read fail-closed: anything that is not plainly "no" counts as "yes", an unknown grant
  * setting as "no standing permission".
  */
+function isSecretKind(v: unknown): v is SecretKind {
+  return typeof v === 'string' && (SECRET_KINDS as string[]).includes(v);
+}
+
 function normalNeeds(raw: unknown): ApprovalNeeds {
   const n = isPlainObject(raw) ? raw : {};
   const flags: ApproverFlag[] = [];
   for (const f of [...(Array.isArray(n.flags) ? n.flags : []), n.flag]) if (isApproverFlag(f) && !flags.includes(f)) flags.push(f);
-  const secrets = (Array.isArray(n.secrets) ? n.secrets : []).filter(
-    (s): s is SecretKind => typeof s === 'string' && (SECRET_KINDS as string[]).includes(s),
-  );
+  const secrets = [...new Set((Array.isArray(n.secrets) ? n.secrets : []).filter(isSecretKind))];
   const grantable = (GRANTABLE_ORDER as readonly string[]).includes(n.grantable as string) ? (n.grantable as Grantable) : 'no';
   return {
     admin: n.admin !== false,
@@ -576,17 +609,36 @@ function normalNeeds(raw: unknown): ApprovalNeeds {
     flag: flags[0] ?? null,
     flags,
     grantAdminOnly: n.grantAdminOnly !== false,
-    secrets: [...new Set(secrets)],
+    secrets,
+    // Kept only when the needs say it (wave 4), and only of the secrets they list: a needs that
+    // does not say which secrets may be left empty is read by the rule of its operation
+    // (optionalSecretsOf), never as "every secret is optional".
+    ...(Array.isArray(n.optionalSecrets) ? { optionalSecrets: secrets.filter((k) => (n.optionalSecrets as unknown[]).includes(k)) } : {}),
     twoPerson: n.twoPerson !== false,
     grantable,
   };
 }
 
-/** The stricter of two needs, field by field. */
+/**
+ * What one needs says of a secret: nothing (it does not list the secret, or does not say which are
+ * optional), that the route goes ahead without it, or that it is required.
+ */
+function secretSaid(n: ApprovalNeeds, kind: SecretKind): 'optional' | 'required' | null {
+  if (!n.secrets.includes(kind) || !Array.isArray(n.optionalSecrets)) return null;
+  return n.optionalSecrets.includes(kind) ? 'optional' : 'required';
+}
+
+/** The stricter of two needs, field by field. A secret stays optional only when no side requires it. */
 function mergeNeeds(a: ApprovalNeeds, b: ApprovalNeeds): ApprovalNeeds {
   const flags: ApproverFlag[] = [];
   for (const f of [...(a.flags ?? []), a.flag, ...(b.flags ?? []), b.flag]) if (isApproverFlag(f) && !flags.includes(f)) flags.push(f);
   const grantable = GRANTABLE_ORDER[Math.max(GRANTABLE_ORDER.indexOf(a.grantable), GRANTABLE_ORDER.indexOf(b.grantable))];
+  const secrets = [...new Set([...a.secrets, ...b.secrets])];
+  const said = Array.isArray(a.optionalSecrets) || Array.isArray(b.optionalSecrets);
+  const optional = secrets.filter((k) => {
+    const sides = [secretSaid(a, k), secretSaid(b, k)];
+    return sides.includes('optional') && !sides.includes('required');
+  });
   return {
     admin: a.admin || b.admin,
     fileAdmin: a.fileAdmin || b.fileAdmin,
@@ -594,7 +646,8 @@ function mergeNeeds(a: ApprovalNeeds, b: ApprovalNeeds): ApprovalNeeds {
     flag: flags[0] ?? null,
     flags,
     grantAdminOnly: Boolean(a.grantAdminOnly || b.grantAdminOnly),
-    secrets: [...new Set([...a.secrets, ...b.secrets])],
+    secrets,
+    ...(said ? { optionalSecrets: optional } : {}),
     twoPerson: a.twoPerson || b.twoPerson,
     grantable: grantable ?? 'no',
   };
@@ -635,10 +688,16 @@ function needsOf(row: Row): ApprovalNeeds {
   return normalNeeds(row.needs);
 }
 
-/** The needs as a view shows them (without the request's own bookkeeping). */
-function viewNeeds(row: Row): ApprovalNeeds | null {
+/**
+ * The needs as a view shows them (without the request's own bookkeeping), with the secrets the
+ * approver may leave empty as this module judges them (optionalSecretsOf), so the card offers the
+ * same boxes the approval then accepts.
+ */
+function viewNeeds(row: Row, target: Target): ApprovalNeeds | null {
   if (!isPlainObject(row.needs)) return null;
-  return needsOf(row);
+  const { optionalSecrets: said, ...needs } = needsOf(row);
+  const optional = optionalSecretsOf(needs.secrets, said, target);
+  return optional.length ? { ...needs, optionalSecrets: optional } : needs;
 }
 
 function classOf(row: Row): RiskClass {
@@ -740,6 +799,39 @@ function questionsOf(target: Target): FlowQuestion[] {
   return def ? (jsonCopy(def.questions) as FlowQuestion[]) : [];
 }
 
+/**
+ * The secrets a route goes ahead without, as the bridge's commit rule has them (lib/agent/bridge.ts
+ * OPTIONAL_ROUTE_SECRETS, which is private: keep the two the same). The sign-in of another company
+ * file: a backup made in this same file needs none, and the route says so itself when one does.
+ */
+const OPTIONAL_ROUTE_SECRETS: readonly SecretKind[] = ['archive_credentials'];
+
+/**
+ * Which of a request's secrets the approver may leave empty (ApprovalNeeds.optionalSecrets, wave 4):
+ *  - what the needs say, when they say it (`said`), and only of the secrets they list;
+ *  - when they do not say (a request asked before wave 4, or a policy that does not tell): for a
+ *    route, those its route goes ahead without (OPTIONAL_ROUTE_SECRETS; every other one it takes
+ *    always, and the bridge refuses a commit without it); for a desktop flow, those its flow uses
+ *    only at the prompt it meets (a portable file saved with a password needs it,
+ *    lib/agent/operations/shell.ts), so a yes without one is right for a file that has none. That is
+ *    how such a flow was approved before wave 4.
+ * Never, either way, a secret the desktop flow needs every time it runs (ShellOperationEntry
+ * .alwaysNeedsSecret): a yes without it would be claimed, refused at its prompt and failed for good.
+ */
+function optionalSecretsOf(secrets: readonly SecretKind[], said: readonly SecretKind[] | undefined, target: Target): SecretKind[] {
+  const def = shellDefOf(target);
+  const always = new Set<SecretKind>((def?.alwaysNeedsSecret ?? []).filter(isSecretKind));
+  if (Array.isArray(said)) return secrets.filter((k) => said.includes(k) && !always.has(k));
+  if (!def) return target.kind === 'operation' ? secrets.filter((k) => OPTIONAL_ROUTE_SECRETS.includes(k)) : [];
+  const flowSecrets = new Set<SecretKind>([...(def.needsSecret ?? []), ...flowPasswordSecrets(def.questions)]);
+  return secrets.filter((k) => flowSecrets.has(k) && !always.has(k));
+}
+
+/** The secrets a desktop flow's password questions name (their answer goes with the secrets). */
+function flowPasswordSecrets(questions: readonly FlowQuestion[]): SecretKind[] {
+  return questions.filter((q) => q.kind === 'password' && isSecretKind(q.secret)).map((q) => q.secret as SecretKind);
+}
+
 // ---------------------------------------------------------------------------
 // How an approved request ended, kept beside the run's answer
 // ---------------------------------------------------------------------------
@@ -760,6 +852,22 @@ interface StoredOutcome {
   entryIds?: string[];
   grant: GrantGiven | null;
   grantError: string | null;
+  /**
+   * An approved reveal (D6): until when (ISO) the answer keeps the full values for the agent. Once
+   * past, every view masks it, and the settle step masks the stored answer and takes this away.
+   */
+  revealUntil?: string;
+  /** The answer of a reveal, masked for good once its time was up. */
+  revealEnded?: boolean;
+  /**
+   * The id of a reveal's staged file whose time is up but which may still be with the agent's
+   * files (lib/agent/files.ts), where get_file would hand it over for the rest of the day. The row
+   * no longer points to it; this mark comes off once it is removed, and a removal that failed is
+   * tried again by the next settle (letGoRevealFile).
+   */
+  revealFileLeft?: string;
+  /** Claimed and then cut off (LOST_TRACK_MESSAGE, UNKNOWN_OUTCOME_MESSAGE): whether it posted is not known. */
+  outcomeUnknown?: boolean;
 }
 
 /** Journal entry ids, each once, oldest first as given, at most PREVIEW_ROW_LIMIT. */
@@ -782,37 +890,149 @@ function cleanGrantGiven(v: unknown): GrantGiven | null {
 }
 
 /**
+ * Whether a run that made no entry, and only changed entries in place, moved any money: what the
+ * bridge's own facts say (lib/agent/bridge.ts factsFor). For an operation with no amount field the
+ * amount of such a run is all the money it moved, "0.00" when it only gave an entry a new title,
+ * number, link or memo. Null when that cannot be told (an operation whose amount comes from its
+ * body, or an amount the bridge could not know).
+ */
+function movedByChanges(r: BridgeResult, target: Target): boolean | null {
+  if (target.kind !== 'operation' || target.op.amountField) return null;
+  const amount = r.facts?.amount;
+  if (typeof amount !== 'string' || !amount.trim()) return null;
+  try {
+    return !Money.isZero(amount);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * What a committed run that worked posted, from its own preview ("Commit: what happened"):
- *  - `posted`: it moved the ledger at all, by an entry it made or one it voided, deleted or changed
- *    (the test lib/agent/operate.ts hasLedger makes when it answers an agent's own commit
- *    'posted', so a replay of an approved request answers the same);
+ *  - `posted`: it moved the ledger: an entry it made, or one it voided or deleted, whatever its
+ *    amount (a void is never "nothing": the rule lib/agent/operate.ts postedToLedger applies when it
+ *    answers an agent's own commit 'posted', so that answer and a replay of the request agree).
+ *    When it only changed entries in place, they count when they moved money (lines rewritten, a
+ *    draft posted), never for a new title, number, link or memo (movedByChanges); when that cannot
+ *    be told, unknown;
  *  - `entryIds`: only the entries it made, for the card's links (the bridge marks the others
  *    `touched`, lib/agent/bridge.ts TouchedPostingEntry; a deleted one could not be opened).
  * Unknown (left out) for a run that did not work, and for one whose ledger was never read: an
  * operation whose service opens its own database handle (dryRun 'none') or a desktop flow reports
  * no ledger at all, which says nothing about whether it posted.
  */
-function committedLedger(r: BridgeResult): Pick<StoredOutcome, 'posted' | 'entryIds'> {
+function committedLedger(r: BridgeResult, target: Target): Pick<StoredOutcome, 'posted' | 'entryIds'> {
   if (r.mode !== 'commit' || r.outcome !== 'ok') return {};
   const list: unknown = r.preview?.ledger?.entries;
   if (!Array.isArray(list)) return {};
-  const made = list.filter((e): e is Record<string, unknown> => isPlainObject(e) && (e.touched === undefined || e.touched === null));
-  return { posted: list.length > 0, entryIds: cleanEntryIds(made.map((e) => e.journalEntryId)) };
+  const entries = list.filter(isPlainObject);
+  const made = entries.filter((e) => e.touched === undefined || e.touched === null);
+  const entryIds = cleanEntryIds(made.map((e) => e.journalEntryId));
+  if (made.length > 0) return { posted: true, entryIds };
+  if (!entries.length) return { posted: false, entryIds };
+  // Anything but "changed in place" (voided, deleted, or a mark this module does not know) moved
+  // the ledger: only a run whose every entry was changed in place is judged by the money it moved.
+  if (entries.some((e) => e.touched !== 'changed')) return { posted: true, entryIds };
+  const moved = movedByChanges(r, target);
+  if (moved !== null) return { posted: moved, entryIds };
+  return {};
 }
+
+/** The messages of a request whose run was cut off: nobody can tell whether it posted. */
+const OUTCOME_UNKNOWN_MESSAGES = new Set([UNKNOWN_OUTCOME_MESSAGE, LOST_TRACK_MESSAGE]);
 
 /**
  * The outcome fields of a view. An executed request with no `posted` beside its answer (recorded
  * before these were kept, or by a run that never read the ledger) leaves `posted` and `entryIds`
- * out: unknown, so a reader keeps its own fallback rather than being told "nothing was posted".
- * Anything not done posted nothing.
+ * out: unknown, so a reader keeps its own fallback rather than being told "nothing was posted". So
+ * does one still being carried out, and one whose run was cut off (its outcome cannot be told).
+ * Anything else not done posted nothing.
  */
 function outcomeOf(row: Row): Pick<AgentRequestView, 'posted' | 'entryIds' | 'grant' | 'grantError'> {
   const r = isPlainObject(row.result) ? row.result : null;
   const grant = cleanGrantGiven(r?.grant);
   const grantError = typeof r?.grantError === 'string' && r.grantError ? r.grantError : null;
   if (r && typeof r.posted === 'boolean') return { posted: r.posted, entryIds: cleanEntryIds(r.entryIds), grant, grantError };
-  if (row.status === 'executed') return { grant, grantError };
+  const unknown =
+    row.status === 'executed' ||
+    row.status === 'approved' ||
+    r?.outcomeUnknown === true ||
+    (row.status === 'failed' && typeof row.error === 'string' && OUTCOME_UNKNOWN_MESSAGES.has(row.error));
+  if (unknown) return { grant, grantError };
   return { posted: false, entryIds: [], grant, grantError };
+}
+
+// ---------------------------------------------------------------------------
+// An approved reveal (D6, plan §5.9)
+// ---------------------------------------------------------------------------
+
+/** The agent asked for the full values and a person approved that for this one call. */
+function isReveal(row: Row): boolean {
+  return metaOf(row).facts.reveal === true || (isPlainObject(row.input) && (row.input as Record<string, unknown>).reveal === true);
+}
+
+/** What a reveal of each kind shows in full, in the audit trail's words. */
+const REVEAL_WORDS: Record<NonNullable<Operation['reveal']>, string> = {
+  ssn: 'full SSNs and tax IDs',
+  account_numbers: 'full bank account numbers',
+  payroll: 'full payroll details',
+};
+
+/** Which kinds of values a reveal showed: the operation's own kind, or what the approver needed to hold. */
+function revealedKinds(row: Row, target: Target): string {
+  if (target.kind === 'operation' && target.op.reveal && REVEAL_WORDS[target.op.reveal]) return REVEAL_WORDS[target.op.reveal];
+  const flags = dataFlagsFor(row);
+  const words = [
+    ...(flags.includes('sensitivePayroll') ? ['full SSNs and payroll details'] : []),
+    ...(flags.includes('fullAccountNumbers') ? ['full bank account numbers'] : []),
+  ];
+  return words.length ? words.join(' and ') : 'protected values';
+}
+
+/** The reveal's time for the agent is up: when it is past, or cannot be read (fail closed). */
+function revealOver(stored: Record<string, unknown>, now: Date): boolean {
+  if (!('revealUntil' in stored)) return false;
+  const ends = typeof stored.revealUntil === 'string' ? Date.parse(stored.revealUntil) : NaN;
+  return !(Number.isFinite(ends) && now.getTime() < ends);
+}
+
+/**
+ * A reveal's answer once its time is up: masked as any answer of the operation is when no reveal
+ * was approved (lib/agent/guards.ts maskSensitiveFields), and every SSN, tax ID or account number
+ * by its field name besides.
+ */
+function maskedAnswer(target: Target, answer: unknown): unknown {
+  let out: unknown = stripSecrets(jsonCopy(answer ?? null));
+  if (target.kind === 'operation') {
+    try {
+      out = maskSensitiveFields(target.op, out, { reveal: false });
+    } catch {
+      // Masked by field name below.
+    }
+  }
+  return maskSensitive(out, NO_FLAGS);
+}
+
+/** A staged file's id as lib/agent/files.ts makes them: anything else was never a staged file. */
+const STAGED_FILE_ID_RE = /^[0-9a-f]{32}$/;
+
+/**
+ * The stored result of a reveal whose time is up, masked for good: no full value, and no pointer to
+ * its file. The file itself is still with the agent's staged files, so its id is kept as the mark
+ * of a file still to be removed (revealFileLeft): the settle step removes it, then the mark.
+ */
+function endedReveal(stored: Record<string, unknown>, target: Target): Record<string, unknown> {
+  const rest: Record<string, unknown> = { ...stored };
+  delete rest.revealUntil;
+  const fileId = isPlainObject(stored.file) && typeof stored.file.fileId === 'string' ? stored.file.fileId : null;
+  const left = fileId && STAGED_FILE_ID_RE.test(fileId) ? { revealFileLeft: fileId } : {};
+  return { ...rest, answer: maskedAnswer(target, stored.answer), file: null, revealEnded: true, ...left };
+}
+
+/** The reveal's file still to be removed (StoredOutcome.revealFileLeft), or null. */
+function revealFileLeftOf(row: Row): string | null {
+  const r = isPlainObject(row.result) ? row.result : null;
+  return typeof r?.revealFileLeft === 'string' && STAGED_FILE_ID_RE.test(r.revealFileLeft) ? r.revealFileLeft : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -930,10 +1150,15 @@ function iso(d: Date | null | undefined): string | null {
   return d instanceof Date && Number.isFinite(d.getTime()) ? d.toISOString() : null;
 }
 
-/** The run's answer as stored: `{ answer, file }`, or a copied proposal's own shape. */
-function storedResult(row: Row): { result: unknown; file: StagedFile | null } {
+/**
+ * The run's answer as stored: `{ answer, file }`, or a copied proposal's own shape. A reveal whose
+ * time is up reads masked (and without its file) whether or not the settle step has masked the row
+ * yet, as an expiry reads as expired before anything marks it.
+ */
+function storedResult(row: Row, target: Target, now: Date): { result: unknown; file: StagedFile | null } {
   const r = row.result;
   if (isPlainObject(r) && 'answer' in r) {
+    if (revealOver(r, now)) return { result: stripSecrets(endedReveal(r, target).answer ?? null), file: null };
     const file = isPlainObject(r.file) ? (r.file as unknown as StagedFile) : null;
     return { result: stripSecrets(r.answer ?? null), file };
   }
@@ -964,7 +1189,7 @@ export function shownStatus(row: { status: string; expiresAt: Date | string | nu
 function toView(row: Row, agentName: string, people: Map<string, string>, now: Date): AgentRequestView {
   const meta = metaOf(row);
   const target = targetOf(row);
-  const { result, file } = storedResult(row);
+  const { result, file } = storedResult(row, target, now);
   const status = shownStatus(row, now);
   return {
     id: row.id,
@@ -978,7 +1203,7 @@ function toView(row: Row, agentName: string, people: Map<string, string>, now: D
     reason: row.reason ?? null,
     summary: row.summary,
     amount: meta.facts.amount,
-    needs: viewNeeds(row),
+    needs: viewNeeds(row, target),
     input: maskedInput(isPlainObject(row.input) ? (row.input as OperationInput) : null, sensitiveFieldsOf(target)),
     preview: previewOf(row),
     grantAsked: meta.grantAsked,
@@ -1033,31 +1258,20 @@ interface JudgeEnv {
    * whether it can be approved at all depends on it.
    */
   grantWindows: boolean;
-  /** grantMinutesFor, once per operation and facts for this person. */
+  /** The standing window for this person (grantWindowReader: the company's day read once per env). */
   grantMinutes: (operation: string, facts: RequestFacts) => Promise<number>;
 }
 
 /**
- * A route the permission map has no rule for: denied to every role, an Admin too (lib/agent/policy.ts
- * routeWithoutRule, which is private), so no other person can approve it either.
+ * What the person's own access is missing for the request's route, or null. A route the permission
+ * map has no rule for is denied to every role, an Admin too (lib/agent/policy.ts routeWithoutRule),
+ * so no other person can approve it either: said in decide()'s own words (NO_RULE_FOR_APPROVER).
  */
-function routeWithoutRule(op: Operation): boolean {
-  const rule = op.rule;
-  if (rule === 'public' || rule === 'self' || rule === 'member') return false;
-  if (rule && typeof rule === 'object') return false;
-  return op.kind === 'route';
-}
-
-/** decide()'s own words for such a route, with what the person can do instead. */
-const NO_RULE_MESSAGE =
-  'No role can allow this request, not even Admin, because Ironbooks has no permission rule for it. Deny it; a person can do the work in Ironbooks if it is still needed.';
-
-/** What the person's own access is missing for the request's route, or null. */
 function routeProblem(person: Person, target: Target): string | null {
   if (target.kind === 'operation') {
     const missing = roleProblem(person.access, target.op);
     if (!missing) return null;
-    if (routeWithoutRule(target.op)) return NO_RULE_MESSAGE;
+    if (routeWithoutRule(target.op)) return NO_RULE_FOR_APPROVER;
     return `Your own access does not allow this: it needs ${missing}. Someone who has that right can approve it.`;
   }
   if (target.kind === 'proposal') {
@@ -1079,7 +1293,7 @@ function windowCap(g: Grantable): number {
 
 /**
  * Whole minutes of standing permission this person may give with this request right now. The
- * limit is grantMinutesFor (lib/services/agentGrants.ts): every rule createGrant applies (the end
+ * limit is grantWindowReader (lib/services/agentGrants.ts): every rule createGrant applies (the end
  * of the COMPANY's day, host-only and file-Admin work, the Admin rule for outside sends, the
  * person's own role), so the card never offers a window createGrant then refuses. It is never
  * longer than the request's stored class and needs allow either (they may be stricter than the
@@ -1151,27 +1365,15 @@ function visibleTo(person: Person, target: Target): boolean {
   return routeProblem(person, target) === null;
 }
 
-/**
- * What of a request can change its standing window, as the cache key of judgeEnv.grantMinutes. Each
- * grantMinutesFor reads the company's day from the company file, and a list of approvable requests
- * would otherwise read it once per request (their amounts, names and dates all differ). The window
- * depends on the operation and the facts its rules read (lib/services/agentGrants.ts grantRules,
- * through lib/agent/policy.ts requestClasses and flagsNeeded): a reveal, closed-period work and the
- * "yes, I am sure" flags. Amounts, ids, dates and counts play no part in it (approvalNeeds is asked
- * there without a two-person limit; a count limit is checked when the grant is given). createGrant
- * applies every rule again when a person gives one, so should these rules ever read more, a key
- * that missed it could only offer a window createGrant then refuses (the work still runs and the
- * person is told why), never give a longer one.
- */
-function windowKey(operation: string, facts: RequestFacts): string {
-  const confirm = Array.isArray(facts.confirm) ? [...facts.confirm].map(String).sort() : [];
-  return JSON.stringify([operation, facts.reveal === true, facts.closedPeriod === true, confirm]);
-}
+/** A window that cannot be worked out is none (fail closed): the request can still be approved once. */
+const NO_WINDOW: GrantWindow = () => 0;
 
 async function judgeEnv(person: Person, rows: Row[], atHost: boolean, now: Date, opts: { grantWindows?: boolean } = {}): Promise<JudgeEnv> {
   const db = person.ctx.db;
   let fileAdminAnswer: Promise<boolean> | null = null;
-  const windows = new Map<string, Promise<number>>();
+  // The company's day is read once for the whole list, and only when a window is asked for
+  // (lib/services/agentGrants.ts grantWindowReader applies every rule createGrant applies).
+  let windowOf: Promise<GrantWindow> | null = null;
   return {
     person,
     states: await agentStates(db, person.ctx.companyId, rows.map((r) => r.agentId)),
@@ -1184,15 +1386,14 @@ async function judgeEnv(person: Person, rows: Row[], atHost: boolean, now: Date,
         () => false,
       )),
     grantWindows: opts.grantWindows !== false,
-    grantMinutes: (operation, facts) => {
-      const key = windowKey(operation, facts);
-      let answer = windows.get(key);
-      if (!answer) {
-        // A window that cannot be worked out is none (fail closed): the request can still be approved once.
-        answer = grantMinutesFor(person.ctx, operation, facts, now).catch(() => 0);
-        windows.set(key, answer);
+    grantMinutes: async (operation, facts) => {
+      windowOf ??= grantWindowReader(person.ctx, now).catch(() => NO_WINDOW);
+      const window = await windowOf;
+      try {
+        return window(operation, facts);
+      } catch {
+        return 0;
       }
-      return answer;
     },
   };
 }
@@ -1317,6 +1518,9 @@ async function endWaiting(db: DB, row: Row, status: Status, set: Partial<typeof 
   return updated ?? null;
 }
 
+/** What a request whose run was cut off keeps as its result: no answer, and that how it ended is not known. */
+const OUTCOME_UNKNOWN: StoredOutcome = { answer: null, file: null, grant: null, grantError: null, outcomeUnknown: true };
+
 /** Approved rows claimed so long ago that their run cannot still be going (STUCK_AFTER_MS). */
 function stuckSince(now: Date) {
   const cutoff = new Date(now.getTime() - STUCK_AFTER_MS);
@@ -1340,7 +1544,7 @@ async function settleStuck(db: DB, row: Row, now: Date): Promise<Row> {
     const tx = txRaw as unknown as DB;
     const [updated] = await tx
       .update(agentPermissionRequests)
-      .set({ status: 'failed', error: UNKNOWN_OUTCOME_MESSAGE, input: settled.input, ...(settled.needs ? { needs: settled.needs } : {}) })
+      .set({ status: 'failed', error: UNKNOWN_OUTCOME_MESSAGE, result: OUTCOME_UNKNOWN, input: settled.input, ...(settled.needs ? { needs: settled.needs } : {}) })
       .where(and(eq(agentPermissionRequests.id, row.id), eq(agentPermissionRequests.status, 'approved'), stuckSince(now)))
       .returning();
     if (!updated) return null;
@@ -1362,12 +1566,96 @@ async function settleStuck(db: DB, row: Row, now: Date): Promise<Row> {
 }
 
 /**
+ * A done reveal the settle step still has work on: its answer still holds the full values
+ * (StoredOutcome.revealUntil), or its time is up and its file is still to be removed (revealFileLeft).
+ */
+function holdsReveal(row: Row): boolean {
+  if (row.status !== 'executed' || !isPlainObject(row.result)) return false;
+  return 'revealUntil' in row.result || revealFileLeftOf(row) !== null;
+}
+
+/**
+ * A done reveal whose time is up: its stored answer masked for good, then its file removed from the
+ * agent's staged files (D6). The masking is written only while the row still holds the full answer,
+ * so two readers at once mask it once; the file goes only once the row no longer points to it (the
+ * masking was written, by this reader or another). The audit trail already holds the reveal itself
+ * (record); this changes nothing a person decided.
+ */
+async function endReveal(db: DB, row: Row, now: Date): Promise<Row> {
+  const stored = row.result as Record<string, unknown>;
+  let current = row;
+  if ('revealUntil' in stored) {
+    if (!revealOver(stored, now)) return row;
+    const [updated] = await db
+      .update(agentPermissionRequests)
+      .set({ result: endedReveal(stored, targetOf(row)) })
+      .where(
+        and(
+          eq(agentPermissionRequests.id, row.id),
+          eq(agentPermissionRequests.status, 'executed'),
+          sql`(${agentPermissionRequests.result} -> 'revealUntil') IS NOT NULL`,
+        ),
+      )
+      .returning();
+    current = updated ?? (await rowById(db, row.companyId, row.id)) ?? row;
+  }
+  return letGoRevealFile(db, current);
+}
+
+/**
+ * Remove the staged file of a reveal whose time is up: the agent learned its id while it could read
+ * the answer, and get_file (lib/agent/files.ts readStagedFile) would otherwise hand it over again
+ * until staged files are cleared, a day later. Only for a row whose masking was written (the mark is
+ * written with it). The mark comes off once the file is gone (removeStagedFile answering false: it
+ * was gone already); a removal or a write that fails leaves it, for the next settle to try again,
+ * and never fails the reader.
+ */
+async function letGoRevealFile(db: DB, row: Row): Promise<Row> {
+  const fileId = revealFileLeftOf(row);
+  if (!fileId || row.status !== 'executed') return row;
+  try {
+    await removeStagedFile({ companyId: row.companyId, agentId: row.agentId }, fileId);
+    const [updated] = await db
+      .update(agentPermissionRequests)
+      .set({ result: sql`${agentPermissionRequests.result} - 'revealFileLeft'` })
+      .where(and(eq(agentPermissionRequests.id, row.id), sql`(${agentPermissionRequests.result} ->> 'revealFileLeft') = ${fileId}`))
+      .returning();
+    return updated ?? row;
+  } catch {
+    return row;
+  }
+}
+
+/**
+ * An approved reveal ends on time even when nothing reads the request again (D6): a timer in this
+ * process masks its answer and removes its file just after its time is up, so an agent that keeps
+ * the file's id cannot fetch it again with get_file. When Ironbooks stops before then, its staged
+ * files go as the company file closes (electron/main.js clearStagedAgentFiles), and the row is masked
+ * by the first reader once the file is open again (at the latest the title bar's poll once someone is
+ * signed in, settleForBadge). Never holds the process open; never fails anything.
+ */
+function endRevealOnTime(db: DB, row: Row): void {
+  const r = isPlainObject(row.result) ? row.result : null;
+  const ends = typeof r?.revealUntil === 'string' ? Date.parse(r.revealUntil) : NaN;
+  if (row.status !== 'executed' || !Number.isFinite(ends)) return;
+  const delay = Math.min(Math.max(ends - Date.now(), 0), REVEAL_KEPT_MS) + REVEAL_TIMER_SLACK_MS;
+  const timer = setTimeout(() => {
+    void (async () => {
+      const current = await rowById(db, row.companyId, row.id);
+      if (current) await settleRow(db, current, new Date());
+    })().catch(() => undefined);
+  }, delay);
+  timer.unref?.();
+}
+
+/**
  * Bring one row up to date before anyone reads or decides it: a waiting request past its time is
- * marked expired, a copied proposal already decided under Ask AI takes that decision, and a run
- * cut off long ago is marked failed.
+ * marked expired, a copied proposal already decided under Ask AI takes that decision, a run cut off
+ * long ago is marked failed, and a reveal whose time is up is masked for good and its file removed.
  */
 async function settleRow(db: DB, row: Row, now: Date): Promise<Row> {
   if (row.status === 'approved') return settleStuck(db, row, now);
+  if (holdsReveal(row)) return endReveal(db, row, now);
   if (row.status !== 'pending') return row;
   if (row.expiresAt.getTime() <= now.getTime()) {
     const ended = await db.transaction(async (txRaw) => {
@@ -1434,6 +1722,25 @@ async function settleCompany(db: DB, companyId: string, now: Date): Promise<numb
     .from(agentPermissionRequests)
     .where(and(eq(agentPermissionRequests.companyId, companyId), eq(agentPermissionRequests.status, 'approved'), stuckSince(now)));
   for (const row of stuck) await settleRow(db, row, now);
+  // Reveals whose time is up (D6), and those whose file is still to be removed (a removal that
+  // failed before). ISO times sort as text, and only this module writes them.
+  const revealed = await db
+    .select()
+    .from(agentPermissionRequests)
+    .where(
+      and(
+        eq(agentPermissionRequests.companyId, companyId),
+        eq(agentPermissionRequests.status, 'executed'),
+        or(
+          and(
+            sql`(${agentPermissionRequests.result} ->> 'revealUntil') IS NOT NULL`,
+            sql`(${agentPermissionRequests.result} ->> 'revealUntil') <= ${now.toISOString()}`,
+          ),
+          sql`(${agentPermissionRequests.result} ->> 'revealFileLeft') IS NOT NULL`,
+        ),
+      ),
+    );
+  for (const row of revealed) await settleRow(db, row, now);
   return expired;
 }
 
@@ -1621,7 +1928,7 @@ export const requestForAgent: RequestForAgent = async (ctx, idOrKey) => {
   const row = await ownRow(ctx.db, ctx.companyId, agent.id, idOrKey);
   if (!row) return null;
   const now = new Date();
-  const settled = row.status === 'pending' || row.status === 'approved' ? await settleRow(await writableDb(ctx), row, now) : row;
+  const settled = row.status === 'pending' || row.status === 'approved' || holdsReveal(row) ? await settleRow(await writableDb(ctx), row, now) : row;
   return (await viewsFor(ctx.db, ctx.companyId, [settled], now))[0];
 };
 
@@ -2048,16 +2355,28 @@ function failureMessage(r: BridgeResult): string {
 export const approveAgentRequest: ApproveAgentRequest = (ctx, id, rawInput, opts) => approveRequest(ctx, id, rawInput, opts, null);
 
 /**
- * A secret the operation's own route always takes (Operation.needsSecret) and the approver did not
- * type: the commit would be refused for it with certainty (lib/agent/bridge.ts refuses a commit
- * missing any of them), and the request would then fail for good. Sent back to the card first, while
- * the request can still be approved. A desktop flow's secrets are not checked here: its flow asks for
- * one only when the file turns out to be protected (lib/agent/operations/shell.ts, "a portable file
- * saved with a password needs it"), so a yes without one is right for a file that has none.
+ * A secret the run cannot do without that the approver did not type: the run would be refused for
+ * it, and the request would then fail for good (a desktop flow is never run twice under one id).
+ * Sent back to the card first, while the request can still be approved.
+ *  - A route: every secret the operation lists (Operation.needsSecret: lib/agent/bridge.ts refuses
+ *    a commit missing one).
+ *  - A desktop flow: every secret it or its password questions name, and every one the needs list.
+ * Less, for both, what the approver may leave empty (optionalSecretsOf: what the needs say, wave 4;
+ * when they do not say, a desktop flow's secrets it uses only at the prompt it meets). A secret the
+ * flow needs every time (alwaysNeedsSecret) is never left empty, whatever the needs say.
  */
-function checkTypedSecrets(target: Target, typed: Partial<Record<SecretKind, string>>): void {
-  if (target.kind !== 'operation' || target.op.kind !== 'route') return;
-  const missing = [...new Set(target.op.needsSecret ?? [])].filter((k) => !(typeof typed[k] === 'string' && typed[k]!.length > 0));
+function checkTypedSecrets(target: Target, needs: ApprovalNeeds, typed: Partial<Record<SecretKind, string>>): void {
+  if (target.kind !== 'operation') return;
+  const def = shellDefOf(target);
+  const wanted = new Set<SecretKind>((target.op.needsSecret ?? []).filter(isSecretKind));
+  if (def) {
+    const flowSecrets = [...(def.needsSecret ?? []), ...(def.alwaysNeedsSecret ?? []), ...flowPasswordSecrets(def.questions), ...needs.secrets];
+    for (const k of flowSecrets) if (isSecretKind(k)) wanted.add(k);
+  } else if (target.op.kind !== 'route') {
+    return;
+  }
+  const optional = optionalSecretsOf([...wanted], needs.optionalSecrets, target);
+  const missing = [...wanted].filter((k) => !optional.includes(k) && !(typeof typed[k] === 'string' && typed[k]!.length > 0));
   if (!missing.length) return;
   const words = missing.map((k) => SECRET_WORDS[k] ?? 'a password');
   const list = words.length > 1 ? `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}` : words[0];
@@ -2065,8 +2384,9 @@ function checkTypedSecrets(target: Target, typed: Partial<Record<SecretKind, str
 }
 
 /**
- * approveAgentRequest itself. `onClaim` hears the moment this call claims the request (batchApprove,
- * so it can tell a request it claimed and then lost track of from one it never got to).
+ * approveAgentRequest itself. `onClaim` hears the moment this call claims the request, or records
+ * the first of two approvals (batchApprove, so it can tell a request this call acted on and then
+ * lost track of from one it never got to).
  */
 async function approveRequest(
   ctx: ServiceContext,
@@ -2124,7 +2444,7 @@ async function approveRequest(
 
   // What the run will be refused without is typed before anything is claimed (the first of two
   // approvals types nothing: the second approver's run is the one that needs it).
-  if (!firstOfTwo && meta.kind === 'operation') checkTypedSecrets(target, input.secrets);
+  if (!firstOfTwo && meta.kind === 'operation') checkTypedSecrets(target, needs, input.secrets);
 
   if (firstOfTwo) {
     // D8: the first of two different people. Nothing runs yet; nothing typed is kept.
@@ -2148,6 +2468,7 @@ async function approveRequest(
     });
     if (!recorded) throw new ServiceError('CONFLICT', CHANGED_JUST_NOW_MESSAGE);
     wake(recorded);
+    onClaim?.();
     return { status: 'needs_second_approver', request: await personView(person, recorded, atHost), produced: [], effects: [] };
   }
 
@@ -2214,7 +2535,7 @@ async function endLostClaim(person: Person, claimed: Row, target: Target): Promi
   const ended = await inTransaction(person.ctx, async (tx) => {
     const [updated] = await tx.db
       .update(agentPermissionRequests)
-      .set({ status: 'failed', error: LOST_TRACK_MESSAGE, input: settled.input, ...(settled.needs ? { needs: settled.needs } : {}) })
+      .set({ status: 'failed', error: LOST_TRACK_MESSAGE, result: OUTCOME_UNKNOWN, input: settled.input, ...(settled.needs ? { needs: settled.needs } : {}) })
       .where(
         and(
           eq(agentPermissionRequests.id, claimed.id),
@@ -2258,10 +2579,13 @@ async function carryOut(c: ClaimedRun): Promise<ApproveResult> {
         requestId: row.id,
       });
     } catch (err) {
-      error = scrubText(messageOf(err), typed, UNEXPECTED_MESSAGE);
+      // Nothing but the grant was asked, so nothing else was done: never the words that send the
+      // person to check the books.
+      const why = err instanceof ServiceError && err.message ? err.message : GRANT_REQUEST_NOT_GIVEN_MESSAGE;
+      error = scrubText(why, typed, GRANT_REQUEST_NOT_GIVEN_MESSAGE);
     }
     const grantId = made && typeof made.id === 'string' ? made.id : null;
-    if (!grantId && !error) error = UNEXPECTED_MESSAGE;
+    if (!grantId && !error) error = GRANT_REQUEST_NOT_GIVEN_MESSAGE;
     const final = await record(person, claimed, target, {
       status: grantId ? 'executed' : 'failed',
       error,
@@ -2326,16 +2650,27 @@ async function carryOut(c: ClaimedRun): Promise<ApproveResult> {
     }
   }
   const failed = ok ? null : shellDef && r.mode === 'dry_run' && r.outcome === 'ok' ? UNEXPECTED_MESSAGE : failureMessage(r);
-  const final = await record(person, claimed, target, {
-    status: ok ? 'executed' : 'failed',
-    error: failed === null ? null : scrubText(changedUnder ? `${BOOKS_CHANGED_FAILED} ${failed}` : failed, hide, UNEXPECTED_MESSAGE),
-    answer: ok ? scrubDeep(stripSecrets(jsonCopy(r.result ?? null)), hide) : null,
-    file: ok && r.file ? jsonCopy(r.file) : null,
-    ...committedLedger(r),
-    grantId: made ? made.id : null,
-    grant: made && grant ? grantGiven(made, grant, now) : null,
-    grantError,
-  });
+  // An approved reveal (D6): the full values stay readable by the agent for a while after the run,
+  // then are masked for good; the audit trail words what was revealed, to whom, approved by whom.
+  const revealed = ok && isReveal(row);
+  const final = await record(
+    person,
+    claimed,
+    target,
+    {
+      status: ok ? 'executed' : 'failed',
+      error: failed === null ? null : scrubText(changedUnder ? `${BOOKS_CHANGED_FAILED} ${failed}` : failed, hide, UNEXPECTED_MESSAGE),
+      answer: ok ? scrubDeep(stripSecrets(jsonCopy(r.result ?? null)), hide) : null,
+      file: ok && r.file ? jsonCopy(r.file) : null,
+      ...committedLedger(r, target),
+      grantId: made ? made.id : null,
+      grant: made && grant ? grantGiven(made, grant, now) : null,
+      grantError,
+      ...(revealed ? { revealUntil: new Date(Date.now() + REVEAL_KEPT_MS).toISOString() } : {}),
+    },
+    revealed ? await revealAudit(person, claimed, target) : {},
+  );
+  if (revealed) endRevealOnTime(person.ctx.db, final);
   return {
     status: ok ? 'executed' : 'failed',
     request: await personView(person, final, atHost),
@@ -2345,15 +2680,45 @@ async function carryOut(c: ClaimedRun): Promise<ApproveResult> {
 }
 
 /**
+ * The audit trail's words for an approved reveal (plan §5.9): "Revealed <which kinds of values> of
+ * <record or report> to agent <name>, approved by <person>", with the kinds beside it on their own.
+ * The record or report is the request's summary (the app's own words from the operation, never the
+ * agent's reason). Names as they are now; a name that cannot be read is said plainly.
+ */
+async function revealAudit(person: Person, claimed: Row, target: Target): Promise<Record<string, unknown>> {
+  const kinds = revealedKinds(claimed, target);
+  let agentName = 'a removed agent';
+  let approvers = 'a person';
+  try {
+    const states = await agentStates(person.ctx.db, claimed.companyId, [claimed.agentId]);
+    const agent = states.get(claimed.agentId);
+    if (agent?.exists) agentName = `"${oneLine(agent.name).slice(0, 100) || 'Agent'}"`;
+    const ids = [claimed.decidedBy, claimed.secondApprover].filter((x): x is string => typeof x === 'string');
+    const names = await personNames(person.ctx.db, ids);
+    const said = ids.map((id) => oneLine(names.get(id) ?? '') || 'a person');
+    if (said.length) approvers = said.join(' and ');
+  } catch {
+    // The words below still say what was revealed and that a person approved it.
+  }
+  const of = oneLine(claimed.summary).slice(0, 200) || claimed.operation;
+  return {
+    revealed: `Revealed ${kinds} of "${of}" to agent ${agentName}, approved by ${approvers}.`,
+    revealedFields: kinds,
+  };
+}
+
+/**
  * Write how an approved request ended, with its input masked for good, and the decision to the
- * audit trail. The result column keeps the answer beside what the committed run posted and the
- * standing permission given (StoredOutcome), for every reader of the request from then on.
+ * audit trail (with `audit` beside it: the words of a reveal). The result column keeps the answer
+ * beside what the committed run posted and the standing permission given (StoredOutcome), for
+ * every reader of the request from then on.
  */
 async function record(
   person: Person,
   claimed: Row,
   target: Target,
   outcome: { status: 'executed' | 'failed'; error: string | null; grantId: string | null } & StoredOutcome,
+  audit: Record<string, unknown> = {},
 ): Promise<Row> {
   const settled = settledInput(claimed, target);
   const kept: StoredOutcome = {
@@ -2363,6 +2728,7 @@ async function record(
     ...(typeof outcome.posted === 'boolean' ? { posted: outcome.posted, entryIds: cleanEntryIds(outcome.entryIds) } : {}),
     grant: outcome.grant ?? null,
     grantError: outcome.grantError ?? null,
+    ...(typeof outcome.revealUntil === 'string' ? { revealUntil: outcome.revealUntil } : {}),
   };
   const final = await inTransaction(person.ctx, async (tx) => {
     const [updated] = await tx.db
@@ -2384,6 +2750,7 @@ async function record(
       grantId: outcome.grantId,
       ...(outcome.error ? { error: outcome.error } : {}),
       ...(outcome.grantError ? { grantNotGiven: outcome.grantError } : {}),
+      ...audit,
     });
     return updated ?? claimed;
   });
@@ -2620,14 +2987,14 @@ export const denyAgentRequest: DenyAgentRequest = async (ctx, id, rawNote) => {
 
 /** Classes a batch may approve (plan §7.2): everyday entry and change, nothing riskier. */
 const BATCH_CLASSES: readonly RiskClass[] = ['enter', 'change'];
-const BATCH_MAX = 100;
 
 export const batchApprove: BatchApprove = async (ctx, ids, opts) => {
   const person = await requirePerson(ctx);
   const atHost = opts?.atHost === true;
   const wanted = [...new Set((Array.isArray(ids) ? ids : []).filter((x): x is string => typeof x === 'string'))];
   if (!wanted.length) throw validation('Choose the requests to approve.');
-  if (wanted.length > BATCH_MAX) throw validation(`Approve at most ${BATCH_MAX} requests at once.`);
+  // The one number the screen and the route hold a batch to as well (lib/validation/agentAccess.ts).
+  if (wanted.length > BATCH_APPROVE_MAX) throw validation(`Approve at most ${BATCH_APPROVE_MAX} requests at once.`);
   const now = new Date();
 
   const rows: Row[] = [];
@@ -2657,12 +3024,12 @@ export const batchApprove: BatchApprove = async (ctx, ids, opts) => {
   // Each on its own: one that is not approved, fails or finds the books changed never stops the others.
   const results: ApproveResult[] = [];
   for (const row of rows) {
-    const track = { claimed: false };
+    const track = { acted: false };
     try {
-      results.push(await approveRequest(ctx, row.id, {}, { atHost }, () => (track.claimed = true)));
+      results.push(await approveRequest(ctx, row.id, {}, { atHost }, () => (track.acted = true)));
     } catch (err) {
       const current = await rowById(person.ctx.db, ctx.companyId, row.id);
-      results.push(batchOutcome(await personView(person, current ?? row, atHost), err, track.claimed));
+      results.push(batchOutcome(await personView(person, current ?? row, atHost), err, track.acted));
     }
   }
   return results;
@@ -2671,24 +3038,41 @@ export const batchApprove: BatchApprove = async (ctx, ids, opts) => {
 /**
  * What one approval of a batch came to when it threw: read from where the request stands now, not
  * assumed failed.
- *  - Done or failed (by this batch or by someone else's approval): reported as such.
- *  - Claimed by THIS batch and then lost track of (it threw after its run had ended, and even
- *    ending the request failed): 'failed', saying the outcome cannot be told. Never "nothing ran":
- *    the work may well have been done. One it sent back to waiting with a new preview is 'stale'.
- *  - Anything else this batch never got to approve (this person may not, the agent was paused part
- *    way, someone else denied, withdrew, expired or is carrying it out): 'not_approved', nothing ran
- *    for it here, why in `error`; `request.status` says where it stands (still waiting, mostly).
+ *  - Acted on by THIS call (claimed, or its first of two approvals recorded) and then lost track of:
+ *    as the request stands, done, failed, back to waiting with a new preview ('stale') or waiting
+ *    for a second person; otherwise 'failed', saying the outcome cannot be told. Never "nothing
+ *    ran": the work may well have been done.
+ *  - Anything this call never got to approve (this person may not, the agent was paused part way,
+ *    someone else denied, withdrew, let it expire, is carrying it out or has done it):
+ *    'not_approved' (contract: this call approved nothing and ran nothing for it), why in `error`;
+ *    `request.status` says where it stands now (still waiting, mostly). The screen shows `error`
+ *    after "Not approved, and nothing was done.", so one approved before this call got to it says
+ *    that it was approved already and this approval added nothing (ALREADY_APPROVED_WHY), never
+ *    STATUS_WHY's "was approved and done" on its own, which would read as a contradiction.
  */
-function batchOutcome(view: AgentRequestForPerson, err: unknown, claimedHere: boolean): ApproveResult {
+function batchOutcome(view: AgentRequestForPerson, err: unknown, actedHere: boolean): ApproveResult {
   const result = (status: ApproveResult['status'], request: AgentRequestForPerson): ApproveResult => ({ status, request, produced: [], effects: [] });
-  if (view.status === 'executed') return result('executed', view);
-  if (view.status === 'failed') return result('failed', view);
-  if (claimedHere && view.status === 'approved') return result('failed', { ...view, error: LOST_TRACK_MESSAGE });
-  if (claimedHere && view.status === 'pending' && view.stale) return result('stale', view);
-  if (view.status === 'pending' && view.needs?.twoPerson && view.decidedByName) return result('needs_second_approver', view);
-  const why = view.status === 'pending' ? (view.cannotApproveWhy ?? messageOf(err)) : STATUS_WHY[view.status] || messageOf(err);
+  if (actedHere) {
+    if (view.status === 'executed') return result('executed', view);
+    if (view.status === 'failed') return result('failed', view);
+    if (view.status === 'pending' && view.stale) return result('stale', view);
+    if (view.status === 'pending' && view.needs?.twoPerson && view.decidedByName) return result('needs_second_approver', view);
+    return result('failed', { ...view, error: LOST_TRACK_MESSAGE });
+  }
+  const why =
+    view.status === 'pending'
+      ? (view.cannotApproveWhy ?? messageOf(err))
+      : (ALREADY_APPROVED_WHY[view.status] ?? (STATUS_WHY[view.status] || messageOf(err)));
   return result('not_approved', { ...view, error: why });
 }
+
+/** Why a batch did not approve a request someone approved before it got there (batchOutcome). */
+const ALREADY_APPROVED_WHY: Partial<Record<Status, string>> = {
+  approved: 'It was already approved, and it is being carried out right now. This approval added nothing.',
+  executed: 'It was already approved before this approval got to it, and it was done then. This approval added nothing.',
+  failed:
+    'It was already approved before this approval got to it, and that time the work could not be done. Open it to see why. This approval added nothing.',
+};
 
 export const expireRequests: ExpireRequests = async (ctx, now = new Date()) => {
   if (!ctx || typeof ctx.companyId !== 'string' || !UUID_RE.test(ctx.companyId)) return 0;

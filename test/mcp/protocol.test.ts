@@ -2,8 +2,8 @@
  * The MCP server's protocol layer (mcp/protocol.mjs): JSON-RPC over stdio for a tools-only server.
  */
 import { PassThrough } from 'node:stream';
-import { describe, expect, it } from 'vitest';
-import { MAX_MESSAGE_CHARS, PROTOCOL_VERSIONS, ToolContent, ToolError, argumentProblem, createServer, idFromHead, serve } from '../../mcp/protocol.mjs';
+import { describe, expect, it, vi } from 'vitest';
+import { MAX_MESSAGE_CHARS, PROTOCOL_VERSIONS, ToolContent, ToolError, argumentProblem, createServer, idFromHead, serve, slowDownAdvice } from '../../mcp/protocol.mjs';
 import { IronbooksError } from '../../mcp/client.mjs';
 import { SERVER_INFO } from '../../mcp/ironbooks-mcp.mjs';
 import { INSTRUCTIONS, TOOLS } from '../../mcp/tools.mjs';
@@ -128,6 +128,41 @@ describe('tools', () => {
     expect(argumentProblem(echoSchema, { text: 'ok', n: null })).toBeNull();
   });
 
+  it('holds a text to its shortest length (minLength), as JSON Schema does', () => {
+    const schema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: { title: { type: 'string', minLength: 1, maxLength: 5 }, code: { type: 'string', minLength: 3 }, tags: { type: 'array', items: { type: 'string', minLength: 2 } } },
+    };
+    // An optional text given empty is refused, with what to do; left out, it is fine.
+    expect(argumentProblem(schema, { title: '' })).toBe('"title" cannot be empty: give a value, or leave it out.');
+    expect(argumentProblem(schema, {})).toBeNull();
+    expect(argumentProblem(schema, { title: ' ' })).toBeNull();
+    expect(argumentProblem(schema, { code: 'ab' })).toBe('"code" must be at least 3 characters.');
+    expect(argumentProblem(schema, { code: 'abc', title: 'hello' })).toBeNull();
+    expect(argumentProblem(schema, { title: 'toolong' })).toBe('"title" is too long.');
+    expect(argumentProblem(schema, { tags: ['ok', 'x'] })).toBe('"tags"[2] must be at least 2 characters.');
+    // Only an optional field can be left out: an entry of a list, or a field inside a required
+    // object, given empty, is told to give a value, nothing more.
+    const named = {
+      type: 'object',
+      additionalProperties: false,
+      required: ['payee'],
+      properties: {
+        payee: { type: 'object', additionalProperties: false, required: ['name'], properties: { name: { type: 'string' }, memo: { type: 'string', minLength: 1 } } },
+        notes: { type: 'array', items: { type: 'string', minLength: 1 } },
+      },
+    };
+    expect(argumentProblem(named, { payee: { name: 'Acme', memo: '' } })).toBe('"payee".memo cannot be empty: give a value, or leave it out.');
+    expect(argumentProblem(named, { payee: { name: 'Acme' }, notes: ['ok', ''] })).toBe('"notes"[2] cannot be empty: give a value.');
+    // A required field given empty is said to be required (it cannot be left out).
+    expect(argumentProblem(named, { payee: { name: '' } })).toBe('"payee".name is required.');
+    // The shipped tools that set one: export_report's title.
+    const exportReport = (TOOLS as Msg[]).find((t) => t.name === 'export_report')!;
+    expect(argumentProblem(exportReport.inputSchema, { key: 'trial-balance', format: 'pdf', title: '' })).toBe('"title" cannot be empty: give a value, or leave it out.');
+    expect(argumentProblem(exportReport.inputSchema, { key: 'trial-balance', format: 'pdf', title: 'Board pack' })).toBeNull();
+  });
+
   it('an unknown tool is a protocol error', async () => {
     const { s } = server();
     expect(await s.handle(call(9, 'nope'))).toMatchObject({ id: 9, error: { code: -32602, message: 'Unknown tool: nope' } });
@@ -140,10 +175,35 @@ describe('tools', () => {
     expect(refused.result).toEqual({ content: [{ type: 'text', text: 'Give a date.' }], isError: true });
     const denied = (await s.handle(call(2, 'books_say_no'))) as Msg;
     expect(denied.result).toEqual({ content: [{ type: 'text', text: 'You do not have permission to view Payroll.' }], isError: true });
-    const broke = (await s.handle(call(3, 'breaks'))) as Msg;
-    expect(broke.result.isError).toBe(true);
-    expect(broke.result.content[0].text).toBe('Something went wrong reading from Ironbooks. Try again.');
-    expect(JSON.stringify(broke)).not.toContain('secret internal detail');
+    // An unexpected failure is written to the connector's log (stderr, never stdout) for whoever
+    // looks into it, and the agent gets a plain message only. The log is caught here, not printed.
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const broke = (await s.handle(call(3, 'breaks'))) as Msg;
+      expect(broke.result.isError).toBe(true);
+      expect(broke.result.content[0].text).toBe('Something went wrong reading from Ironbooks. Try again.');
+      expect(JSON.stringify(broke)).not.toContain('secret internal detail');
+      expect(stderr).toHaveBeenCalledTimes(1);
+      expect(String(stderr.mock.calls[0][0])).toMatch(/^\[ironbooks-mcp\] breaks failed: TypeError: secret internal detail at C:\\path\n/);
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('a "slow down" from Ironbooks (429) says that nothing was done, how long to wait, and that sending it again is safe', async () => {
+    const tools = [
+      { name: 'busy', description: 'x', inputSchema: { type: 'object', properties: {} }, handler: async () => { throw new IronbooksError('This agent has sent more than 60 requests in the last minute.', { status: 429, retryAfter: 20 }); } },
+      { name: 'busy_quiet', description: 'x', inputSchema: { type: 'object', properties: {} }, handler: async () => { throw new IronbooksError('Ironbooks is busy', { status: 429 }); } },
+    ];
+    const s = createServer({ tools, client: {}, serverInfo: { name: 't', version: '0' } });
+    expect(((await s.handle(call(1, 'busy'))) as Msg).result).toEqual({
+      content: [{ type: 'text', text: `This agent has sent more than 60 requests in the last minute. ${slowDownAdvice(20)}` }],
+      isError: true,
+    });
+    expect(((await s.handle(call(2, 'busy_quiet'))) as Msg).result.content[0].text).toBe(`Ironbooks is busy. ${slowDownAdvice(0)}`);
+    expect(slowDownAdvice(20)).toBe('Nothing was done. Wait 20 seconds, then send it again as it was (with the same request_id, if it had one: it is never done twice).');
+    expect(slowDownAdvice(1)).toMatch(/Wait 1 second,/);
+    expect(slowDownAdvice(0)).toMatch(/Wait a little while,/);
   });
 });
 
@@ -389,9 +449,21 @@ describe('resources, prompts and notifications', () => {
     expect(await s.handle({ jsonrpc: '2.0', id: 4, method: 'resources/read', params: { uri: 'x://nothing' } })).toMatchObject({ id: 4, error: { code: -32002 } });
     expect(await s.handle({ jsonrpc: '2.0', id: 5, method: 'resources/read', params: {} })).toMatchObject({ id: 5, error: { code: -32602 } });
     expect(await s.handle({ jsonrpc: '2.0', id: 6, method: 'resources/read', params: { uri: 'x://broken' } })).toMatchObject({ error: { code: -32603, message: 'Ironbooks is not ready.' } });
-    const crash = (await s.handle({ jsonrpc: '2.0', id: 7, method: 'resources/read', params: { uri: 'x://crash' } })) as Msg;
-    expect(crash.error.message).toBe('Something went wrong reading from Ironbooks. Try again.');
-    expect(JSON.stringify(crash)).not.toContain('secret detail');
+    // An unexpected failure goes to the connector's log (caught here, not printed), and the client
+    // gets a plain message only.
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const crash = (await s.handle({ jsonrpc: '2.0', id: 7, method: 'resources/read', params: { uri: 'x://crash' } })) as Msg;
+      expect(crash.error.message).toBe('Something went wrong reading from Ironbooks. Try again.');
+      expect(JSON.stringify(crash)).not.toContain('secret detail');
+      expect(stderr).toHaveBeenCalledTimes(1);
+      expect(String(stderr.mock.calls[0][0])).toMatch(/^\[ironbooks-mcp\] reading x:\/\/crash failed: Error: secret detail\n/);
+      // A known failure is the plain message itself: not logged.
+      await s.handle({ jsonrpc: '2.0', id: 8, method: 'resources/read', params: { uri: 'x://broken' } });
+      expect(stderr).toHaveBeenCalledTimes(1);
+    } finally {
+      stderr.mockRestore();
+    }
   });
 
   it('lists and gives prompts', async () => {

@@ -24,9 +24,14 @@
  *
  * An answer is held to MAX_RESULT_CHARS: its result, the operation's own preview and what it would
  * also send are each cut to a fair share, and the answer says what was cut and how to see the rest.
+ *
+ * A warning is offered for sending again only with a confirm flag the operation lists (learnt from
+ * describe_operation), since the door accepts no other. The door's "slow down" (retryAfterSeconds)
+ * is told as a wait, never as a refusal of the work. describe_operation passes on the operation's
+ * worked examples.
  */
 import { WAITS_BUSY_CODE } from './client.mjs';
-import { ToolError } from './protocol.mjs';
+import { ToolError, slowDownAdvice } from './protocol.mjs';
 import { CLASS_MEANINGS, SETTING_MEANINGS, SHORT_GRANT_MINUTES, STANDING, STANDING_TEXT } from './guide.mjs';
 import { camelize, settle } from './write-tools.mjs';
 
@@ -304,11 +309,80 @@ export function holdToLimit(shaped, budget = MAX_RESULT_CHARS, opts = {}) {
 }
 
 /**
- * Run settle() on an answer that may be very long anywhere (its result, the operation's own
- * preview, what it would also send), then hold it to MAX_RESULT_CHARS (holdToLimit).
+ * The door's "slow down" given as an answer (lib/agent/contract.ts AgentOperationAnswer
+ * retryAfterSeconds, wave 4): too many calls in the last minute, or too many under way. It is not a
+ * refusal of the work, and nothing was done, so the agent is told to wait and send it again as it
+ * was, never to give up on it. Null for any other answer.
+ * @param {any} answer
+ * @returns {ToolError | null}
  */
-export function settleLong(/** @type {any} */ answer) {
-  return holdToLimit(settle(answer, { fields: 'confirm' }));
+export function slowDownOf(answer) {
+  if (!answer || typeof answer !== 'object' || answer.outcome !== 'refused') return null;
+  const seconds = Number(answer.retryAfterSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  const note = typeof answer.note === 'string' && answer.note.trim() ? answer.note.trim() : 'Ironbooks is busy with your other requests.';
+  return new ToolError(`Not now: ${/[.!?]$/.test(note) ? note : `${note}.`} ${slowDownAdvice(Math.min(Math.ceil(seconds), 3600))}`);
+}
+
+/**
+ * Run settle() on an answer that may be very long anywhere (its result, the operation's own
+ * preview, what it would also send), then hold it to MAX_RESULT_CHARS (holdToLimit). A "slow down"
+ * is answered as such (slowDownOf), not as a refusal. `opts`: how a warning's flag is sent again
+ * (mcp/write-tools.mjs resendWith): the operation's own confirm flags when they are known.
+ * @param {any} answer
+ * @param {{ fields?: string[] | 'confirm', confirm?: string[] }} [opts]
+ */
+export function settleLong(answer, opts = { fields: 'confirm' }) {
+  const slow = slowDownOf(answer);
+  if (slow) throw slow;
+  return holdToLimit(settle(answer, opts));
+}
+
+/**
+ * Per client, the confirm flags each operation lists, as describe_operation gave them, and the run
+ * of Ironbooks that gave them (client.run, the endpoint file's value: a new one each time Ironbooks
+ * starts). An update can change an operation's flags, so flags learnt from another run are dropped.
+ * @type {WeakMap<object, { run: unknown, flags: Map<string, string[]> }>}
+ */
+const flagsByClient = new WeakMap();
+/** At most this many operations' flags are kept per client (there are about 800). */
+const FLAGS_KEPT = 1000;
+
+/** The flags kept for `client`, emptied first when they came from another run of Ironbooks. */
+function keptFlags(/** @type {any} */ client) {
+  const run = client.run ?? null;
+  let kept = flagsByClient.get(client);
+  if (!kept || kept.run !== run) flagsByClient.set(client, (kept = { run, flags: new Map() }));
+  return kept.flags;
+}
+
+/** Keep an operation's confirm flags from its description, for run_operation's warnings. */
+function rememberFlags(/** @type {any} */ client, /** @type {any} */ d) {
+  if (!client || typeof client !== 'object' || !d || typeof d.id !== 'string' || !Array.isArray(d.confirmFlags)) return;
+  const kept = keptFlags(client);
+  if (kept.size >= FLAGS_KEPT && !kept.has(d.id)) kept.delete(/** @type {string} */ (kept.keys().next().value));
+  kept.set(d.id, d.confirmFlags.filter((/** @type {unknown} */ f) => typeof f === 'string'));
+}
+
+/**
+ * The confirm flags an operation lists (the only ones the door accepts with it), from an earlier
+ * describe_operation or by asking for its description now. Null when they cannot be learnt: the
+ * door's own note on the answer still says whether the warning can be accepted.
+ * @param {any} client @param {unknown} operation
+ * @returns {Promise<string[] | null>}
+ */
+async function confirmFlagsOf(client, operation) {
+  if (typeof operation !== 'string' || !operation) return null;
+  // Flags from this same run of Ironbooks only: after an update the operation may list others.
+  const known = client && typeof client === 'object' ? keptFlags(client).get(operation) : undefined;
+  if (known) return known;
+  try {
+    const d = await verb(client, 'describe_operation', { operation });
+    rememberFlags(client, d);
+    return Array.isArray(d?.confirmFlags) ? d.confirmFlags.filter((/** @type {unknown} */ f) => typeof f === 'string') : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,11 +432,39 @@ function howToRun(/** @type {any} */ d) {
   return `${parts.join(', ')}, and dry_run true first. Then the same again without dry_run, with a request_id${d.treatment === 'ask' ? ' and a reason' : ''}.`;
 }
 
+/** The most worked examples passed on from one description. */
+export const MAX_EXAMPLES = 10;
+
+const isMap = (/** @type {unknown} */ v) => !!v && typeof v === 'object' && !Array.isArray(v);
+const wordsOf = (/** @type {unknown} */ v) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 300) : undefined);
+
+/**
+ * One worked example of an operation (lib/agent/contract.ts OperationDescription.examples, wave 4:
+ * a whole request { params?, query?, body?, confirm?, reveal? } with an optional title or note),
+ * in the tool's words. The request parts keep their names: they are run_operation's own arguments.
+ * Null for an example that is not a request.
+ */
+function exampleRow(/** @type {unknown} */ e) {
+  if (!isMap(e)) return null;
+  const x = /** @type {Record<string, unknown>} */ (e);
+  const row = compact({
+    title: wordsOf(x.title) ?? wordsOf(x.describe) ?? wordsOf(x.summary),
+    note: wordsOf(x.note),
+    params: isMap(x.params) ? x.params : undefined,
+    query: isMap(x.query) ? x.query : undefined,
+    body: x.body,
+    confirm: Array.isArray(x.confirm) ? x.confirm.filter((f) => typeof f === 'string') : undefined,
+    reveal: x.reveal === true ? true : undefined,
+  });
+  return 'params' in row || 'query' in row || 'body' in row ? row : null;
+}
+
 /** describe_operation's answer, for the agent (lib/agent/contract.ts OperationDescription). */
 export function shapeDescription(/** @type {any} */ d) {
   if (!d || typeof d !== 'object' || !d.id) throw new ToolError('Ironbooks did not describe that operation. Check the id with find_operations.');
   const needsSecret = Array.isArray(d.needsSecret) ? d.needsSecret : [];
   const effects = Array.isArray(d.effects) ? d.effects : [];
+  const examples = (Array.isArray(d.examples) ? d.examples : []).map(exampleRow).filter((x) => x !== null).slice(0, MAX_EXAMPLES);
   return compact({
     operation: d.id,
     does: d.describe,
@@ -392,6 +494,12 @@ export function shapeDescription(/** @type {any} */ d) {
       : undefined,
     effects: effects.length ? effects.map((e) => EFFECT_WORDS[/** @type {keyof typeof EFFECT_WORDS} */ (e)] ?? e) : undefined,
     notes: d.notes,
+    examples: examples.length ? examples : undefined,
+    ...(examples.length
+      ? {
+          examples_mean: `Each example is a whole request: call run_operation with operation "${d.id}" and its params, query, body, confirm and reveal as shown (dry_run true first). Put in your own ids, dates and amounts; send a confirm flag only after a warning named it.`,
+        }
+      : {}),
     how_to_run: howToRun(d),
   });
 }
@@ -693,9 +801,13 @@ export const OPERATION_TOOLS = [
     name: 'describe_operation',
     title: 'Describe an operation',
     description:
-      'Everything needed to run one operation: its path parameters, the JSON Schema of its query and its body (in the app\'s own field names, camelCase), what it returns, whether it can be dry run, the warnings it may raise and their confirm flags, whether it needs a person\'s password or key (never yours to ask for), what it does outside the books, and how your policy treats it.',
+      'Everything needed to run one operation: its path parameters, the JSON Schema of its query and its body (in the app\'s own field names, camelCase), what it returns, whether it can be dry run, the warnings it may raise and their confirm flags, whether it needs a person\'s password or key (never yours to ask for), what it does outside the books, how your policy treats it, and worked examples where Ironbooks has them.',
     inputSchema: schema({ operation: OPERATION }, ['operation']),
-    handler: async (a, c) => shapeDescription(await verb(c, 'describe_operation', { operation: a.operation })),
+    handler: async (a, c) => {
+      const d = await verb(c, 'describe_operation', { operation: a.operation });
+      rememberFlags(c, d);
+      return shapeDescription(d);
+    },
   },
   {
     name: 'run_operation',
@@ -716,7 +828,8 @@ export const OPERATION_TOOLS = [
         query: {
           type: 'object',
           additionalProperties: {
-            anyOf: [{ type: 'string', maxLength: 2000 }, { type: 'array', maxItems: 200, items: { type: 'string', maxLength: 2000 } }],
+            // As many as the door takes (lib/agent/operate.ts runOperationArgs).
+            anyOf: [{ type: 'string', maxLength: 2000 }, { type: 'array', maxItems: 100, items: { type: 'string', maxLength: 2000 } }],
             anyOfHint: 'must be text, or a list of text',
           },
           maxProperties: 50,
@@ -755,6 +868,12 @@ export const OPERATION_TOOLS = [
       // a silence of Ironbooks may be that restart, so no second copy is started meanwhile.
       if (answer?.outcome === 'asked' && typeof answer.requestId === 'string') {
         c.noteRequest?.({ id: answer.requestId, operation: answer.operation ?? a.operation, status: answer.status ?? 'pending' });
+      }
+      // A warning's flag is offered for sending again only when the operation lists it: the door
+      // accepts no other flag with it, so any other warning is one to change the request for.
+      if (answer?.outcome === 'needs_confirmation') {
+        const flags = await confirmFlagsOf(c, typeof answer.operation === 'string' ? answer.operation : a.operation);
+        return settleLong(answer, flags ? { confirm: flags } : { fields: 'confirm' });
       }
       return settleLong(answer);
     },

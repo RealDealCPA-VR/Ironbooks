@@ -18,7 +18,7 @@ import { ToolError } from './protocol.mjs';
 import { WRITE_READ_TOOLS, WRITE_TOOLS } from './write-tools.mjs';
 import { BANKING_READ_TOOLS, BANKING_WRITE_TOOLS } from './banking-tools.mjs';
 import { ENTRY_TOOLS } from './entry-tools.mjs';
-import { DATE_PRESETS, REPORT_TOOLS, TXN_TYPES, shapeReport } from './report-tools.mjs';
+import { DATE_PRESETS, REPORT_TOOLS, TXN_TYPES, compactCollected, shapeReport } from './report-tools.mjs';
 import { OPERATION_TOOLS, REQUEST_TEMPLATE, REQUEST_URI_PREFIX, readRequestResource } from './operations-tools.mjs';
 import { FILE_TEMPLATE, FILE_TOOLS, FILE_URI_PREFIX, readFileResource } from './files-tools.mjs';
 import { GUIDE_PROMPT, GUIDE_PROMPT_NAME, GUIDE_RESOURCE, GUIDE_URI, guideContents, guidePrompt } from './guide.mjs';
@@ -422,6 +422,92 @@ export const READ_TOOLS = [
   },
 ];
 
+const isObject = (/** @type {unknown} */ v) => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/** Where the generic door's tools read one request by id (operations-tools.mjs getRequest). */
+const REQUEST_PATH = '/api/agent/requests/';
+
+/** One stand-in per client (collectingClient), so what operations-tools keeps per client stays together. */
+const collecting = new WeakMap();
+
+/**
+ * The client the generic door's tools are given. It makes an approved report read compact as the
+ * answer arrives, before operations-tools.mjs holds the answer to the connector's size limit
+ * (holdToLimit): the limit is then spent on the compact rows, so the agent sees as many rows as
+ * run_report shows for the same report, and row_count stays the report's own. Two answers are
+ * touched: a request read by id (wait_for_decision, the request's resource) and run_operation sent
+ * again with the request id it was asked under (the door's answer then says `replayed`); only a
+ * report or drill-down result in them changes (report-tools.mjs compactCollected). Everything else
+ * goes to the client and comes back as it is. The same stand-in is given for one client every time:
+ * operations-tools keeps an operation's confirm flags per client (describe_operation, then
+ * run_operation), and they must meet.
+ * @param {any} client
+ */
+function collectingClient(client) {
+  if (!client || typeof client !== 'object') return client;
+  let stand = collecting.get(client);
+  if (stand) return stand;
+  // A Proxy over an empty object, not over the client itself: its methods run on the client (state
+  // such as noteRequest's stays there), and a frozen client still works.
+  stand = new Proxy(
+    {},
+    {
+      get(_t, prop) {
+        if (prop === 'get' && typeof client.get === 'function') {
+          return async (/** @type {unknown} */ path, /** @type {unknown[]} */ ...rest) => {
+            const res = await client.get(path, ...rest);
+            if (typeof path !== 'string' || !path.startsWith(REQUEST_PATH) || !isObject(res) || !isObject(res.request)) return res;
+            const request = compactCollected(res.request);
+            return request === res.request ? res : { ...res, request };
+          };
+        }
+        if (prop === 'act' && typeof client.act === 'function') {
+          return async (/** @type {any} */ request) => {
+            const answer = await client.act(request);
+            return request?.verb === 'run_operation' && isObject(answer) && answer.replayed === true ? compactCollected(answer, request.operation) : answer;
+          };
+        }
+        const v = client[prop];
+        return typeof v === 'function' ? v.bind(client) : v;
+      },
+      has: (_t, prop) => prop in client,
+    },
+  );
+  collecting.set(client, stand);
+  return stand;
+}
+
+/**
+ * A report read a person approved (asked for with run_operation, as run_report and report_drilldown
+ * advise when reports are set to Ask) comes back in the shape those tools give, wherever the agent
+ * collects it: wait_for_decision, run_operation sent again with the request id it was asked under
+ * (its answer then says `repeated`), and the request's resource (collectedContents, below). It is
+ * made compact before the answer is held to its size limit (collectingClient); after that,
+ * compactCollected runs again to say inside the result what the limit cut, if anything. A read
+ * run_operation does at once keeps the app's own shape, as everything run_operation answers does.
+ * Anything else these tools answer passes as it is (compactCollected changes only a report or
+ * drill-down result).
+ * @param {import('./protocol.mjs').Tool} tool
+ * @returns {import('./protocol.mjs').Tool}
+ */
+function collectingReads(tool) {
+  /** @type {import('./protocol.mjs').Tool['handler']} */
+  const handler = (a, c, s) => tool.handler(a, collectingClient(c), s);
+  if (tool.name === 'wait_for_decision') {
+    return { ...tool, handler: async (a, c, s) => compactCollected(await handler(a, c, s)) };
+  }
+  if (tool.name === 'run_operation') {
+    return {
+      ...tool,
+      handler: async (a, c, s) => {
+        const out = await handler(a, c, s);
+        return out && typeof out === 'object' && /** @type {any} */ (out).repeated === true ? compactCollected(out, a.operation) : out;
+      },
+    };
+  }
+  return { ...tool, handler };
+}
+
 /**
  * Every tool: the reads (with every standard report, report-tools.mjs), the tools that change the
  * books (write-tools.mjs, banking-tools.mjs, and entry-tools.mjs over the generic door), then the
@@ -438,7 +524,7 @@ export const TOOLS = [
   ...WRITE_TOOLS,
   ...BANKING_WRITE_TOOLS,
   ...ENTRY_TOOLS,
-  ...OPERATION_TOOLS,
+  ...OPERATION_TOOLS.map(collectingReads),
   ...FILE_TOOLS,
 ];
 
@@ -448,12 +534,34 @@ export const INSTRUCTIONS = [
   'Before entering anything, look: use find_transactions or search to make sure it is not already there, and list_accounts, list_customers or list_vendors for the ids you need.',
   'Every standard report (about 100) is list_reports, then run_report; report_drilldown lists the transactions behind an amount, and export_report makes the report a PDF or Excel file.',
   'The named tools cover everyday bookkeeping: invoices, bills, payments, checks, deposits, estimates, purchase orders, receiving items, credit memos, vendor credits, time, inventory adjustments, sales tax, bank statements and reconciling. For anything else (1099s, paystubs, the audit trail, emailing a form, budgets …), find_operations, then describe_operation, then run_operation: every operation a person can do in Ironbooks has an id.',
-  'Every tool that changes the books takes dry_run and request_id. dry_run true checks the change and shows what it would post, without keeping anything: use it whenever you are not sure. request_id is your own name for one change; asking again with the same request_id never does it twice, so repeat a request with the SAME request_id after a timeout, and use a NEW one for each new change.',
+  'Every tool that changes the books takes dry_run, request_id and reason. dry_run true checks the change and shows what it would post, without keeping anything: use it whenever you are not sure. request_id is your own name for one change; asking again with the same request_id never does it twice, so repeat a request with the SAME request_id after a timeout, and use a NEW one for each new change. reason is one plain sentence saying why you want it: a person who must approve it reads it on the approval card.',
   'When an answer says "asked", a person must approve it in Ironbooks: call wait_for_decision with its request_id, and do not send it again. "needs_confirmation" is a warning a person would have been asked about: go ahead only if it is right, as the answer says. "Refused" means stop.',
+  'When you edit, void or make something inactive, send the updated_at you read (get_transaction; for an account or an item, its edited_at) as expected_updated_at. A 409 (conflict) then means someone changed the record after you read it, and nothing was changed: read it again and make your change on what it says now.',
   'The named tools never delete: a mistake is voided (void_transaction) or corrected (edit_transaction). Deleting for good, closed-period work and settings always need a person; sending anything outside this computer does too, unless a person gave you a short standing permission for it. Dates are YYYY-MM-DD and amounts are text with two decimals ("1250.00").',
   'Never ask the person for a password, code or key, and never send one: when an operation needs one, the person types it on their own screen.',
   'If a tool says Ironbooks is not ready, the person needs to open the company file in Ironbooks and sign in. If Ironbooks stops answering, it may be restarting: wait a minute, then read what you need again.',
 ].join(' ');
+
+/**
+ * One request read as a resource, with an approved report read in run_report's shape, as
+ * wait_for_decision gives it (collectingReads: made compact as it arrives, then what the size
+ * limit cut said inside the result). A text that is not JSON passes as it is.
+ * @param {Array<{ uri: string, mimeType?: string, text?: string }> | null} contents
+ */
+function collectedContents(contents) {
+  if (!Array.isArray(contents)) return contents;
+  return contents.map((part) => {
+    if (typeof part?.text !== 'string') return part;
+    let request;
+    try {
+      request = JSON.parse(part.text);
+    } catch {
+      return part;
+    }
+    const shaped = compactCollected(request);
+    return shaped === request ? part : { ...part, text: JSON.stringify(shaped) };
+  });
+}
 
 /** The resources this server serves: the guide, and (by template) the agent's requests and files. */
 export const RESOURCES = {
@@ -462,7 +570,7 @@ export const RESOURCES = {
   /** @param {string} uri @param {any} client */
   read: async (uri, client) => {
     if (uri === GUIDE_URI) return guideContents();
-    if (uri.startsWith(REQUEST_URI_PREFIX)) return readRequestResource(uri, client);
+    if (uri.startsWith(REQUEST_URI_PREFIX)) return collectedContents(await readRequestResource(uri, collectingClient(client)));
     if (uri.startsWith(FILE_URI_PREFIX)) return readFileResource(uri, client);
     return null;
   },

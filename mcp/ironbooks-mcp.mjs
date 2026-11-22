@@ -25,8 +25,12 @@ import { IronbooksClient } from './client.mjs';
 import { createServer, serve } from './protocol.mjs';
 import { INSTRUCTIONS, PROMPTS, RESOURCES, TOOLS } from './tools.mjs';
 
-/** 1.2.0: the entry tools (estimates, purchase orders, receiving, credits, time, inventory, sales tax) and every report by key. */
-export const SERVER_INFO = { name: 'ironbooks', version: '1.2.0' };
+/**
+ * 1.2.0: the entry tools (estimates, purchase orders, receiving, credits, time, inventory, sales tax) and every report by key.
+ * 1.3.0: every tool that changes the books takes a reason for the approval card; edits, voids and
+ * making inactive send the version last read; an approved report read comes back as run_report gives it.
+ */
+export const SERVER_INFO = { name: 'ironbooks', version: '1.3.0' };
 
 /** The server as shipped: the tools, the guide (resource and prompt), the agent's requests and files. */
 export function createIronbooksServer(client) {

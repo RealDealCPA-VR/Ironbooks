@@ -8,11 +8,15 @@
  * which policy cells can be Allow are decided by the services (lib/services/agentRequests.ts,
  * agentGrants.ts, agentPolicies.ts), which have the last word. Making an agent (POST /api/agents)
  * keeps its schema in lib/validation/agents.ts.
+ *
+ * What they answer is read by a person (or an agent), so every refusal is in plain words: a field
+ * the request does not take is named, a choice lists what it may be, never zod's own
+ * "Unrecognized key(s)" or "Invalid enum value".
  */
 import { z } from 'zod';
 import { AREA_KEYS, type Area } from '@/lib/permissions/model';
 import { AGENT_PRESETS, POLICY_SETTINGS, REQUEST_STATUSES, RISK_CLASSES, type SecretKind } from '@/lib/agent/operations/types';
-import { parseDateInput, zUuid } from './helpers';
+import { parseDateInput } from './helpers';
 
 // ---------------------------------------------------------------------------
 // Small pieces
@@ -36,17 +40,49 @@ const SECRET_KIND_SET: Record<SecretKind, true> = {
 };
 export const SECRET_KINDS = Object.keys(SECRET_KIND_SET) as [SecretKind, ...SecretKind[]];
 
-const AREA_ENUM = z.enum(AREA_KEYS as [Area, ...Area[]]);
+/** Most field names a refusal of unknown fields names; each is cut short (they are the caller's text). */
+const UNKNOWN_SHOWN = 3;
+const UNKNOWN_NAME_MAX = 40;
+
+/**
+ * The plain words for an object's own refusals. A field it does not take is named ("Ironbooks does
+ * not take "approveEverything" here."), and a value that is not an object at all says to reload:
+ * the window builds these bodies, so a wrong shape means the page is older than the server.
+ */
+export const plainObjectErrors: z.ZodErrorMap = (issue, ctx) => {
+  if (issue.code === z.ZodIssueCode.unrecognized_keys) {
+    const names = issue.keys.slice(0, UNKNOWN_SHOWN).map((k) => `"${k.slice(0, UNKNOWN_NAME_MAX)}"`);
+    const more = issue.keys.length > UNKNOWN_SHOWN ? ` and ${issue.keys.length - UNKNOWN_SHOWN} more` : '';
+    const it = issue.keys.length > 1 ? 'them' : 'it';
+    return { message: `Ironbooks does not take ${names.join(', ')}${more} here. Leave ${it} out and try again.` };
+  }
+  if (issue.code === z.ZodIssueCode.invalid_type) {
+    return { message: issue.received === 'undefined' ? 'is required' : 'is not in the form Ironbooks expects. Reload the page and try again.' };
+  }
+  return { message: ctx.defaultError };
+};
+
+/** One of a fixed list of words, refused in plain words with the list. */
+function zOneOf<T extends string>(values: readonly [T, ...T[]]) {
+  return z.enum(values as [T, ...T[]], { errorMap: () => ({ message: `must be one of: ${values.join(', ')}` }) });
+}
+
+const AREA_ENUM = zOneOf(AREA_KEYS as [Area, ...Area[]]);
+
+/** The id of a record (lib/validation/helpers.ts zUuid), refused in plain words. */
+const zId = z
+  .string({ invalid_type_error: 'must be the id of a record, as Ironbooks gives it' })
+  .uuid('must be the id of a record, as Ironbooks gives it')
+  .describe('Id (a uuid) of an existing record.');
 
 /** Longest note a person can leave an agent, and longest typed secret. */
 export const NOTE_MAX = 1000;
 const SECRET_MAX = 1000;
 /**
- * Most requests one batch approval takes (each is still approved and reported on its own). POST
- * /api/agent-requests/batch-approve refuses more through batchApproveSchema, and the approval
- * center reads it from here (app/agent-requests/words.ts BATCH_MAX). The service
- * (lib/services/agentRequests.ts) still keeps a copy of its own, BATCH_MAX, until it imports this
- * one: test/agentRequestsApi.test.ts holds the two to the same number meanwhile.
+ * Most requests one batch approval takes (each is still approved and reported on its own), the one
+ * number for it: POST /api/agent-requests/batch-approve refuses more through batchApproveSchema,
+ * the service (lib/services/agentRequests.ts batchApprove) imports it from here, and so does the
+ * approval center (app/agent-requests/words.ts BATCH_MAX).
  */
 export const BATCH_APPROVE_MAX = 100;
 /** Longest standing permission the form can ask for; the service holds it to the class's own limit. */
@@ -72,9 +108,29 @@ const zNote = z
   .nullish()
   .transform((v) => (v ? v : null));
 
+/** A whole number from min to max, in plain words. */
+function zWhole(min: number, max: number, unit: string) {
+  return z
+    .number({ invalid_type_error: `must be a whole number of ${unit}` })
+    .int(`must be a whole number of ${unit}`)
+    .min(min, `must be at least ${min}`)
+    .max(max, `can be at most ${max}`);
+}
+
 /** A query value: blank counts as left out, so "?status=" is the same as no status. */
 function queryValue<T extends z.ZodTypeAny>(schema: T) {
   return z.preprocess((v) => (v === '' ? undefined : v), schema.optional());
+}
+
+/** A whole number in a query ("?limit=50"), from 1 to max. */
+function queryLimit(max: number) {
+  return queryValue(
+    z.coerce
+      .number({ invalid_type_error: 'must be a number' })
+      .int('must be a whole number')
+      .min(1, 'must be at least 1')
+      .max(max, `can be at most ${max}`),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -83,58 +139,102 @@ function queryValue<T extends z.ZodTypeAny>(schema: T) {
 
 /** GrantConstraints (lib/agent/operations/types.ts): every field the approver ticked must match. */
 export const grantConstraintsSchema = z
-  .object({
-    entityIds: z.array(zUuid).max(200).optional(),
-    accountIds: z.array(zUuid).max(200).optional(),
-    maxAmount: zAmountText.optional(),
-    dateFrom: zDay.optional(),
-    dateTo: zDay.optional(),
-    maxUses: z.number().int().min(1).max(10_000).optional(),
-    maxCount: z.number().int().min(1).max(100_000).optional(),
-  })
+  .object(
+    {
+      entityIds: z.array(zId, { invalid_type_error: 'must be a list of record ids' }).max(200, 'can name at most 200 records').optional(),
+      accountIds: z.array(zId, { invalid_type_error: 'must be a list of account ids' }).max(200, 'can name at most 200 accounts').optional(),
+      maxAmount: zAmountText.optional(),
+      dateFrom: zDay.optional(),
+      dateTo: zDay.optional(),
+      maxUses: zWhole(1, 10_000, 'uses').optional(),
+      maxCount: zWhole(1, 100_000, 'records').optional(),
+    },
+    { errorMap: plainObjectErrors },
+  )
   .strict()
   .refine((c) => !c.dateFrom || !c.dateTo || c.dateFrom <= c.dateTo, {
     message: 'the first date must be on or before the last one',
     path: ['dateTo'],
   });
 
+/**
+ * What the approver typed on the card, by kind. A box left empty is the same as one not sent and is
+ * dropped here: a secret the route treats as optional (ApprovalNeeds.optionalSecrets, wave 4: the
+ * sign-in of another company file for a restore, which a backup of this same file does not need)
+ * may be left empty, and the run goes ahead without it. Which secrets a request cannot do without
+ * is the request's, not the body's, and the service judges it (lib/services/agentRequests.ts
+ * checkTypedSecrets; what it covers is in app/api/agent-requests/[id]/approve/route.ts). A typed
+ * value is kept exactly as typed, spaces and all, and is never echoed in a refusal (only the kind's
+ * name is).
+ */
+const zTypedSecrets = z
+  .record(
+    z.enum(SECRET_KINDS, { errorMap: () => ({ message: 'is not something an approval card asks you to type' }) }),
+    z.string({ invalid_type_error: 'must be text' }).max(SECRET_MAX, 'is too long'),
+    { errorMap: plainObjectErrors },
+  )
+  .transform((typed) => {
+    const out: Partial<Record<SecretKind, string>> = {};
+    for (const [kind, value] of Object.entries(typed) as Array<[SecretKind, string | undefined]>) {
+      if (typeof value === 'string' && value.length > 0) out[kind] = value;
+    }
+    return out;
+  });
+
 /** ApproveInput (lib/agent/contract.ts). Every field is optional: "Approve once" sends nothing. */
 export const approveRequestSchema = z
-  .object({
-    /** Typed on the card, for this one run. Never stored, never echoed in an error. */
-    secrets: z.record(z.enum(SECRET_KINDS), z.string().min(1, 'is empty').max(SECRET_MAX, 'is too long')).optional(),
-    grant: z
-      .object({
-        minutes: z.number().int().min(1, 'must be at least 1 minute').max(GRANT_MINUTES_MAX, 'can be at most a day'),
-        constraints: grantConstraintsSchema,
-      })
-      .strict()
-      .nullish(),
-    acceptStale: z.boolean().optional(),
-    answers: z.record(z.string().min(1).max(100), z.unknown()).optional(),
-    note: zNote,
-  })
+  .object(
+    {
+      /** Typed on the card, for this one run. Never stored, never echoed in an error. */
+      secrets: zTypedSecrets.optional(),
+      grant: z
+        .object(
+          {
+            minutes: z
+              .number({ invalid_type_error: 'must be a whole number of minutes', required_error: 'say how many minutes it lasts' })
+              .int('must be a whole number of minutes')
+              .min(1, 'must be at least 1 minute')
+              .max(GRANT_MINUTES_MAX, 'can be at most a day'),
+            constraints: grantConstraintsSchema,
+          },
+          { errorMap: plainObjectErrors },
+        )
+        .strict()
+        .nullish(),
+      acceptStale: z.boolean({ invalid_type_error: 'must be true or false' }).optional(),
+      answers: z
+        .record(z.string().min(1, 'names no question').max(100, 'names a question Ironbooks does not know'), z.unknown(), {
+          errorMap: plainObjectErrors,
+        })
+        .optional(),
+      note: zNote,
+    },
+    { errorMap: plainObjectErrors },
+  )
   .strict();
 
 /** POST /api/agent-requests/[id]/deny { note? } */
-export const denyRequestSchema = z.object({ note: zNote }).strict();
+export const denyRequestSchema = z.object({ note: zNote }, { errorMap: plainObjectErrors }).strict();
 
 /** POST /api/agent-requests/batch-approve { ids } (asked twice is approved once). */
 export const batchApproveSchema = z
-  .object({
-    ids: z
-      .array(zUuid, { required_error: 'choose the requests to approve', invalid_type_error: 'must be a list of request ids' })
-      .min(1, 'choose at least one request')
-      .max(BATCH_APPROVE_MAX, `can be at most ${BATCH_APPROVE_MAX} requests at once`),
-  })
+  .object(
+    {
+      ids: z
+        .array(zId, { required_error: 'choose the requests to approve', invalid_type_error: 'must be a list of request ids' })
+        .min(1, 'choose at least one request')
+        .max(BATCH_APPROVE_MAX, `can be at most ${BATCH_APPROVE_MAX} requests at once`),
+    },
+    { errorMap: plainObjectErrors },
+  )
   .strict()
   .transform((b) => ({ ids: [...new Set(b.ids)] }));
 
 /** GET /api/agent-requests?status=&agentId=&limit= */
 export const personRequestListQuerySchema = z.object({
-  status: queryValue(z.enum([...REQUEST_STATUSES, 'all'] as const)),
-  agentId: queryValue(zUuid),
-  limit: queryValue(z.coerce.number().int().min(1).max(500)),
+  status: queryValue(zOneOf([...REQUEST_STATUSES, 'all'] as const)),
+  agentId: queryValue(zId),
+  limit: queryLimit(500),
 });
 
 // ---------------------------------------------------------------------------
@@ -143,8 +243,8 @@ export const personRequestListQuerySchema = z.object({
 
 /** GET /api/agent/requests?status=&limit= */
 export const agentRequestListQuerySchema = z.object({
-  status: queryValue(z.enum(REQUEST_STATUSES)),
-  limit: queryValue(z.coerce.number().int().min(1).max(200)),
+  status: queryValue(zOneOf(REQUEST_STATUSES)),
+  limit: queryLimit(200),
 });
 
 /**
@@ -161,24 +261,43 @@ export const agentRequestWaitQuerySchema = z.object({
 
 /** One Allow / Ask / Never cell of the policy grid, for a class, in one area or everywhere (null). */
 export const policyOverrideSchema = z
-  .object({
-    class: z.enum(RISK_CLASSES),
-    area: AREA_ENUM.nullish().transform((v) => v ?? null),
-    setting: z.enum(POLICY_SETTINGS),
-  })
+  .object(
+    {
+      class: zOneOf(RISK_CLASSES),
+      area: AREA_ENUM.nullish().transform((v) => v ?? null),
+      setting: zOneOf(POLICY_SETTINGS),
+    },
+    { errorMap: plainObjectErrors },
+  )
   .strict();
 
 /** PATCH /api/agents/[id]: AgentPolicyInput (lib/agent/contract.ts). `overrides` replaces every stored one. */
 export const agentPolicySchema = z
-  .object({
-    preset: z.enum(AGENT_PRESETS).optional(),
-    overrides: z.array(policyOverrideSchema).max(RISK_CLASSES.length * (AREA_KEYS.length + 1)).optional(),
-    bulkCap: z.number().int().min(1, 'must be at least 1').max(100_000).nullable().optional(),
-    twoPersonOver: zAmountText.nullable().optional(),
-    requestExpiryDays: z.number().int().min(1, 'must be at least 1 day').max(365, 'can be at most 365 days').optional(),
-    folders: z.array(z.string().trim().min(1, 'is empty').max(1000)).max(50).optional(),
-    notifyEmail: z.boolean().optional(),
-  })
+  .object(
+    {
+      preset: zOneOf(AGENT_PRESETS).optional(),
+      overrides: z
+        .array(policyOverrideSchema, { invalid_type_error: 'must be a list of settings' })
+        .max(RISK_CLASSES.length * (AREA_KEYS.length + 1), 'has more settings than the grid has cells')
+        .optional(),
+      bulkCap: zWhole(1, 100_000, 'records').nullable().optional(),
+      twoPersonOver: zAmountText.nullable().optional(),
+      requestExpiryDays: z
+        .number({ invalid_type_error: 'must be a whole number of days' })
+        .int('must be a whole number of days')
+        .min(1, 'must be at least 1 day')
+        .max(365, 'can be at most 365 days')
+        .optional(),
+      folders: z
+        .array(z.string({ invalid_type_error: 'must be a folder path' }).trim().min(1, 'is empty').max(1000, 'is too long'), {
+          invalid_type_error: 'must be a list of folders',
+        })
+        .max(50, 'can be at most 50 folders')
+        .optional(),
+      notifyEmail: z.boolean({ invalid_type_error: 'must be true or false' }).optional(),
+    },
+    { errorMap: plainObjectErrors },
+  )
   .strict()
   .superRefine((b, ctx) => {
     const seen = new Set<string>();
@@ -192,14 +311,19 @@ export const agentPolicySchema = z
   });
 
 /** POST /api/agents/[id]/pause and POST /api/agents/pause-all: { paused } */
-export const pauseAgentsSchema = z.object({ paused: z.boolean({ required_error: 'say paused: true or false' }) }).strict();
+export const pauseAgentsSchema = z
+  .object(
+    { paused: z.boolean({ required_error: 'say paused: true or false', invalid_type_error: 'say paused: true or false' }) },
+    { errorMap: plainObjectErrors },
+  )
+  .strict();
 
 /** GET /api/agents/[id]/grants?live= (live only unless live=0 or false). */
 export const agentGrantsQuerySchema = z.object({
-  live: queryValue(z.enum(['1', '0', 'true', 'false'])),
+  live: queryValue(zOneOf(['1', '0', 'true', 'false'] as const)),
 });
 
 /** GET /api/agents/[id]/activity?limit= (at most 200). */
 export const agentActivityQuerySchema = z.object({
-  limit: queryValue(z.coerce.number().int().min(1).max(200)),
+  limit: queryLimit(200),
 });

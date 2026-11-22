@@ -27,6 +27,7 @@ import { and, eq } from 'drizzle-orm';
 import { csvUnsafeText } from '@/lib/csv';
 import { refreshPlannerStats } from '@/lib/db/plannerStats';
 import { bankAccounts, bankTransactions, fileImports } from '@/lib/db/schema';
+import { currentEffectsMode } from '@/lib/effects';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { listRules, matchRule } from './rules';
@@ -1130,8 +1131,15 @@ export async function importTransactions(
   // Auto-posting (AI & Automation, on by default for new companies): the lines the learned
   // categorizer is sure enough about are posted now, each logged and undoable. Best effort — the
   // import itself is done; the rest wait in Bank Review as usual.
+  //
+  // Not for an agent's import, which only stages the lines, as the agent's statement import does
+  // (lib/agent/banking.ts): entering them is a separate step a person can see and approve. So an
+  // agent's rolled-back preview (effects captured, lib/effects.ts) and its real run do the same
+  // thing, and neither loads the AI settings, whose loading looks the saved *.ts.net AI addresses
+  // up in DNS. Any other rolled-back preview skips it too, for the same reason.
   let autoPosted = 0;
-  if (importedCount > 0 && !input.skipAutoPost) {
+  const autoPostHere = !input.skipAutoPost && !ctx.agent && currentEffectsMode() !== 'capture';
+  if (importedCount > 0 && autoPostHere) {
     try {
       const { loadSettings } = await import('./aiSettings');
       if ((await loadSettings(ctx)).autoApplyEnabled) {

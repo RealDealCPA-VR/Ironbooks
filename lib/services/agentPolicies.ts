@@ -81,7 +81,7 @@ import type {
   PauseAllAgents,
   SaveAgentPolicy,
 } from '@/lib/agent/contract';
-import { allowedFolder, stagedFilesRoot } from '@/lib/agent/files';
+import { allowedFolder, appDataPlaces, isThisComputerShare, overlapsAppData, stagedFilesRoot } from '@/lib/agent/files';
 import { endpointDir } from '@/lib/agent/endpointFile';
 // The scope module, not lib/context.ts: it holds no database or service imports, so the agent's
 // door can import this module without a cycle through lib/context.ts.
@@ -126,6 +126,8 @@ const PAUSE_ALL_FOR_ADMIN =
 const PRESET_CHOICE =
   'Choose what the agent may do: Read only, Ask for every change, Trusted bookkeeper or Full, with asks.';
 const SAY_PAUSED = 'Say whether to pause (true) or turn back on (false).';
+const FOLDERS_CHANGED =
+  "This agent's folders were changed by someone else while you were saving. Open the agent again and save once more.";
 
 // ---------------------------------------------------------------------------
 // Who may do what
@@ -655,10 +657,15 @@ function within(child: string, parent: string): boolean {
   return c === p || c.startsWith(p.endsWith(path.sep) ? p : p + path.sep);
 }
 
-/** Each path as written and, where it exists, with links resolved. */
+/**
+ * Each path as written and, where it exists, with links resolved. A network path is kept as
+ * written only: looking at it would offer this person's sign-in to that server (a backup folder
+ * chosen on a share, say), and its words are what a folder is compared with.
+ */
 function withLinks(list: string[]): string[] {
   const out = [...list];
   for (const p of list) {
+    if (isSharePath(p)) continue;
     try {
       out.push(fs.realpathSync.native(p));
     } catch {
@@ -675,12 +682,17 @@ function withLinks(list: string[]): string[] {
  * the books.
  */
 function booksPlaces(): string[] {
+  return withLinks(booksPlacesAsWritten());
+}
+
+/** booksPlaces as written, nothing looked at on the disk (for a folder judged by its words: keptFolderRefusal). */
+function booksPlacesAsWritten(): string[] {
   const out = [resolveDataDir()];
   const state = process.env.BKA_COMPANY_STATE;
   if (state) out.push(path.dirname(path.resolve(state)));
   const file = process.env.BKA_COMPANY_FILE;
   if (file) out.push(path.resolve(file));
-  return withLinks(out);
+  return out;
 }
 
 /**
@@ -696,20 +708,37 @@ const APP_FOLDER_NAMES = ['Ironbooks', 'ironbooks', 'BookKeeper AI', 'bookkeeper
  * sealed device secret), its local folder (working copies of company files, sandboxes) and the
  * backup folders this computer writes to. Each holds a copy of the books, another agent's files or
  * the app's own state, so an agent's folder may be none of them, inside none of them and hold none
- * of them, as for the books.
+ * of them, as for the books. Every place lib/agent/files.ts appDataPlaces names is one of them too
+ * (the copies Ironbooks writes beside the books and the company file, the real books while a
+ * practice copy is open), so this list and its overlapsAppData never disagree about a stored folder.
  */
 function ironbooksPlaces(): string[] {
+  // Where staged files really are (lib/agent/files.ts decides: the open file's working folder, or
+  // this computer's local app data). Null when that setup is refused and nothing is kept; the
+  // usual places are in the rest either way.
+  const staged = stagedFilesRoot();
+  return withLinks([...(staged ? [staged] : []), ...ironbooksPlacesAsWritten()]);
+}
+
+/**
+ * ironbooksPlaces as written, nothing looked at on the disk (for a folder judged by its words:
+ * keptFolderRefusal). Where staged files really are is left out, since finding it looks at the
+ * disk; appDataPlaces names every place it can be, by the words.
+ */
+function ironbooksPlacesAsWritten(): string[] {
   const env = process.env;
   const home = os.homedir();
   const out: string[] = [];
-  // Where staged files really are (lib/agent/files.ts decides: the open file's working folder, or
-  // this computer's local app data). Null when that setup is refused and nothing is kept; the
-  // usual places are below either way.
-  const staged = stagedFilesRoot();
-  if (staged) out.push(staged);
   out.push(endpointDir());
   if (env.IRONBOOKS_USER_DATA) out.push(path.resolve(env.IRONBOOKS_USER_DATA));
   if (env.BKA_SANDBOX_ROOT) out.push(path.resolve(env.BKA_SANDBOX_ROOT));
+  // Practice copies (whole plain copies of the books) where lib/services/sandbox.ts sandboxRoot keeps
+  // them when the shell names no folder: beside the real books' data folder (the browser version).
+  // Not imported from there: that module loads the company-file and protection code.
+  for (const dataDir of [resolveDataDir(), env.BKA_SANDBOX_REAL_DIR?.trim() || null]) {
+    if (dataDir) out.push(path.join(path.dirname(path.resolve(dataDir)), 'Ironbooks Sandboxes'));
+  }
+  out.push(...appDataPlaces());
   // Every company file's working folder, not only the open one's: they all sit in one folder
   // (electron/companySession.js workingRoot), the one that holds the open file's working folder.
   const state = env.BKA_COMPANY_STATE?.trim();
@@ -730,7 +759,7 @@ function ironbooksPlaces(): string[] {
   }
   for (const name of APP_FOLDER_NAMES) out.push(path.join(settingsParent, name));
   out.push(...backupFoldersHere(), preOpFolder());
-  return withLinks(out);
+  return out;
 }
 
 /**
@@ -846,45 +875,157 @@ function storedFolders(row: AgentRow): string[] {
   return Array.isArray(row.folders) ? row.folders.filter((f): f is string => typeof f === 'string' && f.trim() !== '') : [];
 }
 
+/** A share of this very computer (\\localhost\c$\…, its own name or address): say what to type instead. */
+function thisComputerShareRefusal(typed: string): ServiceError {
+  return validation(
+    `"${shown(typed, 200)}": that folder is on this computer, reached as a network share. Type its own path on this computer instead, like ${EXAMPLE_FOLDER}.`,
+  );
+}
+
 /**
- * The folders as they will be used: full paths of folders that exist on this computer, links
- * resolved the way the save check resolves them (allowedFolder in lib/agent/files.ts), each once.
+ * A local-looking path that the disk answers as a share of this very computer (a drive letter
+ * mapped to \\localhost\c$): allowedFolder refuses it, and the person should hear why rather than
+ * "not found". Asked only of a path with no link along it (see checkFolders).
  */
-async function checkFolders(list: string[]): Promise<string[]> {
-  const books = booksPlaces();
-  const own = ironbooksPlaces();
-  const out: string[] = [];
+function reachedAsThisComputerShare(p: string): boolean {
+  try {
+    return isThisComputerShare(fs.realpathSync.native(p));
+  } catch {
+    return false;
+  }
+}
+
+function booksFolderRefusal(typed: string): ServiceError {
+  return validation(
+    `The folder "${shown(typed, 200)}" holds the company file or its working data, or is inside them. Choose another folder for the agent.`,
+  );
+}
+
+function ownFolderRefusal(typed: string): ServiceError {
+  return validation(
+    `The folder "${shown(typed, 200)}" is one of the folders Ironbooks keeps its own data in (settings, working copies, backups or agents' files), or is inside or holds one. Choose another folder for the agent.`,
+  );
+}
+
+/**
+ * Why a folder the agent already has would be refused were it new today, judged by its words
+ * alone against the places as written (booksPlacesAsWritten, ironbooksPlacesAsWritten), or null.
+ * The disk is never asked about it (see checkFolders): it may be gone, on a drive that is
+ * unplugged or behind a link to a share that is offline. So this catches a folder an older
+ * version took before a rule existed (the condense archives, the practice copies), and one that has
+ * since come to hold the open company file or a chosen backups folder; what it misses through a link
+ * is left to where the folder is used. A folder that is not a full path is left alone: it reaches
+ * nothing where folders are used.
+ */
+function keptFolderRefusal(folder: string, books: string[], own: string[]): ServiceError | null {
+  if (!looksAbsolute(folder)) return null;
+  if (isThisComputerShare(folder)) return thisComputerShareRefusal(folder);
+  if (isRootByWords(folder)) return wholeDriveRefusal(folder);
+  if (touchesOwnPlaces(folder, books)) return booksFolderRefusal(folder);
+  if (touchesOwnPlaces(folder, own)) return ownFolderRefusal(folder);
+  return null;
+}
+
+/**
+ * What checkFolders found: the list to store, which of it the agent already had (taken
+ * unlooked-at), and the folders it had that were sent back but are taken away (why: the reason a
+ * person would be given), for a person who is not an Admin.
+ */
+interface CheckedFolders {
+  folders: string[];
+  kept: string[];
+  dropped: Array<{ folder: string; why: string }>;
+}
+
+/**
+ * The folders as they will be used, each once.
+ *
+ * A folder the agent already has (one of `had`, the stored list, the same by samePathKey) is kept
+ * as it is stored and never looked at again on the disk, whatever it is today: deleted, on a drive
+ * that is unplugged, a share that is offline. Keeping a folder lets the agent do nothing more, and a
+ * person who only takes folders away must never be stopped by, or told to make, one they kept. Its
+ * words are still held to the rules below (keptFolderRefusal): one an older version took before a
+ * rule existed, or that has since come to hold the books or Ironbooks' own data, is not written back
+ * unremarked. An Admin is told, as for a new folder, and removes it; for anyone else it is taken
+ * away (a tightening, which anyone who manages agents may make) and the audit row says so, so a
+ * person who is only tightening is never blocked by it. (What a kept folder still reaches is decided
+ * when it is used: allowedFolder skips a whole drive, a share of this computer and a folder that is
+ * gone.)
+ *
+ * Every other folder is new in this save. It must be the full path of a folder that exists on this
+ * computer, and is taken with links resolved the way the save check resolves them (allowedFolder in
+ * lib/agent/files.ts). It is refused, with what to do instead, when it is a share of this very
+ * computer (isThisComputerShare: even its own folder, \\localhost\c$, is told to type the path on
+ * this computer), a whole drive or share, or when it is, lies inside or holds one of the books' or
+ * Ironbooks' own folders: the company file and its working data (booksPlaces), and every place
+ * Ironbooks keeps its own data or copies of the books (ironbooksPlaces, and overlapsAppData of
+ * lib/agent/files.ts, the same check the other units make): reading there would hand the agent the
+ * whole books unmasked, another agent's files or the app's own state.
+ */
+async function checkFolders(list: string[], had: readonly string[], isAdmin: boolean): Promise<CheckedFolders> {
+  const stored = new Map(had.map((h) => [samePathKey(h), h]));
+  // Worked out at the first folder that needs them only. The places with links resolved look at
+  // the disk, so a save that sends only folders the agent already has (judged against the places
+  // as written) looks at nothing there.
+  let books: string[] | null = null;
+  let own: string[] | null = null;
+  let booksWords: string[] | null = null;
+  let ownWords: string[] | null = null;
+  const out: CheckedFolders = { folders: [], kept: [], dropped: [] };
   const seen = new Set<string>();
+  const add = (p: string): boolean => {
+    const key = samePathKey(p);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    out.folders.push(p);
+    return true;
+  };
   for (const typed of list) {
+    const already = stored.get(samePathKey(typed));
+    if (already !== undefined) {
+      booksWords ??= booksPlacesAsWritten();
+      ownWords ??= ironbooksPlacesAsWritten();
+      const refusal = keptFolderRefusal(already, booksWords, ownWords);
+      if (refusal && isAdmin) throw refusal;
+      if (refusal) {
+        if (!out.dropped.some((d) => samePathKey(d.folder) === samePathKey(already))) out.dropped.push({ folder: already, why: refusal.message });
+        continue;
+      }
+      if (add(already)) out.kept.push(already);
+      continue;
+    }
     if (!looksAbsolute(typed)) {
       throw validation(`"${shown(typed, 200)}" is not a full folder path. Type the whole path, like ${EXAMPLE_FOLDER}.`);
     }
-    // By the words first: allowedFolder never takes a whole drive or share and answers null for
-    // one, as for a folder that is not there, so the person would be told the wrong thing.
+    // By the words first: allowedFolder never takes a share of this computer, nor a whole drive or
+    // share, and answers null for one, as for a folder that is not there, so the person would be
+    // told the wrong thing. A share of this computer is never looked at at all, and is told to type
+    // the path on this computer even when it is the share's own folder (\\localhost\c$): "choose a
+    // folder on it" would lead to \\localhost\c$\..., refused in turn.
+    if (isThisComputerShare(typed)) throw thisComputerShareRefusal(typed);
     if (isRootByWords(typed)) throw wholeDriveRefusal(typed);
     const real = await allowedFolder([typed], typed);
     if (!real) {
-      // A volume mounted as a folder (/Volumes/USB) is skipped by allowedFolder too: say what it
-      // is. Asked only of a local path with no link along it, so the disk is the only thing looked
-      // at (looking at a network path, or a link to one, is a sign-in to that server).
-      if (!isSharePath(typed) && noLinksAlong(typed) && isMountedVolume(typed) === true) throw wholeDriveRefusal(typed);
+      // A volume mounted as a folder (/Volumes/USB), and a drive mapped to a share of this computer,
+      // are skipped by allowedFolder too: say what it is. Asked only of a local path with no link
+      // along it, so the disk is the only thing looked at (looking at a network path, or a link to
+      // one, is a sign-in to that server).
+      if (!isSharePath(typed) && noLinksAlong(typed)) {
+        if (isMountedVolume(typed) === true) throw wholeDriveRefusal(typed);
+        if (reachedAsThisComputerShare(typed)) throw thisComputerShareRefusal(typed);
+      }
       throw validation(`The folder "${shown(typed, 200)}" was not found on this computer. Check the path, or make the folder first.`);
     }
+    // The words before the disk: isDriveOrShareRoot looks at the folder, a share's included.
+    if (isThisComputerShare(real)) throw thisComputerShareRefusal(typed);
     if (isDriveOrShareRoot(real)) throw wholeDriveRefusal(typed);
-    if (touchesOwnPlaces(real, books)) {
-      throw validation(
-        `The folder "${shown(typed, 200)}" holds the company file or its working data, or is inside them. Choose another folder for the agent.`,
-      );
-    }
-    if (touchesOwnPlaces(real, own)) {
-      throw validation(
-        `The folder "${shown(typed, 200)}" is one of the folders Ironbooks keeps its own data in (settings, working copies, backups or agents' files), or is inside or holds one. Choose another folder for the agent.`,
-      );
-    }
-    const key = samePathKey(real);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(real);
+    books ??= booksPlaces();
+    own ??= ironbooksPlaces();
+    if (touchesOwnPlaces(real, books)) throw booksFolderRefusal(typed);
+    // The real path and the path as typed: allowedFolder has just shown that the links along it
+    // stay on this computer, so overlapsAppData looks at nothing the person did not name.
+    if (touchesOwnPlaces(real, own) || overlapsAppData(real) || overlapsAppData(typed)) throw ownFolderRefusal(typed);
+    add(real);
   }
   return out;
 }
@@ -1017,16 +1158,24 @@ export const saveAgentPolicy: SaveAgentPolicy = async (ctx, agentId, input) => {
   if (!before) throw notFound('Agent');
   if (before.revokedAt) throw validation(REMOVED);
   const asked = readPolicyInput(input);
-  // On the disk, so outside the transaction: the folders sent, and, for a person who may not let
-  // the agent do more, which of them a folder it already has really holds (heldBy). A save that
-  // sends no folders looks at none.
-  const folders = asked.folders === undefined ? undefined : await checkFolders(asked.folders);
+  // On the disk, so outside the transaction: the folders sent that are new (checkFolders: one the
+  // agent already has is never looked at again on the disk, only held to the rules by its words),
+  // and, for a person who may not let the agent do more, which of them a folder it already has
+  // really holds (heldBy). A save that sends no folders, or only folders it already has, looks at none.
+  const checked = asked.folders === undefined ? undefined : await checkFolders(asked.folders, storedFolders(before), person.isAdmin);
+  const folders = checked?.folders;
   const held = folders === undefined || person.isAdmin ? new Set<string>() : await heldBy(folders, storedFolders(before));
 
   await inTransaction(ctx, async (tx) => {
     const row = await agentRowFor(tx, agentId);
     if (!row) throw notFound('Agent');
     if (row.revokedAt) throw validation(REMOVED);
+    // A folder taken as one the agent already had was not looked at. Should someone have taken it
+    // away since the read above, it would be new after all, and unchecked: nothing is saved then.
+    if (checked?.kept.length) {
+      const still = new Set(storedFolders(row).map(samePathKey));
+      if (checked.kept.some((f) => !still.has(samePathKey(f)))) throw new ServiceError('CONFLICT', FOLDERS_CHANGED);
+    }
     const stored = await storedOverrides(tx, row.id);
 
     const preset = asked.preset ?? presetOfRow(row);
@@ -1118,12 +1267,15 @@ export const saveAgentPolicy: SaveAgentPolicy = async (ctx, agentId, input) => {
     }
 
     const pick = (from: Record<string, unknown>) => Object.fromEntries(changed.map((k) => [k, from[k]]));
+    // Folders it had that this save sent back but Ironbooks took away (checkFolders): the audit row
+    // says which, and why, since the person did not take them away themselves.
+    const takenAway = checked?.dropped.length ? { foldersTakenAway: checked.dropped } : {};
     await writeAudit(tx, {
       action: 'update',
       entityType: 'agent',
       entityId: row.id,
       oldValues: { name: row.name, ...pick(prev), ...(overridesChanged ? { overrides: stored } : {}) },
-      newValues: { name: row.name, ...pick(next), ...(overridesChanged ? { overrides: asked.overrides } : {}) },
+      newValues: { name: row.name, ...pick(next), ...(overridesChanged ? { overrides: asked.overrides } : {}), ...takenAway },
     });
   });
 

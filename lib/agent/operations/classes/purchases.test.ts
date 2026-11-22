@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { amountOf } from '@/lib/agent/facts';
+import { defaultSiteForRead } from '@/lib/services/inventorySites';
 import { operationById } from '../registry';
 import type { Operation } from '../types';
 import { bucketProblems } from './check';
@@ -28,10 +29,23 @@ describe('classification: purchases', () => {
     expect(amountOf(pay, { body: { vendorId: 'v1' } })).toBeNull();
   });
 
-  it('keeps the inventory site lists and reports reads (the read-only handle refuses their one write)', () => {
+  it('keeps the inventory site lists and reports reads (an agent\'s read never makes the default site)', () => {
     for (const id of ['inventory-sites.list', 'inventory-sites.reorder-points', 'inventory-sites.reports']) {
       expect(op(id), id).toMatchObject({ class: 'read', method: 'GET', dryRun: 'none' });
       expect(op(id).why, id).toMatch(/read-only/);
     }
+    // The list and the reports read through defaultSiteForRead, which makes the site for a person only.
+    expect(typeof defaultSiteForRead).toBe('function');
+    for (const id of ['inventory-sites.list', 'inventory-sites.reports']) {
+      expect(op(id).why, id).toMatch(/defaultSiteForRead/);
+      expect(op(id).why, id).not.toMatch(/has no read-only guard/);
+    }
+  });
+
+  it('names the preview option of the bulk vendor save and the bill for received items', () => {
+    expect(op('vendors.bulk.save')).toMatchObject({ dryRun: 'preview', countField: 'rows' });
+    expect(op('vendors.bulk.save').why).toMatch(/dryRun: true/);
+    expect(op('receiving.bill')).toMatchObject({ dryRun: 'preview', amountField: 'total' });
+    expect(op('receiving.bill').why).toMatch(/preview: true/);
   });
 });

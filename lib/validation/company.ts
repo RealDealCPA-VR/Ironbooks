@@ -1,10 +1,11 @@
 /**
- * Zod schemas for /api/company (Preferences) and /api/company/closing-date.
+ * Zod schemas for /api/company (Preferences), /api/company/closing-date and the custom field
+ * values of a record (/api/custom-fields/values).
  * The persisted settings shape is documented in lib/services/company.ts
  * (CompanySettings + COMPANY_SETTINGS_KEYS whitelist).
  */
 import { z } from 'zod';
-import { zUuid } from './helpers';
+import { zLenient, zUuid } from './helpers';
 import { EMAIL_TEMPLATE_TYPES, REMINDER_KEYS } from '@/lib/preferences';
 
 /** Day counts for warnings / reminder windows. */
@@ -31,6 +32,21 @@ export const customFieldsSettingSchema = z.object({
   invoice: z.array(customFieldDefSchema).max(7).default([]),
 });
 export type CustomFieldsSetting = z.infer<typeof customFieldsSettingSchema>;
+
+/**
+ * POST /api/custom-fields/values — set the custom field values of one customer, vendor, item or
+ * invoice (lib/services/customFields.ts setEntityCustomFields). The route checks the three fields
+ * itself; each value is read with String(), so any value passes here as it does there.
+ */
+export const customFieldValuesSchema = z.object({
+  entity: z.enum(CUSTOM_FIELD_ENTITIES).describe('Kind of record: customer, vendor, item or invoice.'),
+  id: z.string().min(1).describe('Id of that customer, vendor, item or invoice.'),
+  values: z
+    .record(zLenient(z.string().nullable()))
+    .describe(
+      'Values by custom field name, such as { "Region": "West" }; each name must be a field defined for that kind of record (GET /api/custom-fields). An empty text clears a field; fields not named keep their values.',
+    ),
+});
 
 /**
  * Every settings key the Preferences dialog may persist. All optional — PATCH

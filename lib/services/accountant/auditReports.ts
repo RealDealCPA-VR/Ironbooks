@@ -12,16 +12,23 @@
  * Both read the audit trail, whose snapshots can hold what the reader may not see (a paycheck's
  * pay and deductions, for someone with no payroll access): the rows they show follow the Audit
  * Trail's rule (lib/services/auditVisibility.ts), so each entry is shown only to someone who may
- * view the record it is about. Admins see everything, as before.
+ * view the record it is about. Admins see everything, as before. The reader is the Audit Trail's
+ * (auditTrail.ts auditReaderFor): an agent never reads them as an Admin would.
+ *
+ * What they show is masked as the Audit Trail masks it, for a reader without "View sensitive
+ * payroll data" or "View full bank / account numbers": a voided or deleted record's original values
+ * through auditEntryValuesFor (SSNs, tax IDs and account numbers by field name, and the account
+ * number in memo text, "Acct # ••••6789"), and the exception report's journal line memos through
+ * journal.ts lineMemoFor, as the registers and the General Ledger show them.
  */
 import { and, asc, desc, eq, gte, inArray, lt, lte, or, sql } from 'drizzle-orm';
 import { accounts, auditLogs, classes, companies, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from '../_base';
-import { maskForContext } from '../access';
+import { auditEntryValuesFor, auditReaderFor } from '../auditTrail';
 import { auditVisibilitySql } from '../auditVisibility';
 import { companyDayBound } from '../preferences';
-import { resolveEntityNames } from '../journal';
+import { lineMemoFor, resolveEntityNames } from '../journal';
 
 /** A 'when it happened' filter: a calendar day is read in the company's time zone (Preferences). */
 export type HappenedBound = Date | string | null | undefined;
@@ -238,7 +245,7 @@ async function exceptionGroups(ctx: ServiceContext, rows: ClosingDateExceptionRo
       account: acctLabel.get(accountId) ?? `${l.code} · ${l.acct}`,
       className: classId ? className.get(classId) ?? null : null,
       name: l.entityType && l.entityId ? names.get(`${l.entityType}:${l.entityId}`) ?? null : null,
-      memo: l.memo ?? null,
+      memo: lineMemoFor(ctx, l.memo ?? null),
       debit: l.debit && !Money.isZero(l.debit) ? toAmountString(l.debit) : null,
       credit: l.credit && !Money.isZero(l.credit) ? toAmountString(l.credit) : null,
     };
@@ -337,7 +344,7 @@ export async function closingDateExceptionReport(
   if (range.from) conds.push(gte(auditLogs.createdAt, range.from));
   if (range.to) conds.push(lte(auditLogs.createdAt, range.to));
   // Only the exceptions this person may read in the Audit Trail (Closing Date: view).
-  const visible = auditVisibilitySql(ctx.access);
+  const visible = auditVisibilitySql(auditReaderFor(ctx));
   if (visible) conds.push(visible);
   const logs = await ctx.db
     .select({ id: auditLogs.id, entityId: auditLogs.entityId, newValues: auditLogs.newValues, createdAt: auditLogs.createdAt, user: users.name })
@@ -586,7 +593,8 @@ export async function voidedDeletedTransactions(
   // Only voids and deletes of records this person may view (a paycheck needs payroll access): the
   // number, name, amount and original values all come from the audit row. Filtered in SQL, so the
   // row limit and count agree with what is shown.
-  const visible = auditVisibilitySql(ctx.access);
+  const reader = auditReaderFor(ctx);
+  const visible = auditVisibilitySql(reader);
   if (visible) conds.push(visible);
   const fetched = await ctx.db
     .select({
@@ -705,7 +713,12 @@ export async function voidedDeletedTransactions(
       user: l.user ?? null,
       at: l.createdAt.toISOString(),
     };
-    if (opts.detail) row.original = maskForContext(ctx, l.oldValues ?? l.newValues);
+    if (opts.detail) {
+      // As the Audit Trail shows the same entry (auditEntryValuesFor): masked for this reader's
+      // View rights, memo text included, and never credential material.
+      const shown = auditEntryValuesFor(reader, l.entityType, l.oldValues, l.newValues);
+      row.original = l.oldValues != null ? shown.oldValues : shown.newValues;
+    }
     return row;
   });
   return { rows, count: rows.length, ...(truncated ? { truncated: true } : {}) };

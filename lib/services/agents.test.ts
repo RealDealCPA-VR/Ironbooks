@@ -285,6 +285,46 @@ describe('making an agent', () => {
     expect((await revokeAgent(admin, adjusted.agent.id)).overrideCount).toBe(2);
     await revokeAgent(admin, plain.agent.id);
   });
+
+  it('counts only adjustments that change what their cell would otherwise follow', async () => {
+    const companyId = admin.companyId;
+    // "Ask for every change": Enter new is Ask everywhere; "Trusted bookkeeper" lets it run.
+    const kept = await createAgent(admin, { name: 'Kept as chosen', roleKeys: ['bookkeeper'] });
+    const mixed = await createAgent(admin, { name: 'Mixed', roleKeys: ['bookkeeper'], preset: 'trusted_bookkeeper' });
+    const row = (agentId: string, cls: string, area: string | null, setting: string) => ({ companyId, agentId, class: cls, area, setting });
+    await db.insert(agentPolicies).values([
+      // The preset's own setting, clicked again: no adjustment.
+      row(kept.agent.id, 'enter', null, 'ask'),
+      // An area that says what everywhere says: no adjustment.
+      row(kept.agent.id, 'enter', 'banking', 'ask'),
+      // An Allow the engine never gives is the Ask the preset already has: no adjustment.
+      row(kept.agent.id, 'remove', null, 'allow'),
+      // Rows the engine ignores: no adjustment.
+      row(kept.agent.id, 'no_such_class', null, 'never'),
+      row(kept.agent.id, 'change', 'no_such_area', 'never'),
+      row(kept.agent.id, 'change', 'payroll', 'maybe'),
+
+      // Everywhere moved from the preset's Allow to Ask: one.
+      row(mixed.agent.id, 'enter', null, 'ask'),
+      // Banking back at Allow, as the preset had it, but against everywhere's Ask now: one.
+      row(mixed.agent.id, 'enter', 'banking', 'allow'),
+      // Payroll following everywhere's Ask: none.
+      row(mixed.agent.id, 'enter', 'payroll', 'ask'),
+      // Never for deleting in payroll, where everywhere is Ask: one.
+      row(mixed.agent.id, 'remove', 'payroll', 'never'),
+    ]);
+    const listed = await listAgents(admin);
+    expect(listed.find((a) => a.id === kept.agent.id)?.overrideCount).toBe(0);
+    expect(listed.find((a) => a.id === mixed.agent.id)?.overrideCount).toBe(3);
+
+    // The same rows read under another preset count against that one. Read only: Enter new is Never,
+    // so Ask everywhere and Allow in Banking still differ, Ask in Payroll follows everywhere, and
+    // Never for deleting in Payroll is now what everywhere says anyway.
+    await db.update(agents).set({ preset: 'read_only' }).where(eq(agents.id, mixed.agent.id));
+    expect((await listAgents(admin)).find((a) => a.id === mixed.agent.id)?.overrideCount).toBe(2);
+    expect((await revokeAgent(admin, kept.agent.id)).overrideCount).toBe(0);
+    expect((await revokeAgent(admin, mixed.agent.id)).overrideCount).toBe(2);
+  });
 });
 
 describe('who may make agents, and what an agent may be', () => {

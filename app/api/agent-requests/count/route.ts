@@ -18,7 +18,8 @@
  * agent's words: the four fields are copied one by one, so nothing else the service may hold (the
  * agent's reason above all) can reach the notice.
  *
- * A person's window only (app/api/agent-requests/_guards.ts).
+ * A person only, never an agent (app/api/agent-requests/_guards.ts). Reading stays open to any of
+ * a person's windows and sign-ins.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -27,8 +28,7 @@ import { agentCount, agentsBlockedFor } from '@/lib/services/agents';
 import { mayPauseAllAgents } from '@/lib/services/agentPolicies';
 import type { ServiceContext } from '@/lib/services/_base';
 import type { AgentRequestCount, BadgeForPerson } from '@/lib/agent/contract';
-import { routeError } from '@/lib/routeErrors';
-import { NO_STORE, atHostWindow, refuseAgent } from '@/app/api/agent-requests/_guards';
+import { NO_STORE, atHostWindow, refuseAgent, refuseAgentRequest, routeErrorPlain } from '@/app/api/agent-requests/_guards';
 
 export const dynamic = 'force-dynamic';
 
@@ -51,6 +51,8 @@ async function canPauseAll(ctx: ServiceContext): Promise<boolean> {
 
 export async function GET(req: NextRequest) {
   try {
+    const early = refuseAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
     const refused = refuseAgent(ctx, req);
     if (refused) return refused;
@@ -64,6 +66,6 @@ export async function GET(req: NextRequest) {
     };
     return NextResponse.json(answer, { headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agent-requests/count/route');
+    return routeErrorPlain(err, 'agent-requests/count/route');
   }
 }

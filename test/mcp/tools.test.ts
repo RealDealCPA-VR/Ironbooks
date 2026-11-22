@@ -16,9 +16,9 @@ import { describe, expect, it } from 'vitest';
 import { ToolError, createServer, serve } from '../../mcp/protocol.mjs';
 import { HOST, IronbooksClient, IronbooksError, expectedProof } from '../../mcp/client.mjs';
 import { DATE_PRESETS, OTHER_LISTS, READ_TOOLS, TOOLS, TXN_TYPES, shapeReport } from '../../mcp/tools.mjs';
-import { LIST_TYPES, TRANSACTION_TYPES, WRITE_READ_TOOLS, WRITE_TOOLS, camelize, shapeAnswer, shapeRecord } from '../../mcp/write-tools.mjs';
+import { CHANGED_SINCE, LIST_TYPES, TRANSACTION_TYPES, WRITE_READ_TOOLS, WRITE_TOOLS, camelize, shapeAnswer, shapeRecord } from '../../mcp/write-tools.mjs';
 import { BANKING_READ_TOOLS, BANKING_WRITE_TOOLS } from '../../mcp/banking-tools.mjs';
-import { OPERATION_TOOLS } from '../../mcp/operations-tools.mjs';
+import { MAX_RESULT_CHARS, OPERATION_TOOLS } from '../../mcp/operations-tools.mjs';
 import { FILE_TOOLS } from '../../mcp/files-tools.mjs';
 import { ENTRY_TOOLS } from '../../mcp/entry-tools.mjs';
 import { REPORT_TOOLS, shapeReport as shapeReportHere } from '../../mcp/report-tools.mjs';
@@ -28,6 +28,8 @@ import { operationForPath } from '@/lib/agent/operations/registry';
 import { matchRoutePattern } from '@/lib/permissions/routes';
 import { SIMPLE_LIST_KEYS } from '@/lib/services/lists/simpleLists';
 import { reportParamsSchema } from '@/lib/validation/reports';
+import { REQUEST_ID_MESSAGE } from '@/lib/agent/actions';
+import { createIronbooksServer } from '../../mcp/ironbooks-mcp.mjs';
 
 type Any = Record<string, any>;
 const ID = '11111111-2222-4333-8444-555555555555';
@@ -97,6 +99,44 @@ const NAMED_TOOL_READ_ROUTES = [
 ];
 const registryLookup = (p: string) => operationForPath('GET', p)?.operation ?? null;
 
+/** One valid set of arguments for each tool that changes the books (dry_run, request_id and reason left out). */
+const CHANGE_SAMPLES: Record<string, Any> = {
+  enter_journal_entry: { date: '2026-01-05', description: 'x', lines: [{ account_id: ID, debit: '1.00' }, { account_id: ID2, credit: '1.00' }] },
+  enter_invoice: { customer_id: ID, date: '2026-01-05', lines: [{ account_id: ID2, quantity: '1', rate: '5' }] },
+  enter_sales_receipt: { date: '2026-01-05', lines: [{ account_id: ID2, quantity: '1', rate: '5' }] },
+  receive_payment: { customer_id: ID, date: '2026-01-05', method: 'check', amount: '5.00' },
+  enter_bill: { vendor_id: ID, date: '2026-01-05', lines: [{ account_id: ID2, amount: '5.00' }] },
+  pay_bills: { vendor_id: ID, date: '2026-01-05', method: 'check', payment_account_id: ID2, applications: [{ bill_id: ID, amount_applied: '5.00' }] },
+  write_check: { payee_name: 'x', date: '2026-01-05', method: 'check', payment_account_id: ID2, lines: [{ account_id: ID, amount: '5.00' }] },
+  make_deposit: { deposit_account_id: ID, date: '2026-01-05', payment_ids: [ID2] },
+  transfer_funds: { date: '2026-01-05', from_account_id: ID, to_account_id: ID2, amount: '5.00' },
+  add_customer: { name: 'x' },
+  add_vendor: { name: 'x' },
+  add_account: { name: 'x', account_type: 'Expense' },
+  add_item: { name: 'x' },
+  add_class: { name: 'x' },
+  import_statement_lines: { bank_account_id: ID, statement_kind: 'bank', opening_balance: '0.00', closing_balance: '-1.00', lines: [{ date: '2026-01-05', description: 'x', amount: '-1.00' }] },
+  categorize_bank_line: { bank_transaction_id: ID, account_id: ID2 },
+  match_bank_line: { bank_transaction_id: ID, journal_entry_id: ID2 },
+  unmatch_bank_line: { bank_transaction_id: ID },
+  exclude_bank_line: { bank_transaction_id: ID },
+  start_reconciliation: { bank_account_id: ID, statement_date: '2026-01-31', statement_balance: '10.00' },
+  mark_cleared: { reconciliation_id: ID, line_ids: [ID2] },
+  update_reconciliation_statement: { reconciliation_id: ID, statement_balance: '11.00' },
+  add_statement_adjustments: { reconciliation_id: ID, service_charge: '1.00', service_charge_account_id: ID2 },
+  finish_reconciliation: { reconciliation_id: ID },
+  cancel_reconciliation: { reconciliation_id: ID },
+  undo_last_reconciliation: { bank_account_id: ID },
+};
+/** The same for the tools that edit, void or make inactive (they also take the version last read). */
+const VERSIONED_SAMPLES: Record<string, Any> = {
+  edit_transaction: { type: 'invoice', id: ID, changes: { memo: 'x' } },
+  void_transaction: { type: 'check', id: ID },
+  edit_list_entry: { type: 'vendor', id: ID, changes: { name: 'x' } },
+  deactivate_list_entry: { type: 'customer', id: ID },
+};
+const VERSION = '2026-01-05T10:00:00.000Z';
+
 describe('the tools and the app agree on names', () => {
   it('every tool reads only routes an agent may read, and changes go to the one action route', async () => {
     const used = new Set<string>();
@@ -158,37 +198,7 @@ describe('the tools and the app agree on names', () => {
     const known = new Set(AGENT_ACTIONS.map((a) => a.name));
     const sent: Any[] = [];
     const client = { async act(request: Any) { sent.push(request); return { action: request.action, outcome: 'dry_run' }; }, async get() { throw new Error('a change must not read here'); } };
-    const line = { account_id: ID, debit: '1.00' };
-    const samples: Record<string, Any> = {
-      enter_journal_entry: { date: '2026-01-05', description: 'x', lines: [line, { account_id: ID2, credit: '1.00' }] },
-      enter_invoice: { customer_id: ID, date: '2026-01-05', lines: [{ account_id: ID2, quantity: '1', rate: '5' }] },
-      enter_sales_receipt: { date: '2026-01-05', lines: [{ account_id: ID2, quantity: '1', rate: '5' }] },
-      receive_payment: { customer_id: ID, date: '2026-01-05', method: 'check', amount: '5.00' },
-      enter_bill: { vendor_id: ID, date: '2026-01-05', lines: [{ account_id: ID2, amount: '5.00' }] },
-      pay_bills: { vendor_id: ID, date: '2026-01-05', method: 'check', payment_account_id: ID2, applications: [{ bill_id: ID, amount_applied: '5.00' }] },
-      write_check: { payee_name: 'x', date: '2026-01-05', method: 'check', payment_account_id: ID2, lines: [{ account_id: ID, amount: '5.00' }] },
-      make_deposit: { deposit_account_id: ID, date: '2026-01-05', payment_ids: [ID2] },
-      transfer_funds: { date: '2026-01-05', from_account_id: ID, to_account_id: ID2, amount: '5.00' },
-      add_customer: { name: 'x' },
-      add_vendor: { name: 'x' },
-      add_account: { name: 'x', account_type: 'Expense' },
-      add_item: { name: 'x' },
-      add_class: { name: 'x' },
-    };
-    Object.assign(samples, {
-      import_statement_lines: { bank_account_id: ID, statement_kind: 'bank', opening_balance: '0.00', closing_balance: '-1.00', lines: [{ date: '2026-01-05', description: 'x', amount: '-1.00' }] },
-      categorize_bank_line: { bank_transaction_id: ID, account_id: ID2 },
-      match_bank_line: { bank_transaction_id: ID, journal_entry_id: ID2 },
-      unmatch_bank_line: { bank_transaction_id: ID },
-      exclude_bank_line: { bank_transaction_id: ID },
-      start_reconciliation: { bank_account_id: ID, statement_date: '2026-01-31', statement_balance: '10.00' },
-      mark_cleared: { reconciliation_id: ID, line_ids: [ID2] },
-      update_reconciliation_statement: { reconciliation_id: ID, statement_balance: '11.00' },
-      add_statement_adjustments: { reconciliation_id: ID, service_charge: '1.00', service_charge_account_id: ID2 },
-      finish_reconciliation: { reconciliation_id: ID },
-      cancel_reconciliation: { reconciliation_id: ID },
-      undo_last_reconciliation: { bank_account_id: ID },
-    });
+    const samples = CHANGE_SAMPLES;
     for (const t of [...WRITE_TOOLS, ...BANKING_WRITE_TOOLS]) {
       expect(t.changes, t.name).toBe(true);
       if (samples[t.name]) {
@@ -641,6 +651,107 @@ describe('tools that change the books', () => {
     expect(b.text).toMatch(/^Refused: An Admin has not allowed agents to enter bills\. Nothing was done\./);
   });
 
+  it('would_post only when the answer has a ledger: an untried dry run, an asked request or an old proposal without one claim nothing', () => {
+    const ledger = { entries: [{ journalEntryId: ID, date: '2026-01-05', description: 'x', lines: [{ accountCode: '6400', accountName: 'Rent', debit: '5.00', credit: null }] }], changes: [] };
+    // The door could not try it (a preview of its own, a desktop step): no ledger, so no would_post.
+    const untried = shapeAnswer({ outcome: 'dry_run', summary: 'Email invoice 1042', note: 'This cannot be tried without really doing it, so nothing was run.' });
+    expect(untried).not.toHaveProperty('would_post');
+    expect(untried.note).toMatch(/nothing was run/);
+    for (const outcome of ['asked', 'proposed', 'needs_confirmation']) {
+      expect(shapeAnswer({ outcome, requestId: ID2 }), outcome).not.toHaveProperty('would_post');
+      expect(shapeAnswer({ outcome, requestId: ID2, preview: { ledger: null, records: [], effects: [], warnings: [], loss: null, routePreview: null, truncated: false } }), outcome).not.toHaveProperty('would_post');
+      expect((shapeAnswer({ outcome, requestId: ID2, ledger }) as Any).would_post, outcome).toHaveLength(1);
+      expect((shapeAnswer({ outcome, requestId: ID2, preview: { ledger } }) as Any).would_post, outcome).toHaveLength(1);
+    }
+    // 'asked' and the older 'proposed' are read alike, by whichever id they carry.
+    expect(shapeAnswer({ outcome: 'asked', requestId: ID2, ledger })).toMatchObject({ request_id: ID2, would_post: [{ journal_entry_id: ID }] });
+    expect(shapeAnswer({ outcome: 'proposed', proposalId: ID, ledger })).toMatchObject({ proposal_id: ID, would_post: [{ journal_entry_id: ID }] });
+    expect(shapeAnswer({ outcome: 'proposed', requestId: ID2 })).toMatchObject({ request_id: ID2 });
+    // Kept: the ledger only when something was posted.
+    expect(shapeAnswer({ outcome: 'done', ledger: { entries: [], changes: [] } })).not.toHaveProperty('ledger');
+    expect(shapeAnswer({ outcome: 'done' })).not.toHaveProperty('would_post');
+  });
+
+  it('every tool that changes the books takes a reason for the approval card, sent with a real request only', async () => {
+    const tools = [...WRITE_TOOLS, ...BANKING_WRITE_TOOLS] as Any[];
+    const samples: Record<string, Any> = { ...CHANGE_SAMPLES, ...VERSIONED_SAMPLES };
+    expect(tools.map((t) => t.name).sort()).toEqual(Object.keys(samples).sort());
+    const why = 'The owner asked for this in today\'s note.';
+    for (const t of tools) {
+      const reason = t.inputSchema.properties.reason;
+      expect(reason, t.name).toMatchObject({ type: 'string', maxLength: 500 });
+      expect(reason.description, t.name).toMatch(/a person must approve it, they read it on the approval card/);
+      expect(t.inputSchema.required, t.name).not.toContain('reason');
+      const { client, sent } = acting({ outcome: 'asked', requestId: ID2, status: 'pending' });
+      const r = await call(client, t.name, { ...samples[t.name], request_id: `${t.name}-1`, reason: `  ${why}  ` });
+      expect(r.isError, `${t.name}: ${r.text}`).toBe(false);
+      // Next to the input, never in it; trimmed.
+      expect(sent[0], t.name).toMatchObject({ requestId: `${t.name}-1`, reason: why });
+      expect(JSON.stringify(sent[0].input), t.name).not.toMatch(/reason|owner asked/);
+      // A dry run carries no reason; a reason of only spaces, or none, is left out.
+      await call(client, t.name, { ...samples[t.name], dry_run: true, reason: why });
+      expect(sent[1], t.name).not.toHaveProperty('reason');
+      expect(sent[1].dryRun, t.name).toBe(true);
+      await call(client, t.name, { ...samples[t.name], request_id: `${t.name}-2`, reason: '   ' });
+      expect(sent[2], t.name).not.toHaveProperty('reason');
+      await call(client, t.name, { ...samples[t.name], request_id: `${t.name}-3` });
+      expect(sent[3], t.name).not.toHaveProperty('reason');
+    }
+    const { client } = acting();
+    expect((await call(client, 'add_vendor', { name: 'x', request_id: 'v-long', reason: 'x'.repeat(501) })).text).toMatch(/"reason" is too long/);
+  });
+
+  it('edit, void and make-inactive send the version last read; a 409 then says to read the record again', async () => {
+    const tools = new Map((WRITE_TOOLS as Any[]).map((t) => [t.name, t]));
+    for (const name of Object.keys(VERSIONED_SAMPLES)) {
+      const t = tools.get(name)!;
+      expect(t.inputSchema.properties, name).toHaveProperty('expected_updated_at');
+      expect(t.description, name).toMatch(/expected_updated_at/);
+      expect(t.description, name).toMatch(/409 \(conflict\)/);
+      expect(t.description, name).toMatch(/read it again/);
+      const { client, sent } = acting();
+      await call(client, name, { ...VERSIONED_SAMPLES[name], expected_updated_at: VERSION, request_id: `${name}-v` });
+      expect(sent[0].input.expectedUpdatedAt, name).toBe(VERSION);
+      // Not a version: refused before anything is sent.
+      const bad = await call(client, name, { ...VERSIONED_SAMPLES[name], expected_updated_at: '2026-01-05', request_id: `${name}-b` });
+      expect(bad.text, name).toMatch(/"expected_updated_at" must be the updated_at exactly as get_transaction gave it/);
+      expect(sent, name).toHaveLength(1);
+    }
+    expect((WRITE_READ_TOOLS as Any[]).find((t) => t.name === 'get_transaction')!.description).toMatch(/edited_at for an account or an item\) as expected_updated_at/);
+
+    // The route's 409 for a record changed since: its own words, then what to do in the agent's terms.
+    const stale = 'This record was changed by Dana Lee at Mar 8, 2026, 2:05 PM. Reload to see the latest.';
+    const conflict = { async act() { throw new IronbooksError(stale, { status: 409, code: 'CONFLICT' }); } };
+    for (const name of Object.keys(VERSIONED_SAMPLES)) {
+      const r = await call(conflict, name, { ...VERSIONED_SAMPLES[name], expected_updated_at: VERSION, request_id: `${name}-c` });
+      expect(r.isError, name).toBe(true);
+      expect(r.text, name).toBe(`${stale} ${CHANGED_SINCE}`);
+      expect(r.text, name).toMatch(/read it again with get_transaction/);
+      // Without a version sent, a 409 is something else (a request_id used before): the app's words alone.
+      const plain = await call(conflict, name, { ...VERSIONED_SAMPLES[name], request_id: `${name}-p` });
+      expect(plain.text, name).toBe(stale);
+    }
+    // A class has no version: none is sent for it, and its 409 is the app's own.
+    const { client, sent } = acting();
+    await call(client, 'deactivate_list_entry', { type: 'class', id: ID, expected_updated_at: VERSION, request_id: 'cls-1' });
+    expect(sent[0].input).toEqual({ id: ID });
+    expect((await call(conflict, 'deactivate_list_entry', { type: 'class', id: ID, expected_updated_at: VERSION, request_id: 'cls-2' })).text).toBe(stale);
+    // Any other error is passed on as it was.
+    const other = { async act() { throw new IronbooksError('Nothing on or before the closing date can be changed.', { status: 400, code: 'PERIOD_CLOSED' }); } };
+    expect((await call(other, 'void_transaction', { type: 'check', id: ID, expected_updated_at: VERSION, request_id: 'v-x' })).text).toBe('Nothing on or before the closing date can be changed.');
+  });
+
+  it('a "slow down" answer says to wait and send it again, never to stop', async () => {
+    const { client } = acting({ outcome: 'refused', note: 'This agent has sent more than 60 requests in the last minute, which slows Ironbooks down for everyone. Wait about 12 seconds, then carry on.', retryAfterSeconds: 11.2 });
+    const r = await call(client, 'enter_bill', { vendor_id: ID, date: '2026-01-05', lines: [{ account_id: ID2, amount: '1.00' }], request_id: 'b-slow' });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/^Not now: This agent has sent more than 60 requests/);
+    expect(r.text).toMatch(/Wait 12 seconds, then send it again as it was/);
+    expect(r.text).not.toMatch(/Do not send it again/);
+    expect(shapeAnswer({ outcome: 'refused', retryAfterSeconds: 1 })).toMatchObject({ retry_after_seconds: 1, next: expect.stringMatching(/Wait 1 second,/) });
+    expect(shapeAnswer({ outcome: 'refused', retryAfterSeconds: 0 })).not.toHaveProperty('retry_after_seconds');
+  });
+
   it('a preview from the generic door: changes, what leaves the computer, what is lost, the file made', () => {
     const preview = {
       ledger: null,
@@ -651,14 +762,17 @@ describe('tools that change the books', () => {
       routePreview: null,
       truncated: false,
     };
+    // No ledger in the preview: nothing is claimed about what it would post.
     expect(shapeAnswer({ outcome: 'dry_run', preview }, { fields: 'confirm' })).toEqual({
       outcome: 'dry_run',
       said: 'Not entered. This is what it would do.',
-      would_post: [],
       would_change: [{ kind: 'invoice', id: ID, action: 'update', fields: [{ field: 'memo', before: 'a', after: 'b' }] }],
       would_also: ['Email to billing@acme.test: Invoice 1042'],
       loss: 'Invoice 1042 is gone for good.',
     });
+    // A ledger with no entries: it was tried, and would post nothing.
+    expect((shapeAnswer({ outcome: 'dry_run', preview: { ...preview, ledger: { entries: [], changes: [] } } }) as Any).would_post).toEqual([]);
+    expect((shapeAnswer({ outcome: 'dry_run', ledger: { entries: [], changes: [] } }) as Any).would_post).toEqual([]);
     const posted = shapeAnswer({
       outcome: 'posted',
       result: { ok: true },
@@ -784,7 +898,7 @@ describe('statements and reconciliation', () => {
     const client = {
       async act(request: Any) {
         acted.push(request);
-        return { result: { suggestions: [{ bank_transaction_id: ID, account_id: ID2, account: 'Office Supplies', payee: 'Depot', confidence: 80, reason: 'You used this account for this payee 4 times.', rule: null }] } };
+        return { action: 'bank_feed_suggestions', outcome: 'read', result: { suggestions: [{ bank_transaction_id: ID, account_id: ID2, account: 'Office Supplies', payee: 'Depot', confidence: 80, reason: 'You used this account for this payee 4 times.', rule: null }] } };
       },
       async get(p: string, query: Any) {
         if (p === '/api/bank-transactions') {
@@ -845,6 +959,63 @@ describe('statements and reconciliation', () => {
     expect(asked.data.suggestions).toMatch(/your permissions do not let you read them on your own/);
   });
 
+  it('get_bank_feed: suggestions only from an answer that says it was read, after one call whatever the error', async () => {
+    const line = { id: ID, date: '2026-01-05T00:00:00.000Z', description: 'OFFICE DEPOT', payee: null, amount: '-30.00', matched: false, excluded: false, matchedEntryId: null };
+    const door = (answer: (r: Any) => unknown) => {
+      const acted: Any[] = [];
+      return {
+        acted,
+        client: {
+          async act(r: Any) {
+            acted.push(r);
+            const a = answer(r);
+            if (a instanceof Error) throw a;
+            return a;
+          },
+          async get(p: string) {
+            if (p === '/api/bank-transactions') return [line];
+            if (p === '/api/bank-transactions/matches') return { matches: {} };
+            throw new Error(`unexpected ${p}`);
+          },
+        },
+      };
+    };
+    // The door's request-id check (the app's own words) or any other 400: the read is not sent
+    // again (the door never asks this read for a request id), and nothing in the answer sends the
+    // agent to an argument this tool does not have.
+    for (const words of [REQUEST_ID_MESSAGE, 'That bank account was not found.']) {
+      const failed = door(() => new IronbooksError(words, { status: 400, code: 'VALIDATION' }));
+      const out = await call(failed.client, 'get_bank_feed', { bank_account_id: ID });
+      expect(out.isError).toBe(false);
+      expect(out.data.lines).toHaveLength(1);
+      expect(out.data.suggestions).toMatch(/^No suggested accounts: Ironbooks did not give them this time\./);
+      expect(out.text).not.toMatch(/request_id/);
+      expect(failed.acted).toEqual([{ action: 'bank_feed_suggestions', input: { bankAccountId: ID } }]);
+    }
+    // An Admin set this read to Ask: the door refuses it outright (lib/agent/actions.ts
+    // OWN_READ_ASKS), and its own words say why.
+    const ask = "This agent's settings ask a person before it reads this. Ask an Admin to change what it may do in Users & Roles > Agents, or ask a person to look it up in Ironbooks.";
+    const asks = await call(door(() => ({ action: 'bank_feed_suggestions', outcome: 'refused', note: ask })).client, 'get_bank_feed', { bank_account_id: ID });
+    expect(asks.data.suggestions).toBe(`No suggested accounts: ${ask} Choose each line's account from its description and list_accounts, or ask the person.`);
+    // Suggestions come only from an answer that says it was read: a dry run's, or an answer with
+    // no outcome, are not taken as read.
+    const S = [{ bank_transaction_id: ID, account_id: ID2, account: 'Office Supplies', confidence: 80, reason: 'Used before.' }];
+    for (const [answer, why] of [
+      [{ outcome: 'dry_run', result: { suggestions: S } }, /^No suggested accounts: your permissions do not let you read them on your own\./],
+      [{ result: { suggestions: S } }, /^No suggested accounts: Ironbooks did not give them this time\./],
+    ] as Array<[Any, RegExp]>) {
+      const out = await call(door(() => answer).client, 'get_bank_feed', { bank_account_id: ID });
+      expect(out.data.lines[0], JSON.stringify(answer)).not.toHaveProperty('suggested_account_id');
+      expect(out.data.suggestions, JSON.stringify(answer)).toMatch(why);
+    }
+    // 'read', or 'done' from an older Ironbooks: used.
+    for (const outcome of ['read', 'done']) {
+      const got = await call(door(() => ({ outcome, result: { suggestions: S } })).client, 'get_bank_feed', { bank_account_id: ID });
+      expect(got.data, outcome).not.toHaveProperty('suggestions');
+      expect(got.data.lines[0], outcome).toMatchObject({ suggested_account_id: ID2, suggested_account: 'Office Supplies' });
+    }
+  });
+
   it('get_reconciliation says whether it can be finished', async () => {
     const { client } = recorder({
       [`/api/reconciliations/${ID}`]: { reconciliationId: ID, statementBalance: '759.00', clearedBalance: '759.00', difference: '0.00' },
@@ -857,6 +1028,137 @@ describe('statements and reconciliation', () => {
     expect(out.data).toMatchObject({ statement_balance: '759.00', cleared_balance: '759.00', difference: '0.00', can_finish: true, line_count: 2 });
     expect(out.data.lines[1]).toEqual({ line_id: ID, journal_entry_id: ID2, date: '2026-05-05', number: '1001', description: 'Check', debit: null, credit: '200.00', cleared: false });
     expect((await call(client, 'get_reconciliation', { reconciliation_id: ID, only_uncleared: true })).data.lines).toHaveLength(1);
+  });
+});
+
+describe('an approved report read, as the agent collects it', () => {
+  const P_AND_L = { ...REPORT, key: 'profit-loss', title: 'Profit & Loss' };
+  /** lib/agent/contract.ts AgentRequestView of a report read a person approved and Ironbooks carried out. */
+  const VIEW = {
+    id: ID2, kind: 'operation', agentId: 'a-1', agentName: 'Bot', operation: 'reports.std.get', class: 'read', area: 'reports', status: 'executed',
+    reason: 'Month-end review.', summary: 'Read the Profit & Loss report', amount: null, needs: null, input: null, preview: null, grantAsked: null,
+    createdAt: '2026-01-05T10:00:00.000Z', expiresAt: '2026-01-12T10:00:00.000Z', decidedAt: '2026-01-05T10:05:00.000Z', decidedByName: 'Dana Lee',
+    secondApproverName: null, note: null, error: null, result: P_AND_L, file: null, grantId: null,
+  };
+  const reading = (view: Any, answer: Any = {}) => {
+    const acted: Any[] = [];
+    return {
+      acted,
+      client: {
+        async get(p: string) {
+          if (p === `/api/agent/requests/${ID2}`) return { request: view };
+          throw new IronbooksError('Not found', { status: 404 });
+        },
+        async act(r: Any) {
+          acted.push(r);
+          return typeof answer === 'function' ? answer(r) : answer;
+        },
+      },
+    };
+  };
+
+  it('wait_for_decision gives the report as run_report does; anything else as it was', async () => {
+    const shown = await call(reading(VIEW, { operation: 'reports.std.get', outcome: 'read', result: P_AND_L }).client, 'run_report', { key: 'profit-loss' });
+    expect(shown.data.rows[1]).toMatchObject({ row_id: 'b', cells: ['Sales', '100.00'] });
+    const waited = await call(reading(VIEW).client, 'wait_for_decision', { request_id: ID2, timeout_seconds: 0 });
+    expect(waited.isError, waited.text).toBe(false);
+    expect(waited.data).toMatchObject({ request_id: ID2, decision: 'approved', operation: 'reports.std.get', decided_by: 'Dana Lee' });
+    expect(waited.data.result).toEqual(shown.data);
+    // A drill-down asked the same way: as report_drilldown gives it.
+    const raw = { report: 'profit-loss', rowLabel: 'Sales', columnLabel: 'Jan 2026', kind: 'transactions', cell: '100.00', total: '100.00', ties: true, count: 0, transactions: [], listTruncated: false, incomplete: false };
+    const drilled = await call(reading(VIEW, { operation: 'reports.drilldown.get', outcome: 'read', result: raw }).client, 'report_drilldown', { key: 'profit-loss', row_id: 'b', column: 'amount' });
+    const waitedDrill = await call(reading({ ...VIEW, operation: 'reports.drilldown.get', result: raw }).client, 'wait_for_decision', { request_id: ID2, timeout_seconds: 0 });
+    expect(waitedDrill.data.result).toEqual(drilled.data);
+    // Another operation's result, a denial, or a request still waiting: as the door's tools give them.
+    const invoice = await call(reading({ ...VIEW, operation: 'invoices.get', result: { invoice: { id: ID, refNumber: '1001' } } }).client, 'wait_for_decision', { request_id: ID2, timeout_seconds: 0 });
+    expect(invoice.data.result).toEqual({ invoice: { id: ID, refNumber: '1001' } });
+    const denied = await call(reading({ ...VIEW, status: 'denied', result: null, note: 'Not this month.' }).client, 'wait_for_decision', { request_id: ID2, timeout_seconds: 0 });
+    expect(denied.data).toMatchObject({ decision: 'denied', note_from_person: 'Not this month.' });
+    expect(denied.data).not.toHaveProperty('result');
+  });
+
+  it('run_operation sent again with the request id gives the report as run_report does; a read run at once keeps the app\'s shape', async () => {
+    const shown = await call(reading(VIEW, { operation: 'reports.std.get', outcome: 'read', result: P_AND_L }).client, 'run_report', { key: 'profit-loss' });
+    const replay = { operation: 'reports.std.get', summary: VIEW.summary, requestId: ID2, status: 'executed', replayed: true, outcome: 'read', result: P_AND_L, note: 'A person approved it and it was done.' };
+    const again = await call(reading(VIEW, replay).client, 'run_operation', { operation: 'reports.std.get', params: { report: 'profit-loss' }, request_id: 'pl-ask-1', reason: 'Month-end review.' });
+    expect(again.isError, again.text).toBe(false);
+    expect(again.data).toMatchObject({ outcome: 'read', repeated: true, note: 'A person approved it and it was done.' });
+    expect(again.data.result).toEqual(shown.data);
+    const now = await call(reading(VIEW, { operation: 'reports.std.get', outcome: 'read', result: P_AND_L }).client, 'run_operation', { operation: 'reports.std.get', params: { report: 'profit-loss' } });
+    expect(now.data.result).toEqual(P_AND_L);
+  });
+
+  it('a report too long for one answer is made compact before it is held: row_count is the report\'s own, and the result says what was cut', async () => {
+    const N = 5000;
+    const BIG = {
+      ...P_AND_L,
+      rows: Array.from({ length: N }, (_, i) => ({ id: `r${i}`, depth: 1, kind: 'data', cells: { label: `Account ${i} ${'x'.repeat(60)}`, amount: '100.00' }, entryId: ID })),
+    };
+    expect(JSON.stringify(BIG).length).toBeGreaterThan(MAX_RESULT_CHARS * 2);
+    const check = (result: Any, where: string) => {
+      expect(result.row_count, where).toBe(N);
+      expect(result.rows.length, where).toBeLessThan(N);
+      expect(result.rows.length, where).toBeGreaterThan(100);
+      expect(result.truncated, where).toBe(true);
+      expect(result.notes.at(-1), where).toBe(`Showing the first ${result.rows.length} of ${N} rows: the whole report was too long for one answer. To see the rest, run it again with a shorter date range or a filter.`);
+      // In run_report's shape, row for row.
+      expect(result.rows[0], where).toEqual({ row_id: 'r0', kind: 'data', level: 1, cells: [BIG.rows[0].cells.label, '100.00'], journal_entry_id: ID });
+    };
+    const waited = await call(reading({ ...VIEW, result: BIG }).client, 'wait_for_decision', { request_id: ID2, timeout_seconds: 0 });
+    expect(waited.isError, waited.text).toBe(false);
+    expect(waited.text.length).toBeLessThan(MAX_RESULT_CHARS + 5_000);
+    expect(waited.data.cut_short.result).toMatch(/too long to show in full/);
+    check(waited.data.result, 'wait_for_decision');
+    const replay = { operation: 'reports.std.get', requestId: ID2, status: 'executed', replayed: true, outcome: 'read', result: BIG };
+    const again = await call(reading(VIEW, replay).client, 'run_operation', { operation: 'reports.std.get', params: { report: 'profit-loss' }, request_id: 'pl-ask-1', reason: 'Month-end review.' });
+    expect(again.text.length).toBeLessThan(MAX_RESULT_CHARS + 5_000);
+    check(again.data.result, 'run_operation sent again');
+    const server = createIronbooksServer(reading({ ...VIEW, result: BIG }).client);
+    const res = (await server.handle({ jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: `ironbooks://requests/${ID2}` } })) as Any;
+    check(JSON.parse(res.result.contents[0].text).result, 'the resource');
+  });
+
+  it('the generic door\'s tools still reach the client as they did: its other answers, its state, and an operation\'s confirm flags', async () => {
+    const acted: Any[] = [];
+    const noted: Any[] = [];
+    const client = {
+      async act(r: Any) {
+        acted.push(r);
+        if (r.verb === 'describe_operation') return { id: r.operation, describe: 'Enter a bill', class: 'enter', params: [], treatment: 'run', confirmFlags: ['allowNegativeStock'] };
+        if (r.verb === 'run_operation' && r.operation === 'bills.create') return { operation: 'bills.create', outcome: 'needs_confirmation', warnings: [{ flag: 'allowNegativeStock', message: 'Not enough on hand.' }] };
+        return { operation: r.operation, outcome: 'asked', requestId: ID2, status: 'pending' };
+      },
+      async get() {
+        return { request: { ...VIEW, operation: 'invoices.get', result: { id: ID } } };
+      },
+      noteRequest(r: Any) {
+        noted.push(r.id);
+      },
+    };
+    const server = createIronbooksServer(client);
+    const tool = async (name: string, args: Any) => JSON.parse(((await server.handle({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } })) as Any).result.content[0].text);
+    await tool('describe_operation', { operation: 'bills.create' });
+    const warned = await tool('run_operation', { operation: 'bills.create', body: {}, request_id: 'b-1' });
+    // The flags describe_operation read are the ones run_operation offers: not asked for again.
+    expect(warned.warnings[0].resend_with).toBe('confirm: ["allowNegativeStock"]');
+    expect(acted.filter((a) => a.verb === 'describe_operation')).toHaveLength(1);
+    // An "asked" still notes the request on the client itself.
+    await tool('run_operation', { operation: 'estimates.create', body: {}, request_id: 'e-1', reason: 'Quote.' });
+    expect(noted).toContain(ID2);
+    expect((await tool('wait_for_decision', { request_id: ID2, timeout_seconds: 0 })).result).toEqual({ id: ID });
+  });
+
+  it('the request\'s resource gives the report as run_report does', async () => {
+    const shown = await call(reading(VIEW, { operation: 'reports.std.get', outcome: 'read', result: P_AND_L }).client, 'run_report', { key: 'profit-loss' });
+    const server = createIronbooksServer(reading(VIEW).client);
+    const res = (await server.handle({ jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: `ironbooks://requests/${ID2}` } })) as Any;
+    expect(res.error, JSON.stringify(res.error)).toBeUndefined();
+    const body = JSON.parse(res.result.contents[0].text);
+    expect(body).toMatchObject({ request_id: ID2, decision: 'approved' });
+    expect(body.result).toEqual(shown.data);
+    const other = createIronbooksServer(reading({ ...VIEW, operation: 'invoices.get', result: { id: ID } }).client);
+    const plain = (await other.handle({ jsonrpc: '2.0', id: 2, method: 'resources/read', params: { uri: `ironbooks://requests/${ID2}` } })) as Any;
+    expect(JSON.parse(plain.result.contents[0].text).result).toEqual({ id: ID });
   });
 });
 

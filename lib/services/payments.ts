@@ -144,7 +144,8 @@ export interface ReceivePaymentInput {
   exchangeRate?: string | number | null;
   /**
    * wave2 sales (C4): earlier unapplied payments (customer credit left over from a previous
-   * overpayment) applied to invoices from inside Receive Payments. New payments only.
+   * overpayment) applied to invoices or General Journal charges from inside Receive Payments, on a
+   * new payment and on an edit (updatePayment applies them from their own payment).
    */
   paymentCredits?: PaymentCreditFromPaymentInput[] | null;
   /**
@@ -577,25 +578,51 @@ export async function listAvailableCredits(
  * Credit memos listed in `credits` are applied in the same transaction (no GL — the memo
  * credited A/R when it was saved). Every invoice's cash + discount + credits must fit its
  * balance due.
+ *
+ * The answer carries `creditsApplied`: one total of every credit this save used, as Pay Bills
+ * answers it (billPayments.ts payBillsWithCredits). Applying a credit posts no new entry, so the
+ * cash `amount` alone would judge a $1 payment that applies a $50,000 credit at $1 (the agent
+ * policy's two-person rule and a standing permission's amount limit read this total).
  */
 export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentInput) {
   return inTransaction(ctx, async (tx) => {
     const paymentCredits = input.paymentCredits ?? [];
-    if (paymentCredits.length === 0) return postPayment(tx, input, null);
+    // Added up once the save went through: every amount has been checked by then.
+    if (paymentCredits.length === 0) return { ...(await postPayment(tx, input, null)), creditsApplied: creditsAppliedBy(input) };
 
     // C4: apply earlier unapplied payments first (no new GL — that money already credited A/R
     // when it was received). postPayment then re-reads invoice balances, so cash + discounts +
     // credits + earlier payments together can never exceed what an invoice owes.
     const lastPaymentId = await applyEarlierPayments(tx, input, null);
 
-    if (hasNewMoney(input)) return postPayment(tx, { ...input, paymentCredits: null }, null);
+    if (hasNewMoney(input)) {
+      return { ...(await postPayment(tx, { ...input, paymentCredits: null }, null)), creditsApplied: creditsAppliedBy(input) };
+    }
     // Only earlier payments were used: no new payment is recorded (as in QuickBooks).
     const [payment] = await tx.db
       .select()
       .from(paymentsReceived)
       .where(eq(paymentsReceived.id, lastPaymentId!));
-    return { payment, entry: null };
+    return { payment, entry: null, creditsApplied: creditsAppliedBy(input) };
   });
+}
+
+/**
+ * The credits one Receive Payments save applies, added up (decimal text): credit memos (`credits`),
+ * earlier payments (`paymentCredits`), General Journal credits applied to invoices
+ * (`journalCredits`) and to General Journal charges (`journalOffsets`). Each part is rounded to the
+ * cent as the services that apply it round it; the save is refused when any of them does not fit.
+ */
+function creditsAppliedBy(input: ReceivePaymentInput): string {
+  let total = Money.zero();
+  const parts: Array<{ amount: string | number }> = [
+    ...(input.credits ?? []),
+    ...(input.paymentCredits ?? []),
+    ...(input.journalCredits ?? []),
+    ...(input.journalOffsets ?? []),
+  ];
+  for (const p of parts) total = total.plus(Money.round2(p.amount));
+  return toAmountString(total);
 }
 
 /** True when the request does more than re-use earlier payments (so a payment is recorded). */

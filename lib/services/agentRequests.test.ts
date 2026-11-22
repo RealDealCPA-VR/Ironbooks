@@ -32,8 +32,18 @@
  *  - a password the route always takes is typed before anything is claimed;
  *  - a desktop flow that fails is failed for good and never runs again under the same id.
  *
- * Grants are the real grantMinutesFor (wrapped) and a stand-in createGrant; one test uses the real
- * createGrant to show the card's window is the one it accepts.
+ * Grants are the real grantWindowReader (wrapped) and a stand-in createGrant; one test uses the
+ * real createGrant to show the card's window is the one it accepts.
+ *
+ * Wave 4: an approved reveal's answer is the agent's for REVEAL_KEPT_MINUTES, then masked for good
+ * (and worded in the audit trail), in every view even before the row is masked, by any reader or
+ * sweep, with its staged file removed so get_file no longer has it; what a run that only changed
+ * entries in place posted, and that a void or a delete always counts; a request whose run was cut
+ * off does not claim to know what it posted; secrets the needs mark optional; a desktop flow's
+ * required secret (the needs', or one the flow needs every time) typed before the claim; the hard
+ * floor refusing at approval; a batch that finds a request approved already says so plainly.
+ * Staged files live in a folder of their own here (BKA_AGENT_FILES_DIR); removeStagedFile is the
+ * real one unless a test makes it fail.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -45,6 +55,8 @@ const TEST_DIR = path.join(ROOT, 'data');
 process.env.BKA_DATA_DIR = TEST_DIR;
 process.env.BKA_AUTH_SECRET = 'agent-requests-test-secret';
 process.env.IRONBOOKS_AGENT_ENDPOINT_DIR = path.join(ROOT, 'endpoints');
+// The agents' staged files (lib/agent/files.ts), for the file of an approved reveal.
+process.env.BKA_AGENT_FILES_DIR = path.join(ROOT, 'agent-files');
 delete process.env.BKA_DEVICE_VAULT;
 
 type AnyFn = (...args: never[]) => unknown;
@@ -54,10 +66,12 @@ const m = vi.hoisted(() => ({
   policies: new Map<string, Record<string, unknown>>(),
   runApproved: vi.fn(),
   createGrant: vi.fn(),
-  grantMinutesFor: vi.fn(),
+  grantWindowReader: vi.fn(),
   sendMail: vi.fn(),
-  // The real ones, kept by the mock below: the card's window comes from the real grantMinutesFor.
-  real: {} as { createGrant?: AnyFn; grantMinutesFor?: AnyFn },
+  removeStagedFile: vi.fn(),
+  // The real ones, kept by the mocks below: the card's window comes from the real grantWindowReader,
+  // and a reveal's file is removed by the real removeStagedFile unless a test says otherwise.
+  real: {} as { createGrant?: AnyFn; grantWindowReader?: AnyFn; removeStagedFile?: AnyFn },
 }));
 
 vi.mock('@/lib/agent/operations/registry', async (importOriginal) => ({
@@ -99,11 +113,11 @@ vi.mock('@/lib/services/agentPolicies', () => ({
 vi.mock('@/lib/services/agentGrants', async (importOriginal) => {
   const real = await importOriginal<typeof import('@/lib/services/agentGrants')>();
   m.real.createGrant = real.createGrant as unknown as AnyFn;
-  m.real.grantMinutesFor = real.grantMinutesFor as unknown as AnyFn;
+  m.real.grantWindowReader = real.grantWindowReader as unknown as AnyFn;
   return {
     ...real,
     createGrant: m.createGrant,
-    grantMinutesFor: m.grantMinutesFor,
+    grantWindowReader: m.grantWindowReader,
     liveGrants: vi.fn(),
     revokeGrant: vi.fn(),
     useGrant: vi.fn(),
@@ -114,6 +128,11 @@ vi.mock('@/lib/services/email', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   sendMail: m.sendMail,
 }));
+vi.mock('@/lib/agent/files', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@/lib/agent/files')>();
+  m.real.removeStagedFile = real.removeStagedFile as unknown as AnyFn;
+  return { ...real, removeStagedFile: m.removeStagedFile };
+});
 
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { readOnlyDb } from '@/lib/db/readOnly';
@@ -134,12 +153,14 @@ import type { BridgeResult, NewAgentRequest, OperationPreview } from '@/lib/agen
 import { ASKS_PER_HOUR_BEFORE_PAUSE } from '@/lib/agent/contract';
 import type { ApprovalNeeds, Operation, RequestFacts } from '@/lib/agent/operations/types';
 import { SHELL_OPERATIONS } from '@/lib/agent/operations/shell';
+import { readStagedFile, stageFile } from '@/lib/agent/files';
 import { createCompany } from './company';
 import { agentAccess, createAgent } from './agents';
 import { resolveAccess } from './access';
 import { endSession, startSession } from './sessions';
 import { ServiceError, type ServiceContext } from './_base';
 import {
+  REVEAL_KEPT_MINUTES,
   approveAgentRequest,
   badgeForPerson,
   batchApprove,
@@ -400,10 +421,12 @@ beforeEach(() => {
     }),
   );
   // The real window (the company's day, host-only and file-Admin work, the person's role).
-  m.grantMinutesFor.mockReset();
-  m.grantMinutesFor.mockImplementation((...args: never[]) => m.real.grantMinutesFor!(...args));
+  m.grantWindowReader.mockReset();
+  m.grantWindowReader.mockImplementation((...args: never[]) => m.real.grantWindowReader!(...args));
   m.sendMail.mockReset();
   m.sendMail.mockResolvedValue({ from: 'books@requests.test', to: 'x' });
+  m.removeStagedFile.mockReset();
+  m.removeStagedFile.mockImplementation((...args: never[]) => m.real.removeStagedFile!(...args));
 });
 
 // ---------------------------------------------------------------------------
@@ -649,14 +672,20 @@ describe('who may approve', () => {
 describe('the answer of an approved reveal', () => {
   const SSN = '123-45-6789';
 
-  it('is shown in full only to people who hold the View flag it needed; the agent keeps its answer (D6)', async () => {
-    const view = await ask('b', 'test.reveal', {
+  const FILE = { fileId: 'f-1', name: 'w2.pdf', type: 'application/pdf', size: 10 };
+  const askReveal = (agent: string, over: Partial<NewAgentRequest> = {}) =>
+    ask(agent, 'test.reveal', {
       effectiveClass: 'read_sensitive',
       input: { query: { id: 'emp-1' }, reveal: true },
       facts: facts({ reveal: true, amount: null }),
+      summary: 'Read employee emp-1',
+      ...over,
     });
+
+  it('is shown in full only to people who hold the View flag it needed', async () => {
+    const view = await askReveal('b');
     expect(view.needs?.flags).toContain('sensitivePayroll');
-    m.runApproved.mockResolvedValue(bridge({ result: { employee: { name: 'Dana Lee', ssn: SSN } }, file: { fileId: 'f-1', name: 'w2.pdf', type: 'application/pdf', size: 10 } }));
+    m.runApproved.mockResolvedValue(bridge({ mode: 'read', result: { employee: { name: 'Dana Lee', ssn: SSN } }, file: FILE }));
     expect((await approveAgentRequest(people.ada, view.id, {}, { atHost: true })).status).toBe('executed');
 
     // Bo's role allows the route but not "View sensitive payroll data": a note, no value, no file.
@@ -671,9 +700,212 @@ describe('the answer of an approved reveal', () => {
       expect(JSON.stringify(listed)).not.toContain(SSN);
     }
 
-    // Cy holds the flag and reads it in full; the agent reads what was revealed to it.
+    // Cy holds the flag and reads it in full; the agent reads what was revealed to it (for now).
     expect(JSON.stringify((await requestForPerson(people.cy, view.id)).result)).toContain(SSN);
     expect(JSON.stringify((await requestForAgent(agentCtx.b, view.id))?.result)).toContain(SSN);
+  });
+
+  it(`stays readable by the agent for ${REVEAL_KEPT_MINUTES} minutes after the run, then is masked for good, in every view and in the row`, () =>
+    frozenAt(new Date(), async (moveTo) => {
+      await makeAgent('reveal');
+      const view = await askReveal('reveal');
+      m.runApproved.mockResolvedValue(bridge({ mode: 'read', result: { employee: { name: 'Dana Lee', ssn: SSN } }, file: FILE }));
+      const done = await approveAgentRequest(people.ada, view.id, {}, { atHost: true });
+      expect(done.status).toBe('executed');
+      // The approver sees what they approved.
+      expect(JSON.stringify(done.request.result)).toContain(SSN);
+
+      // Within the time: the wait, the list and a replay (the same request id) all show it in full.
+      moveTo((REVEAL_KEPT_MINUTES - 1) * 60_000);
+      const read = async () => [
+        await requestForAgent(agentCtx.reveal, view.id),
+        await requestForAgent(agentCtx.reveal, `req-${seq}`),
+        (await listRequestsForAgent(agentCtx.reveal)).find((r) => r.id === view.id),
+        await waitForDecision(agentCtx.reveal, view.id, 5),
+      ];
+      for (const seen of await read()) {
+        expect(JSON.stringify(seen?.result)).toContain(SSN);
+        expect(seen?.file).toEqual(FILE);
+      }
+      expect(JSON.stringify((await rowOf(view.id)).result)).toContain(SSN);
+
+      // Past it: the row still holds it until something reads the request; the first reader (here a
+      // person's card) masks it in its own view and in the row, and every view after is masked too.
+      moveTo(REVEAL_KEPT_MINUTES * 60_000 + 1000);
+      expect(JSON.stringify((await rowOf(view.id)).result)).toContain(SSN);
+      const asCy = await requestForPerson(people.cy, view.id);
+      expect(JSON.stringify(asCy)).not.toContain(SSN);
+      expect(asCy.file).toBeNull();
+      for (const seen of await read()) {
+        expect(seen?.status).toBe('executed');
+        expect(JSON.stringify(seen)).not.toContain(SSN);
+        expect(seen?.result).toEqual({ employee: { name: 'Dana Lee', ssn: '***-**-6789' } });
+        expect(seen?.file).toBeNull();
+      }
+      // And for good: the row itself no longer holds the full SSN, nor the file.
+      const row = await rowOf(view.id);
+      expect(JSON.stringify(row)).not.toContain(SSN);
+      expect(row.result).toMatchObject({ answer: { employee: { ssn: '***-**-6789' } }, file: null, revealEnded: true });
+      expect(row.result).not.toHaveProperty('revealUntil');
+      expect((await requestForAgent(agentCtx.reveal, view.id))?.result).toEqual({ employee: { name: 'Dana Lee', ssn: '***-**-6789' } });
+    }));
+
+  it('reads masked once its time is up, even while the row itself still holds the full answer', () =>
+    frozenAt(new Date(), async (moveTo) => {
+      await makeAgent('reveal4');
+      const view = await askReveal('reveal4');
+      m.runApproved.mockResolvedValue(bridge({ mode: 'read', result: { employee: { name: 'Dana Lee', ssn: SSN } }, file: FILE }));
+      expect((await approveAgentRequest(people.ada, view.id, {}, { atHost: true })).status).toBe('executed');
+      moveTo(REVEAL_KEPT_MINUTES * 60_000 + 1000);
+      // The settle step's write changes nothing (as when another reader is at the row), so each view
+      // below is built from a row that still holds the full SSN and the file.
+      const update = vi.spyOn(db, 'update').mockImplementation((() => ({ set: () => ({ where: () => ({ returning: async () => [] }) }) })) as never);
+      let seen: unknown[];
+      try {
+        seen = [
+          await requestForAgent(agentCtx.reveal4, view.id),
+          await waitForDecision(agentCtx.reveal4, view.id, 5),
+          (await listRequestsForAgent(agentCtx.reveal4)).find((r) => r.id === view.id),
+          // Cy holds the View flag: only the time being up masks it for him.
+          await requestForPerson(people.cy, view.id),
+        ];
+        expect(update).toHaveBeenCalled();
+      } finally {
+        update.mockRestore();
+      }
+      expect(JSON.stringify((await rowOf(view.id)).result)).toContain(SSN);
+      for (const s of seen) {
+        expect(s).toBeDefined();
+        expect(JSON.stringify(s)).not.toContain(SSN);
+        expect((s as { file: unknown }).file).toBeNull();
+        expect((s as { result: unknown }).result).toEqual({ employee: { name: 'Dana Lee', ssn: '***-**-6789' } });
+      }
+      // The next read whose write goes through masks the row too.
+      await requestForAgent(agentCtx.reveal4, view.id);
+      expect(JSON.stringify((await rowOf(view.id)).result)).not.toContain(SSN);
+    }));
+
+  it('a file it answered with is removed from the agent\'s files once its time is up, so get_file no longer has it', () =>
+    frozenAt(new Date(), async (moveTo) => {
+      await makeAgent('revealfile');
+      const owner = { companyId, agentId: agentCtx.revealfile.agent!.id };
+      const scan = await stageFile(owner, { name: 'w4.pdf', type: 'application/pdf', bytes: new Uint8Array([37, 80, 68, 70, 1]) });
+      const other = await stageFile(owner, { name: 'statement.pdf', type: 'application/pdf', bytes: new Uint8Array([37, 80, 68, 70, 2]) });
+      const view = await askReveal('revealfile');
+      m.runApproved.mockResolvedValue(bridge({ mode: 'read', result: { employee: { name: 'Dana Lee', ssn: SSN } }, file: scan }));
+      expect((await approveAgentRequest(people.ada, view.id, {}, { atHost: true })).status).toBe('executed');
+
+      moveTo((REVEAL_KEPT_MINUTES - 1) * 60_000);
+      expect((await requestForAgent(agentCtx.revealfile, view.id))?.file).toEqual(scan);
+      expect(await readStagedFile(owner, scan.fileId)).not.toBeNull();
+      expect(m.removeStagedFile).not.toHaveBeenCalled();
+
+      moveTo(REVEAL_KEPT_MINUTES * 60_000 + 1000);
+      expect((await requestForAgent(agentCtx.revealfile, view.id))?.file).toBeNull();
+      expect(await readStagedFile(owner, scan.fileId)).toBeNull();
+      expect(m.removeStagedFile).toHaveBeenCalledTimes(1);
+      expect((await rowOf(view.id)).result).not.toHaveProperty('revealFileLeft');
+      // Only that file: the agent's other staged files stay.
+      expect(await readStagedFile(owner, other.fileId)).not.toBeNull();
+      // Nothing more to do on later reads.
+      await requestForAgent(agentCtx.revealfile, view.id);
+      expect(m.removeStagedFile).toHaveBeenCalledTimes(1);
+    }));
+
+  it('a file that could not be removed is tried again by the next read, and the row never points to it again', () =>
+    frozenAt(new Date(), async (moveTo) => {
+      await makeAgent('revealfile2');
+      const owner = { companyId, agentId: agentCtx.revealfile2.agent!.id };
+      const scan = await stageFile(owner, { name: 'w9.pdf', type: 'application/pdf', bytes: new Uint8Array([37, 80, 68, 70, 3]) });
+      const view = await askReveal('revealfile2');
+      m.runApproved.mockResolvedValue(bridge({ mode: 'read', result: { vendor: { name: 'Acme', ssn: SSN } }, file: scan }));
+      await approveAgentRequest(people.ada, view.id, {}, { atHost: true });
+      moveTo(REVEAL_KEPT_MINUTES * 60_000 + 1000);
+
+      m.removeStagedFile.mockRejectedValueOnce(new Error('the disk is busy'));
+      const first = await requestForAgent(agentCtx.revealfile2, view.id);
+      // The read itself still works, masked, without the file.
+      expect(first).toMatchObject({ status: 'executed', file: null });
+      expect(JSON.stringify(first)).not.toContain(SSN);
+      const row = await rowOf(view.id);
+      expect(JSON.stringify(row)).not.toContain(SSN);
+      expect(row.result).toMatchObject({ file: null, revealFileLeft: scan.fileId });
+      expect(await readStagedFile(owner, scan.fileId)).not.toBeNull();
+
+      // The next settle (here the overdue sweep) removes it, and the mark with it.
+      await expireRequests(people.ada);
+      expect(await readStagedFile(owner, scan.fileId)).toBeNull();
+      expect((await rowOf(view.id)).result).not.toHaveProperty('revealFileLeft');
+    }));
+
+  it('a reveal nobody opens again is masked by the title bar\'s poll, the agent\'s list or the overdue sweep', () =>
+    frozenAt(new Date(), async (moveTo) => {
+      await makeAgent('reveal2');
+      const sweeps: Array<[string, () => Promise<unknown>]> = [
+        ["the title bar's poll", () => badgeForPerson(people.rae, { atHost: true })],
+        ["the agent's list", () => listRequestsForAgent(agentCtx.reveal2)],
+        ['the overdue sweep', () => expireRequests(people.ada)],
+      ];
+      let at = 0;
+      for (const [by, sweep] of sweeps) {
+        const ids: string[] = [];
+        for (let i = 0; i < 2; i++) {
+          const view = await askReveal('reveal2');
+          m.runApproved.mockResolvedValueOnce(bridge({ mode: 'read', result: { employee: { name: `Emp ${i}`, ssn: SSN } } }));
+          await approveAgentRequest(people.ada, view.id, {}, { atHost: true });
+          ids.push(view.id);
+        }
+        at += REVEAL_KEPT_MINUTES * 60_000 + 61_000;
+        moveTo(at);
+        // Nothing has read them since: the rows still hold the full answer until the sweep.
+        for (const id of ids) expect(JSON.stringify((await rowOf(id)).result), by).toContain(SSN);
+        await sweep();
+        for (const id of ids) expect(JSON.stringify((await rowOf(id)).result), by).not.toContain(SSN);
+      }
+    }));
+
+  it('the audit trail words it: which kinds of values of which record, to which agent, approved by whom', async () => {
+    const view = await askReveal('b');
+    m.runApproved.mockResolvedValue(bridge({ mode: 'read', result: { employee: { name: 'Dana Lee', ssn: SSN } } }));
+    await approveAgentRequest(people.ada, view.id, {}, { atHost: true });
+    const audit = await db
+      .select()
+      .from(auditLogs)
+      .where(and(eq(auditLogs.entityType, 'agent_permission_request'), eq(auditLogs.entityId, view.id)));
+    const executed = audit.find((a) => (a.newValues as { status?: string }).status === 'executed');
+    expect(executed?.newValues).toMatchObject({
+      revealed: 'Revealed full SSNs and tax IDs of "Read employee emp-1" to agent "Agent b", approved by Ada Admin.',
+      revealedFields: 'full SSNs and tax IDs',
+      approvedBy: people.ada.userId,
+    });
+    // Never the values themselves.
+    expect(JSON.stringify(audit)).not.toContain(SSN);
+    // An ordinary approval says nothing of a reveal.
+    const plain = await ask('b', 'test.enter');
+    await approveAgentRequest(people.ada, plain.id, {}, { atHost: true });
+    const plainAudit = JSON.stringify(await db.select().from(auditLogs).where(eq(auditLogs.entityId, plain.id)));
+    expect(plainAudit).not.toMatch(/reveal/i);
+    // Nor does a reveal that did not go through: nothing was shown.
+    const refused = await askReveal('b');
+    m.runApproved.mockResolvedValue(bridge({ mode: 'read', outcome: 'error', result: null, error: { message: 'Not found.', code: 'NOT_FOUND', details: null } }));
+    expect((await approveAgentRequest(people.ada, refused.id, {}, { atHost: true })).status).toBe('failed');
+    const refusedAudit = await db.select().from(auditLogs).where(eq(auditLogs.entityId, refused.id));
+    expect(JSON.stringify(refusedAudit)).not.toMatch(/Revealed/);
+    expect((await rowOf(refused.id)).result).not.toHaveProperty('revealUntil');
+  });
+
+  it('two people approving a reveal are both named', async () => {
+    await makeAgent('reveal3');
+    const view = await askReveal('reveal3', { needs: { ...NO_NEEDS, twoPerson: true } });
+    expect(view.needs?.twoPerson).toBe(true);
+    m.runApproved.mockResolvedValue(bridge({ mode: 'read', result: { employee: { name: 'Dana Lee', ssn: SSN } } }));
+    expect((await approveAgentRequest(people.ada, view.id, {}, { atHost: true })).status).toBe('needs_second_approver');
+    expect((await approveAgentRequest(people.cy, view.id, {}, { atHost: true })).status).toBe('executed');
+    const audit = await db.select().from(auditLogs).where(and(eq(auditLogs.entityType, 'agent_permission_request'), eq(auditLogs.entityId, view.id)));
+    const executed = audit.find((a) => (a.newValues as { status?: string }).status === 'executed');
+    expect((executed?.newValues as { revealed?: string }).revealed).toBe(
+      'Revealed full SSNs and tax IDs of "Read employee emp-1" to agent "Agent reveal3", approved by Ada Admin and Cy.',
+    );
   });
 
   it('an ordinary answer is masked by the reader\'s own flags', async () => {
@@ -961,6 +1193,26 @@ describe('approving', () => {
       expect(res.request).toMatchObject({ posted: false, entryIds: [], grantError: null });
     }));
 
+  it('a request for standing permission that fails for a reason nobody can name says nothing changed, not "check the books"', () =>
+    atMidday(async () => {
+      m.createGrant.mockRejectedValueOnce(new Error('disk I/O error at page 7'));
+      m.createGrant.mockResolvedValueOnce({ id: null });
+      for (const n of [1, 2]) {
+        const view = await ask('a', 'test.enter', { kind: 'grant', input: {}, grantAsked: { constraints: {}, minutes: 1 }, summary: `Standing permission ${n}` });
+        const res = await approveAgentRequest(people.bo, view.id, {}, { atHost: true });
+        expect(res.status).toBe('failed');
+        expect(res.request.error).toBe('Standing permission was not given because of an unexpected problem, so nothing changed. The agent can ask for it again.');
+        expect(res.request.error).not.toMatch(/Check the books|disk I\/O/);
+        expect(res.request.grantId).toBeNull();
+      }
+      // A refusal the app can name is passed on as it is.
+      const WHY = 'Standing permission cannot be given for "Delete for good" work: each request is approved on its own.';
+      m.createGrant.mockRejectedValueOnce(new ServiceError('FORBIDDEN', WHY));
+      const named = await ask('a', 'test.enter', { kind: 'grant', input: {}, grantAsked: { constraints: {}, minutes: 1 } });
+      expect((await approveAgentRequest(people.bo, named.id, {}, { atHost: true })).request.error).toBe(WHY);
+      expect(m.runApproved).not.toHaveBeenCalled();
+    }));
+
   it('a request for standing permission on a class that allows none can only be denied', async () => {
     const view = await ask('a', 'test.enter', { kind: 'grant', input: {}, grantAsked: { constraints: {}, minutes: 1 }, needs: { ...NO_NEEDS, grantable: 'no' } });
     const asAda = await requestForPerson(people.ada, view.id);
@@ -1024,9 +1276,17 @@ describe('approving', () => {
     });
     try {
       const results = await batchApprove(people.bo, [one.id, two.id, three.id], { atHost: true });
+      // The second was approved and done by Cy, not by this batch: this call ran nothing for it, and
+      // its request says where it stands (the contract's 'not_approved').
       // The third was not approved (the agent was paused) and nothing ran for it: not a failed run.
-      expect(results.map((r) => r.status)).toEqual(['executed', 'executed', 'not_approved']);
-      expect(results[1].request.decidedByName).toBe('Cy');
+      expect(results.map((r) => r.status)).toEqual(['executed', 'not_approved', 'not_approved']);
+      // The screen puts its error after "Not approved, and nothing was done.": it says it was approved
+      // already and this approval added nothing, never "was approved and done" alone.
+      expect(results[1].request).toMatchObject({
+        status: 'executed',
+        decidedByName: 'Cy',
+        error: 'It was already approved before this approval got to it, and it was done then. This approval added nothing.',
+      });
       expect(results[2].request.status).toBe('pending');
       expect(results[2].request.error).toMatch(/paused/);
       expect((await rowOf(three.id)).status).toBe('pending');
@@ -1480,6 +1740,68 @@ describe('what a view tells', () => {
     m.runApproved.mockResolvedValueOnce(bridge({ preview: touched(withLedger([E2]), 'voided') }));
     const voided = await ask('w3', 'test.enter');
     expect((await approveAgentRequest(people.bo, voided.id, {}, { atHost: true })).request).toMatchObject({ posted: true, entryIds: [] });
+    // With no amount field and an amount of "0.00" (a void of a draft or of an entry already void):
+    // still posted, as lib/agent/operate.ts postedToLedger answers the agent's own commit ("a void is
+    // never nothing"), so that answer and a replay of the request agree.
+    op('test.void', { class: 'change', method: 'POST', rule: { area: 'customers', action: 'modify' }, action: 'modify', amountField: null });
+    for (const how of ['voided', 'deleted']) {
+      m.runApproved.mockResolvedValueOnce(bridge({ preview: touched(withLedger([E2]), how), facts: facts({ amount: '0.00' }) }));
+      const view = await ask('w3', 'test.void', { effectiveClass: 'change' });
+      expect((await approveAgentRequest(people.bo, view.id, {}, { atHost: true })).request, how).toMatchObject({ status: 'executed', posted: true, entryIds: [] });
+      expect(await requestForAgent(agentCtx.w3, view.id), how).toMatchObject({ posted: true });
+    }
+    // One entry voided and one only retitled: the void moved the ledger.
+    const mixed = withLedger([E1, E2]);
+    const list = mixed.ledger!.entries as unknown as Array<Record<string, unknown>>;
+    list[0] = { ...list[0], touched: 'changed' };
+    list[1] = { ...list[1], touched: 'voided' };
+    m.runApproved.mockResolvedValueOnce(bridge({ preview: mixed, facts: facts({ amount: '0.00' }) }));
+    const both = await ask('w3', 'test.void', { effectiveClass: 'change' });
+    expect((await approveAgentRequest(people.bo, both.id, {}, { atHost: true })).request).toMatchObject({ posted: true, entryIds: [] });
+  });
+
+  it('a run that only gave an entry a new title posted nothing; one that rewrote its lines did', async () => {
+    // No amount field: the bridge's amount is the money the run moved ("0.00" for a new title).
+    op('test.retitle', { class: 'change', method: 'PATCH', rule: { area: 'customers', action: 'modify' }, action: 'modify', amountField: null });
+    const changed = () => {
+      const p = withLedger([E1]);
+      (p.ledger!.entries as unknown as Array<Record<string, unknown>>)[0].touched = 'changed';
+      return p;
+    };
+    const run = async (opId: string, amount: string | null) => {
+      m.runApproved.mockResolvedValueOnce(bridge({ preview: changed(), facts: facts({ amount }) }));
+      const view = await ask('w3', opId, { effectiveClass: 'change' });
+      const res = await approveAgentRequest(people.bo, view.id, {}, { atHost: true });
+      expect(res.status).toBe('executed');
+      return { res, agentSees: await requestForAgent(agentCtx.w3, view.id) };
+    };
+    const retitled = await run('test.retitle', '0.00');
+    expect(retitled.res.request).toMatchObject({ posted: false, entryIds: [] });
+    expect(retitled.agentSees).toMatchObject({ posted: false, entryIds: [] });
+    expect((await run('test.retitle', '125.00')).res.request).toMatchObject({ posted: true, entryIds: [] });
+    // Its amount comes from the body, or is not known: whether it moved money cannot be told.
+    for (const [opId, amount] of [['test.change', '10.00'], ['test.retitle', null]] as const) {
+      const { res } = await run(opId, amount);
+      expect(res.request.posted).toBeUndefined();
+      expect(res.request.entryIds).toBeUndefined();
+    }
+  });
+
+  it('a request whose run was cut off does not claim to know what it posted', async () => {
+    const view = await ask('w3', 'test.enter');
+    await db
+      .update(agentPermissionRequests)
+      .set({ status: 'approved', decidedBy: people.bo.userId, decidedAt: new Date(Date.now() - 3 * 3_600_000) })
+      .where(eq(agentPermissionRequests.id, view.id));
+    const seen = await requestForAgent(agentCtx.w3, view.id);
+    expect(seen?.status).toBe('failed');
+    expect(seen?.posted).toBeUndefined();
+    expect(seen?.entryIds).toBeUndefined();
+    // Nor while it is being carried out.
+    const running = await ask('w3', 'test.enter');
+    await db.update(agentPermissionRequests).set({ status: 'approved', decidedBy: people.bo.userId, decidedAt: new Date() }).where(eq(agentPermissionRequests.id, running.id));
+    expect((await requestForAgent(agentCtx.w3, running.id))?.posted).toBeUndefined();
+    await db.update(agentPermissionRequests).set({ status: 'failed' }).where(eq(agentPermissionRequests.id, running.id));
   });
 
   it('a run that never read the ledger does not claim to know what it posted', async () => {
@@ -1579,17 +1901,21 @@ describe('what a view tells', () => {
       expect(m.runApproved).toHaveBeenCalledTimes(2);
     }));
 
-  it('a list works out the standing window once per kind of work, not once per request', () =>
+  it('a list reads the company\'s day once, however many requests and kinds of work it judges', () =>
     atMidday(async () => {
       await makeAgent('win');
       for (const amount of ['1.00', '2.00', '3.00']) await ask('win', 'test.enter', { facts: facts({ amount }) });
       await ask('win', 'test.change', { effectiveClass: 'change' });
-      m.grantMinutesFor.mockClear();
+      m.grantWindowReader.mockClear();
       const listed = await listRequestsForPerson(people.bo, { agentId: agentCtx.win.agent!.id });
       expect(listed).toHaveLength(4);
       expect(listed.every((r) => r.canApprove && r.grantMinutesMax > 0)).toBe(true);
-      // One company-day read for the three entries (amounts differ), one for the change.
-      expect(m.grantMinutesFor).toHaveBeenCalledTimes(2);
+      // One company-day read for the whole list: three entries (amounts differ) and a change.
+      expect(m.grantWindowReader).toHaveBeenCalledTimes(1);
+      // A window that cannot be worked out is none: the requests can still be approved once.
+      m.grantWindowReader.mockRejectedValueOnce(new Error('the company file is busy'));
+      const busy = await listRequestsForPerson(people.bo, { agentId: agentCtx.win.agent!.id });
+      expect(busy.every((r) => r.canApprove && r.grantMinutesMax === 0)).toBe(true);
     }));
 
   it('a route with no permission rule is refused in decide()\'s words: no role can allow it', async () => {
@@ -1826,7 +2152,9 @@ describe('the window it is approved from', () => {
 describe('a desktop flow', () => {
   const DEF = SHELL_OPERATIONS.find((d) => d.id === 'shell.company.open')!;
   const FILE = { body: { file: 'C:\\Books\\Acme.ironbooks' } };
-  const ANSWERS = { temporaryFolder: 'Cancel', readOnlyFile: 'Cancel', cloudFolder: false };
+  const ANSWERS = { temporaryFolder: 'Cancel', cloudFolder: false };
+  /** The temporary-folder question's own button words, as the shell lists them (lib/agent/operations/shell.ts). */
+  const TEMPORARY_CHOICES = (DEF.questions.find((q) => q.id === 'temporaryFolder')?.choices ?? []).join(', ');
 
   beforeAll(async () => {
     await makeAgent('shell');
@@ -1858,16 +2186,18 @@ describe('a desktop flow', () => {
 
     await expectError(approveAgentRequest(people.ada, view.id, {}, { atHost: true }), 'VALIDATION', /Answer every question/);
     await expectError(approveAgentRequest(people.ada, view.id, { answers: { ...ANSWERS, cloudFolder: '' } }, { atHost: true }), 'VALIDATION', /Answer every question/);
-    await expectError(approveAgentRequest(people.ada, view.id, { answers: { ...ANSWERS, temporaryFolder: 'Maybe' } }, { atHost: true }), 'VALIDATION', /one of: Save a Copy and Open It/);
+    expect(TEMPORARY_CHOICES).toBeTruthy();
+    const notAChoice = await expectError(approveAgentRequest(people.ada, view.id, { answers: { ...ANSWERS, temporaryFolder: 'Maybe' } }, { atHost: true }), 'VALIDATION');
+    expect(notAChoice.message).toContain(`one of: ${TEMPORARY_CHOICES}.`);
     await expectError(approveAgentRequest(people.ada, view.id, { answers: { ...ANSWERS, cloudFolder: 'perhaps' } }, { atHost: true }), 'VALIDATION', /yes or no/);
     await expectError(approveAgentRequest(people.ada, view.id, { answers: ANSWERS }, { atHost: false }), 'FORBIDDEN', /computer that holds the company file/);
     expect(m.runApproved).not.toHaveBeenCalled();
     expect((await rowOf(view.id)).status).toBe('pending');
 
     // The shell's own words are accepted too (any case, yes/no as text).
-    const res = await approveAgentRequest(people.ada, view.id, { answers: { temporaryFolder: 'open it here anyway', readOnlyFile: 'CANCEL', cloudFolder: 'Yes' } }, { atHost: true });
+    const res = await approveAgentRequest(people.ada, view.id, { answers: { temporaryFolder: 'open it here anyway', cloudFolder: 'Yes' } }, { atHost: true });
     expect(res.status).toBe('executed');
-    expect(m.runApproved.mock.calls[0][2].answers).toEqual({ temporaryFolder: 'open it here anyway', readOnlyFile: 'CANCEL', cloudFolder: 'Yes' });
+    expect(m.runApproved.mock.calls[0][2].answers).toEqual({ temporaryFolder: 'open it here anyway', cloudFolder: 'Yes' });
   });
 
   it('one that fails is failed for good and never runs again under the same id', async () => {
@@ -1995,6 +2325,28 @@ describe('batch approval, item by item', () => {
     expect(results[1].request).toMatchObject({ status: 'denied', error: 'This request was denied.' });
     expect(calls).toBe(1);
   });
+
+  it('one someone else approved meanwhile, whose work could not be done, says it was approved already', async () => {
+    const one = await ask('batch3', 'test.enter');
+    const two = await ask('batch3', 'test.enter');
+    let calls = 0;
+    m.runApproved.mockImplementation(async () => {
+      const call = ++calls;
+      // While the batch runs the first, Cy approves the second; his run of it fails.
+      if (call === 1) await approveAgentRequest(people.cy, two.id, {}, { atHost: true });
+      if (call === 2) return bridge({ outcome: 'error', httpStatus: 400, result: null, error: { message: 'Customer is inactive.', code: null, details: null } });
+      return bridge();
+    });
+    const results = await batchApprove(people.bo, [one.id, two.id], { atHost: true });
+    expect(results.map((r) => r.status)).toEqual(['executed', 'not_approved']);
+    expect(results[1].request.status).toBe('failed');
+    expect(results[1].request.error).toBe(
+      'It was already approved before this approval got to it, and that time the work could not be done. Open it to see why. This approval added nothing.',
+    );
+    expect(calls).toBe(2);
+    // The request itself keeps its own reason.
+    expect((await rowOf(two.id)).error).toBe('Customer is inactive.');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2018,6 +2370,9 @@ describe('an approval that loses track of its run', () => {
     expect(res.status).toBe('failed');
     expect(res.request.status).toBe('failed');
     expect(res.request.error).toMatch(LOST);
+    // The work may have been done: never "nothing was posted".
+    expect(res.request.posted).toBeUndefined();
+    expect((await requestForAgent(agentCtx.lost, view.id))?.posted).toBeUndefined();
     const row = await rowOf(view.id);
     expect(row.status).toBe('failed');
     expect(JSON.stringify(row.input)).not.toContain('555-66-7777');
@@ -2098,5 +2453,169 @@ describe('a password the run cannot do without', () => {
     } finally {
       m.policies.delete(agentCtx.pw.agent!.id);
     }
+  });
+
+  it('a secret the needs mark optional may be left empty; the others still must be typed', async () => {
+    // A restore: the sign-in of another company file is needed only for a backup made there.
+    op('test.restore', { needsSecret: ['archive_credentials', 'closing_password'] });
+    const needs: ApprovalNeeds = { ...NO_NEEDS, secrets: ['archive_credentials', 'closing_password'], optionalSecrets: ['archive_credentials'] };
+    const view = await ask('pw', 'test.restore', { needs });
+    // The card is told which box may stay empty.
+    expect((await requestForPerson(people.bo, view.id)).needs).toMatchObject({ secrets: ['archive_credentials', 'closing_password'], optionalSecrets: ['archive_credentials'] });
+    await expectError(approveAgentRequest(people.bo, view.id, {}, { atHost: true }), 'VALIDATION', /^Type the closing-date password on the card/);
+    expect(m.runApproved).not.toHaveBeenCalled();
+    const done = await approveAgentRequest(people.bo, view.id, { secrets: { closing_password: 'Close-2026!' } }, { atHost: true });
+    expect(done.status).toBe('executed');
+    expect(m.runApproved.mock.calls[0][2].secrets).toEqual({ closing_password: 'Close-2026!' });
+
+    // Without a word on which are optional: what the bridge's commit rule lets a route go without
+    // (another file's sign-in), and every other secret the route lists must be typed.
+    const unsaid = await ask('pw', 'test.restore', { needs: { ...NO_NEEDS, secrets: ['archive_credentials', 'closing_password'] } });
+    expect((await requestForPerson(people.bo, unsaid.id)).needs?.optionalSecrets).toEqual(['archive_credentials']);
+    await expectError(approveAgentRequest(people.bo, unsaid.id, {}, { atHost: true }), 'VALIDATION', /^Type the closing-date password on the card/);
+    expect((await approveAgentRequest(people.bo, unsaid.id, { secrets: { closing_password: 'x-1' } }, { atHost: true })).status).toBe('executed');
+    op('test.backup', { needsSecret: ['backup_password'] });
+    const plain = await ask('pw', 'test.backup', { needs: { ...NO_NEEDS, secrets: ['backup_password'] } });
+    expect((await requestForPerson(people.bo, plain.id)).needs?.optionalSecrets).toBeUndefined();
+    await expectError(approveAgentRequest(people.bo, plain.id, {}, { atHost: true }), 'VALIDATION', /backup file's password/);
+  });
+
+  it('only the secrets the needs mark optional may be left empty: one they list as required still must be typed', async () => {
+    // The caller says optional for one and required for the other; the policy engine's own needs
+    // say nothing of which. A secret is optional only where no side requires it.
+    op('test.restore2', { needsSecret: ['archive_credentials', 'backup_password'] });
+    const view = await ask('pw', 'test.restore2', {
+      needs: { ...NO_NEEDS, secrets: ['archive_credentials', 'backup_password'], optionalSecrets: ['archive_credentials'] },
+    });
+    expect(view.needs?.optionalSecrets).toEqual(['archive_credentials']);
+    await expectError(approveAgentRequest(people.bo, view.id, {}, { atHost: true }), 'VALIDATION', /backup file's password/);
+  });
+
+  it('a desktop flow whose needs require its password is sent back to the card before anything is claimed', async () => {
+    const PORTABLE = SHELL_OPERATIONS.find((d) => d.id === 'shell.portable.open')!;
+    op(PORTABLE.id, {
+      kind: 'shell',
+      route: PORTABLE.flow,
+      rule: null,
+      area: null,
+      action: null,
+      class: PORTABLE.class,
+      hostOnly: true,
+      fileAdmin: true,
+      dryRun: 'none',
+      amountField: null,
+      describe: PORTABLE.describe,
+      needsSecret: [...PORTABLE.needsSecret],
+    });
+    await makeAgent('pwshell');
+    const askFlow = (needs: ApprovalNeeds) =>
+      ask('pwshell', PORTABLE.id, {
+        effectiveClass: 'file',
+        input: { body: { file: 'C:\\Books\\Acme.bkp', target: 'C:\\Books\\Acme Restored.ironbooks' } },
+        facts: facts({ amount: null }),
+        stalenessKey: null,
+        needs,
+      });
+    // The needs say the password is required (the file is known to be protected).
+    const required = await askFlow({ ...NO_NEEDS, secrets: ['backup_password'], optionalSecrets: [] });
+    await expectError(approveAgentRequest(people.ada, required.id, { answers: { openNow: false } }, { atHost: true }), 'VALIDATION', /^Type the backup file's password on the card/);
+    expect(m.runApproved).not.toHaveBeenCalled();
+    expect((await rowOf(required.id))).toMatchObject({ status: 'pending', decidedBy: null });
+    const done = await approveAgentRequest(people.ada, required.id, { answers: { openNow: false }, secrets: { backup_password: 'Bkp-Pass-1' } }, { atHost: true });
+    expect(done.status).toBe('executed');
+    expect(m.runApproved.mock.calls[0][2].secrets).toEqual({ backup_password: 'Bkp-Pass-1' });
+
+    // The needs do not say: the flow asks only for a protected file, so the box may stay empty, and the card says so.
+    const unsaid = await askFlow(NO_NEEDS);
+    const card = await requestForPerson(people.ada, unsaid.id, { atHost: true });
+    expect(card.needs).toMatchObject({ secrets: ['backup_password'], optionalSecrets: ['backup_password'] });
+    expect((await approveAgentRequest(people.ada, unsaid.id, { answers: { openNow: false } }, { atHost: true })).status).toBe('executed');
+  });
+
+  it('a desktop flow that needs its password every time is sent back to the card without it, whatever the needs say', async () => {
+    // A flow whose every run meets the prompt (ShellOperationEntry.alwaysNeedsSecret): a yes without
+    // the password would be claimed, refused at the prompt and failed for good under its id.
+    const PORTABLE = SHELL_OPERATIONS.find((d) => d.id === 'shell.portable.open')!;
+    const before = PORTABLE.alwaysNeedsSecret;
+    PORTABLE.alwaysNeedsSecret = ['backup_password'];
+    try {
+      op(PORTABLE.id, {
+        kind: 'shell',
+        route: PORTABLE.flow,
+        rule: null,
+        area: null,
+        action: null,
+        class: PORTABLE.class,
+        hostOnly: true,
+        fileAdmin: true,
+        dryRun: 'none',
+        amountField: null,
+        describe: PORTABLE.describe,
+        needsSecret: [...PORTABLE.needsSecret],
+      });
+      if (!agentCtx.pwshell) await makeAgent('pwshell');
+      // The needs say nothing of which are optional, or even that this one is.
+      for (const needs of [NO_NEEDS, { ...NO_NEEDS, secrets: ['backup_password'], optionalSecrets: ['backup_password'] }] as ApprovalNeeds[]) {
+        m.runApproved.mockClear();
+        const view = await ask('pwshell', PORTABLE.id, {
+          effectiveClass: 'file',
+          input: { body: { file: 'C:\\Books\\Acme.bkp', target: 'C:\\Books\\Acme Restored.ironbooks' } },
+          facts: facts({ amount: null }),
+          stalenessKey: null,
+          needs,
+        });
+        // The card asks for it as required: no "may stay empty".
+        const card = await requestForPerson(people.ada, view.id, { atHost: true });
+        expect(card.needs?.secrets).toContain('backup_password');
+        expect(card.needs?.optionalSecrets ?? []).not.toContain('backup_password');
+        await expectError(approveAgentRequest(people.ada, view.id, { answers: { openNow: false } }, { atHost: true }), 'VALIDATION', /^Type the backup file's password on the card/);
+        expect(m.runApproved).not.toHaveBeenCalled();
+        expect(await rowOf(view.id)).toMatchObject({ status: 'pending', decidedBy: null });
+        const done = await approveAgentRequest(people.ada, view.id, { answers: { openNow: false }, secrets: { backup_password: 'Bkp-Pass-2' } }, { atHost: true });
+        expect(done.status).toBe('executed');
+        expect(m.runApproved.mock.calls[0][2].secrets).toEqual({ backup_password: 'Bkp-Pass-2' });
+      }
+    } finally {
+      PORTABLE.alwaysNeedsSecret = before;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The hard floor at the moment of approval (plan 4.6, D9)
+// ---------------------------------------------------------------------------
+
+describe('a refusal at the moment of approval', () => {
+  beforeAll(async () => {
+    await makeAgent('floor');
+    op('test.role', { class: 'admin', method: 'PATCH', rule: { area: 'users', action: 'modify' }, area: 'users', action: 'modify', amountField: null });
+  });
+
+  it('a role an agent holds: the request fails with the door\'s plain note, for good, never left being carried out', async () => {
+    const NOTE =
+      'Nothing was done. Agents can never change or delete the role "Bookkeeper", because an agent holds it. A person can change it in Users & Roles once no agent holds it.';
+    m.runApproved.mockRejectedValue(new ServiceError('FORBIDDEN', NOTE, { hardFloor: true }));
+    const view = await ask('floor', 'test.role', { effectiveClass: 'admin', input: { params: { key: 'bookkeeper' }, body: { name: 'Bookkeeper', taxId: '987-65-0000' } } });
+    const res = await approveAgentRequest(people.ada, view.id, {}, { atHost: true });
+    expect(res.status).toBe('failed');
+    expect(res.request).toMatchObject({ status: 'failed', error: NOTE });
+    const row = await rowOf(view.id);
+    expect(row.status).toBe('failed');
+    expect(JSON.stringify(row.input)).not.toContain('987-65-0000');
+    // The agent reads the same note; nothing is approved twice.
+    expect(await requestForAgent(agentCtx.floor, view.id)).toMatchObject({ status: 'failed', error: NOTE });
+    await expectError(approveAgentRequest(people.ada, view.id, {}, { atHost: true }), 'CONFLICT');
+    expect(m.runApproved).toHaveBeenCalledTimes(1);
+    const audit = await db.select().from(auditLogs).where(and(eq(auditLogs.entityType, 'agent_permission_request'), eq(auditLogs.entityId, view.id)));
+    expect(audit.some((a) => (a.newValues as { status?: string; error?: string }).status === 'failed' && (a.newValues as { error?: string }).error === NOTE)).toBe(true);
+  });
+
+  it('the same refusal answered as a failed run ends it the same way', async () => {
+    const NOTE = 'Nothing was done. Agents can never change or delete the role "Payroll Clerk", because an agent holds it.';
+    m.runApproved.mockResolvedValue(bridge({ outcome: 'error', httpStatus: 403, result: null, error: { message: NOTE, code: 'HARD_FLOOR', details: null } }));
+    const view = await ask('floor', 'test.role', { effectiveClass: 'admin' });
+    const res = await approveAgentRequest(people.ada, view.id, {}, { atHost: true });
+    expect(res.request).toMatchObject({ status: 'failed', error: NOTE });
+    expect((await rowOf(view.id)).status).toBe('failed');
   });
 });

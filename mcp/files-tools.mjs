@@ -10,8 +10,11 @@
  *    every link and ".." is resolved, is inside one of the folders an Admin opened to this agent
  *    (get_my_permissions lists them), and not inside a folder Ironbooks keeps for itself
  *    (ironbooksFolders: its settings, the working copies of company files, staged agent files),
- *    even when an opened folder holds one. Anywhere else it is refused before the file is opened,
- *    and every refusal is written to the connector's log. A missing file is said to be missing
+ *    even when an opened folder holds one, under any spelling of it (case, short names, trailing
+ *    dots). A path through a share of this very computer (\\localhost\c$\…, \\127.1\…, its own
+ *    name: isThisComputerShare) is never read, nor is such a folder ever one the agent may use:
+ *    through it Ironbooks' own folders are there under another name. Anywhere else it is refused
+ *    before the file is opened, and every refusal is written to the connector's log. A missing file is said to be missing
  *    only where it would be inside an allowed folder, so nothing is learnt about what exists
  *    elsewhere. A network share is looked at only when an allowed folder is on it: merely touching
  *    a share makes Windows offer it this person's sign-in. The file is read with the size cap
@@ -47,18 +50,22 @@ const DEVICE_PATH = /^(?:[\\/]{2}[?.](?:[\\/]|$)|\\\?\?\\)/;
 /** Names Windows keeps for devices, with or without an extension (lib/agent/files.ts DEVICE_NAME). */
 const DEVICE_NAME = /^(con|prn|aux|nul|conin\$|conout\$|clock\$|com[0-9¹²³]|lpt[0-9¹²³]) *(\.|$)/iu;
 const PATH_MAX = 1024;
+/** The longest folder save_file sends (lib/agent/operate.ts save_file: at most 1000). */
+const SAVE_FOLDER_MAX = 1000;
 const MAX_LINK_HOPS = 32;
 
-const FILE_ID = { type: 'string', pattern: '^[A-Za-z0-9_-]{8,128}$', patternHint: 'must be a file_id an answer gave you' };
+/** As long as the door takes one (lib/agent/operate.ts get_file, save_file: at most 64). */
+const FILE_ID = { type: 'string', pattern: '^[A-Za-z0-9_-]{8,64}$', patternHint: 'must be a file_id an answer gave you' };
 const FILE_NAME = {
   type: 'string',
   maxLength: 255,
   pattern: '^[^\\\\/\\u0000-\\u001f]+$',
   patternHint: 'must be a file name without folders, for example "statement-2026-03.pdf"',
 };
+/** A media type, as long as the door's upload takes one (lib/agent/operate.ts upload_file: at most 200). */
 const MIME = {
   type: 'string',
-  maxLength: 255,
+  maxLength: 200,
   pattern: '^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$',
   patternHint: 'must be a media type like application/pdf or text/csv',
 };
@@ -169,17 +176,195 @@ export function decodeBase64(/** @type {string} */ text) {
 // ---------------------------------------------------------------------------
 
 /**
- * On Windows, the share a UNC path is on, as "\\server\share" in lower case; '' for a UNC path
- * without a share; null for any other path (and always on other systems).
+ * A name as Windows compares names (lib/agent/files.ts windowsFold): each character in upper case
+ * when that is still one character, as NTFS does. Not lower case: "K" (the Kelvin sign) lowers to
+ * "k" but is a name of its own on the disk.
+ * @param {string} s
+ */
+function windowsFold(s) {
+  let out = '';
+  for (const ch of s) {
+    const up = ch.toUpperCase();
+    out += Array.from(up).length === 1 ? up : ch;
+  }
+  return out;
+}
+
+/**
+ * On Windows, the share a UNC path is on, as "\\SERVER\SHARE" folded the way Windows compares
+ * names; '' for a UNC path without a share; null for any other path (and always on other systems).
  * @param {string} p
  */
 function uncShare(p) {
   if (!WIN || !/^[\\/]{2}/.test(p) || DEVICE_PATH.test(p)) return null;
   const m = /^[\\/]{2}([^\\/]+)[\\/]+([^\\/]+)/.exec(p);
-  return m ? `\\\\${m[1]}\\${m[2]}`.toLowerCase() : '';
+  return m ? windowsFold(`\\\\${m[1]}\\${m[2]}`) : '';
 }
 
-const key = (/** @type {string} */ p) => (WIN ? p.toLowerCase() : p);
+const key = (/** @type {string} */ p) => (WIN ? windowsFold(p) : p);
+
+// ---------------------------------------------------------------------------
+// A share of this very computer (lib/agent/files.ts isThisComputerShare, ported: the connector
+// cannot import TypeScript; test/mcp/files.test.ts holds the two to lib/agent/thisComputerShares.json)
+// ---------------------------------------------------------------------------
+
+/** "\\?\UNC\server\share\…", "\\.\UNC\…" and "\??\UNC\…": a share written as a device path (lib/agent/files.ts DEVICE_UNC). */
+const DEVICE_UNC = /^(?:[\\/]{2}[?.][\\/]|\\\?\?\\)UNC(?=[\\/]|$)/i;
+
+/**
+ * The server a UNC path names ("\\SERVER\share\…" gives "SERVER"), as written, also when it is
+ * written as a device path ("\\?\UNC\SERVER\share\…"); null for any other path (lib/agent/files.ts
+ * uncServer; the caller says whether this is Windows).
+ * @param {string} p
+ * @returns {string | null}
+ */
+function uncServer(p) {
+  const s = DEVICE_UNC.test(p) ? `\\\\${p.replace(DEVICE_UNC, '').replace(/^[\\/]+/, '')}` : p;
+  if (DEVICE_PATH.test(s)) return null;
+  const m = /^[\\/]{2}([^\\/]*)/.exec(s);
+  return m ? m[1] : null;
+}
+
+/**
+ * A server name as the name service may take it, for a refusal only: compatibility forms folded
+ * (a full-width "ｌｏｃａｌｈｏｓｔ" is "localhost" once the system maps it), the other full stops a
+ * name may be written with as ".", lower case.
+ * @param {string} s
+ */
+function looseHost(s) {
+  return s.normalize('NFKC').replace(/[\u3002\uff0e\uff61]/g, '.').toLowerCase();
+}
+
+/**
+ * An IPv4 address in any spelling the system takes ("127.0.0.1", "127.1", "0x7f.1", "0177.0.0.1",
+ * "2130706433"), as its 32-bit number; null for anything else.
+ * @param {string} s
+ * @returns {number | null}
+ */
+function ipv4Number(s) {
+  const parts = s.split('.');
+  if (parts.length > 4) return null;
+  /** @type {number[]} */
+  const nums = [];
+  for (const part of parts) {
+    let n;
+    if (/^0x[0-9a-f]*$/i.test(part)) n = part.length === 2 ? 0 : parseInt(part.slice(2), 16);
+    else if (/^0[0-7]*$/.test(part)) n = part.length === 1 ? 0 : parseInt(part.slice(1), 8);
+    else if (/^[1-9][0-9]*$/.test(part)) n = parseInt(part, 10);
+    else return null;
+    if (!Number.isSafeInteger(n)) return null;
+    nums.push(n);
+  }
+  const last = /** @type {number} */ (nums.pop());
+  if (nums.some((n) => n > 255)) return null;
+  const room = 2 ** (8 * (4 - nums.length));
+  if (last >= room) return null;
+  return nums.reduce((v, n) => v * 256 + n, 0) * room + last;
+}
+
+/**
+ * An IPv6 address as its eight 16-bit groups: "::1", "[::1]", "0:0:0:0:0:0:0:1", with a zone or an
+ * IPv4 tail, and Windows' own UNC spelling of one ("0--1.ipv6-literal.net"). Null for anything else.
+ * @param {string} s
+ * @returns {number[] | null}
+ */
+function ipv6Groups(s) {
+  let h = s.startsWith('[') && s.endsWith(']') ? s.slice(1, -1) : s;
+  const literal = /^(.+)\.ipv6-literal\.net$/.exec(h);
+  if (literal) h = literal[1].replace(/-/g, ':').replace(/s/g, '%');
+  h = h.replace(/%.*$/, '');
+  if (!h.includes(':')) return null;
+  const tail = /^(.*:)([^:]*\.[^:]*)$/.exec(h);
+  if (tail) {
+    const v4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(tail[2]) ? ipv4Number(tail[2].replace(/(^|\.)0+(?=\d)/g, '$1')) : null;
+    if (v4 === null) return null;
+    h = `${tail[1]}${Math.floor(v4 / 65536).toString(16)}:${(v4 % 65536).toString(16)}`;
+  }
+  const halves = h.split('::');
+  if (halves.length > 2) return null;
+  const groups = (/** @type {string} */ x) => (x === '' ? [] : x.split(':'));
+  const head = groups(halves[0]);
+  const rest = halves.length === 2 ? groups(halves[1]) : [];
+  if (![...head, ...rest].every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  const missing = 8 - head.length - rest.length;
+  if (missing < 0 || (halves.length === 1 && missing !== 0)) return null;
+  return [...head, ...Array(missing).fill('0'), ...rest].map((g) => parseInt(g, 16));
+}
+
+/** An address in one spelling for comparing ("v4:2130706433", "v6:0:0:0:0:0:0:0:1"), or null for a name. */
+function addressKey(/** @type {string} */ host) {
+  const v4 = ipv4Number(host);
+  if (v4 !== null) return `v4:${v4}`;
+  const g = ipv6Groups(host);
+  if (!g) return null;
+  if (g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || (g[5] === 0 && g[6] !== 0))) return `v4:${g[6] * 65536 + g[7]}`;
+  return `v6:${g.join(':')}`;
+}
+
+/** This computer itself: 127.0.0.0/8, 0.0.0.0/8, ::1 and ::. */
+function isLoopbackKey(/** @type {string} */ k) {
+  if (k.startsWith('v4:')) {
+    const first = Math.floor(Number(k.slice(3)) / 2 ** 24);
+    return first === 127 || first === 0;
+  }
+  return k === 'v6:0:0:0:0:0:0:0:1' || k === 'v6:0:0:0:0:0:0:0:0';
+}
+
+/** This computer's own addresses (every network card's), as addressKey spells them. Nothing is sent. */
+function ownAddressKeys() {
+  const out = new Set();
+  try {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const a of list ?? []) {
+        const k = addressKey(looseHost(a.address));
+        if (k) out.add(k);
+      }
+    }
+  } catch {
+    /* none known: names and loopback still count */
+  }
+  return out;
+}
+
+/** This computer's own names (its host name and its Windows computer name), first label only. */
+function ownNames(/** @type {Record<string, string | undefined>} */ env) {
+  /** @type {Array<string | undefined>} */
+  const names = [env.COMPUTERNAME];
+  try {
+    names.push(os.hostname());
+  } catch {
+    /* the computer name from the environment still counts */
+  }
+  return names.map((n) => looseHost(n?.trim() ?? '').split('.')[0]).filter((n) => !!n);
+}
+
+/**
+ * A path whose server is this very computer, on Windows: "localhost" and every name under
+ * ".localhost", "wsl$", a loopback address in any spelling (127.1, 0x7f000001, ::1, [::1],
+ * 0--1.ipv6-literal.net), one of this computer's own addresses, or its own name (with any domain
+ * after it). Through such a share Ironbooks' own folders, the books and other agents' files are
+ * there under another name, so it is never a folder an agent may read from. Judged by the words
+ * alone: nothing is looked up and nothing is looked at. The share may be written as a device path
+ * ("\\?\UNC\localhost\c$", which readAllowedFile refuses anyway), and the server with spaces or
+ * dots around it. False for every path that is no UNC path, and on other systems. `opts` are for
+ * tests: another system, another environment.
+ * @param {unknown} p
+ * @param {{ platform?: string, env?: Record<string, string | undefined> }} [opts]
+ */
+export function isThisComputerShare(p, opts = {}) {
+  if (typeof p !== 'string' || (opts.platform ?? process.platform) !== 'win32') return false;
+  const raw = uncServer(p.trim());
+  if (raw === null) return false;
+  // "server@SSL@443" (a WebDAV share) is on that same server; trailing dots, and spaces either
+  // side, leave the same name (a refusal errs on the side of refusing).
+  const host = looseHost(raw.split('@')[0]).trim().replace(/[.\s]+$/, '');
+  // No server at all is no share anyone can name: refused as well.
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.localhost') || host === 'wsl$') return true;
+  const k = addressKey(host);
+  if (k) return isLoopbackKey(k) || ownAddressKeys().has(k);
+  return ownNames(opts.env ?? process.env).includes(host.split('.')[0]);
+}
 
 /** `child` is strictly inside `parent` (case-insensitive on Windows). */
 function inside(/** @type {string} */ child, /** @type {string} */ parent) {
@@ -220,9 +405,10 @@ export function plainPath(raw) {
  * `at` is where the path leads with every link on the way followed. When a part is missing, it is
  * the place reached so far with the missing part and the rest added as given: that is where the
  * file would be, so the caller can tell "missing in an allowed folder" from "missing somewhere
- * else" without being fooled by a link that leads out. Null when a link was refused.
+ * else" without being fooled by a link that leads out. Null when a link was refused. `found` is
+ * the part that exists (links followed), `missing` the parts after it that do not.
  * @param {string} start @param {ReadonlySet<string>} shares
- * @returns {Promise<{ ok: boolean, at: string | null }>}
+ * @returns {Promise<{ ok: boolean, at: string | null, found: string, missing: string[] }>}
  */
 async function walkLinks(start, shares) {
   const split = (/** @type {string} */ p) => {
@@ -232,43 +418,47 @@ async function walkLinks(start, shares) {
   let { root, rest } = split(start);
   let current = root;
   let hops = 0;
+  const refused = { ok: false, at: null, found: '', missing: [] };
   while (rest.length) {
-    const next = path.join(current, /** @type {string} */ (rest.shift()));
+    const part = /** @type {string} */ (rest.shift());
+    const next = path.join(current, part);
     let st;
     try {
       st = await fsp.lstat(next);
     } catch {
-      return { ok: false, at: path.join(next, ...rest) };
+      return { ok: false, at: path.join(next, ...rest), found: current, missing: [part, ...rest] };
     }
     if (!st.isSymbolicLink()) {
       current = next;
       continue;
     }
-    if (++hops > MAX_LINK_HOPS) return { ok: false, at: null };
+    if (++hops > MAX_LINK_HOPS) return refused;
     let target;
     try {
       target = await fsp.readlink(next);
     } catch {
-      return { ok: false, at: null };
+      return refused;
     }
     const abs = path.resolve(current, target);
-    if (DEVICE_PATH.test(abs)) return { ok: false, at: null };
+    if (DEVICE_PATH.test(abs)) return refused;
     const share = uncShare(abs);
-    if (share !== null && !shares.has(share)) return { ok: false, at: null };
+    if (share !== null && !shares.has(share)) return refused;
     const more = split(abs);
     current = more.root;
     rest = [...more.rest, ...rest];
   }
-  return { ok: true, at: current };
+  return { ok: true, at: current, found: current, missing: [] };
 }
 
 function realpathNative(/** @type {string} */ p) {
   return new Promise((resolve, reject) => fs.realpath.native(p, (err, out) => (err ? reject(err) : resolve(out))));
 }
 
-/** `p` with every link resolved, or null (missing, or a link leads somewhere not allowed). */
-async function realOf(/** @type {string} */ p, /** @type {ReadonlySet<string>} */ shares) {
-  if (!(await walkLinks(p, shares)).ok) return null;
+/** realOf's answer for a place the disk gives as a share of this very computer (a drive mapped to \\localhost\c$). */
+const HERE = Symbol('a share of this computer');
+
+/** `p` (which exists) as the system spells it: true case, short names expanded, links resolved. Null when it will not say. */
+async function systemSpelling(/** @type {string} */ p) {
   /** @type {string} */
   let real;
   try {
@@ -284,6 +474,66 @@ async function realOf(/** @type {string} */ p, /** @type {ReadonlySet<string>} *
   return real;
 }
 
+/**
+ * `p` with every link resolved, or null (missing, or a link leads somewhere not allowed), or HERE
+ * when the disk answers it as a share of this very computer (refused like one typed that way).
+ * @param {string} p @param {ReadonlySet<string>} shares
+ * @returns {Promise<string | null | typeof HERE>}
+ */
+async function realOf(p, shares) {
+  if (!(await walkLinks(p, shares)).ok) return null;
+  const real = await systemSpelling(p);
+  if (real === null) return null;
+  return isThisComputerShare(real) ? HERE : real;
+}
+
+/** realOf for a folder to compare with: a share of this computer is no place to compare with. */
+async function realBase(/** @type {string} */ p, /** @type {ReadonlySet<string>} */ shares) {
+  const real = await realOf(p, shares);
+  return typeof real === 'string' ? real : null;
+}
+
+/**
+ * Where `p` is, as the system spells the part of it that exists (true case, short names such as
+ * IRONBO~1 expanded, links followed), with the parts that do not exist added as given. So a file
+ * that is missing is still placed by the real spelling of its folder. Null when a link on the way
+ * may not be followed.
+ * @param {string} p @param {ReadonlySet<string>} shares
+ */
+async function diskSpelling(p, shares) {
+  const w = await walkLinks(p, shares);
+  if (!w.found) return null;
+  const base = await systemSpelling(w.found);
+  if (base === null) return null;
+  return w.missing.length ? path.join(base, ...w.missing) : base;
+}
+
+/**
+ * The forms a path is compared in with Ironbooks' own places: on Windows without the trailing dots
+ * and spaces the system drops from every name ("Ironbooks." is "Ironbooks"), and in either folding
+ * of case (lower case, and the upper case NTFS compares in, which differ for a few letters such as
+ * "ſ"). Case is folded on every system: a Mac's disk ignores it too, and here refusing more is the
+ * safe side.
+ * @param {string} p
+ */
+function ownForms(p) {
+  const root = path.parse(p).root;
+  const parts = p
+    .slice(root.length)
+    .split(WIN ? /[\\/]+/ : /\/+/)
+    .map((part) => (WIN ? part.replace(/[. ]+$/, '') : part))
+    .filter(Boolean);
+  const s = root + parts.join(path.sep);
+  return [s.toLowerCase(), windowsFold(s)];
+}
+
+/** `p` is `place`, or inside it, in any of the forms the disk takes for the same name. */
+function ownWithin(/** @type {string} */ p, /** @type {string} */ place, /** @type {boolean} */ orInside = true) {
+  const a = ownForms(p);
+  const b = ownForms(place);
+  return a.some((x, i) => x === b[i] || (orInside && x.startsWith(b[i].endsWith(path.sep) ? b[i] : b[i] + path.sep)));
+}
+
 export const NO_FOLDERS_MESSAGE =
   'No folders are open to this agent, so it cannot read files from this computer. An Admin can add folders for it under Users & Roles > Agents. Or hand the file over with upload_file.';
 export const NOT_A_PATH_MESSAGE = 'Give the full path of the file, for example C:\\Users\\Pat\\Documents\\Ironbooks\\statement.pdf.';
@@ -294,6 +544,14 @@ export function outsideMessage(/** @type {string[]} */ folders) {
 }
 
 export const NOT_FOUND_MESSAGE = 'That file could not be found. Check the path, or ask the person where the file is.';
+
+/** Said of a path that reaches this computer through one of its own network shares (isThisComputerShare). */
+export const THIS_COMPUTER_SHARE_MESSAGE =
+  "That path reaches this computer through one of its own network shares (\\\\localhost, a loopback address or this computer's own name). An agent may never read files that way. Give the file's own path on this computer instead, for example C:\\Users\\Pat\\Documents\\Ironbooks\\statement.pdf.";
+
+/** Said when every folder open to this agent is such a share, so none can be used. */
+export const ONLY_THIS_COMPUTER_FOLDERS_MESSAGE =
+  "The folders open to this agent are reached through a network share of this same computer (\\\\localhost or this computer's own name), which an agent may never use, so it cannot read files from this computer. An Admin can open the folder again by its own path on this computer (for example C:\\Users\\Pat\\Documents\\Ironbooks) under Users & Roles > Agents. Or hand the file over with upload_file.";
 
 /**
  * Said of a file in ironbooksFolders or ironbooksFiles. It names only what those cover: the
@@ -353,9 +611,11 @@ export function ironbooksFiles(env = process.env) {
 }
 
 /**
- * `p` (a path with its links resolved) is inside, or is, one of Ironbooks' own folders or files.
- * Each is taken as written and with its own links followed, but a folder on a network share is
- * only looked at when an allowed folder is on that share too.
+ * `p` (a path with its links resolved) is inside, or is, one of Ironbooks' own folders or files,
+ * under any spelling the disk takes for the same place: in either folding of case, without the
+ * trailing dots and spaces Windows drops, and as the system spells the part that exists (short
+ * names expanded, links followed, even for a place that does not exist yet). A folder on a network
+ * share is only looked at when an allowed folder is on that share too.
  * @param {string} p @param {{ folders: string[], files: string[] }} own @param {ReadonlySet<string>} shares
  */
 async function isIronbooksOwn(p, own, shares) {
@@ -363,15 +623,15 @@ async function isIronbooksOwn(p, own, shares) {
     const s = uncShare(f);
     return s === null || shares.has(s);
   };
+  const places = async (/** @type {string} */ f) => {
+    const spelled = lookable(f) ? await diskSpelling(f, shares) : null;
+    return spelled && spelled !== f ? [f, spelled] : [f];
+  };
   for (const folder of own.folders) {
-    if (inside(p, folder) || key(p) === key(folder)) return true;
-    const real = lookable(folder) ? await realOf(folder, shares) : null;
-    if (real && (inside(p, real) || key(p) === key(real))) return true;
+    for (const place of await places(folder)) if (ownWithin(p, place)) return true;
   }
   for (const file of own.files) {
-    if (key(p) === key(file)) return true;
-    const real = lookable(file) ? await realOf(file, shares) : null;
-    if (real && key(p) === key(real)) return true;
+    for (const place of await places(file)) if (ownWithin(p, place, false)) return true;
   }
   return false;
 }
@@ -388,7 +648,7 @@ function logRefusal(/** @type {unknown} */ requested, /** @type {string} */ why)
 async function inAllowedFolder(/** @type {string} */ p, /** @type {string[]} */ folders, /** @type {ReadonlySet<string>} */ shares) {
   for (const folder of folders) {
     if (inside(p, folder) || key(p) === key(folder)) return true;
-    const base = await realOf(folder, shares);
+    const base = await realBase(folder, shares);
     if (base && (inside(p, base) || key(p) === key(base))) return true;
   }
   return false;
@@ -430,17 +690,27 @@ export async function readUpTo(handle, cap, sizeHint = 0) {
  * @returns {Promise<{ path: string, bytes: Buffer }>}
  */
 export async function readAllowedFile(requested, folders, opts = {}) {
-  const entries = /** @type {string[]} */ ((Array.isArray(folders) ? folders : []).map(plainPath).filter((p) => typeof p === 'string'));
+  const typed = /** @type {string[]} */ ((Array.isArray(folders) ? folders : []).map(plainPath).filter((p) => typeof p === 'string'));
+  // A folder reached through a share of this very computer is never one an agent may use, nor does
+  // it allow anything (lib/agent/files.ts allowedFolder): by the words, so it is never looked at,
+  // and so never among `shares` below, which keeps a link that leads to it out too.
+  const entries = typed.filter((p) => !isThisComputerShare(p));
   // Every refusal is logged (plan §5.7); a file that is missing, a folder or too large is not one.
   if (!entries.length) {
-    logRefusal(requested, 'no folders are open to this agent.');
-    throw new ToolError(NO_FOLDERS_MESSAGE);
+    logRefusal(requested, typed.length ? 'every folder open to this agent is a share of this same computer.' : 'no folders are open to this agent.');
+    throw new ToolError(typed.length ? ONLY_THIS_COMPUTER_FOLDERS_MESSAGE : NO_FOLDERS_MESSAGE);
   }
   const want = plainPath(requested);
   if (!want) {
     logRefusal(requested, 'not a plain full path (relative, a device, a stream or a device name).');
     throw new ToolError(NOT_A_PATH_MESSAGE);
   }
+  const thisComputer = () => {
+    logRefusal(requested, 'it reaches this computer through one of its own network shares.');
+    return new ToolError(THIS_COMPUTER_SHARE_MESSAGE);
+  };
+  // \\localhost\c$\…, \\127.1\…, this computer's own name: refused by the words, before anything is looked at.
+  if (isThisComputerShare(want)) throw thisComputer();
   const outside = () => {
     logRefusal(requested, 'not inside a folder this agent may use.');
     return new ToolError(outsideMessage(entries));
@@ -456,14 +726,20 @@ export async function readAllowedFile(requested, folders, opts = {}) {
   if (wantShare !== null && !shares.has(wantShare)) throw outside();
 
   const real = await realOf(want, shares);
+  // As the disk has it, on a share of this very computer (a drive mapped to \\localhost\c$).
+  if (real === HERE) throw thisComputer();
   if (!real) {
     // Missing: say so only where the file would be inside an allowed folder once every link on the
     // way is followed, so nothing is learnt about what exists elsewhere, even through a link that
     // leads out. A link that may not be followed at all counts as outside.
     const { at } = await walkLinks(want, shares);
-    if (!at || !(await inAllowedFolder(at, entries, shares))) throw outside();
+    if (!at) throw outside();
+    // Where it would be, as the system spells the folders that exist (short names, true case).
+    const spelled = await diskSpelling(want, shares);
+    if (!(await inAllowedFolder(at, entries, shares)) && !(spelled && (await inAllowedFolder(spelled, entries, shares)))) throw outside();
+    if (spelled && isThisComputerShare(spelled)) throw thisComputer();
     // Inside one of Ironbooks' own folders: refused alike whether the file is there or not.
-    if (await isIronbooksOwn(at, own, shares)) throw ironbooksOwn();
+    if ((await isIronbooksOwn(at, own, shares)) || (spelled && (await isIronbooksOwn(spelled, own, shares)))) throw ironbooksOwn();
     throw new ToolError(NOT_FOUND_MESSAGE);
   }
   const realShare = uncShare(real);
@@ -471,7 +747,7 @@ export async function readAllowedFile(requested, folders, opts = {}) {
   for (const entry of entries) {
     const entryShare = uncShare(entry);
     if (entryShare !== null && entryShare !== realShare) continue;
-    const base = await realOf(entry, shares);
+    const base = await realBase(entry, shares);
     // The folder itself counts too, so that it is refused below as "not a file", not as outside.
     if (base && (inside(real, base) || key(real) === key(base))) {
       allowed = true;
@@ -491,7 +767,7 @@ export async function readAllowedFile(requested, folders, opts = {}) {
   try {
     const st = await handle.stat();
     // The path still leads to the file that was checked: nothing was swapped in meanwhile.
-    const again = await realOf(real, shares);
+    const again = await realBase(real, shares);
     if (!st.isFile() || !again || key(again) !== key(real) || st.ino !== before.ino || st.dev !== before.dev) throw outside();
     if (st.size > UPLOAD_MAX_BYTES) throw new ToolError(TOO_LARGE(st.size));
     // Never more than the cap in memory, even when the file grows while it is read.
@@ -635,7 +911,7 @@ export const FILE_TOOLS = [
     inputSchema: schema(
       {
         file_id: { ...FILE_ID, description: 'The file_id from an answer or from upload_file.' },
-        folder: { type: 'string', maxLength: PATH_MAX, description: 'The folder to save it in: one get_my_permissions lists, or a folder inside one.' },
+        folder: { type: 'string', maxLength: SAVE_FOLDER_MAX, description: 'The folder to save it in: one get_my_permissions lists, or a folder inside one.' },
         name: { ...FILE_NAME, description: 'The name to save it under (default: the file\'s own name).' },
         request_id: REQUEST_ID,
         reason: { type: 'string', maxLength: 500, description: 'Why it should be saved there, in a sentence. The person sees it labelled as your words.' },

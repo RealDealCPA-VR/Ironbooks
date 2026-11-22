@@ -12,13 +12,19 @@
  *  - a save is checked against the engine's rules and refused with what to change; it replaces
  *    the overrides, keeps the older mode in step with the preset and writes one audit row; the
  *    engine's own check catches what a hand-edited file keeps (a cell stored twice, a stored Allow);
- *  - folders must be full paths that exist, never a whole drive or share, and never the books' or
- *    Ironbooks' own folders (staged files, working copies of every company file, settings, backups);
+ *  - a new folder must be a full path that exists, never a whole drive or share, never a share of
+ *    this very computer, and never the books' or Ironbooks' own folders (staged files, working
+ *    copies of every company file, settings, backups, archives, practice copies: overlapsAppData);
+ *    a folder the agent already has is kept as stored and never looked at again on the disk, so
+ *    taking folders away is never stopped by one that has since gone missing; its words still meet
+ *    the rules (an Admin sending back one Ironbooks now keeps its own data in is told, anyone else
+ *    has it taken away);
  *  - pause one agent, or all of them through the Integrated Applications switch, "paused since"
  *    staying put through later company saves;
  *  - the ceiling, the detail page and the activity list.
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { and, eq, sql } from 'drizzle-orm';
@@ -36,36 +42,65 @@ delete process.env.BKA_AGENT_FILES_DIR;
 
 // Another unit's modules, replaced here: whether code runs inside an agent's bridged run (the
 // service scope), and the folder check the save check shares with save_file and where staged
-// files are kept (lib/agent/files.ts).
-// `realFolders` hands the folder check to the real allowedFolder, loaded only then, to show what
-// a person is told for what it never takes (a whole drive or share). The stand-in takes an
-// existing folder that is one of `allowed` or inside one. `looked` is every path either was asked of.
-const scope = vi.hoisted(() => ({ inside: false, staged: null as string | null, realFolders: false, looked: [] as string[] }));
+// files are kept (lib/agent/files.ts); the rest of that module (overlapsAppData, isThisComputerShare,
+// appDataPlaces) is the real one.
+// `realFolders` hands the folder check to the real allowedFolder, to show what a person is told
+// for what it never takes (a whole drive or share). The stand-in takes an existing folder that is
+// one of `allowed` or inside one. `looked` is every path either was asked of, and every path the
+// real overlapsAppData was asked of; `overlapAsked` only the latter, word for word.
+// `overlapSays`, when set, is a path (exactly as asked) that overlapsAppData answers true for
+// whatever the real one says: a place only that check knows of. `skip`, when set, is a folder the
+// folder check answers null for, as the real one does for a folder it skips.
+// `beforeLook`, when set, runs once just before the folder check looks (another save landing then).
+const scope = vi.hoisted(() => ({
+  inside: false,
+  staged: null as string | null,
+  realFolders: false,
+  looked: [] as string[],
+  overlapAsked: [] as string[],
+  overlapSays: null as string | null,
+  skip: null as string | null,
+  beforeLook: null as null | (() => Promise<void>),
+}));
 vi.mock('@/lib/serviceScope', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   inServiceScope: () => scope.inside,
 }));
-vi.mock('@/lib/agent/files', () => ({
-  stagedFilesRoot: () => scope.staged,
-  allowedFolder: async (allowed: readonly string[], folder: string) => {
-    scope.looked.push(...allowed, folder);
-    if (scope.realFolders) {
-      const real = await vi.importActual<typeof import('@/lib/agent/files')>('@/lib/agent/files');
-      return real.allowedFolder(allowed, folder);
-    }
-    const nodeFs = await import('node:fs');
-    const nodePath = await import('node:path');
-    if (!nodePath.isAbsolute(folder)) return null;
-    const want = nodePath.resolve(folder);
-    const inside = (a: string) => nodePath.isAbsolute(a) && (want === nodePath.resolve(a) || want.startsWith(nodePath.resolve(a) + nodePath.sep));
-    if (!allowed.some(inside)) return null;
-    try {
-      return nodeFs.statSync(folder).isDirectory() ? want : null;
-    } catch {
-      return null;
-    }
-  },
-}));
+vi.mock('@/lib/agent/files', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@/lib/agent/files')>();
+  return {
+    ...real,
+    stagedFilesRoot: () => scope.staged,
+    overlapsAppData: (folder: string) => {
+      scope.looked.push(folder);
+      scope.overlapAsked.push(folder);
+      if (scope.overlapSays !== null && folder === scope.overlapSays) return true;
+      return real.overlapsAppData(folder);
+    },
+    allowedFolder: async (allowed: readonly string[], folder: string) => {
+      scope.looked.push(...allowed, folder);
+      const meanwhile = scope.beforeLook;
+      scope.beforeLook = null;
+      if (meanwhile) await meanwhile();
+      if (scope.skip !== null) {
+        const nodePath = await import('node:path');
+        if (nodePath.resolve(folder) === nodePath.resolve(scope.skip)) return null;
+      }
+      if (scope.realFolders) return real.allowedFolder(allowed, folder);
+      const nodeFs = await import('node:fs');
+      const nodePath = await import('node:path');
+      if (!nodePath.isAbsolute(folder)) return null;
+      const want = nodePath.resolve(folder);
+      const inside = (a: string) => nodePath.isAbsolute(a) && (want === nodePath.resolve(a) || want.startsWith(nodePath.resolve(a) + nodePath.sep));
+      if (!allowed.some(inside)) return null;
+      try {
+        return nodeFs.statSync(folder).isDirectory() ? want : null;
+      } catch {
+        return null;
+      }
+    },
+  };
+});
 
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { agentGrants, agentPermissionRequests, agentPolicies, agents, auditLogs, companies, users } from '@/lib/db/schema';
@@ -75,6 +110,7 @@ import { NEVER_ALLOW_CLASSES } from '@/lib/agent/operations/types';
 import { createCompany, updateCompany } from './company';
 import { ServiceError, type ServiceContext, writeAudit } from './_base';
 import { agentAccess, createAgent, findAgentByToken, revokeAgent } from './agents';
+import { rememberChosenFolder } from './backupHistory';
 import {
   agentCeiling,
   getAgentDetail,
@@ -151,6 +187,10 @@ beforeEach(() => {
   scope.staged = null;
   scope.realFolders = false;
   scope.looked = [];
+  scope.overlapAsked = [];
+  scope.overlapSays = null;
+  scope.skip = null;
+  scope.beforeLook = null;
 });
 
 afterAll(async () => {
@@ -521,11 +561,188 @@ describe('saving a policy', () => {
         // drive: not a full path at all.
         await expectError(saveAgentPolicy(admin, agent.id, { folders: [drive.slice(0, 2)] }), 'VALIDATION', /not a full folder path/);
         // A share's own folder, by the words alone: the server is never looked at, so one that
-        // does not exist is refused the same way.
-        for (const folder of [String.raw`\\localhost\c$`, String.raw`\\localhost\c$\\`, String.raw`\\no-such-server.invalid\books`]) {
+        // does not exist is refused the same way. (A share of this computer is told something
+        // else, its own folder included: see the test below.)
+        for (const folder of [String.raw`\\no-such-server.invalid\books`, String.raw`\\no-such-server.invalid\books\\`]) {
           await expectError(saveAgentPolicy(admin, agent.id, { folders: [folder] }), 'VALIDATION', whole);
         }
       }
+    }
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([]);
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('never a folder Ironbooks keeps copies of the books in, nor one holding a chosen backups folder (overlapsAppData)', async () => {
+    const { agent } = await newAgent('Copies', ['bookkeeper']);
+    const own = /one of the folders Ironbooks keeps its own data in .* Choose another folder for the agent\./;
+    // Beside the books' data folder: the condense archives, and the practice copies (sandboxes)
+    // where lib/services/sandbox.ts keeps them when the shell names no folder.
+    const besideBooks = path.dirname(TEST_DIR);
+    const archives = path.join(besideBooks, 'archives');
+    const sandboxes = path.join(besideBooks, 'Ironbooks Sandboxes', 'practice-1');
+    // Beside the company file: its condense archives. The folder of the company file itself is
+    // refused by the books' rule; a folder inside it that holds no books is refused by this one.
+    const filed = path.join(FOLDERS, 'filed');
+    const fileArchives = path.join(filed, 'archives');
+    // A backups folder chosen on this computer (Back Up settings), and the folder that holds it.
+    const office = path.join(FOLDERS, 'office');
+    const chosen = path.join(office, 'backups');
+    for (const d of [archives, sandboxes, fileArchives, chosen]) fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(filed, 'Acme.ironbooks'), 'x');
+    const saved = process.env.BKA_COMPANY_FILE;
+    process.env.BKA_COMPANY_FILE = path.join(filed, 'Acme.ironbooks');
+    try {
+      for (const folder of [archives, sandboxes, path.dirname(sandboxes), fileArchives]) {
+        await expectError(saveAgentPolicy(admin, agent.id, { folders: [folder] }), 'VALIDATION', own);
+      }
+      await expectError(saveAgentPolicy(admin, agent.id, { folders: [filed] }), 'VALIDATION', /holds the company file/);
+
+      // Until it is chosen for backups, the office folder is an ordinary folder.
+      expect((await saveAgentPolicy(admin, agent.id, { folders: [office] })).policy.folders).toEqual([path.resolve(office)]);
+      await saveAgentPolicy(admin, agent.id, { folders: [] });
+      rememberChosenFolder(chosen);
+      for (const folder of [chosen, office]) {
+        await expectError(saveAgentPolicy(admin, agent.id, { folders: [folder] }), 'VALIDATION', own);
+      }
+      // A folder beside them is fine.
+      expect((await saveAgentPolicy(admin, agent.id, { folders: [path.join(FOLDERS, 'receipts')] })).policy.folders).toEqual([
+        path.resolve(FOLDERS, 'receipts'),
+      ]);
+    } finally {
+      if (saved === undefined) delete process.env.BKA_COMPANY_FILE;
+      else process.env.BKA_COMPANY_FILE = saved;
+      // The list of chosen backup folders lives in the default backups folder beside the data.
+      fs.rmSync(path.join(besideBooks, 'backups'), { recursive: true, force: true });
+    }
+    await revokeAgent(admin, agent.id);
+  });
+
+  it("overlapsAppData is asked of the folder as typed and as the disk has it, and its answer alone refuses", async () => {
+    const { agent } = await newAgent('Only overlaps', ['bookkeeper']);
+    const own = /one of the folders Ironbooks keeps its own data in .* Choose another folder for the agent\./;
+    // An ordinary folder, typed with a detour (".."), so the path as typed and the real path the
+    // folder check hands back are two different strings. No other rule refuses it.
+    const ordinary = path.join(FOLDERS, 'ordinary');
+    fs.mkdirSync(ordinary, { recursive: true });
+    const typed = [FOLDERS, 'receipts', '..', 'ordinary'].join(path.sep);
+    scope.realFolders = true;
+    const real = fs.realpathSync.native(ordinary);
+    expect(real).not.toBe(typed);
+    // A place only overlapsAppData knows of (stood in), named once by each spelling.
+    for (const says of [typed, real]) {
+      scope.overlapSays = says;
+      scope.overlapAsked = [];
+      await expectError(saveAgentPolicy(admin, agent.id, { folders: [typed] }), 'VALIDATION', own);
+      expect(scope.overlapAsked).toContain(says);
+      expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([]);
+    }
+    // When it says nothing, the same folder is taken, as the disk has it.
+    scope.overlapSays = null;
+    expect((await saveAgentPolicy(admin, agent.id, { folders: [typed] })).policy.folders).toEqual([real]);
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('a folder it already has that Ironbooks keeps its own data in: an Admin is told, anyone else has it taken away', async () => {
+    const { agent } = await newAgent('Kept own', ['view_only']);
+    const own = /one of the folders Ironbooks keeps its own data in .* Choose another folder for the agent\./;
+    const receipts = path.resolve(FOLDERS, 'receipts');
+    // The condense archives beside the books' data folder, as an earlier round stored them before
+    // they were one of Ironbooks' own folders (it is gone today: only its words are judged).
+    const archives = path.join(path.dirname(TEST_DIR), 'archives');
+    fs.rmSync(archives, { recursive: true, force: true });
+    await db.update(agents).set({ folders: [archives, receipts], requestExpiryDays: 7 }).where(eq(agents.id, agent.id));
+    // An Admin sending it back is told why, as for a new folder, and nothing is saved.
+    await expectError(saveAgentPolicy(admin, agent.id, { folders: [archives, receipts] }), 'VALIDATION', own);
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([archives, receipts]);
+    // A manager who sends it back while tightening something else is not blocked: it is taken away
+    // (a tightening), the rest is saved, the audit row says which and why, and neither kept folder
+    // is looked at, on the disk or by the folder check.
+    scope.looked = [];
+    const disk = [vi.spyOn(fs, 'statSync'), vi.spyOn(fs, 'lstatSync'), vi.spyOn(fs.realpathSync, 'native')];
+    const key = (p: string) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+    let onDisk: string[];
+    let view: Awaited<ReturnType<typeof saveAgentPolicy>>;
+    try {
+      view = await saveAgentPolicy(manager, agent.id, { folders: [archives, receipts], requestExpiryDays: 3 });
+      onDisk = disk.flatMap((spy) => spy.mock.calls.map((call) => key(String(call[0]))));
+    } finally {
+      for (const spy of disk) spy.mockRestore();
+    }
+    expect(view.policy).toMatchObject({ folders: [receipts], requestExpiryDays: 3 });
+    expect(scope.looked).toEqual([]);
+    expect(onDisk.filter((p) => p === key(archives) || p === key(receipts))).toEqual([]);
+    const rows = await auditRowsFor(agent.id);
+    const audit = rows.find((r) => (r.newValues as Record<string, unknown> | null)?.foldersTakenAway);
+    expect(audit?.newValues).toMatchObject({ folders: [receipts], foldersTakenAway: [{ folder: archives, why: expect.stringMatching(own) }] });
+
+    // A folder it was given while it was ordinary, which has since come to hold a chosen backups
+    // folder: the same, for an Admin and for anyone else.
+    const office = path.join(FOLDERS, 'office-kept');
+    const chosen = path.join(office, 'backups');
+    fs.mkdirSync(chosen, { recursive: true });
+    await saveAgentPolicy(admin, agent.id, { folders: [office, receipts] });
+    const stored = (await loadAgentPolicy(admin, agent.id)).folders;
+    expect(stored).toHaveLength(2);
+    try {
+      rememberChosenFolder(chosen);
+      await expectError(saveAgentPolicy(admin, agent.id, { folders: stored }), 'VALIDATION', own);
+      // A save that sends no folders judges none (the screen sends only what changed).
+      await saveAgentPolicy(manager, agent.id, { requestExpiryDays: 2 });
+      expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual(stored);
+      expect((await saveAgentPolicy(manager, agent.id, { folders: stored })).policy.folders).toEqual([receipts]);
+    } finally {
+      fs.rmSync(path.join(path.dirname(TEST_DIR), 'backups'), { recursive: true, force: true });
+    }
+    await revokeAgent(admin, agent.id);
+  });
+
+  it.runIf(process.platform === 'win32')('never a share of this very computer, and the person is told to type its own path', async () => {
+    const { agent } = await newAgent('Loopback', ['bookkeeper']);
+    const onThisComputer = /that folder is on this computer, reached as a network share\. Type its own path on this computer instead, like C:\\/;
+    const host = os.hostname();
+    const shares = [
+      String.raw`\\localhost\c$\Users\Public\Documents`,
+      String.raw`\\127.0.0.1\c$\Users\Public`,
+      String.raw`\\[::1]\c$\Users\Public`,
+      `\\\\${host}\\c$\\Users\\Public`,
+      // The share's own folder too: "choose a folder on it" would only lead to \\localhost\c$\...,
+      // refused in turn, so it is told to type the path on this computer as well.
+      String.raw`\\localhost\c$`,
+      String.raw`\\localhost\c$\\`,
+      `\\\\${host}\\c$`,
+    ];
+    for (const real of [false, true]) {
+      scope.realFolders = real;
+      for (const share of shares) {
+        scope.looked = [];
+        await expectError(saveAgentPolicy(admin, agent.id, { folders: [share] }), 'VALIDATION', onThisComputer);
+        // Refused by the words: the share is never looked at, so nothing is offered a sign-in.
+        expect(scope.looked, share).toEqual([]);
+      }
+    }
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([]);
+    await revokeAgent(admin, agent.id);
+  });
+
+  it.runIf(process.platform === 'win32')('a drive letter the disk answers as a share of this computer is told so, not "not found"', async () => {
+    const { agent } = await newAgent('Mapped', ['bookkeeper']);
+    const onThisComputer = /that folder is on this computer, reached as a network share\. Type its own path on this computer instead/;
+    // As a drive mapped to \\localhost\c$ looks: a local path the folder check skips, which the disk
+    // spells as a share of this computer. Stood in for (mapping a drive changes this computer).
+    const mapped = path.join(FOLDERS, 'mapped');
+    fs.mkdirSync(mapped, { recursive: true });
+    scope.skip = mapped;
+    // Skipped for another reason (the disk spells it as itself): not found, as before.
+    await expectError(saveAgentPolicy(admin, agent.id, { folders: [mapped] }), 'VALIDATION', /was not found on this computer/);
+    const realpath = fs.realpathSync.native;
+    const spy = vi.spyOn(fs.realpathSync, 'native').mockImplementation(((p: fs.PathLike, options?: unknown) =>
+      path.resolve(String(p)).toLowerCase() === path.resolve(mapped).toLowerCase()
+        ? String.raw`\\localhost\c$\Shared\mapped`
+        : realpath(p, options as fs.EncodingOption)) as typeof fs.realpathSync.native);
+    try {
+      await expectError(saveAgentPolicy(admin, agent.id, { folders: [mapped] }), 'VALIDATION', onThisComputer);
+    } finally {
+      spy.mockRestore();
     }
     expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([]);
     await revokeAgent(admin, agent.id);
@@ -808,6 +1025,84 @@ describe('letting an agent do more is for an Admin (plan 4.4)', () => {
     } finally {
       for (const spy of disk) spy.mockRestore();
     }
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('folders: taking one away is never stopped by another it keeps that has since gone missing, and a kept one is never looked at', async () => {
+    const { agent } = await newAgent('Gone but kept', ['view_only']);
+    const receipts = path.join(FOLDERS, 'receipts');
+    const statements = path.join(FOLDERS, 'statements');
+    const gone = path.join(FOLDERS, 'gone-later');
+    fs.mkdirSync(gone, { recursive: true });
+    await saveAgentPolicy(admin, agent.id, { folders: [receipts, gone] });
+    fs.rmSync(gone, { recursive: true, force: true });
+    const stored = (await loadAgentPolicy(admin, agent.id)).folders;
+    const goneAsStored = stored.find((f) => f !== path.resolve(receipts))!;
+    // A network folder an older version took, offline now (looking would offer it a sign-in).
+    const share = '\\\\nowhere.invalid\\share\\Receipts';
+    const disk = [vi.spyOn(fs, 'statSync'), vi.spyOn(fs, 'lstatSync'), vi.spyOn(fs.realpathSync, 'native')];
+    const key = (p: string) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+    const lookedAt = (p: string) =>
+      [...scope.looked, ...disk.flatMap((spy) => spy.mock.calls.map((call) => String(call[0])))].some((q) => key(q) === key(p));
+    const fresh = () => {
+      scope.looked = [];
+      for (const spy of disk) spy.mockClear();
+    };
+    try {
+      // A manager takes receipts away and keeps the folder that is gone: tightening, saved as asked,
+      // and the gone folder is never looked at (it is not "made first").
+      fresh();
+      const view = await saveAgentPolicy(manager, agent.id, { folders: [goneAsStored] });
+      expect(view.policy.folders).toEqual([goneAsStored]);
+      expect(lookedAt(gone)).toBe(false);
+      // Sent back spelled another way (another case on Windows), it is still the one it had: kept as stored.
+      if (process.platform === 'win32') {
+        fresh();
+        expect((await saveAgentPolicy(manager, agent.id, { folders: [goneAsStored.toUpperCase()] })).policy.folders).toEqual([goneAsStored]);
+        expect(lookedAt(gone)).toBe(false);
+      }
+      // The same with a stored share that is offline, kept beside it.
+      await db.update(agents).set({ folders: [goneAsStored, share, path.resolve(receipts)] }).where(eq(agents.id, agent.id));
+      fresh();
+      await saveAgentPolicy(manager, agent.id, { folders: [share, goneAsStored] });
+      expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([share, goneAsStored]);
+      expect(lookedAt(gone) || lookedAt(share)).toBe(false);
+      // An Admin adding a folder beside a kept one that is gone: only the new one is looked at.
+      fresh();
+      await saveAgentPolicy(admin, agent.id, { folders: [goneAsStored, statements] });
+      expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([goneAsStored, path.resolve(statements)]);
+      expect(lookedAt(gone)).toBe(false);
+      expect(lookedAt(statements)).toBe(true);
+      // Sending it twice keeps it once.
+      await saveAgentPolicy(manager, agent.id, { folders: [goneAsStored, goneAsStored] });
+      expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([goneAsStored]);
+    } finally {
+      for (const spy of disk) spy.mockRestore();
+    }
+    // A folder that is gone and was never the agent's is new: refused as before.
+    await expectError(saveAgentPolicy(admin, agent.id, { folders: [path.join(FOLDERS, 'never-there')] }), 'VALIDATION', /was not found on this computer/);
+    await revokeAgent(admin, agent.id);
+  });
+
+  it('folders: a kept folder someone took away while the save was being checked saves nothing', async () => {
+    const { agent } = await newAgent('Raced', ['view_only']);
+    const receipts = path.join(FOLDERS, 'receipts');
+    const statements = path.join(FOLDERS, 'statements');
+    await saveAgentPolicy(admin, agent.id, { folders: [receipts] });
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([path.resolve(receipts)]);
+    const audits = (await auditRowsFor(agent.id)).length;
+    // Another person's save lands while this one checks its new folder: receipts is no longer the
+    // agent's, so this save would add it back unchecked. It is refused, and saves nothing.
+    scope.beforeLook = async () => {
+      await db.update(agents).set({ folders: [] }).where(eq(agents.id, agent.id));
+    };
+    await expectError(
+      saveAgentPolicy(admin, agent.id, { folders: [path.resolve(receipts), statements] }),
+      'CONFLICT',
+      /changed by someone else while you were saving\. Open the agent again and save once more\./,
+    );
+    expect((await loadAgentPolicy(admin, agent.id)).folders).toEqual([]);
+    expect((await auditRowsFor(agent.id)).length).toBe(audits);
     await revokeAgent(admin, agent.id);
   });
 

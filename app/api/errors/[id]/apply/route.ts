@@ -13,6 +13,8 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { applyCorrection, type ProposedEntry } from '@/lib/services/llmCorrector';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { applyCorrectionSchema } from '@/lib/validation/ai';
 
 export async function POST(
   request: Request,
@@ -24,14 +26,14 @@ export async function POST(
     // (a detection can have multiple correction suggestions over time).
     const { id: _detectionId } = await params;
 
-    let body: { correctionId?: string; approved?: unknown; entry?: unknown };
+    let raw: unknown;
     try {
-      // `null` (or a non-object) reads as {} so the checks below answer 400, never a TypeError.
-      const raw: unknown = await request.json();
-      body = raw && typeof raw === 'object' ? (raw as typeof body) : {};
+      raw = await request.json();
     } catch {
       return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
     }
+    // `null` (or a non-object) reads as {} so the checks below answer 400, never a TypeError.
+    const body = (raw && typeof raw === 'object' ? raw : {}) as { correctionId?: string; approved?: unknown; entry?: unknown };
 
     const { correctionId } = body;
     if (!correctionId) {
@@ -46,6 +48,11 @@ export async function POST(
     if (entry === undefined) {
       return NextResponse.json({ error: 'The correcting entry is not valid.', code: 'VALIDATION' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/ai.ts). The checks above answer first,
+    // and by now the body is an object, so it refuses only values the service could not use (a
+    // correctionId that is not text, such as 5, now answers 400 here).
+    const checked = applyCorrectionSchema.safeParse(raw);
+    if (!checked.success) throw bodyValidationError(checked.error);
     const correction = await applyCorrection(ctx, correctionId, { approved: body.approved === true, entry });
     return NextResponse.json({ correction });
   } catch (err) {

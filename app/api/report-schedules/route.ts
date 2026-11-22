@@ -1,5 +1,7 @@
 /**
- * GET  /api/report-schedules — list scheduled reports (+ the export folder they write to)
+ * GET  /api/report-schedules — list scheduled reports (+ the export folder they write to). Each
+ *   schedule also carries `waitingForAPerson`: it does not run until a person confirms its
+ *   recipients, because an agent set it up or changed it (lib/services/memorizedReports.ts).
  * POST /api/report-schedules — schedule a memorized report or group
  *   ({ name, memorizedReportId | groupId, frequency: daily|weekly|monthly, startDate?, format?, folder?,
  *    emailTo? — also email the files to these addresses })

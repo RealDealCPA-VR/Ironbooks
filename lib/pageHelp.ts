@@ -42,21 +42,25 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   // Agent full access (plan §7): the approval center, on the menu while the company has an agent.
   // The Agents tab of Users & Roles has its own entry in TAB_HELP below. What a person must know
   // (on its own vs asks, approve once or standing permission, pausing one or all, the record) is in
-  // `what` and `first`, the part every help screen shows. Every approver reads it, so pausing is
-  // said as an Admin's: the Agents tab (pause one, Revoke) shows to Admins only (app/users/page.tsx),
-  // and Pause all agents only to whoever the count route says may use it (canPauseAll). Only what
-  // an agent's settings say to ask about comes here: work set to Never is refused without asking.
+  // `what` and `first`, the part every help screen shows. Every approver reads it, and not every
+  // approver may pause: pausing one agent (Pause this agent) or taking back standing permission
+  // (Revoke) is for whoever may change Users & Roles > Users, and Pause all agents for an Admin
+  // (canPauseAll; lib/services/agentPolicies.ts). Only what an agent's settings say to ask about
+  // comes here: work set to Never is refused without asking. "The books changed" is the stale mark
+  // (plan 7.4): a record the request reads or changes was changed since it was asked; numbers and
+  // records the run would make for itself do not count. A reveal (D6) is in the Audit Trail as
+  // "revealed … to agent …, approved by …".
   '/agent-requests': {
     title: 'Agent requests',
     what: 'On its own an agent does only what its settings allow, usually looking and drafting; what it must ask for waits here, showing the change. The Audit Trail and Agent Activity report keep the record.',
-    first: 'Approve once, Approve similar… (standing permission) or Deny. An Admin can pause one agent (Users & Roles > Agents) or all.',
+    first: 'Approve once, Approve similar… (standing permission) or Deny. Whoever manages users can pause an agent; an Admin can pause all.',
     more: [
-      'Usually an agent looks and prepares drafts by itself, and asks before it enters, changes, deletes, emails or prints anything.',
-      'Work set to Never in its settings is refused without asking, so it never shows up here.',
-      'Approve once runs just that request. Approve similar… also lets the agent do requests like it by itself for a while; an Admin can take that back in Users & Roles > Agents.',
-      'Some requests need an Admin, a second person or a password: the request says so.',
-      'An Admin can stop one agent with Pause this agent in Users & Roles > Agents, or every agent at once with Pause all agents at the top of the window.',
-      'Everything an agent did or asked is kept: see the Audit Trail, or Reports > Accountant & Taxes > Agent Activity.',
+      'Usually an agent looks and prepares drafts by itself and asks before it enters, changes, deletes, emails or prints anything. Work set to Never is refused without asking.',
+      'Approve similar… lets the agent do requests like this one by itself, within limits you tick, until the end of the day at most (30 minutes for emails and printing).',
+      'Deleting, closed periods, settings, users, the company file and passwords are always asked one request at a time. Some requests need an Admin, a second person or a password.',
+      '"The books changed since the agent asked" means a record the request uses was changed since. It shows what would happen now: approve again only if that is still right.',
+      'An agent sees full Social Security or account numbers only through a request a person approves. The Audit Trail says which kinds were shown, to which agent and who approved it.',
+      'Whoever manages users can pause an agent or Revoke standing permission in Users & Roles > Agents. Everything is kept in the Audit Trail and Reports > Accountant & Taxes > Agent Activity.',
     ],
   },
   '/todos': {
@@ -464,25 +468,29 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
 
 /**
  * Help for a tab that has no address of its own (its page keeps the tab in its state), keyed
- * '<page>/<tab>'. The tab is to show it itself, with <Help page="/users/agents">; the page's own
- * help (PAGE_HELP) covers the page as a whole, and is what the shell's bubble and F1 show on
- * /users. app/users/AgentsTab.tsx does not render it yet, so today no screen shows this entry. As
- * with PAGE_HELP, the essentials are in `what` and `first`, the part the bubble shows.
+ * '<page>/<tab>'. The tab shows it itself, with <Help page="/users/agents"> in its header
+ * (app/users/AgentsTab.tsx); the page's own help (PAGE_HELP) covers the page as a whole, and is
+ * what the shell's bubble and F1 show on /users. As with PAGE_HELP, the essentials are in `what`
+ * and `first`, the part the bubble shows.
  */
 export const TAB_HELP: Record<string, PageHelpEntry> = {
-  // Agent full access (plan §7.1): Users & Roles > Agents, a tab only Admins see
-  // (app/users/page.tsx), so this help speaks to an Admin. The server also lets anyone who may
-  // modify Users make an agent stricter or pause it, but no screen offers that to them today.
+  // Agent full access (plan §7.1, 4.4): Users & Roles > Agents, shown to anyone who may view
+  // Users & Roles > Users (app/users/page.tsx). Only an Admin makes or removes an agent or lets one
+  // do more by itself; whoever may change users may make one stricter, pause it or Revoke its
+  // standing permission; Pause all agents is an Admin's (lib/services/agentPolicies.ts). Standing
+  // permission is never given for deleting, closed periods, settings, users, the company file or
+  // passwords, Admins included (GRANTABLE).
   '/users/agents': {
     title: 'Agents',
     what: 'AI agents you let into this file. For each kind of work choose Allow (does it alone), Ask (waits in Agent requests, where a person approves once or gives standing permission) or Never.',
     first: 'Click an agent. Pause this agent stops it; an Admin can pause all. The Audit Trail and Agent Activity report keep the record.',
     more: [
       'A preset is the starting point: Read only, Ask for every change (the usual choice), Trusted bookkeeper, or Full, with asks.',
-      'Only an Admin can let an agent do more by itself: a higher preset, Allow, a higher limit or another folder.',
-      'A person approves a request once, or gives standing permission for similar requests for a while; Revoke takes that back.',
-      'Pause this agent stops one agent. An Admin can stop every agent at once with Pause all agents at the top of the window. Nothing already done is undone.',
-      'Each agent’s Activity lists its recent work and requests. The Audit Trail and Reports > Accountant & Taxes > Agent Activity keep the full record.',
+      'Anyone who may see Users & Roles > Users sees this tab. Only an Admin can add or remove an agent, or let one do more by itself: a higher preset, Allow, a higher limit or another folder.',
+      'Whoever may change users can make an agent stricter, pause it, or Revoke standing permission it was given. Nothing an agent already did is undone.',
+      'Standing permission lets an agent do requests like one a person approved by itself, for a while. It is never given for deleting, closed periods, settings, users, the company file or passwords.',
+      'An Admin can stop every agent at once with Pause all agents, on this tab and in the desktop app at the top of the window.',
+      'Each agent’s Activity lists its recent work and requests. The Audit Trail and the Agent Activity report keep the full record, including which kinds of numbers were shown to it and who approved.',
     ],
   },
 };

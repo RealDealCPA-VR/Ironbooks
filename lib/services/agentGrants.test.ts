@@ -13,7 +13,10 @@
  *  - nothing running inside an agent's bridged run reads, lists or uses a grant;
  *  - a use is counted inside the run's transaction: a rolled-back run gives it back, and two runs
  *    racing for the last use cannot both have it (PGlite runs transactions one after another, so
- *    this shows the outcome, not the locking; Ironbooks runs on PGlite);
+ *    this shows the outcome, not the locking; Ironbooks runs on PGlite); a giver who has lost the
+ *    right since lends nothing: the engine asks again, and the run cannot count the grant;
+ *  - the window a person may give is the same from grantMinutesFor and from a reader that reads the
+ *    company's day once for many requests; host-only and file-Admin work has none, for anyone;
  *  - only the giver, or someone who may manage agents, takes a grant back; never an agent, nor
  *    anything running inside an agent's bridged run.
  *
@@ -32,6 +35,17 @@ process.env.BKA_AUTH_SECRET = 'agent-grants-test-secret';
 process.env.IRONBOOKS_AGENT_ENDPOINT_DIR = path.join(ROOT, 'endpoints');
 delete process.env.BKA_DEVICE_VAULT;
 
+// One made-up operation on top of the real registry: everyday entry that only the file's Admin may
+// approve (FILE_ADMIN_ENTER). No real operation is both (every file-Admin route is company-file or
+// Users & Roles work, which never has standing permission), so without it the file-Admin rule of
+// standing permission would never be reached on its own.
+vi.mock('@/lib/agent/operations/registry', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@/lib/agent/operations/registry')>();
+  const made = { ...real.operationById('invoices.create')!, id: 'test.file-admin-enter', fileAdmin: true };
+  return { ...real, operationById: (id: string) => (id === made.id ? made : real.operationById(id)) };
+});
+const FILE_ADMIN_ENTER = 'test.file-admin-enter';
+
 import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   agentGrants,
@@ -46,13 +60,13 @@ import {
 } from '@/lib/db/schema';
 import { builtinRole, fullAccess, unionRoles, type EffectiveAccess, type PermissionGrant } from '@/lib/permissions/model';
 import { allOperations, operationById } from '@/lib/agent/operations/registry';
-import { DEFAULT_BULK_CAP, grantCovers, roleAllows } from '@/lib/agent/policy';
+import { DEFAULT_BULK_CAP, decide, grantCovers, roleAllows } from '@/lib/agent/policy';
 import { GRANTABLE, type Operation, type RequestFacts } from '@/lib/agent/operations/types';
 import { runWithServiceContext } from '@/lib/serviceScope';
 import { createCompany } from './company';
 import { ServiceError, inTransaction, type ServiceContext } from './_base';
-import { createGrant, grantMinutesFor, listGrants, liveGrants, revokeGrant, useGrant } from './agentGrants';
-import { loadAgentPolicy } from './agentPolicies';
+import { createGrant, grantMinutesFor, grantWindowReader, listGrants, liveGrants, revokeGrant, useGrant } from './agentGrants';
+import { agentCeiling, loadAgentPolicy } from './agentPolicies';
 
 let db: DB;
 let companyId: string;
@@ -406,6 +420,26 @@ describe('giving standing permission', () => {
       await expectError(give(admin, HOST_ONLY), 'FORBIDDEN', /computer that holds the company file/);
     });
 
+    it('host-only or file-Admin work for anyone, an Admin included, and the words never send the person to an Admin', async () => {
+      const fileAdminEnter = op(FILE_ADMIN_ENTER);
+      expect(fileAdminEnter).toMatchObject({ class: 'enter', fileAdmin: true, hostOnly: false, availability: 'agent' });
+      const nobody = /nobody can give standing permission for it, an Admin included\.$/;
+      for (const [operation, where] of [
+        [HOST_ONLY, /computer that holds the company file/],
+        [fileAdminEnter, /company-file work, which the file's Admin approves/],
+      ] as const) {
+        for (const who of [admin, secondAdmin]) {
+          const e = await expectError(give(who, operation, { minutes: 10 }), 'FORBIDDEN', nobody);
+          expect(e.message).toMatch(where);
+          expect(e.message).not.toMatch(/ask an Admin/i);
+          // The card is offered no window for it either.
+          expect(await grantMinutesFor(who, operation.id, facts())).toBe(0);
+        }
+      }
+      // The same work without the file-Admin rule has a window.
+      expect(await grantMinutesFor(admin, ENTER.id, facts())).toBeGreaterThan(0);
+    });
+
     it('outside sends from anyone but an Admin (D5)', async () => {
       await expectError(give(bookkeeper, OUTSIDE), 'FORBIDDEN', /Only an Admin/);
     });
@@ -545,6 +579,57 @@ describe('the end of the company’s day', () => {
     }
   });
 
+  it('a reader reads the company’s day once and answers each request as grantMinutesFor does', async () => {
+    at('2026-11-20T04:30:00.000Z'); // 23:30 on the 19th in New York
+    const cases: Array<[string, RequestFacts]> = [
+      [ENTER.id, facts()],
+      [OUTSIDE.id, facts()],
+      [BULK.id, facts({ count: 5 })],
+      [REMOVE.id, facts()],
+      [ENTER.id, facts({ reveal: true })],
+      [ENTER.id, facts({ closedPeriod: true })],
+      [HOST_ONLY.id, facts()],
+      [FILE_ADMIN_ENTER, facts()],
+      [READ.id, facts()],
+      ['no.such.thing', facts()],
+    ];
+    // Every read of the company file this person's context makes.
+    let reads = 0;
+    const counted: ServiceContext = {
+      ...admin,
+      db: new Proxy(db, {
+        get(target, prop, receiver) {
+          if (prop === 'select') reads += 1;
+          return Reflect.get(target, prop, receiver);
+        },
+      }),
+    };
+    const reader = await grantWindowReader(counted);
+    expect(reads).toBe(1);
+    for (const [operation, f] of cases) {
+      expect(reader(operation, f), operation).toBe(await grantMinutesFor(admin, operation, f));
+    }
+    expect(reads).toBe(1);
+    expect(reader(ENTER.id, facts())).toBe(30);
+    expect(reader(REMOVE.id, facts())).toBe(0);
+
+    // Read once: the company moving to Tokyo afterwards changes nothing for this reader; a new one sees it.
+    await setCompanySettings(companyId, { timezone: 'Asia/Tokyo' });
+    try {
+      expect(reader(ENTER.id, facts())).toBe(30);
+      expect((await grantWindowReader(admin))(ENTER.id, facts())).toBe(630);
+    } finally {
+      await setCompanySettings(companyId, { timezone: 'America/New_York' });
+    }
+
+    // The person is judged when each window is asked for: an agent, a person who may not, work
+    // inside an agent's bridged run, facts that cannot be read: none.
+    expect((await grantWindowReader(agentCtx))(ENTER.id, facts())).toBe(0);
+    expect((await grantWindowReader(apClerk))(ENTER.id, facts())).toBe(0);
+    expect(await runWithServiceContext(agentCtx, { path: '/api/agents', method: 'GET' }, async () => reader(ENTER.id, facts()))).toBe(0);
+    expect(reader(ENTER.id, null as unknown as RequestFacts)).toBe(0);
+  });
+
   it('offers nothing to an agent, a person who may not, or a class asked one by one', async () => {
     at('2026-11-20T15:00:00.000Z');
     expect(await grantMinutesFor(admin, ENTER.id, facts())).toBe(14 * 60);
@@ -656,6 +741,48 @@ describe('the person who gave it', () => {
     }
     expect(await live(helper)).toEqual([g.id]);
     expect((await listGrants(admin, { agentId: helper, live: true })).map((x) => x.id)).toEqual([g.id]);
+  });
+
+  it('no longer lets anything run once the giver has lost the right: deactivated, or given another role', async () => {
+    const helper = await addAgent(companyId, 'Lent helper');
+    const helperCtx = agentContext(helper, 'Lent helper');
+    const g = await enterGrant({ agent: helper, by: bookkeeper });
+    // What the agent's door asks: the policy engine, with the agent's own policy and ceiling and the
+    // grants liveGrants hands it.
+    const decision = async () =>
+      decide({
+        access: (await agentCeiling(admin, helper)).access,
+        policy: await loadAgentPolicy(admin, helper),
+        operation: ENTER,
+        facts: facts(),
+        grants: await liveGrants(helperCtx, helper),
+        now: new Date().toISOString(),
+      });
+    expect(await decision()).toMatchObject({ outcome: 'run', grantId: g.id });
+
+    const lose: Array<[string, () => Promise<void>, () => Promise<void>]> = [
+      ['given a role that may not enter invoices', () => setRoles(bookkeeperId, ['ap_clerk']), () => setRoles(bookkeeperId, ['bookkeeper'])],
+      ['deactivated', () => setActive(bookkeeperId, false), () => setActive(bookkeeperId, true)],
+    ];
+    for (const [how, take, give] of lose) {
+      // Looked up while the giver still had the right, as the door does before its dry run.
+      const handedOut = await liveGrants(helperCtx, helper);
+      expect(handedOut.map((x) => x.id), how).toEqual([g.id]);
+      await take();
+      try {
+        // The next request is asked of a person: the grant no longer covers anything.
+        expect(await decision(), how).toMatchObject({ outcome: 'ask' });
+        // And a run that looked the grant up before cannot count it: the giver is read again.
+        await expectError(inTransaction(helperCtx, (tx) => useGrant(tx, g.id)), 'FORBIDDEN', /may no longer do this work/);
+      } finally {
+        await give();
+      }
+    }
+    expect(await uses(g.id)).toBe(0);
+    // Given the right back the same day: it was never taken back, so it runs again.
+    expect(await decision()).toMatchObject({ outcome: 'run', grantId: g.id });
+    await inTransaction(helperCtx, (tx) => useGrant(tx, g.id));
+    expect(await uses(g.id)).toBe(1);
   });
 
   it('keeps an outside send standing only while its giver is an Admin (D5)', async () => {

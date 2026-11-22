@@ -175,6 +175,19 @@ export function zLenient<T extends z.ZodTypeAny>(schema: T) {
 }
 
 /**
+ * A field the handler turns into text with String() before it uses it (`String(quantity)`): any
+ * value it is sent works as that text (`[5]` is "5"), so the schema checks it as that text. Unlike
+ * zLenient the field stays required, and it is described as `schema` is. Same rule as zLenient:
+ * only for a schema the route checks the body with, never one whose parsed data it uses.
+ */
+export function zAsText<T extends z.ZodTypeAny>(schema: T) {
+  return z.preprocess(
+    (v) => (v === undefined || v === null || typeof v === 'string' || typeof v === 'number' ? v : String(v)),
+    schema,
+  );
+}
+
+/**
  * `shape` with `.describe(texts[k])` on every field, for two schemas built from one shared shape
  * that need different words (a create and its edit). The texts are typed by the shape's keys, so
  * a field added to the shape later fails the typecheck until it is described here, instead of

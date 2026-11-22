@@ -8,9 +8,11 @@
  * was typed but not added (withTypedFolder) instead of dropping it without a word.
  *
  * A person who is not an Admin may only tighten (plan 4.4): lower the limit, lower or turn on
- * two-person approval, shorten the wait, turn the email notice off, take folders off. A raise is
- * said under the field (and Save holds it, on the detail page); adding a folder and turning the
- * notice on are not offered to them, and the reason is shown instead.
+ * two-person approval, shorten the wait, turn the email notice off, take folders off, and add a
+ * folder inside one the agent already has (which gives it nothing more: the server agrees, after
+ * asking the disk, or refuses in its own words). A raise is said under the field (and Save holds
+ * it, on the detail page); a folder outside the ones it has is not added for them, and turning the
+ * notice on is not offered, and the reason is shown instead.
  */
 import { FolderPlus, X } from 'lucide-react';
 import { AmountInput, Button, Input, Label, toast } from '@/components/ui';
@@ -24,11 +26,12 @@ import {
   capLoosened,
   capThatApplies,
   expiryLoosened,
+  insideFolder,
   removeFolder,
   twoPersonLoosened,
   type PolicyDraft,
 } from './policyDraft';
-import { ADMIN_TO_ADD_FOLDER, ADMIN_TO_NOTIFY, ADMIN_TO_RAISE_CAP, ADMIN_TO_RAISE_DAYS, ADMIN_TO_RAISE_TWO_PERSON, adminToRaiseUsualCap } from './words';
+import { ADMIN_TO_ADD_FIRST_FOLDER, ADMIN_TO_ADD_FOLDER, ADMIN_TO_NOTIFY, ADMIN_TO_RAISE_CAP, ADMIN_TO_RAISE_DAYS, ADMIN_TO_RAISE_TWO_PERSON, adminToRaiseUsualCap } from './words';
 
 export default function LimitsForm({
   draft,
@@ -52,9 +55,12 @@ export default function LimitsForm({
   /** This person is an Admin and may let the agent do more (plan 4.4). */
   mayLoosen?: boolean;
 }) {
+  /** For a person who is not an Admin: the typed folder sits inside one the agent had when it was opened. */
+  const typedInside = (typed: string) => (saved?.folders ?? []).some((had) => insideFolder(typed.trim(), had));
+
   function add() {
-    if (!mayLoosen) {
-      toast(ADMIN_TO_ADD_FOLDER, 'danger');
+    if (!mayLoosen && folder.trim() !== '' && !typedInside(folder)) {
+      toast((saved?.folders.length ?? 0) > 0 ? ADMIN_TO_ADD_FOLDER : ADMIN_TO_ADD_FIRST_FOLDER, 'danger');
       return;
     }
     const r = addFolder(draft, folder);
@@ -73,6 +79,11 @@ export default function LimitsForm({
   const daysRaised = !mayLoosen && saved ? expiryLoosened(saved, draft) : null;
   // The notice may be turned off by anyone, and on only by an Admin (it is an outside send).
   const notifyLocked = !mayLoosen && !(saved?.notifyEmail ?? false) && !draft.notifyEmail;
+  // A folder inside one the agent has: open to anyone who manages agents. Without one there is
+  // nothing to add inside, so the field stays off for a person who is not an Admin.
+  const hasFolders = (saved?.folders.length ?? 0) > 0;
+  const typedFits = folder.trim() !== '' && typedInside(folder);
+  const folderRule = hasFolders ? ADMIN_TO_ADD_FOLDER : ADMIN_TO_ADD_FIRST_FOLDER;
 
   return (
     <div className="grid gap-4 sm:grid-cols-2">
@@ -189,8 +200,9 @@ export default function LimitsForm({
             <Input
               id="ag-folder"
               value={folder}
-              disabled={!mayLoosen}
-              title={mayLoosen ? undefined : ADMIN_TO_ADD_FOLDER}
+              // A person who is not an Admin may still add a folder inside one the agent has.
+              disabled={!mayLoosen && !hasFolders}
+              title={mayLoosen ? undefined : folderRule}
               onChange={(e) => onFolderChange(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
@@ -198,21 +210,21 @@ export default function LimitsForm({
                   add();
                 }
               }}
-              placeholder="C:\Users\you\Documents\Receipts"
+              placeholder={mayLoosen ? 'C:\\Users\\you\\Documents\\Receipts' : 'A folder inside one listed above'}
             />
-            <Button variant="secondary" onClick={add} disabled={!mayLoosen} title={mayLoosen ? undefined : ADMIN_TO_ADD_FOLDER}>
+            <Button variant="secondary" onClick={add} disabled={!mayLoosen && !typedFits} title={mayLoosen ? undefined : folderRule}>
               <FolderPlus className="mr-1 h-4 w-4" /> Add folder
             </Button>
           </div>
         )}
         {!disabled && !mayLoosen && (
           <p className="mt-1 text-xs text-amber-800" data-admin-only="folders">
-            {ADMIN_TO_ADD_FOLDER}
+            {folderRule}
           </p>
         )}
         {!disabled && folder.trim() !== '' && (
           <p className="mt-1 text-xs text-amber-800" data-folder-pending="">
-            {mayLoosen ? 'Not on the list yet. Add folder puts it there now; Save changes adds it too.' : `Not on the list. ${ADMIN_TO_ADD_FOLDER}`}
+            {mayLoosen || typedFits ? 'Not on the list yet. Add folder puts it there now; Save changes adds it too.' : `Not on the list. ${folderRule}`}
           </p>
         )}
         <p className="mt-1 text-xs text-navy/50">

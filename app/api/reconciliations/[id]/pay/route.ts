@@ -10,6 +10,7 @@
  *   amount?: string,            // defaults to the statement ending balance
  *   date?: string (ISO),        // defaults to today
  *   memo?: string,
+ *   exchangeRate?: string,      // foreign-currency card: home units per 1 unit (default: list rate)
  * }
  */
 import { NextRequest, NextResponse } from 'next/server';
@@ -17,6 +18,8 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { payCreditCardBalance } from '@/lib/services/reconcile';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { bodyValidationError } from '@/lib/validation/helpers';
+import { payCreditCardBalanceSchema } from '@/lib/validation/reconciliations';
 
 function errResponse(err: ServiceError): NextResponse {
   return NextResponse.json(
@@ -37,6 +40,11 @@ export async function POST(
     if (!paymentAccountId) {
       return NextResponse.json({ error: 'paymentAccountId is required.' }, { status: 400 });
     }
+    // The body as agents read it described (lib/validation/reconciliations.ts). The check above
+    // answers first; the schema refuses only a paymentAccountId that is not text, and the service
+    // checks the other fields with its own messages.
+    const checked = payCreditCardBalanceSchema.safeParse(body);
+    if (!checked.success) throw bodyValidationError(checked.error);
     const entry = await payCreditCardBalance(ctx, id, {
       paymentAccountId,
       amount: amount ?? undefined,

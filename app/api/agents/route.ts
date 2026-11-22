@@ -4,7 +4,8 @@
  *                    how many of its settings were changed from the preset (overrideCount) and its
  *                    last use. allPaused: Integrated Applications is switched off, so every agent is
  *                    paused whatever its own state. hostOnly: this window is not the host computer's
- *                    own, so it cannot make, change or remove agents (pausing still works).
+ *                    own, so it cannot make, change or remove agents (pausing still works from a
+ *                    teammate's window; another program on this computer may not pause either).
  *                    unattendedPossible: "may work while nobody is signed in" can do something in
  *                    this company file.
  * POST /api/agents — make an agent: { name, roleKeys[], preset?, unattended? }. Answers the access
@@ -13,9 +14,11 @@
  *                    every change" (D2). The older form with `mode` still works.
  *
  * Who may: the list is for anyone who may view Users & Roles > Users (the service checks, before
- * anything else is read). Making an agent is for an Admin (the service checks), and only at the
- * computer that holds the company file: like the other settings of that kind (lib/net/hostOnly.ts),
- * it decides what may reach the books from outside the app's own window.
+ * anything else is read), Admin or not: the tab shows a non-Admin the screens that tighten, pause
+ * and take back. Making an agent is for an Admin (the service checks), and only at the computer
+ * that holds the company file (agentsHostOnly, app/api/agent-requests/_guards.ts): like the other
+ * settings of that kind (lib/net/hostOnly.ts), it decides what may reach the books from outside
+ * the app's own window.
  *
  * What the list holds is picked here, field by field (listedAgent below), not passed through from the
  * service: someone who may only view gets this list, so a field added to AgentView later reaches
@@ -28,13 +31,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { agentsBlockedFor, createAgent, listAgents, type AgentView } from '@/lib/services/agents';
 import { agentConnection, forUnattended } from '@/lib/agent/connection';
-import { hostOnlyResponse, isRemoteRequest, HOST_ONLY_ACTION_MESSAGE } from '@/lib/net/hostOnly';
-import { routeError, requireJsonObject } from '@/lib/routeErrors';
+import { isRemoteRequest } from '@/lib/net/hostOnly';
+import { requireJsonObject } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createAgentSchema } from '@/lib/validation/agents';
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { isMarkedProtected } from '@/lib/services/fileProtection';
-import { NO_STORE, refuseAgent } from '@/app/api/agent-requests/_guards';
+import { NO_STORE, agentsHostOnly, refuseAgent, refuseAgentRequest, routeErrorPlain } from '@/app/api/agent-requests/_guards';
 
 export const dynamic = 'force-dynamic';
 
@@ -93,6 +96,8 @@ interface AgentsListAnswer {
 
 export async function GET(req: NextRequest) {
   try {
+    const early = refuseAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
     const refused = refuseAgent(ctx, req);
     if (refused) return refused;
@@ -110,24 +115,25 @@ export async function GET(req: NextRequest) {
     };
     return NextResponse.json(answer, { headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agents/route');
+    return routeErrorPlain(err, 'agents/route');
   }
 }
 
 export async function POST(req: NextRequest) {
   try {
+    const early = refuseAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
-    const refused = refuseAgent(ctx, req);
+    const refused = refuseAgent(ctx, req) ?? agentsHostOnly(req);
     if (refused) return refused;
-    if (isRemoteRequest(req)) return hostOnlyResponse(HOST_ONLY_ACTION_MESSAGE);
     const parsed = createAgentSchema.safeParse(await requireJsonObject(req));
-    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400, headers: NO_STORE });
     // The service stores the preset with the agent, in the same step (a mode that does not go
     // with the preset is refused there), so no agent ever exists with other permissions.
     const { agent, token } = await createAgent(ctx, parsed.data);
     const connection = agent.unattended ? forUnattended(agentConnection()) : agentConnection();
     return NextResponse.json({ agent, token, connection }, { status: 201, headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agents/route');
+    return routeErrorPlain(err, 'agents/route');
   }
 }

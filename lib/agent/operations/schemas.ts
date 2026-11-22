@@ -18,9 +18,10 @@
  * does not take), from its properties and from every required list, at any depth, so it never asks
  * an agent for something it must not send.
  *
- * Where a classification gives examples, exampleProblems checks each against the described schema
- * and the guards, and says where one could be read two ways (the registry test runs it over every
- * operation). examplesOf says how to write one.
+ * Where a classification gives examples, examplesOf reads them in the shape describe_operation
+ * answers them (contract.ts OperationDescription.examples, wave 4), and exampleProblems checks each
+ * against the described schema and the guards, and says where one could be read two ways (the
+ * registry test runs it over every operation). examplesOf says how to write one.
  *
  * The largest described schema today is the body of invoices.create, about 9,000 characters
  * (roughly 2,500 tokens); SCHEMA_CHARS_MAX is what the tests hold every one under.
@@ -435,12 +436,24 @@ export async function describeSchemas(operation: Operation): Promise<{ body: unk
 // Examples
 // ---------------------------------------------------------------------------
 
-/** One example request of an operation: what an agent would send to run_operation. */
+/**
+ * One example of an operation as describe_operation passes it on (contract.ts
+ * OperationDescription.examples, wave 4): a whole request as run_operation takes it, { params?,
+ * query?, body?, confirm?, reveal? }, with an optional title or note beside it that is not sent.
+ * The contract types the examples as unknown[], so the compiler checks nothing here: the tests of
+ * describe_operation (lib/agent/operate.test.ts) are what hold the answer to this shape.
+ */
 export interface OperationExample {
   params?: Record<string, string>;
   query?: Record<string, string | string[]>;
   body?: unknown;
   confirm?: string[];
+  /** Only ever true: an example that does not ask for unmasked values leaves it out. */
+  reveal?: true;
+  /** A short name for the example (written as title, describe or summary). Not sent. */
+  title?: string;
+  /** What the example shows or when to use it. Not sent. */
+  note?: string;
 }
 
 const isText = (v: unknown): v is string => typeof v === 'string';
@@ -500,17 +513,24 @@ function readExamples(operation: Operation): ReadExample[] {
     if (e.body !== undefined) read.body = e.body;
     // An empty list confirms nothing: it is only there so the example reads one way (exampleProblems).
     if (Array.isArray(e.confirm) && e.confirm.length) read.confirm = e.confirm as string[];
+    if (e.reveal === true) read.reveal = true;
+    // The words beside it, as the contract names them: title (or describe, or summary) and note.
+    const title = [e.title, e.describe, e.summary].find((t): t is string => isText(t) && t.trim() !== '');
+    if (title) read.title = title.trim();
+    if (isText(e.note) && e.note.trim()) read.note = e.note.trim();
     return { written: ex, read, whole: true };
   });
 }
 
 /**
- * An operation's examples, as run_operation takes them. How to write one (in a classification,
- * a shell definition or on the operation): as a whole request, { params?, query?, body?, confirm?,
- * reveal? }, with words beside it if wanted (title, note, summary, describe: not sent); anything
- * else (another key, or one of those in another shape) is read as the body alone. Where a body's
- * own fields could make it read either way ({ body, note } for a body with fields body and note),
- * exampleProblems says so: write it as a whole request with "confirm": [] beside it.
+ * An operation's examples, as describe_operation answers them (OperationDescription.examples): each
+ * a request as run_operation takes it, with its title and note. How to write one (in a
+ * classification, a shell definition or on the operation): as a whole request, { params?, query?,
+ * body?, confirm?, reveal? }, with words beside it if wanted (title, note, summary, describe: not
+ * sent; summary and describe are read as the title); anything else (another key, or one of those in
+ * another shape) is read as the body alone. Where a body's own fields could make it read either way
+ * ({ body, note } for a body with fields body and note), exampleProblems says so: write it as a
+ * whole request with "confirm": [] beside it.
  */
 export function examplesOf(operation: Operation): OperationExample[] {
   return readExamples(operation).map((e) => e.read);
@@ -583,6 +603,8 @@ export async function exampleProblems(operation: Operation): Promise<string[]> {
     if (ex.query !== undefined) input.query = ex.query;
     if (ex.body !== undefined) input.body = ex.body;
     if (ex.confirm !== undefined) input.confirm = ex.confirm;
+    // A reveal the operation does not have is refused by the guards: an example must not show one.
+    if (ex.reveal) input.reveal = true;
     let guarded: ReturnType<typeof guardInput>;
     try {
       guarded = guardInput(operation, input);

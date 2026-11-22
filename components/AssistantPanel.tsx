@@ -88,6 +88,78 @@ export function canOnlyDecline(p: Pick<Proposal, 'kind' | 'status' | 'agentReque
 }
 
 /**
+ * The request named by a refusal to decide an agent's proposal here (lib/services/aiAssistant.ts:
+ * details.agentRequestId and href, with the fix "Open in Agent requests"), or null when the error
+ * names none. Only the link is known from it, so it reads as waiting there: shownAfterRefusal uses
+ * it only when the refusal does not carry the row as it stands now.
+ */
+export function requestFromRefusal(err: unknown): NonNullable<Proposal['agentRequest']> | null {
+  if (!(err instanceof ApiError)) return null;
+  const d = err.details as { agentRequestId?: unknown } | null | undefined;
+  const id = d && typeof d.agentRequestId === 'string' && d.agentRequestId ? d.agentRequestId : null;
+  if (!id) return null;
+  return { id, status: 'pending', href: agentRequestsHref(id) };
+}
+
+/** A proposal as the list gives it, enough to show (a row in an error's details is checked first). */
+function isShownProposal(v: unknown): v is Proposal {
+  if (!v || typeof v !== 'object') return false;
+  const p = v as Record<string, unknown>;
+  return (
+    typeof p.id === 'string' &&
+    typeof p.kind === 'string' &&
+    typeof p.summary === 'string' &&
+    typeof p.status === 'string' &&
+    !!p.payload &&
+    typeof p.payload === 'object'
+  );
+}
+
+/**
+ * The row to show once Decline was refused, or null to leave it as it is. The server's refusal
+ * carries this proposal as the list shows it now (lib/services/aiAssistant.ts refuseAgentProposal,
+ * details.proposal) when it moved on since the list was read: it is in Agent requests after all
+ * (and its request may be decided already), or someone else settled it first. Only this same
+ * agent's proposal is taken from it, never another row or kind. Without it, a refusal naming a
+ * request still turns the button into the link (requestFromRefusal).
+ */
+export function shownAfterRefusal(p: Proposal, err: unknown): Proposal | null {
+  if (!(err instanceof ApiError)) return null;
+  const d = err.details as { proposal?: unknown } | null | undefined;
+  const now = d && typeof d === 'object' ? d.proposal : null;
+  if (isShownProposal(now) && now.id === p.id && isAgentProposal(now)) return now;
+  const request = requestFromRefusal(err);
+  return request ? { ...p, agentRequest: request } : null;
+}
+
+type PostProposal = (url: string, body: { action: 'reject' }) => Promise<{ proposal: Proposal }>;
+
+/**
+ * Decline a leftover agent proposal (canOnlyDecline): the row to show next (null: leave it as it
+ * is) and the words to show. `post` is the app's api client; a test hands in its own.
+ */
+export async function declineAgentProposal(
+  p: Proposal,
+  post: PostProposal = (url, body) => api.post<{ proposal: Proposal }>(url, body),
+): Promise<{ shown: Proposal | null; message: string; ok: boolean }> {
+  try {
+    const r = await post(`/api/ai/proposals/${p.id}`, { action: 'reject' });
+    return { shown: r.proposal, message: 'Declined. Nothing was entered.', ok: true };
+  } catch (err) {
+    return {
+      shown: shownAfterRefusal(p, err),
+      message: err instanceof ApiError ? err.message : 'It could not be declined. Try again.',
+      ok: false,
+    };
+  }
+}
+
+/** The waiting list after a row changed: kept while it still waits, dropped once it is settled. */
+export function updatePending(list: Proposal[], changed: Proposal): Proposal[] {
+  return changed.status === 'pending' ? list.map((x) => (x.id === changed.id ? changed : x)) : list.filter((x) => x.id !== changed.id);
+}
+
+/**
  * One thing an outside agent asked for: what it asked and where that stands, with a link to its
  * request. No Approve or Reject here: that is done in Agent requests. The one exception is a row
  * with no request there (canOnlyDecline): it gets Decline, which enters nothing and clears it.
@@ -99,11 +171,10 @@ export function AgentRequestRow({ p, onOpen, onChange }: { p: Proposal; onOpen?:
   async function decline() {
     setBusy(true);
     try {
-      const r = await api.post<{ proposal: Proposal }>(`/api/ai/proposals/${p.id}`, { action: 'reject' });
-      onChange?.(r.proposal);
-      toast('Declined. Nothing was entered.', 'info');
-    } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'It could not be declined. Try again.', 'danger');
+      const r = await declineAgentProposal(p);
+      // Refused: the row shows where it really stands (the link to Agent requests, or settled).
+      if (r.shown) onChange?.(r.shown);
+      toast(r.message, r.ok ? 'info' : 'danger');
     } finally {
       setBusy(false);
     }
@@ -538,7 +609,7 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
           <WaitingProposals
             pending={pending}
             onOpen={onClose}
-            onChange={(np) => setPending((prev) => (np.status === 'pending' ? prev.map((x) => (x.id === np.id ? np : x)) : prev.filter((x) => x.id !== np.id)))}
+            onChange={(np) => setPending((prev) => updatePending(prev, np))}
           />
           {messages.length === 0 && (
             <div className="text-sm text-navy/60">

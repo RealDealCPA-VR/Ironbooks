@@ -117,6 +117,13 @@ export const AWAY_MESSAGE =
   'Ironbooks stopped answering. It may be restarting (after a company file was switched or restored, or an update was installed), or it was closed. Nothing was sent. Wait a minute and try again; then read what you need again, because the books may have changed. If it stays away, ask the person to open the company file in Ironbooks and sign in.';
 export const UPDATING_MESSAGE =
   'Ironbooks stopped answering, most likely because it is installing the update you asked for; it starts again by itself when the update is in, which can take several minutes. Nothing was sent. Wait a few minutes and try again; then read what you need again, because the books may have changed. If it stays away for more than 15 minutes, ask the person to open the company file in Ironbooks and sign in.';
+/**
+ * The same silence while the update this agent asked for is still waiting for a person, as far as
+ * this connector knows: a person may have approved it meanwhile (and Ironbooks is installing it),
+ * or Ironbooks was simply closed. It says both, and claims neither.
+ */
+export const UPDATE_MAYBE_MESSAGE =
+  'Ironbooks stopped answering. Nothing was sent. If a person has approved the update you asked for since you last checked, Ironbooks is installing it and starts again by itself, which can take several minutes; otherwise it may be restarting, or it was closed. Wait a few minutes and try again; then read what you need again, because the books may have changed. If it stays away for more than 15 minutes, ask the person to open the company file in Ironbooks and sign in.';
 /** Code of the error a wait gets when MAX_OPEN_WAITS are already open: nothing was sent. */
 export const WAITS_BUSY_CODE = 'WAITS_BUSY';
 export const WAITS_BUSY_MESSAGE = `You are already waiting on ${MAX_OPEN_WAITS} requests at once. Wait for one of those answers before you wait on another, or read this request without waiting.`;
@@ -302,6 +309,18 @@ export class IronbooksClient {
     /** Ironbooks could not be reached since it last answered (it is coming back, or gone). */
     this.lost = false;
     /**
+     * The run of Ironbooks that last answered, by the random value its endpoint file carries (a new
+     * one each time Ironbooks starts, lib/agent/endpointFile.ts): an answer from another run means
+     * Ironbooks restarted, even when this connector sent nothing while it was away.
+     */
+    this.run = null;
+    /**
+     * When this connector last saw Ironbooks come back: after a silence, or as a new run (0: never).
+     * A restart approved before then has happened already, however late the connector hears of the
+     * approval (noteRequest).
+     */
+    this.backAt = 0;
+    /**
      * This agent's requests for an operation that restarts Ironbooks, by request id: how long a
      * silence it may explain, when it was approved (null while it waits), and until when one that
      * waits may still be approved.
@@ -338,8 +357,10 @@ export class IronbooksClient {
    *
    * An approved one counts from when it was approved (decidedAt), so one approved long ago, read
    * again (list_my_requests after the connector started), explains nothing
-   * (RESTART_EXPECTED_WITHIN_MS). One still waiting counts until it expires (expiresAt, or
-   * PENDING_RESTART_KEEP_MS when the answer gives no time).
+   * (RESTART_EXPECTED_WITHIN_MS). Nor does one approved before Ironbooks last came back (backAt):
+   * the connector heard of the approval only after Ironbooks had already restarted for it. One
+   * still waiting counts until it expires (expiresAt, or PENDING_RESTART_KEEP_MS when the answer
+   * gives no time).
    * @param {{ id?: unknown, operation?: unknown, status?: unknown, decidedAt?: unknown, expiresAt?: unknown }} request
    */
   noteRequest(request) {
@@ -365,8 +386,8 @@ export class IronbooksClient {
     }
     const decided = timeOf(request.decidedAt);
     const approvedAt = decided !== null ? Math.min(decided, now) : (seen?.approvedAt ?? now);
-    if (now - approvedAt > this.restartExpectedWithinMs) {
-      // Approved long ago: that restart is over, or never came.
+    if (now - approvedAt > this.restartExpectedWithinMs || (decided !== null && approvedAt < this.backAt)) {
+      // Approved long ago, or before Ironbooks last came back: that restart is over, or never came.
       this.restarts.delete(id);
       this.restartsOver.add(id);
       return;
@@ -377,12 +398,19 @@ export class IronbooksClient {
   /**
    * How long Ironbooks may be silent before this connector starts it: RESTART_GRACE_MS, or longer
    * while one of this agent's requests for a restart may explain the silence (one still waiting
-   * for a person, or one approved shortly before Ironbooks last answered).
-   * @returns {{ graceMs: number, update: boolean }}
+   * for a person, or one approved shortly before Ironbooks last answered). `update`: an update this
+   * agent asked for may be installing; `updateApproved`: one this connector knows a person approved
+   * (otherwise it is only still waiting, as far as the connector knows).
+   *
+   * An update still waiting keeps the longer grace on purpose: a person may approve it at any
+   * moment without the connector hearing of it, and a second copy started while the installer runs
+   * could hold files it must replace. Only what the agent is told differs (UPDATE_MAYBE_MESSAGE).
+   * @returns {{ graceMs: number, update: boolean, updateApproved: boolean }}
    */
   _grace() {
     let graceMs = this.restartGraceMs;
     let update = false;
+    let updateApproved = false;
     const now = Date.now();
     for (const [id, r] of this.restarts) {
       if (r.approvedAt === null && r.until <= now) {
@@ -398,8 +426,9 @@ export class IronbooksClient {
       }
       graceMs = Math.max(graceMs, r.graceMs);
       update = update || r.update;
+      updateApproved = updateApproved || (r.update && r.approvedAt !== null);
     }
-    return { graceMs, update };
+    return { graceMs, update, updateApproved };
   }
 
   /** One HTTP exchange on a kept connection. `beforeSend` sees the socket before any header goes out. */
@@ -525,7 +554,8 @@ export class IronbooksClient {
   /** What the agent is told while Ironbooks is away and may not be started yet. */
   _awayMessage() {
     const g = this._grace();
-    return g.update && Date.now() - this.lastAnswerAt < g.graceMs ? UPDATING_MESSAGE : AWAY_MESSAGE;
+    if (!g.update || Date.now() - this.lastAnswerAt >= g.graceMs) return AWAY_MESSAGE;
+    return g.updateApproved ? UPDATING_MESSAGE : UPDATE_MAYBE_MESSAGE;
   }
 
   /**
@@ -635,10 +665,16 @@ export class IronbooksClient {
     this.answered = true;
     this.lastAnswerAt = Date.now();
     this.awaySince = 0;
-    if (this.lost) {
+    // Another run than the one that answered last: Ironbooks restarted, even if nothing was sent
+    // while it was away.
+    const newRun = this.run !== null && this.run !== endpoint.check;
+    this.run = endpoint.check;
+    if (this.lost || newRun) {
       // Back after a silence: an approved restart has happened, and explains no later one. A
-      // request still waiting for a person may yet restart it, so that one is kept.
+      // request still waiting for a person may yet restart it, so that one is kept; once the
+      // connector hears it was approved before now, it counts as over too (noteRequest, backAt).
       this.lost = false;
+      this.backAt = this.lastAnswerAt;
       for (const [id, r] of this.restarts) {
         if (r.approvedAt === null) continue;
         this.restarts.delete(id);
@@ -659,7 +695,11 @@ export class IronbooksClient {
     const message = body && typeof body.error === 'string' && body.error ? body.error : '';
     const code = body && typeof body.code === 'string' ? body.code : '';
     if (res.status === 429) {
-      throw new IronbooksError(message || 'Ironbooks is busy with your other requests. Try again in a little while.', { status: 429, code, retryAfter: res.retryAfter });
+      // The wait from the Retry-After header, or, where a route gives none, from the answer itself
+      // (the door's details.retryAfterSeconds, or an answer's retryAfterSeconds, contract wave 4).
+      const retryAfter = res.retryAfter || retryAfterOf(body?.details?.retryAfterSeconds) || retryAfterOf(body?.retryAfterSeconds);
+      const said = message || (body && typeof body.note === 'string' ? body.note.trim() : '');
+      throw new IronbooksError(said || 'Ironbooks is busy with your other requests. Try again in a little while.', { status: 429, code, retryAfter });
     }
     if (res.status === 401 || (res.status === 403 && message === 'Authentication required.')) {
       throw new IronbooksError(

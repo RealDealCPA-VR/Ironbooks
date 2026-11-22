@@ -8,6 +8,13 @@
  * Records about something the caller may not view (an employee's pay, a user account…) are left
  * out of the rows, the total and the filter lists (lib/services/auditVisibility.ts).
  *
+ * The records are read exactly like the audit trail's entries (lib/services/auditTrail.ts), with the
+ * same reader (auditReaderFor: an agent never gets Users & Roles or File Utilities records, nor the
+ * whole log as an Admin would) and the same values (logRecordFor): no credential material, SSNs and
+ * account numbers masked for the caller's flags, also as memo text ("Acct # ••••6789"), and an
+ * agent request's note, message and grant limits only for someone who may view its work. The text
+ * search matches the summary as shown, so it cannot test guesses at hidden digits.
+ *
  * SECURITY: middleware excludes /api from the session check, so this handler fails closed
  * via getServerContext() before reading anything.
  */
@@ -17,9 +24,8 @@ import { resolveDataDir } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { queryTransactionLog } from '@/lib/services/transactionLog';
 import { ServiceError } from '@/lib/services/_base';
-import { maskForContext } from '@/lib/services/access';
+import { auditReaderFor, logRecordFor, logSummaryFor } from '@/lib/services/auditTrail';
 import { canSeeLogRecord, seesWholeLog } from '@/lib/services/auditVisibility';
-import { stripSecrets } from '@/lib/permissions/mask';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
@@ -61,6 +67,7 @@ export async function GET(req: NextRequest) {
     const dir = dataDirOf(ctx.db) ?? resolveDataDir();
     const limit = Math.min(Math.max(Number(p.get('limit')) || 200, 1), 5000);
     const offset = Math.max(Number(p.get('offset')) || 0, 0);
+    const reader = auditReaderFor(ctx);
     const page = queryTransactionLog(dir, {
       companyId: ctx.companyId,
       from: parseDay(p.get('from'), false),
@@ -70,19 +77,17 @@ export async function GET(req: NextRequest) {
       action: p.get('action') || undefined,
       entityId: p.get('entityId') || undefined,
       search: p.get('q') || undefined,
-      ...(seesWholeLog(ctx.access) ? {} : { visible: (r) => canSeeLogRecord(ctx.access, r) }),
+      shownSummary: (r) => logSummaryFor(reader, r.summary),
+      ...(seesWholeLog(reader) ? {} : { visible: (r) => canSeeLogRecord(reader, r) }),
       limit,
       offset,
     });
     // The records carry the same before/after snapshots as the audit trail (vendor tax ids, bank
-    // and account numbers, …): mask them for the caller's roles exactly like /api/audit-trail.
-    // Records written by older builds can carry the closing-date / file password hash in a
-    // settings snapshot: the file keeps them (hash chain), the response never does (stripSecrets,
-    // whoever asks).
-    return NextResponse.json({
-      ...page,
-      rows: page.rows.map((r) => ({ ...r, data: maskForContext(ctx, stripSecrets(r.data)) })),
-    });
+    // and account numbers, memo text, an agent request's note …): shown exactly as /api/audit-trail
+    // shows them (logRecordFor). Records written by older builds can carry the closing-date / file
+    // password hash in a settings snapshot: the file keeps them (hash chain), the response never
+    // does, whoever asks.
+    return NextResponse.json({ ...page, rows: page.rows.map((r) => logRecordFor(reader, r)) });
   } catch (err) {
     return errorResponse(err);
   }

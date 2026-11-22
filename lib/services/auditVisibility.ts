@@ -24,7 +24,9 @@
  *
  * An entry a person may read is shown through auditValuesFor: no credential material, SSNs and
  * account numbers masked by field name for their roles, and the account number in memo text
- * ("Acct # 000123456789", the memo a check gets when it is left blank) masked too.
+ * ("Acct # 000123456789", the memo a check gets when it is left blank) masked too. The audit
+ * trail, the transaction log (its page and its CSV), and the audit-based accountant reports
+ * (accountant/auditReports.ts) all read entries this way.
  */
 import { and, eq, inArray, or, sql, type SQL } from 'drizzle-orm';
 import { auditLogs } from '@/lib/db/schema';
@@ -384,9 +386,10 @@ function maskMemoText(v: unknown, key: string | null): unknown {
 /**
  * An entry's before / after snapshot as this reader may see it: the audit trail's entry
  * (auditTrail.ts getAuditLog, through auditEntryValuesFor). The transaction log's records carry
- * the same snapshots; auditTrail.ts logRecordDataFor is this rule for them, but GET
- * /api/transaction-log does not use it yet (it masks by field name only, maskForContext), so the
- * memo text below is still shown there in full. Its CSV export has no snapshots.
+ * the same snapshots; auditTrail.ts logRecordDataFor is this rule for them, and GET
+ * /api/transaction-log answers its records through it (logRecordFor). Its CSV export has no
+ * snapshots; the raw .bktlg download cannot be masked (its hash chain), so it goes only to a
+ * reader who holds both View flags (transactionLogExport.ts).
  *  - Credential material is never in it, whoever asks (stripSecrets; trusted contexts too).
  *  - For a person, SSNs and account numbers are masked by field name for their roles
  *    (maskSensitive), as every other answer is.

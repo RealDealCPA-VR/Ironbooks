@@ -3,20 +3,22 @@
  * "Live grants with Revoke" (plan 4.4, 7.1). Live ones only (unexpired, not taken back, not used
  * up) unless live=0. Answers { grants: AgentGrantView[] }.
  *
- * A person's window only (app/api/agent-requests/_guards.ts).
+ * A person only, never an agent (app/api/agent-requests/_guards.ts). Reading stays open to any of
+ * a person's windows and sign-ins; taking one back (DELETE /api/agent-grants/[id]) needs the window.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listGrants } from '@/lib/services/agentGrants';
-import { routeError } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { agentGrantsQuerySchema } from '@/lib/validation/agentAccess';
-import { NO_STORE, badId, refuseAgent } from '@/app/api/agent-requests/_guards';
+import { NO_STORE, badId, refuseAgent, refuseAgentRequest, routeErrorPlain } from '@/app/api/agent-requests/_guards';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const early = refuseAgentRequest(req);
+    if (early) return early;
     const ctx = await getServerContext();
     const refused = refuseAgent(ctx, req);
     if (refused) return refused;
@@ -28,6 +30,6 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     const live = query.data.live !== '0' && query.data.live !== 'false';
     return NextResponse.json({ grants: await listGrants(ctx, { agentId: id, live }) }, { headers: NO_STORE });
   } catch (err) {
-    return routeError(err, 'agents/[id]/grants/route');
+    return routeErrorPlain(err, 'agents/[id]/grants/route');
   }
 }
