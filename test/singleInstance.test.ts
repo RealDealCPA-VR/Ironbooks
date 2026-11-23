@@ -11,7 +11,8 @@ import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.js'), 'utf8');
+// As checked out: CRLF on a Windows runner, so lines are compared with LF.
+const main = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
 
 /** The text of the block that starts at `start` (up to its matching closing brace). */
 function blockAt(start: string): string {

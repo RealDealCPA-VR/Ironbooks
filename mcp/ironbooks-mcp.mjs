@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * The Ironbooks connector for AI agents: a Model Context Protocol server over stdio.
  *
