@@ -76,6 +76,7 @@ import { randomBytes } from 'node:crypto';
 import fs, { type BigIntStats, type Dirent, type Stats } from 'node:fs';
 import fsp, { type FileHandle } from 'node:fs/promises';
 import os from 'node:os';
+import { homeDir } from './homeDir';
 import path from 'node:path';
 import { ServiceError } from '@/lib/services/errors';
 import { endpointDir } from './endpointFile';
@@ -353,7 +354,7 @@ function companyFile(): string | null {
 
 /** This computer's app data folder for Ironbooks (as lib/agent/endpointFile.ts finds its own). */
 function appDataRoot(): string {
-  const home = os.homedir();
+  const home = homeDir();
   if (WIN) return path.join(process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'Ironbooks', FOLDER_NAME);
   if (process.platform === 'darwin') return path.join(home, 'Library', 'Application Support', 'Ironbooks', FOLDER_NAME);
   return path.join(process.env.XDG_STATE_HOME || path.join(home, '.local', 'state'), 'ironbooks', FOLDER_NAME);
@@ -466,7 +467,7 @@ export function appDataPlaces(): string[] {
  */
 function ironbooksPlaces(withOpenFile: boolean): string[] {
   const env = process.env;
-  const home = os.homedir();
+  const home = homeDir();
   const out: Array<string | null> = [appDataRoot(), path.dirname(appDataRoot())];
   out.push(overrideRoot());
   const workDir = workingFolder();

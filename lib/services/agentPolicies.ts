@@ -33,7 +33,7 @@
  * through the same code path as Preferences (lib/services/company.ts updateCompany).
  */
 import fs from 'node:fs';
-import os from 'node:os';
+import { homeDir } from '@/lib/agent/homeDir';
 import path from 'node:path';
 import Decimal from 'decimal.js';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
@@ -727,7 +727,7 @@ function ironbooksPlaces(): string[] {
  */
 function ironbooksPlacesAsWritten(): string[] {
   const env = process.env;
-  const home = os.homedir();
+  const home = homeDir();
   const out: string[] = [];
   out.push(endpointDir());
   if (env.IRONBOOKS_USER_DATA) out.push(path.resolve(env.IRONBOOKS_USER_DATA));

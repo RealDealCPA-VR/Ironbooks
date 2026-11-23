@@ -23,7 +23,7 @@
  */
 import { createHmac, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
+import { homeDir } from './homeDir';
 import path from 'node:path';
 
 export const ENDPOINT_DIR_ENV = 'IRONBOOKS_AGENT_ENDPOINT_DIR';
@@ -53,7 +53,7 @@ const state: State = (g.__ironbooksAgentEndpoint ??= { signedIn: new Set(), publ
 export function endpointDir(env: Record<string, string | undefined> = process.env, platform: string = process.platform): string {
   const override = env[ENDPOINT_DIR_ENV];
   if (override) return path.resolve(override);
-  const home = os.homedir();
+  const home = homeDir();
   if (platform === 'win32') {
     return path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'Ironbooks', 'agent-endpoints');
   }

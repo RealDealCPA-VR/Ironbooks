@@ -41,7 +41,7 @@
 import { randomUUID } from 'node:crypto';
 import fs, { promises as fsp } from 'node:fs';
 import net from 'node:net';
-import os from 'node:os';
+import { homeDir } from './homeDir';
 import path from 'node:path';
 import type { ServiceContext } from '@/lib/services/_base';
 import { loadAgentPolicy } from '@/lib/services/agentPolicies';
@@ -268,12 +268,12 @@ export function isBroadPersonalFolder(dir: string, where: { home: string; docume
 export function defaultAgentFolders(): string[] {
   const out: string[] = [];
   const told = process.env[SHELL_DOCUMENTS_ENV]?.trim();
-  const docs = told && path.isAbsolute(told) ? told : path.join(os.homedir(), 'Documents');
+  const docs = told && path.isAbsolute(told) ? told : path.join(homeDir(), 'Documents');
   const companyFile = process.env.BKA_COMPANY_FILE?.trim();
   if (companyFile) {
     const dir = path.dirname(path.resolve(companyFile));
     const shared = isDriveOrShareRoot(dir) || isThisComputerShare(dir);
-    if (!shared && !isBroadPersonalFolder(dir, { home: os.homedir(), documents: docs }) && !holdsAppDataSafely(dir)) out.push(dir);
+    if (!shared && !isBroadPersonalFolder(dir, { home: homeDir(), documents: docs }) && !holdsAppDataSafely(dir)) out.push(dir);
   }
   out.push(path.join(docs, 'Ironbooks'), path.join(docs, 'Ironbooks', AGENT_OUTBOX_NAME));
   return out;
