@@ -331,7 +331,14 @@ const MAX_USES = ELIGIBLE - 1;
 
 // Relies on order: the first test brings the lines in; the second adds them to the books. The
 // describes after it use the company these leave.
-describe('2,000 bank lines, brought in and added to the books under standing permission', () => {
+/**
+ * The three load runs below take 10 minutes and more on their own, and longer on a shared CI
+ * runner, where they measure the runner, not Ironbooks. They run in every local full suite, and on
+ * CI only when asked for (IRONBOOKS_LOAD_TEST=1). The other cases in this file always run.
+ */
+const LOAD_RUNS_SKIPPED = Boolean(process.env.CI) && process.env.IRONBOOKS_LOAD_TEST !== '1';
+
+describe.skipIf(LOAD_RUNS_SKIPPED)('2,000 bank lines, brought in and added to the books under standing permission', () => {
   let feeder: ScenarioAgent;
   let pacer: MinutePacer;
   let lines: Map<number, { id: string; amount: string; matched: boolean }>;
@@ -632,7 +639,7 @@ let batched: {
 } | null = null;
 
 // Relies on order: the company of the describes above. Leaves 400 requests waiting for the long poll below.
-describe('500 waiting requests: the list, the badge and a batch approval of 100', () => {
+describe.skipIf(LOAD_RUNS_SKIPPED)('500 waiting requests: the list, the badge and a batch approval of 100', () => {
   it('stay within their times, and the statements one listing sends do not grow with the requests', async () => {
     resetAgentRateLimits();
     // Only the 500 below wait: what the tests above left waiting is declined.
@@ -908,7 +915,7 @@ describe('500 waiting requests: the list, the badge and a batch approval of 100'
 
 const SEEDED = 20_000;
 
-describe(`one large company: ${SEEDED.toLocaleString('en-US')} journal entries more`, () => {
+describe.skipIf(LOAD_RUNS_SKIPPED)(`one large company: ${SEEDED.toLocaleString('en-US')} journal entries more`, () => {
   it(`a bridged dry run of a bill and of a journal entry stays well under BRIDGE_TIME_LIMIT_MS (${BRIDGE_TIME_LIMIT_MS} ms)`, async () => {
     resetAgentRateLimits();
     const bookkeeper = await s.makeAgent('Bookkeeper', 'trusted_bookkeeper');
@@ -1014,8 +1021,8 @@ describe(`one large company: ${SEEDED.toLocaleString('en-US')} journal entries m
 // 5. The long poll: at most WAITS_PER_AGENT open waits per agent
 // ---------------------------------------------------------------------------
 
-// Relies on order: the requests the describe above left waiting (Askers 3 to 10).
-describe(`the long poll: at most ${WAITS_PER_AGENT} open waits per agent`, () => {
+// Relies on order: the requests the describe above left waiting (Askers 3 to 10), so it is skipped with it.
+describe.skipIf(LOAD_RUNS_SKIPPED)(`the long poll: at most ${WAITS_PER_AGENT} open waits per agent`, () => {
   it('one wait more is answered at once with 429 and Retry-After; a slot comes back when a wait ends; another agent is not held back', async () => {
     const agent = askers[2];
     const other = askers[3];
