@@ -1812,6 +1812,12 @@ async function askForAccessFlow(filePath, holder) {
   }
 }
 
+/** A fetch that failed because the connection was dropped or refused, with no answer at all. */
+function connectionDropped(err) {
+  const code = err && err.cause && (err.cause.code || err.cause.errno);
+  return ['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED'].includes(code);
+}
+
 /**
  * Save the open company file into itself and close it (quitting, switching files, Close
  * Company). Resolves true to go on; false when the person chose to keep working because the
@@ -1836,6 +1842,10 @@ async function closeOpenCompanyFile() {
     companyLock.release(openFile.lock);
     return true;
   }
+  // A connection the server dropped before it answered anything (a server just started and still
+  // busy loading) is tried again by itself a few times, over about 7 seconds, before anyone is
+  // asked: nothing was saved or changed by a request that got no answer.
+  let connectionRetries = 0;
   for (;;) {
     let data = {};
     let ok = false;
@@ -1848,6 +1858,11 @@ async function closeOpenCompanyFile() {
       ok = res.ok && data.ok !== false;
     } catch (err) {
       data = { error: String((err && err.message) || err) };
+      if (connectionRetries < 3 && connectionDropped(err)) {
+        await new Promise((r) => setTimeout(r, 1000 * 2 ** connectionRetries));
+        connectionRetries += 1;
+        continue;
+      }
     }
     if (ok) {
       if (data.unsavedKept) {
@@ -4811,8 +4826,13 @@ function agentShellEnv() {
  * computer ran no server of its own). The hourly clear of old files stays the server's own.
  */
 function clearStagedAgentFiles() {
-  if (openFile && openFile.workDir) companySession.clearAgentFiles(openFile.workDir);
-  else if (!remoteHostOrigin) companySession.clearAppDataAgentFiles();
+  // Clean-up only: it never stops a quit or a close (a file still held, a folder already gone).
+  try {
+    if (openFile && openFile.workDir) companySession.clearAgentFiles(openFile.workDir);
+    else if (!remoteHostOrigin) companySession.clearAppDataAgentFiles();
+  } catch (err) {
+    console.error('[agent] could not clear staged files:', err?.message || err);
+  }
 }
 
 app.on('will-quit', () => {
