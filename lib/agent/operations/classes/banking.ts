@@ -582,8 +582,9 @@ export const BANKING_CLASSES: ClassificationMap = {
   'POST /api/recurring': {
     class: 'enter',
     describe: 'Memorize a transaction named {name} ({docType}) to repeat {frequency}',
-    why: 'A memorized transaction set to automatic posts on its schedule without anyone reviewing it, so making one always asks (plan §8, Recurring).',
+    why: 'A memorized transaction set to automatic posts on its schedule without anyone reviewing it, so making one always asks. Its amount is what one run would enter, read from its template.',
     alwaysAsk: true,
+    amountField: '@template',
   },
   'GET /api/recurring/[id]': {
     class: 'read',

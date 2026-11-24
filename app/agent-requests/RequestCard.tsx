@@ -84,6 +84,7 @@ import {
   isUnusualDomain,
   isWaiting,
   mailServerOf,
+  NAMED_KIND_WORDS,
   plain,
   reasonText,
   rebuildGrantForm,
@@ -763,6 +764,21 @@ export default function RequestCard({
               <p data-request-summary="" className="break-words text-base font-semibold text-navy">
                 {plain(request.summary)}
               </p>
+              {request.named && request.named.length > 0 && (
+                // The records the request names by id, by their names in the books. Names are data a
+                // customer or vendor may have written: shown as such, on their own line, never in the
+                // summary above (which is also the desktop notice).
+                <p data-request-named="" className="mt-1 break-words text-sm text-navy/80">
+                  <span className="text-navy/60">Named in this request (from your books): </span>
+                  {request.named.map((n, i) => (
+                    <React.Fragment key={`${n.kind}-${i}`}>
+                      {i > 0 && ' · '}
+                      <span className="font-medium">{plain(n.name)}</span>
+                      <span className="text-navy/60"> ({NAMED_KIND_WORDS[n.kind] ?? plain(n.kind)})</span>
+                    </React.Fragment>
+                  ))}
+                </p>
+              )}
               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-navy/70">
                 <Badge tone="info">{RISK_CLASS_LABELS[request.class] ?? plain(request.class)}</Badge>
                 {amount &&

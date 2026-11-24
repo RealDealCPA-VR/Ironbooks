@@ -99,7 +99,7 @@ import { effects, pinFile, runWithEffects } from '@/lib/effects';
 import { REQUEST_ID_MESSAGE, agentInputHash, type ChangePreview } from '@/lib/agent/actions';
 import { EXPECTED_VERSION_MESSAGE, REVEAL_FILE_ENDED, revealFileEnded as stagedRevealEnded, runOperation, type CommitCheck } from '@/lib/agent/bridge';
 import { guardInput, plainIsoTime, runnableNameProblem } from '@/lib/agent/guards';
-import { factsOf, withLedgerAccounts } from '@/lib/agent/facts';
+import { TEMPLATE_AMOUNT, factsOf, withLedgerAccounts } from '@/lib/agent/facts';
 import { describeRequest, type DescribeNames } from '@/lib/agent/describe';
 import { allowedFolder, overlapsAppData, readStagedFile, readStagedFileForSave, stagedFileInfo, uploadChunk } from '@/lib/agent/files';
 import { AGENT_OUTBOX_NAME, defaultAgentFolders, runShellOperation } from '@/lib/agent/shell';
@@ -586,6 +586,17 @@ async function agentHoldsRole(db: ServiceContext['db'], companyId: string, agent
  * Read from this company's own records; nothing when the id names none of them.
  */
 async function summaryNames(
+  db: ServiceContext['db'],
+  companyId: string,
+  operation: Operation,
+  input: OperationInput,
+  shown: NamesShown,
+): Promise<DescribeNames | undefined> {
+  return pathNames(db, companyId, operation, input, shown);
+}
+
+/** A role's, a person's, an agent's or a sign-in's name for the record the request's path names. */
+async function pathNames(
   db: ServiceContext['db'],
   companyId: string,
   operation: Operation,
@@ -2830,6 +2841,8 @@ function notesFor(operation: Operation): string[] {
   }
   if (AMOUNT_NEVER_KNOWN.has(operation.id)) {
     notes.push('Its amount is not known, before a dry run or after it: it counts as over every two-person limit, and the approval card says the amount is unknown.');
+  } else if (operation.amountField === TEMPLATE_AMOUNT) {
+    notes.push("The amount is what one run would enter: the template's line amounts (quantity × rate for a line without one), or a journal entry's debits.");
   } else if (operation.amountField) {
     notes.push(`The amount is read from "${operation.amountField}", and from the answer of a dry run when that is larger.`);
   }
@@ -3182,6 +3195,8 @@ export const handleVerb: HandleVerb = async (ctx, verb, args) => {
         ...(await summaryFor(ctx, door, operation)),
         params: [...operation.params],
         bodySchema: schemas.body ?? null,
+        ...(schemas.body == null && operation.bodyFields?.length ? { bodyFields: [...operation.bodyFields] } : {}),
+        ...(schemas.body == null && operation.bodyDoc ? { bodyDoc: operation.bodyDoc } : {}),
         querySchema: schemas.query ?? null,
         body: operation.body,
         output: operation.output,

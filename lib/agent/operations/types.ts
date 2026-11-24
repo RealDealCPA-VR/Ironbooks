@@ -242,6 +242,10 @@ export interface Operation {
   alwaysAsk: boolean;
   /** "@/lib/validation/x#name" of the body schema, or null when the route parses by hand. */
   bodySchema: string | null;
+  /** With no body schema: the fields the route reads from its body (scripts/agent-registry.mjs). */
+  bodyFields?: readonly string[];
+  /** With no body schema: the body as the route file's header comment documents it. */
+  bodyDoc?: string;
 }
 
 // ---------------------------------------------------------------------------

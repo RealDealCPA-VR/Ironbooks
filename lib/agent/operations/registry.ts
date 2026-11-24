@@ -250,6 +250,8 @@ function makeOperation(
     amountField: c?.amountField ?? null,
     alwaysAsk: c?.alwaysAsk ?? false,
     bodySchema: c?.bodySchema ?? gen?.bodySchema ?? null,
+    ...(gen?.bodyFields?.length ? { bodyFields: frozen(gen.bodyFields) } : {}),
+    ...(gen?.bodyDoc ? { bodyDoc: gen.bodyDoc } : {}),
   });
 }
 
@@ -505,7 +507,7 @@ export async function loadRouteHandler(operation: Operation): Promise<RouteHandl
 }
 
 export interface FindOperationsOptions {
-  /** Words to look for in the id, the description and the route (all must appear). */
+  /** Words to look for in the id, the route, the description and the why (see findOperations). */
   query?: string;
   area?: Area;
   class?: RiskClass;
@@ -518,17 +520,34 @@ export interface FindOperationsOptions {
 export const FIND_DEFAULT_LIMIT = 30;
 export const FIND_MAX_LIMIT = 200;
 
+/** Words a query is not searched by: they are in almost every description. */
+const FIND_STOP_WORDS = new Set(['a', 'an', 'and', 'the', 'to', 'for', 'of', 'in', 'on', 'my', 'our', 'with', 'from', 'by', 'or', 'it', 'is', 'into', 'all', 'new']);
+
+/** A word as the search compares it: lower case, a plural or simple ending taken off ("invoices", "memorized"). */
+function findStem(word: string): string {
+  const w = word.toLowerCase();
+  if (w.length > 5 && /(ing|ied)$/.test(w)) return w.slice(0, -3);
+  if (w.length > 4 && /(ed|es)$/.test(w)) return w.slice(0, -2);
+  if (w.length > 3 && w.endsWith('s') && !w.endsWith('ss')) return w.slice(0, -1);
+  return w;
+}
+
 /**
- * Search the operations, best match first. Case-insensitive; every word of the query must appear
- * in the id, the description or the route. An exact id, then id matches, rank above route and
- * description matches; ties are in id order.
+ * Search the operations, best match first. Case-insensitive. Each word of the query (common words
+ * like "the" or "for" left out, a plural or simple ending taken off) is looked for in the id, the
+ * route, the description and the why. Operations where every word appears come first, and only
+ * they when there are any; otherwise those where most of the words appear, the most first, so a
+ * query in a person's words ("memorized recurring invoice") still finds what it means. Within that,
+ * an exact id, then id matches, rank above route, description and why matches; ties are in id order.
  */
 export function findOperations(opts: FindOperationsOptions = {}): Operation[] {
-  const words = (opts.query ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+  const raw = (opts.query ?? '').toLowerCase().split(/[\s,;]+/).filter(Boolean);
+  const kept = raw.filter((w) => !FIND_STOP_WORDS.has(w));
+  const words = [...new Set((kept.length ? kept : raw).map(findStem))];
   const whole = (opts.query ?? '').trim().toLowerCase();
   const asked = Number.isFinite(opts.limit) ? Math.floor(opts.limit as number) : FIND_DEFAULT_LIMIT;
   const limit = Math.max(1, Math.min(asked, FIND_MAX_LIMIT));
-  const scored: Array<{ op: Operation; score: number }> = [];
+  const scored: Array<{ op: Operation; matched: number; score: number }> = [];
   for (const op of allOperations()) {
     if (opts.area && op.area !== opts.area) continue;
     if (opts.class && op.class !== opts.class) continue;
@@ -537,23 +556,25 @@ export function findOperations(opts: FindOperationsOptions = {}): Operation[] {
     const id = op.id.toLowerCase();
     const route = `${op.method} ${op.route}`.toLowerCase();
     const describe = op.describe.toLowerCase();
+    const why = (op.why ?? '').toLowerCase();
     let score = 0;
-    let all = true;
+    let matched = 0;
     for (const w of words) {
-      const s = (id.includes(w) ? 4 : 0) + (route.includes(w) ? 2 : 0) + (describe.includes(w) ? 1 : 0);
-      if (s === 0) {
-        all = false;
-        break;
-      }
+      const s = (id.includes(w) ? 8 : 0) + (route.includes(w) ? 4 : 0) + (describe.includes(w) ? 2 : 0) + (why.includes(w) ? 1 : 0);
+      if (s > 0) matched += 1;
       score += s;
     }
-    if (!all) continue;
+    if (words.length && matched === 0) continue;
     if (whole && id === whole) score += 100;
     else if (whole && id.startsWith(whole)) score += 10;
-    scored.push({ op, score });
+    scored.push({ op, matched, score });
   }
-  scored.sort((a, b) => b.score - a.score || (a.op.id < b.op.id ? -1 : a.op.id > b.op.id ? 1 : 0));
-  return scored.slice(0, limit).map((s) => s.op);
+  // Every word where any operation has them all; otherwise at least half of them.
+  const best = scored.reduce((m, s) => Math.max(m, s.matched), 0);
+  const need = words.length === 0 ? 0 : best === words.length ? words.length : Math.max(1, Math.ceil(words.length / 2));
+  const shown = scored.filter((s) => s.matched >= need);
+  shown.sort((a, b) => b.matched - a.matched || b.score - a.score || (a.op.id < b.op.id ? -1 : a.op.id > b.op.id ? 1 : 0));
+  return shown.slice(0, limit).map((s) => s.op);
 }
 
 /** Operations with no hand-written classification (class 'admin' until someone classifies them). */

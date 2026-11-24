@@ -138,7 +138,7 @@ import {
   type RiskClass,
   type SecretKind,
 } from '@/lib/agent/operations/types';
-import { operationById } from '@/lib/agent/operations/registry';
+import { operationById, operationForRoute } from '@/lib/agent/operations/registry';
 import { SHELL_OPERATIONS } from '@/lib/agent/operations/shell';
 import {
   DEFAULT_REQUEST_EXPIRY_DAYS,
@@ -155,6 +155,7 @@ import { removeStagedFile } from '@/lib/agent/files';
 import { guardInput, maskAccountsInText, maskSensitiveFields, plainIsoTime } from '@/lib/agent/guards';
 import { describeRequest } from '@/lib/agent/describe';
 import { requestNames, runApproved } from '@/lib/agent/operate';
+import { LIST_ROUTES, namedRecords, type ListKind } from '@/lib/agent/namedRecords';
 import { OPTIONAL_ROUTE_SECRETS } from '@/lib/agent/bridge';
 import { agentAction, agentInputHash, changesInTransaction, runApprovedAgentAction, type AnyAction } from '@/lib/agent/actions';
 // The old proposals' actions run through the catalog, which registers itself when loaded (as
@@ -1607,18 +1608,22 @@ function resultForPerson(person: Person, row: Row, view: AgentRequestView): Pick
   return { result: maskSensitive(view.result, person.access), file: view.file };
 }
 
-async function personViews(person: Person, rows: Row[], atHost: boolean, now: Date): Promise<AgentRequestForPerson[]> {
+/** `named`: also the names of the records each request names (one card: never for a whole list). */
+async function personViews(person: Person, rows: Row[], atHost: boolean, now: Date, opts: { named?: boolean } = {}): Promise<AgentRequestForPerson[]> {
   if (!rows.length) return [];
   const env = await judgeEnv(person, rows, atHost, now);
   const people = await personNames(person.ctx.db, rows.flatMap((r) => [r.decidedBy, r.secondApprover]));
+  const lists = opts.named ? listsReadBy(person) : new Set<ListKind>();
   const out: AgentRequestForPerson[] = [];
   for (const row of rows) {
     const target = targetOf(row);
     const j = await judge(row, target, env);
     const view = toView(row, (env.states.get(row.agentId) ?? MISSING_AGENT).name, people, now);
+    const named = opts.named && target.kind === 'operation' ? await namedRecords(person.ctx.db, person.ctx.companyId, target.op, storedInput(row), lists).catch(() => []) : [];
     out.push({
       ...view,
       ...resultForPerson(person, row, view),
+      ...(named.length ? { named } : {}),
       canApprove: j.canApprove,
       cannotApproveWhy: j.canApprove ? null : j.why,
       grantMinutesMax: j.grantMinutesMax,
@@ -1628,8 +1633,18 @@ async function personViews(person: Person, rows: Row[], atHost: boolean, now: Da
   return out;
 }
 
+/** The lists whose records this person may read (LIST_ROUTES), judged as their own read of each list. */
+function listsReadBy(person: Person): ReadonlySet<ListKind> {
+  const out = new Set<ListKind>();
+  for (const kind of Object.keys(LIST_ROUTES) as ListKind[]) {
+    const read = operationForRoute('GET', LIST_ROUTES[kind]);
+    if (read && roleProblem(person.access, read) === null) out.add(kind);
+  }
+  return out;
+}
+
 async function personView(person: Person, row: Row, atHost: boolean): Promise<AgentRequestForPerson> {
-  const [view] = await personViews(person, [row], atHost, new Date());
+  const [view] = await personViews(person, [row], atHost, new Date(), { named: true });
   return view;
 }
 

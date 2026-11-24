@@ -352,10 +352,15 @@ describe('lookups', () => {
 });
 
 describe('findOperations', () => {
-  it('ranks id matches first and needs every word', () => {
+  it('ranks id matches first and, when some operation has every word, shows only those', () => {
     const hits = findOperations({ query: 'Invoices EMAIL' });
     expect(hits[0].id).toBe('invoices.email');
-    for (const h of hits) expect(`${h.id} ${h.method} ${h.route} ${h.describe}`.toLowerCase()).toMatch(/invoices/);
+    // Plurals are taken off ("invoices" finds "invoice-reminder" too).
+    for (const h of hits) {
+      const text = `${h.id} ${h.method} ${h.route} ${h.describe} ${h.why ?? ''}`.toLowerCase();
+      expect(text).toMatch(/invoice/);
+      expect(text).toMatch(/email/);
+    }
     expect(findOperations({ query: 'invoices.list' })[0].id).toBe('invoices.list');
     expect(findOperations({ query: 'zzz-nothing-matches' })).toEqual([]);
   });
@@ -549,5 +554,35 @@ describe('loading handlers', () => {
     await expect(loadRouteHandler({ ...list, id: 'invoices.create' })).rejects.toThrow(/not the registered operation/);
     await expect(loadRouteHandler({ ...list, route: '/api/no-such-route' })).rejects.toThrow(/not the registered operation/);
     await expect(loadRouteHandler({ ...list, kind: 'shell' })).rejects.toThrow(/not an API route/);
+  });
+});
+
+describe('an operation whose route parses its body by hand', () => {
+  it('lists the fields the route reads and the body its header documents, for describe_operation', async () => {
+    const { operationById } = await import('./registry');
+    const email = operationById('collections.email');
+    expect(email?.bodySchema).toBeNull();
+    expect(email?.bodyFields).toEqual(expect.arrayContaining(['customerId', 'what', 'to', 'invoiceIds']));
+    expect(email?.bodyDoc).toMatch(/what: 'invoices' \| 'statement'/);
+    // A header whose fields follow on the next lines.
+    expect(operationById('finance-charges')?.bodyDoc).toMatch(/asOf .*customerIds .*settings/);
+    // An operation with a schema gets neither.
+    const bill = operationById('bills.create');
+    expect(bill?.bodySchema).not.toBeNull();
+    expect(bill?.bodyFields).toBeUndefined();
+    expect(bill?.bodyDoc).toBeUndefined();
+  });
+});
+
+describe('find_operations in a person\'s words', () => {
+  it('finds an operation when not every word of the query names it, best match first', async () => {
+    const { findOperations } = await import('./registry');
+    // "memorized" is nowhere in recurring.create's id, route or description; the rest is.
+    expect(findOperations({ query: 'memorized recurring invoice' }).map((o) => o.id)).toContain('recurring.create');
+    // Plurals and common words do not stop a match.
+    expect(findOperations({ query: 'set the closing dates' }).map((o) => o.id)).toContain('company.closing-date.update');
+    // Every word matching still ranks first, and a word matching nothing still finds nothing.
+    expect(findOperations({ query: 'invoices email' })[0].id).toBe('invoices.email');
+    expect(findOperations({ query: 'zzz-nothing-matches' })).toEqual([]);
   });
 });

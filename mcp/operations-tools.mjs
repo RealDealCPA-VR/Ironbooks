@@ -497,6 +497,12 @@ export function shapeDescription(/** @type {any} */ d) {
     query_schema: d.querySchema,
     body: BODY_WORDS[/** @type {keyof typeof BODY_WORDS} */ (d.body)] ?? d.body,
     body_schema: d.bodySchema,
+    // No schema: the fields the route reads and the body as the route documents it, when known.
+    body_fields: d.bodySchema == null && Array.isArray(d.bodyFields) && d.bodyFields.length ? d.bodyFields : undefined,
+    body_described: d.bodySchema == null && typeof d.bodyDoc === 'string' && d.bodyDoc ? d.bodyDoc : undefined,
+    ...(d.bodySchema == null && ((Array.isArray(d.bodyFields) && d.bodyFields.length) || d.bodyDoc)
+      ? { body_fields_mean: 'This operation has no full schema. body_fields are the fields it reads, body_described is its own description; a dry run shows what it refuses.' }
+      : {}),
     returns: OUTPUT_WORDS[/** @type {keyof typeof OUTPUT_WORDS} */ (d.output)] ?? d.output,
     dry_run: d.class === 'read' ? undefined : DRY_RUN_WORDS[/** @type {keyof typeof DRY_RUN_WORDS} */ (d.dryRun)],
     confirm_flags: d.confirmFlags,

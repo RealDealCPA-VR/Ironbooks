@@ -371,6 +371,12 @@ export interface AgentRequestView {
 
 /** What a person's window gets on top: may THIS person approve, and if not, why. */
 export interface AgentRequestForPerson extends AgentRequestView {
+  /**
+   * The list records the request names by id (its customer, vendor, accounts, items …), by their
+   * names in the books, for the lists this person may read. Shown on the card on a line of its own,
+   * marked as names from the books: never in the summary line, which is also the desktop notice.
+   */
+  named?: Array<{ kind: 'customers' | 'vendors' | 'employees' | 'items' | 'accounts' | 'classes'; name: string }>;
   canApprove: boolean;
   cannotApproveWhy: string | null;
   /** Up to how many minutes of standing permission this person may give with the approval (0 = none). */
@@ -537,6 +543,10 @@ export interface OperationDescription extends OperationSummary {
   params: string[];
   /** JSON Schema (draft 2020-12) of the body, or null when the route takes none or parses by hand. */
   bodySchema: unknown;
+  /** With no body schema: the fields the route reads from its body. */
+  bodyFields?: string[];
+  /** With no body schema: the body as the route's own documentation describes it. */
+  bodyDoc?: string;
   querySchema: unknown;
   body: Operation['body'];
   output: Operation['output'];

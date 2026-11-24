@@ -1756,3 +1756,13 @@ export function constraintLines(c: GrantConstraints | null | undefined): string[
   if (c.maxCount) out.push(`At most ${c.maxCount} records each time`);
   return out;
 }
+
+/** What each kind of record on the card's "Named in this request" line is called. */
+export const NAMED_KIND_WORDS: Record<string, string> = {
+  customers: 'customer',
+  vendors: 'vendor',
+  employees: 'employee',
+  items: 'item',
+  accounts: 'account',
+  classes: 'class',
+};

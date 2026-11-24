@@ -278,7 +278,7 @@ afterAll(async () => {
 describe('every tool, against the real route, as an agent', () => {
   it('get_company_info', async () => {
     const info = await ok(bookkeeper, 'get_company_info');
-    expect(info.agent).toMatchObject({ name: 'Bookkeeper agent', modeLabel: 'Read only', canChangeBooks: false, roles: ['Bookkeeper'] });
+    expect(info.agent).toMatchObject({ name: 'Bookkeeper agent', preset: 'read_only', presetLabel: 'Read only', summary: 'It reads the books; it may not change them.', roles: ['Bookkeeper'] });
     expect(info.company).toMatchObject({ name: 'Tools Co', reportBasis: 'accrual' });
     expect(info.company.homeCurrency).toBe('USD');
   });

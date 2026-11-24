@@ -558,12 +558,12 @@ prompt `ironbooks_guide`.
 
 | Group | Tools |
 | --- | --- |
-| Start here | `get_company_info`, `get_my_permissions` (role, setting per kind of work and area, limits, folders, live standing permissions, whether someone is signed in) |
+| Start here | `get_company_info` (the books, and in one sentence what your settings let you do alone), `get_my_permissions` (role, setting per kind of work and area, limits, folders, live standing permissions, whether someone is signed in) |
 | Looking things up | `list_accounts`, `list_customers`, `list_vendors`, `list_items`, `list_classes`, `list_employees`, `list_other`, `search`, `find_transactions`, `get_register`, `get_journal_entry`, `get_transaction`, `list_invoices`, `list_bills`, `undeposited_funds` |
 | Reports | `list_reports`, `run_report` (every standard report by its key), `report_drilldown`, `export_report`, and `report_profit_and_loss`, `report_balance_sheet`, `report_trial_balance`, `report_general_ledger`, `report_ar_aging`, `report_ap_aging` |
 | Entering and changing | `enter_journal_entry`, `enter_invoice`, `enter_sales_receipt`, `receive_payment`, `enter_bill`, `pay_bills`, `write_check`, `make_deposit`, `transfer_funds`, `enter_estimate`, `convert_estimate`, `enter_purchase_order`, `receive_items`, `enter_credit_memo`, `enter_vendor_credit`, `enter_time`, `adjust_inventory`, `pay_sales_tax`, `add_customer`, `add_vendor`, `add_account`, `add_item`, `add_class`, `edit_transaction`, `void_transaction`, `edit_list_entry`, `deactivate_list_entry` |
 | Bank statements and reconciling | `list_bank_accounts`, `get_bank_feed`, `import_statement_lines`, `categorize_bank_line`, `match_bank_line`, `unmatch_bank_line`, `exclude_bank_line`, `reconcile_status`, `get_reconciliation`, `start_reconciliation`, `mark_cleared`, `update_reconciliation_statement`, `add_statement_adjustments`, `finish_reconciliation`, `cancel_reconciliation`, `undo_last_reconciliation` |
-| Everything else | `find_operations`, `describe_operation`, `run_operation`: every operation a person can do in Ironbooks has an id (about 800, `lib/agent/operations/operation-ids.txt`) |
+| Everything else | `find_operations`, `describe_operation`, `run_operation`: every operation a person can do in Ironbooks has an id (about 800, `lib/agent/operations/operation-ids.txt`). `find_operations` takes plain words and shows the best matches first, even when not every word appears. Where an operation has no full schema, `describe_operation` lists the fields it reads (`body_fields`) and its own description of the body (`body_described`). |
 | Requests | `wait_for_decision`, `list_my_requests` (`list_my_proposals` is its older name), `cancel_request`, `ask_for_permission` |
 | Files | `upload_file`, `attach_local_file`, `get_file`, `save_file` |
 

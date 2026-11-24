@@ -132,8 +132,46 @@ function readAmount(v: unknown): Reading {
   }
 }
 
+/**
+ * amountField TEMPLATE_AMOUNT: what one run of a memorized transaction would enter, read from its
+ * template (the body a screen saves for that kind of form): its lines' amounts, a line without one
+ * counted as quantity × rate, or a journal entry's debits. 'bad' when a line can be read by none of
+ * them, so the amount is unknown rather than shown as nothing.
+ */
+export const TEMPLATE_AMOUNT = '@template';
+
+function templateAmount(body: unknown): Reading {
+  const template = isPlainObject(body) ? body.template : undefined;
+  if (!isPlainObject(template)) return NONE;
+  const lines = Array.isArray(template.lines) ? template.lines : Array.isArray(template.items) ? template.items : null;
+  if (!lines) return readAmount(template.amount ?? template.total);
+  let total = new Decimal(0);
+  let any = false;
+  for (const line of lines) {
+    if (!isPlainObject(line)) return BAD;
+    let r = readAmount(line.amount);
+    if (r.kind === 'none') r = readAmount(line.debit);
+    if (r.kind === 'none' && !absent(line.credit)) {
+      // A journal entry: the debits are the entry's size; a credit line adds nothing more.
+      if (readAmount(line.credit).kind === 'bad') return BAD;
+      continue;
+    }
+    if (r.kind === 'none') {
+      const q = absent(line.quantity) ? ({ kind: 'ok', value: new Decimal(1) } as Reading) : readAmount(line.quantity);
+      const rate = readAmount(line.rate);
+      if (q.kind !== 'ok' || rate.kind !== 'ok') return BAD;
+      r = { kind: 'ok', value: q.value.times(rate.value) };
+    }
+    if (r.kind !== 'ok') return BAD;
+    total = total.plus(r.value.abs());
+    any = true;
+  }
+  return any ? { kind: 'ok', value: total } : NONE;
+}
+
 /** The amount at a dotted path. With * (one amount per line) the sizes are added up. */
 function amountIn(root: unknown, path: string): Reading {
+  if (path === TEMPLATE_AMOUNT) return templateAmount(root);
   const values = valuesAt(root, path);
   if (!path.split('.').includes('*')) return values.length > 0 ? readAmount(values[0]) : NONE;
   let total = new Decimal(0);

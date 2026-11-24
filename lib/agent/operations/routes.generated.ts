@@ -25,6 +25,10 @@ export interface GeneratedMethod {
   sessionGate: boolean;
   /** The export is another method's handler (`export { PUT as PATCH }`). */
   aliasOf?: HttpMethod;
+  /** With no body schema: the fields the handler reads from its body. */
+  bodyFields?: string[];
+  /** With no body schema: the body as the route file's header comment documents it. */
+  bodyDoc?: string;
 }
 
 export interface GeneratedRoute {
@@ -55,7 +59,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'file', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'file', serverContext: true, sessionGate: false, bodyFields: ['dividingDate', 'password', 'protect', 'saveAgain'] },
     },
   },
   '/api/accountant-copy/cancel': {
@@ -70,28 +74,28 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'file', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'file', serverContext: true, sessionGate: false, bodyFields: ['note'] },
     },
   },
   '/api/accountant-copy/changes/import': {
     file: 'app/api/accountant-copy/changes/import/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false, bodyDoc: 'POST /api/accountant-copy/changes/import — body: the accountant\'s .ibcx changes file (its JSON).' },
     },
   },
   '/api/accountant-copy/changes/review': {
     file: 'app/api/accountant-copy/changes/review/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false, bodyDoc: 'POST /api/accountant-copy/changes/review — body: the accountant\'s .ibcx changes file (its JSON).' },
     },
   },
   '/api/accountant-copy/open': {
     file: 'app/api/accountant-copy/open/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false, bodyDoc: 'POST /api/accountant-copy/open — body: the client\'s .ibac transfer file (raw bytes).' },
     },
   },
   '/api/accountant/batch-enter': {
@@ -292,7 +296,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/agent/actions/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['args', 'verb'], bodyDoc: 'done (lib/agent/policy.ts). Two kinds of body:' },
     },
   },
   '/api/agent/hello': {
@@ -396,7 +400,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action'] },
     },
   },
   '/api/ai/chatgpt': {
@@ -404,7 +408,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action', 'attemptId'] },
     },
   },
   '/api/ai/posts': {
@@ -433,7 +437,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/ai/proposals/[id]/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action'] },
     },
   },
   '/api/ai/pull': {
@@ -470,7 +474,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/ai/test/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['allowCloud'], bodyDoc: 'Body: a provider config (saved id and/or unsaved draft fields; apiKey optional — a saved' },
     },
   },
   '/api/assemblies': {
@@ -546,14 +550,14 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/attention/invoice-reminder/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['invoiceId', 'to'], bodyDoc: 'Body: { invoiceId: string, to?: string }' },
     },
   },
   '/api/attention/state': {
     file: 'app/api/attention/state/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyDoc: 'Body: { key: string, action: \'snooze\' | \'dismiss\' | \'restore\', days?: 1 | 7 }' },
     },
   },
   '/api/audit-trail': {
@@ -574,14 +578,14 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/auth/2fa/disable/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['token'] },
     },
   },
   '/api/auth/2fa/enable': {
     file: 'app/api/auth/2fa/enable/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['token'] },
     },
   },
   '/api/auth/2fa/recovery-codes': {
@@ -589,14 +593,14 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: false, sessionGate: true },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['token'] },
     },
   },
   '/api/auth/2fa/setup': {
     file: 'app/api/auth/2fa/setup/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['currentPassword'] },
     },
   },
   '/api/auth/challenge': {
@@ -604,7 +608,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: false, sessionGate: true },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['answer', 'currentPassword', 'question'] },
     },
   },
   '/api/auth/change-password': {
@@ -646,28 +650,28 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/auth/recover/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false, bodyFields: ['clearFilePassword', 'login', 'password', 'recoveryKey'], bodyDoc: 'Body: { recoveryKey, login, password, clearFilePassword? }' },
     },
   },
   '/api/auth/request-reset': {
     file: 'app/api/auth/request-reset/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false, bodyFields: ['challengeAnswer', 'email'], bodyDoc: 'Body: { email, challengeAnswer? } — `email` is the login (user name or email address).' },
     },
   },
   '/api/auth/reset': {
     file: 'app/api/auth/reset/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false, bodyFields: ['password', 'token'], bodyDoc: 'Body: { token, password }' },
     },
   },
   '/api/auth/signup': {
     file: 'app/api/auth/signup/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false, bodyFields: ['challengeAnswer', 'challengeQuestion', 'companyName', 'email', 'name', 'password', 'protect'], bodyDoc: 'Body: { name, email, password, companyName, challengeQuestion?, challengeAnswer? } — `email` is' },
     },
   },
   '/api/backup': {
@@ -675,7 +679,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'file', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['byteLength'] },
     },
   },
   '/api/backup/company': {
@@ -683,7 +687,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'file', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['byteLength'] },
     },
   },
   '/api/backups': {
@@ -691,21 +695,21 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['everyHours', 'folder', 'keep', 'schedule'] },
     },
   },
   '/api/backups/preview': {
     file: 'app/api/backups/preview/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['byteLength'] },
     },
   },
   '/api/backups/restore': {
     file: 'app/api/backups/restore/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['id'] },
     },
   },
   '/api/backups/run': {
@@ -794,7 +798,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/bank-transactions/bulk/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action', 'bankAccountId'], bodyDoc: 'Request body: {; bankAccountId: string;; action: \'applyRules\' | \'categorizeSuggested\';; }' },
     },
   },
   '/api/bank-transactions/bulk-accept': {
@@ -915,7 +919,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['id'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyDoc: 'PUT /api/billing-rate-levels/:id — replace it (same body as POST)' },
       DELETE: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
     },
   },
@@ -1049,7 +1053,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/checks/pdf/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'pdf', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'pdf', serverContext: true, sessionGate: false, bodyFields: ['alignmentTest', 'amount', 'checkHeight', 'checkNumber', 'date', 'expenseId', 'firstSheetRemaining', 'id', 'items', 'layout', 'memo', 'offsetX', 'offsetY', 'pageSize', 'payee', 'position', 'source', 'stock', 'style'] },
     },
   },
   '/api/checks/settings': {
@@ -1094,21 +1098,21 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/collections/contacts/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['addCustomerNote', 'addTodo', 'customerId', 'followUpDate', 'invoiceId', 'method', 'note'], bodyDoc: 'Body: { customerId, method?: \'call\'|\'email\'|\'letter\'|\'statement\'|\'visit\'|\'other\'|null, note?, invoiceId?, followUpDate?: \'YYYY-MM-DD\', addTodo?: boolean, addCustomerNote?: boolean }' },
     },
   },
   '/api/collections/email': {
     file: 'app/api/collections/email/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['addTodo', 'customerId', 'followUpDate', 'invoiceIds', 'to', 'what'], bodyDoc: 'Body: { customerId, what: \'invoices\' | \'statement\', invoiceIds?, to?, followUpDate?, addTodo? }' },
     },
   },
   '/api/collections/letter': {
     file: 'app/api/collections/letter/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'pdf', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'pdf', serverContext: true, sessionGate: false, bodyFields: ['addTodo', 'customerId', 'followUpDate', 'signer', 'templateId'], bodyDoc: 'Body: { customerId, templateId, signer?, followUpDate?, addTodo? }. Returns the PDF.' },
     },
   },
   '/api/collections/notes': {
@@ -1116,14 +1120,14 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['customerId', 'followUpDate', 'invoiceId', 'note'] },
     },
   },
   '/api/collections/notes/[id]': {
     file: 'app/api/collections/notes/[id]/route.ts',
     params: ['id'],
     methods: {
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['done'] },
     },
   },
   '/api/command-bar': {
@@ -1155,14 +1159,14 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: false, sessionGate: true },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: true, bodyFields: ['name'] },
     },
   },
   '/api/companies/[id]': {
     file: 'app/api/companies/[id]/route.ts',
     params: ['id'],
     methods: {
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['archived', 'name'] },
       DELETE: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: false, sessionGate: true },
     },
   },
@@ -1170,7 +1174,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/companies/select/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['companyId'] },
     },
   },
   '/api/company': {
@@ -1206,7 +1210,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/company-file/save-as/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false, bodyFields: ['companyName', 'convert'] },
     },
   },
   '/api/company-file/status': {
@@ -1243,7 +1247,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/condense/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['beforeDate', 'dryRun'], bodyDoc: 'Request body: {; beforeDate: "YYYY-MM-DD"; // entries strictly before this date are condensed; dryRun?: boolean; // true = read-only preview, nothing modified; }' },
     },
   },
   '/api/condense/archives': {
@@ -1251,7 +1255,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['id'], bodyDoc: 'POST /api/condense/archives — body { id }: restore that archive copy over the current' },
     },
   },
   '/api/credit-memos': {
@@ -1278,7 +1282,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['code', 'isBase', 'name', 'rateToBase'], bodyDoc: 'body: { code, name, rateToBase, isBase? }' },
     },
   },
   '/api/currencies/fx-adjustment': {
@@ -1293,7 +1297,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['date', 'memo', 'preview', 'rates', 'updateCurrencyList'] },
     },
   },
   '/api/currencies/home-currency-adjustment/[id]': {
@@ -1462,7 +1466,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/employees/[id]/portal-password/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['password'], bodyDoc: 'Body: { password }. Requires a main app session (Employees & Payroll: modify). The company file\'s' },
       DELETE: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
     },
   },
@@ -1517,7 +1521,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/estimates/expire/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['asOf'], bodyDoc: 'Body (all optional): { asOf?: string } — ISO date string; defaults to today\'s date.' },
     },
   },
   '/api/expense-reports': {
@@ -1557,7 +1561,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/expenses/[id]/print/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['allowDuplicateNumber', 'checkNumber'], bodyDoc: 'Body (JSON, optional): { checkNumber?: string }' },
     },
   },
   '/api/export/[list]': {
@@ -1608,7 +1612,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action', 'currentPassword', 'password'] },
     },
   },
   '/api/file-protection': {
@@ -1616,28 +1620,28 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: false, sessionGate: true },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['password'] },
     },
   },
   '/api/file-protection/file-key': {
     file: 'app/api/file-protection/file-key/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['password'] },
     },
   },
   '/api/file-protection/recovery-key': {
     file: 'app/api/file-protection/recovery-key/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: true, bodyFields: ['password'] },
     },
   },
   '/api/finance-charges': {
     file: 'app/api/finance-charges/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['asOf', 'customerIds', 'settings'], bodyDoc: 'Body: asOf (required) — ISO date the charges are assessed as of.; customerIds (optional) — subset of preview customers to assess.; settings (optional) — per-run override { annualRate, minCharge, graceDays }.' },
     },
   },
   '/api/finance-charges/preview': {
@@ -1652,8 +1656,8 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, aliasOf: 'PUT' },
+      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['accountId', 'annualRate', 'assessOnFinanceCharges', 'calculateFrom', 'graceDays', 'markToBePrinted', 'minCharge'] },
+      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, aliasOf: 'PUT', bodyFields: ['accountId', 'annualRate', 'assessOnFinanceCharges', 'calculateFrom', 'graceDays', 'markToBePrinted', 'minCharge'] },
     },
   },
   '/api/find': {
@@ -1668,7 +1672,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['periodEnd', 'periodStart'] },
     },
   },
   '/api/fiscal-periods/[id]': {
@@ -1759,14 +1763,14 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/import/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['bankAccountId', 'content', 'csvMapping', 'fileType', 'filename', 'rows', 'statement'], bodyDoc: 'Request body: {; bankAccountId: string; // UUID of the bankAccounts row; fileType: "ofx" | "qfx" | "qbo" | "csv";; content: string; // raw file text (base64 is NOT required; send as-is); csvMapping?: { // required when fileType === "csv"; dateCol: string | number;; descriptionCol: string | number;; amountCol: string | number;; debitCol?: string | number;' },
     },
   },
   '/api/import/csv-preview': {
     file: 'app/api/import/csv-preview/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['content', 'csvMapping', 'limit'], bodyDoc: 'Request body: {; content: string; // raw CSV text; csvMapping: CsvMapping; // same shape POST /api/import accepts, incl.; // debit/credit split, dateFormat, skipRows, flipSign; limit?: number; // max preview rows (default 10, capped at 50); }' },
     },
   },
   '/api/import/extract': {
@@ -1780,7 +1784,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/import/qb/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['content', 'data', 'format', 'kind', 'mapping', 'openItems', 'openingBalanceDate', 'postOpeningBalances', 'preview', 'replaceStarterChart'], bodyDoc: 'Body (JSON): {; format: \'iif\' | \'csv\' | \'xlsx\',; kind?: \'customers\' | \'vendors\' | \'items\' | \'accounts\', // required for csv / xlsx; content?: string, // raw text (iif / csv); data?: string, // base64 bytes (xlsx); mapping?: Record<string, string>, // required for csv / xlsx; preview?: boolean, // xlsx: return headers + rows only; openItems?: { asDocuments: boolean, alreadyInGl?: boolean } // iif: open invoices / bills; postOpeningBalances?: boolean, // iif: post ACCNT OBAMOUNT as opening balance' },
     },
   },
   '/api/import/rebuild': {
@@ -1788,7 +1792,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action'] },
     },
   },
   '/api/import/statement-assist': {
@@ -1809,7 +1813,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/income-tracker/actions/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action', 'items', 'overrideCreditLimit'], bodyDoc: 'Body: { action: \'email\' | \'queue_print\' | \'queue_email\' | \'convert\', items: [{ type, id }], overrideCreditLimit? }' },
     },
   },
   '/api/integrity': {
@@ -1907,7 +1911,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/inventory/batch-count/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['adjustmentAccountId', 'classId', 'counts', 'customerId', 'date', 'jobId'], bodyDoc: 'Body: { date: string; counts: Array<{ itemId: string; countedQty: string | number }>; adjustmentAccountId?: string; // default "Inventory Adjustments" classId?: string; customerId?: string; jobId?: string; }' },
     },
   },
   '/api/inventory/center': {
@@ -1995,7 +1999,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/invoices/[id]/email/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['templateId', 'to'], bodyDoc: '`to` address). Body: { to?: string }' },
     },
   },
   '/api/invoices/[id]/packing-slip': {
@@ -2452,8 +2456,8 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyDoc: 'PUT /api/network-policy — replace the policy. Body: { mode, cloudOptIn: { ai, email, \'vendor-lookup\', updates }, vendorLookupUrl }. Owner/admin only; Body { allowOnThisComputer: true } instead: "Allow on this computer" —' },
+      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyDoc: 'Body { allowOnThisComputer: true } instead: "Allow on this computer" —' },
     },
   },
   '/api/network-policy/check': {
@@ -2468,14 +2472,14 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['entityType'], bodyDoc: 'POST /api/notes — add a note { entityType, entityId, body, noteDate? }' },
     },
   },
   '/api/notes/[id]': {
     file: 'app/api/notes/[id]/route.ts',
     params: ['id'],
     methods: {
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyDoc: 'PATCH /api/notes/:id — edit a note { body?, noteDate? }' },
       DELETE: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
     },
   },
@@ -2609,7 +2613,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['employeeId', 'policy'], bodyDoc: 'PUT body { employeeId: string, policy: EmployeeAccrualPolicyInput | null }' },
     },
   },
   '/api/payroll/adjustments': {
@@ -2631,7 +2635,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/payroll/calc/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['filingStatus', 'grossPerPeriod', 'periodsPerYear', 'w4', 'year'], bodyDoc: 'Request body: { grossPerPeriod: string|number, periodsPerYear: number,; filingStatus: \'single\'|\'married\'|\'head_of_household\', year?: number, w4?: W4Data }; year defaults to the current calendar year (the tables are keyed by year).' },
     },
   },
   '/api/payroll/pay-runs': {
@@ -2675,7 +2679,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/payroll/state-tax/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['filingStatus', 'grossPerPeriod', 'periodsPerYear', 'state', 'year'], bodyDoc: 'Request body: { grossPerPeriod: string|number, periodsPerYear: number, state: string,; year?: number, filingStatus?: \'single\'|\'married\'|\'married_separate\'|\'head_of_household\' }' },
     },
   },
   '/api/payroll/state-wage-worksheet': {
@@ -2725,7 +2729,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/period-copy/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'file', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'file', serverContext: true, sessionGate: false, bodyFields: ['from', 'password', 'protect', 'to'] },
     },
   },
   '/api/portable': {
@@ -2733,14 +2737,14 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'file', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'file', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'file', serverContext: true, sessionGate: false, bodyFields: ['password', 'protect'] },
     },
   },
   '/api/portable/restore': {
     file: 'app/api/portable/restore/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'bytes', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['byteLength'] },
     },
   },
   '/api/portable/shareable': {
@@ -2754,7 +2758,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/portal/login/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false, bodyFields: ['email', 'password'], bodyDoc: 'POST /api/portal/login — employee self-service login. Body: { email, password }' },
     },
   },
   '/api/portal/logout': {
@@ -2921,7 +2925,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/purchase-orders/[id]/email/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['templateId', 'to'], bodyDoc: 'Body: { to?: string, templateId?: string }. Subject and message: the Purchase Order template of' },
     },
   },
   '/api/purchase-orders/[id]/pdf': {
@@ -2935,7 +2939,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/qb-import/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['content', 'format', 'kind', 'mapping'], bodyDoc: 'Body (JSON): {; format: \'iif\' | \'csv\',; kind?: \'customers\' | \'vendors\', // required when format === \'csv\'; content: string, // raw file text; mapping?: CsvColumnMapping, // required when format === \'csv\'; }' },
     },
   },
   '/api/qb-import/gl': {
@@ -2951,7 +2955,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action', 'alreadyInGl', 'apAccountId', 'arAccountId', 'createMissingNames', 'file', 'items', 'side'] },
     },
   },
   '/api/receipts': {
@@ -2959,7 +2963,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'multipart', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'multipart', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['bytes', 'filename', 'ok', 'response'] },
     },
   },
   '/api/receipts/[id]': {
@@ -2974,7 +2978,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/receipts/[id]/extract/route.ts',
     params: ['id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['force', 'version'] },
     },
   },
   '/api/receipts/[id]/save': {
@@ -2989,7 +2993,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['token'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: false, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'multipart', output: 'json', serverContext: false, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'multipart', output: 'json', serverContext: false, sessionGate: false, bodyFields: ['bytes', 'filename', 'ok', 'response'] },
     },
   },
   '/api/receipts/settings': {
@@ -3049,7 +3053,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['bankAccountId', 'statementBalance', 'statementDate'], bodyDoc: 'POST request body: { bankAccountId: string, statementDate: string (ISO), statementBalance: string }' },
     },
   },
   '/api/reconciliations/[id]': {
@@ -3100,7 +3104,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/reconciliations/undo/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['bankAccountId', 'expectStatementDate'], bodyDoc: 'Body: { bankAccountId: string }' },
     },
   },
   '/api/recurring': {
@@ -3154,7 +3158,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/report-builder/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['groupBy'], bodyDoc: 'Body: ReportConfig { from?, to?, accountTypes?, groupBy, status? }' },
     },
   },
   '/api/report-schedules': {
@@ -3206,7 +3210,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['boxes'], bodyDoc: 'PATCH → body { boxes: [{ box: \'nec_1\'|\'misc_1\'|\'misc_3\', accountIds: string[] }] }' },
     },
   },
   '/api/reports/ap-aging': {
@@ -3532,7 +3536,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/sales-forms/[kind]/[id]/email/route.ts',
     params: ['kind', 'id'],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['templateId', 'to'], bodyDoc: 'Body: { to?: string, templateId?: string }. Sent through sendMail (SMTP config + company network' },
     },
   },
   '/api/sales-forms/[kind]/[id]/flags': {
@@ -3554,14 +3558,14 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action', 'items'] },
     },
   },
   '/api/sales-forms/statement-email': {
     file: 'app/api/sales-forms/statement-email/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['customerId', 'email', 'from', 'to'], bodyDoc: 'Body: { customerId, from?, to?, email? } (from/to = statement period, ISO dates).' },
     },
   },
   '/api/sales-orders': {
@@ -3674,7 +3678,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/sandbox/keep/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['name'], bodyDoc: 'POST /api/sandbox/keep Body: { name: string }' },
     },
   },
   '/api/sandbox/leftovers/[id]': {
@@ -3704,7 +3708,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['action'] },
     },
   },
   '/api/sessions/[id]': {
@@ -3719,7 +3723,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['enabled'] },
     },
   },
   '/api/smart-defaults/bills': {
@@ -3771,7 +3775,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['id'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PATCH: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['components'] },
     },
   },
   '/api/terms/compute': {
@@ -3900,28 +3904,28 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/undo/commit/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['id', 'kind', 'resource', 'token'] },
     },
   },
   '/api/undo/prepare': {
     file: 'app/api/undo/prepare/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['id', 'kind', 'resource'] },
     },
   },
   '/api/unlock': {
     file: 'app/api/unlock/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false, bodyFields: ['password'] },
     },
   },
   '/api/unlock/admin': {
     file: 'app/api/unlock/admin/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: false, sessionGate: false, bodyFields: ['login', 'password', 'totp'], bodyDoc: 'Body: { login, password, totp? }' },
     },
   },
   '/api/uom-sets': {
@@ -3937,7 +3941,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: ['id'],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
-      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      PUT: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyDoc: 'PUT /api/uom-sets/:id — replace it (same body as POST)' },
       DELETE: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
     },
   },
@@ -4040,7 +4044,7 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/year-end-close/route.ts',
     params: [],
     methods: {
-      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+      POST: { bodySchema: null, querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false, bodyFields: ['fiscalYear'], bodyDoc: 'Body: { fiscalYear: number }' },
     },
   },
 };

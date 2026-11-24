@@ -320,6 +320,34 @@ function analyzeFile(fileAbs) {
       ts.forEachChild(fn, visit);
     }
 
+    // The fields the handler reads from its body: body.x, body?.x, body['x'], and
+    // `const { x, y } = body` (or = await req.json()). Shown by describe_operation when the route
+    // parses its body with no schema the registry can load.
+    const bodyFields = new Set();
+    for (const fn of fns) {
+      const visitFields = (n) => {
+        if ((ts.isPropertyAccessExpression(n) || ts.isPropertyAccessChain?.(n)) && ts.isIdentifier(n.expression) && bodyVars.has(n.expression.text)) {
+          bodyFields.add(n.name.text);
+        }
+        if (ts.isElementAccessExpression(n) && ts.isIdentifier(n.expression) && bodyVars.has(n.expression.text) && ts.isStringLiteral(n.argumentExpression)) {
+          bodyFields.add(n.argumentExpression.text);
+        }
+        if (ts.isVariableDeclaration(n) && ts.isObjectBindingPattern(n.name) && n.initializer) {
+          const init = unwrap(n.initializer);
+          if (readKind(n.initializer) || (ts.isIdentifier(init) && bodyVars.has(init.text))) {
+            for (const el of n.name.elements) {
+              const key = el.propertyName ?? el.name;
+              if (ts.isIdentifier(key) || ts.isStringLiteral(key)) bodyFields.add(key.text);
+            }
+          }
+        }
+        ts.forEachChild(n, visitFields);
+      };
+      ts.forEachChild(fn, visitFields);
+    }
+    // Methods of the value itself, not fields a caller sends.
+    for (const notField of ['then', 'catch', 'length', 'map', 'filter', 'toString', 'valueOf']) bodyFields.delete(notField);
+
     const bodySchemas = [];
     const querySchemas = [];
     const isBodyArg = (arg) => {
@@ -365,6 +393,7 @@ function analyzeFile(fileAbs) {
       output,
       serverContext,
       sessionGate,
+      ...(bodyFields.size && bodySchemas.length === 0 ? { bodyFields: [...bodyFields].sort() } : {}),
       // Not written to routes.generated.ts: read by inlineBodySchemas() and the warning in main().
       ...(inlineBody.length ? { inlineBodySchemas: inlineBody } : {}),
     };
@@ -382,6 +411,9 @@ function analyzeFile(fileAbs) {
       : { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: false, sessionGate: false };
     // `export { PUT as PATCH }` and `export const PATCH = PUT` run the PUT handler.
     if (local && local !== name && METHODS.includes(local)) methods[name].aliasOf = local;
+    // What the file's header comment says the body is, for a method with no body schema.
+    const doc = bodyDocOf(src, name);
+    if (doc && methods[name].body !== 'none' && !methods[name].bodySchema && !methods[name].bodySchemaCandidates) methods[name].bodyDoc = doc;
   }
   return { methods, other };
 }
@@ -406,6 +438,40 @@ export function collect() {
   return routes;
 }
 
+/**
+ * The body a route file's header comment documents for `method`: its lines that name a body
+ * ("Body: { customerId, what: 'invoices' | 'statement', … }", "POST body { … }"), comment marks
+ * removed, joined, at most 500 characters. A line that names another method is left out.
+ */
+function bodyDocOf(src, method) {
+  const head = /^\s*\/\*\*([\s\S]*?)\*\//.exec(src);
+  if (!head) return null;
+  const lines = head[1].split('\n').map((l) => l.replace(/^\s*\*\s?/, '').trim());
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!/\bbody\b/i.test(l) || !/[{:]/.test(l)) continue;
+    const other = METHODS.filter((m) => m !== method).some((m) => new RegExp(`\\b${m}\\b`).test(l));
+    if (other && !new RegExp(`\\b${method}\\b`).test(l)) continue;
+    let text = l;
+    // "Body:" (or "Body (JSON):") alone: the fields follow on the next lines, up to a blank one.
+    if (/\bbody(\s*\([^)]*\))?\s*:?\s*$/i.test(l)) {
+      for (let j = i + 1; j < lines.length && j < i + 10 && lines[j] !== ''; j++) text += '; ' + lines[j];
+      out.push(text.replace(/:\s*;\s*/, ': '));
+      continue;
+    }
+    // An object that goes on over the next lines: up to its closing brace.
+    let depth = (text.match(/{/g) || []).length - (text.match(/}/g) || []).length;
+    for (let j = i + 1; depth > 0 && j < lines.length && j < i + 8; j++) {
+      text += ' ' + lines[j];
+      depth += (lines[j].match(/{/g) || []).length - (lines[j].match(/}/g) || []).length;
+    }
+    out.push(text);
+  }
+  const joined = out.join(' ').replace(/\s+/g, ' ').trim();
+  return joined ? joined.slice(0, 500) : null;
+}
+
 function renderMethod(m, meta) {
   const parts = [
     `bodySchema: ${qs(meta.bodySchema)}`,
@@ -416,6 +482,8 @@ function renderMethod(m, meta) {
     `serverContext: ${meta.serverContext}`,
     `sessionGate: ${meta.sessionGate}`,
     ...(meta.aliasOf ? [`aliasOf: ${q(meta.aliasOf)}`] : []),
+    ...(meta.bodyFields ? [`bodyFields: [${meta.bodyFields.map(q).join(', ')}]`] : []),
+    ...(meta.bodyDoc ? [`bodyDoc: ${q(meta.bodyDoc)}`] : []),
   ];
   return `      ${m}: { ${parts.join(', ')} },`;
 }
@@ -448,6 +516,10 @@ export function renderRoutes(routes) {
     '  sessionGate: boolean;',
     '  /** The export is another method\'s handler (`export { PUT as PATCH }`). */',
     '  aliasOf?: HttpMethod;',
+    '  /** With no body schema: the fields the handler reads from its body. */',
+    '  bodyFields?: string[];',
+    "  /** With no body schema: the body as the route file's header comment documents it. */",
+    '  bodyDoc?: string;',
     '}',
     '',
     'export interface GeneratedRoute {',

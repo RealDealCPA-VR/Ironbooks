@@ -909,7 +909,19 @@ describe('finding the app', () => {
     const res = await whoamiGET();
     expect(res.status).toBe(200);
     const info = await res.json();
-    expect(info.agent).toEqual({ name: 'Reader', mode: 'post', modeLabel: 'Post', canChangeBooks: true, canProposeChanges: true, roles: ['Bookkeeper'] });
+    // Described by its settings (the preset an old "post" agent was moved to), not the old modes.
+    expect(info.agent).toEqual({
+      name: 'Reader',
+      preset: 'trusted_bookkeeper',
+      presetLabel: 'Trusted bookkeeper',
+      summary: 'It reads the books and enters and changes records on its own; it asks a person first for the other kinds of work its settings say to ask about.',
+      doesAlone: ['read', 'prepare', 'enter', 'change'],
+      asksFor: ['read_sensitive', 'bulk', 'remove', 'period', 'outside', 'print', 'settings', 'file'],
+      never: ['admin', 'secret'],
+      paused: false,
+      roles: ['Bookkeeper'],
+      detail: 'get_my_permissions',
+    });
     expect(info.company).toMatchObject({ name: 'Agent Context Co', fiscalYearEnd: '12-31', reportBasis: 'accrual', closingDate: null });
     expect(info.company.today).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(info.company).not.toHaveProperty('settings');
