@@ -144,7 +144,7 @@ describe('opening a company file in the one window (source pins)', () => {
 
   it('from No Company Open a company opens in that window, with no relaunch', () => {
     const relaunch = body('function relaunchApp(nextConfig = null) {');
-    expect(relaunch).toMatch(/^function relaunchApp\(nextConfig = null\) \{\s*if \(canOpenInWindow\(\)\) return void openInWindow\(nextConfig\);/);
+    expect(relaunch).toMatch(/^function relaunchApp\(nextConfig = null\) \{\s*if \(canOpenInWindow\(\)\) \{\s*noteInWindowChange\(nextConfig\);\s*return void openInWindow\(nextConfig\);\s*\}/);
     // Only when nothing is open: no company file to save, no server to stop, not already closing.
     const can = body('function canOpenInWindow() {');
     for (const cond of ['startScreenMode', '!openingCompany', '!serverProcess', '!openFile', '!remoteHostOrigin', '!closingInProgress', '!quittingAfterBackup']) {
@@ -189,7 +189,7 @@ describe('opening a company file in the one window (source pins)', () => {
 
   it('closing or switching company files happens in the window too, in the order a quit uses', () => {
     const relaunch = body('function relaunchApp(nextConfig = null) {');
-    expect(relaunch).toMatch(/if \(canCloseInWindow\(\)\) return void closeThenOpenInWindow\(nextConfig\);\s*restartApp\(nextConfig\);/);
+    expect(relaunch).toMatch(/if \(canCloseInWindow\(\)\) \{\s*noteInWindowChange\(nextConfig\);\s*return void closeThenOpenInWindow\(nextConfig\);\s*\}\s*restartApp\(nextConfig\);/);
     const can = body('function canCloseInWindow() {');
     for (const cond of ['startScreenMode', 'openingCompany', 'closingInProgress', 'quittingAfterBackup', 'installAfterClose', 'loadConfig().sandbox', 'sandboxActive()']) {
       expect(can, cond).toContain(cond);

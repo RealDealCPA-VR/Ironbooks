@@ -335,8 +335,10 @@ describe('Needs attention inbox (integration)', () => {
     expect(r.hiddenCount).toBe(0);
     expect(ofKind(r.items, 'todo')).toHaveLength(0);
     expect(ofKind(r.items, 'backup')).toHaveLength(0);
-    // A week later the backup is stale again (new key, so an old dismissal wouldn't hide it).
-    const later = await getAttention(t.ctx, { today: '2026-12-01', now: new Date('2026-12-01T12:00:00Z'), dataDir: t.dir });
+    // A month after the backup (made on the real clock) it is stale again (new key, so an old
+    // dismissal wouldn't hide it).
+    const laterNow = new Date(Date.now() + 30 * 86_400_000);
+    const later = await getAttention(t.ctx, { today: laterNow.toISOString().slice(0, 10), now: laterNow, dataDir: t.dir });
     const backup = ofKind(later.items, 'backup')[0];
     expect(backup.key).not.toBe('backup:never');
   });
