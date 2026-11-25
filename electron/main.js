@@ -132,9 +132,27 @@ let configAfterClose = null;
  *  - otherwise (the sandbox, or something already under way) the app restarts (restartApp).
  */
 function relaunchApp(nextConfig = null) {
-  if (canOpenInWindow()) return void openInWindow(nextConfig);
-  if (canCloseInWindow()) return void closeThenOpenInWindow(nextConfig);
+  if (canOpenInWindow()) {
+    noteInWindowChange(nextConfig);
+    return void openInWindow(nextConfig);
+  }
+  if (canCloseInWindow()) {
+    noteInWindowChange(nextConfig);
+    return void closeThenOpenInWindow(nextConfig);
+  }
   restartApp(nextConfig);
+}
+
+/**
+ * Each change of what the window shows that happens without a restart (open, close or switch in
+ * the window), counted, with what it opens: an agent's approved desktop request reads it to know
+ * that its flow did what it asked (agentShellRestartFlow), as a restart tells it otherwise.
+ */
+let inWindowChanges = 0;
+let inWindowNext = null;
+function noteInWindowChange(nextConfig) {
+  inWindowChanges += 1;
+  inWindowNext = nextConfig || null;
 }
 
 /**
@@ -4625,8 +4643,7 @@ function agentShellDocuments() {
  * an agent the shell never presses "Save a Copy and Open It", which opens a copy in Documents).
  * Null when none is named.
  */
-function agentShellOpening() {
-  const next = configAfterClose || {};
+function agentShellOpening(next = configAfterClose || {}) {
   if (typeof next.companyFile === 'string' && next.companyFile) return next.companyFile;
   return typeof next.dataDir === 'string' && next.dataDir ? next.dataDir : null;
 }
@@ -4637,11 +4654,15 @@ function agentShellOpening() {
  */
 async function agentShellRestartFlow(run, result = {}) {
   const before = relaunchAfterQuit;
+  const changesBefore = inWindowChanges;
   await run();
   await new Promise((r) => setImmediate(r));
   const restarting = !before && relaunchAfterQuit;
-  const opened = restarting ? agentShellOpening() : null;
-  return { done: restarting, restarting, result: opened ? { ...result, opened } : result };
+  // Since one window opens, closes and switches company files without a restart, a flow that did
+  // what it asked may change the window instead: that is done too, and this server stops as well.
+  const inWindow = !restarting && inWindowChanges !== changesBefore;
+  const opened = restarting ? agentShellOpening() : inWindow ? agentShellOpening(inWindowNext || {}) : null;
+  return { done: restarting || inWindow, restarting: restarting || inWindow, result: opened ? { ...result, opened } : result };
 }
 
 /** A restore that writes a new company file at `target`: done when the file is there (it may also restart into it). */
@@ -4655,6 +4676,33 @@ async function agentShellNewFileFlow(run, target) {
   return { done: fs.existsSync(file), restarting, result: opened ? { file, opened } : { file } };
 }
 
+/**
+ * The Recent Companies entry an agent's switch names: its path exactly as the list holds it, or
+ * its company name as the list shows it (companyFile.locationName: the name saved in the file,
+ * else the file's name), compared without regard to case. Refuses a name that is not on the list
+ * or names two files, in words the agent can act on.
+ */
+function recentCompanyFor(input) {
+  const recent = recentCompanyDirs();
+  const file = typeof input.file === 'string' ? input.file.trim() : '';
+  if (file) {
+    if (recent.some((d) => samePath(d, file))) return file;
+    throw new Error('That company file is not in Recent Companies. Ask to open it instead (shell.company.open).');
+  }
+  const wanted = typeof input.company === 'string' ? input.company.trim().toLowerCase() : '';
+  if (!wanted) throw new Error('Name the company file to switch to: its company name as Recent Companies shows it, or its full path.');
+  const named = recent.filter((d) => {
+    try {
+      return companyFile.locationName(d).trim().toLowerCase() === wanted;
+    } catch {
+      return false;
+    }
+  });
+  if (named.length === 1) return named[0];
+  if (named.length > 1) throw new Error(`More than one company file in Recent Companies is called "${input.company}". Ask the person which one, then send its full path.`);
+  throw new Error(`No company file called "${input.company}" is in Recent Companies. Ask the person to open it once in Ironbooks (File > Open Company), then try again.`);
+}
+
 const AGENT_SHELL_FLOWS = {
   'shell.company.new': ({ input }) => agentShellRestartFlow(() => createCompanyFlow(), { file: agentShell.companyFilePath(input.file) }),
   'shell.company.open': ({ input }) => {
@@ -4664,11 +4712,10 @@ const AGENT_SHELL_FLOWS = {
     return agentShellRestartFlow(() => openCompanyFlow(), { file: input.file });
   },
   'shell.company.switch': ({ input }) => {
-    // As File > Recent Companies: only a company file on that list.
-    if (!recentCompanyDirs().some((d) => samePath(d, input.file))) {
-      throw new Error('That company file is not in Recent Companies. Ask to open it instead (shell.company.open).');
-    }
-    return agentShellRestartFlow(() => openCompany(input.file), { file: input.file });
+    // As File > Recent Companies: only a company file on that list, named by its path or by its
+    // company name as the list shows it.
+    const file = recentCompanyFor(input);
+    return agentShellRestartFlow(() => openCompany(file), { file });
   },
   'shell.company.close': () => agentShellRestartFlow(() => closeCompanyFlow()),
   'shell.company.saveCopyAs': async ({ input }) => {

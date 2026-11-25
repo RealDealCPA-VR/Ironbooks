@@ -1017,7 +1017,13 @@ const PATH_FIELD = { type: 'path', required: true };
 const OPERATIONS = Object.freeze({
   'shell.company.new': { fields: { file: PATH_FIELD }, saveDialog: 'file', newFile: 'file', questions: ['temporaryFolder', 'cloudFolder'] },
   'shell.company.open': { fields: { file: PATH_FIELD }, openDialog: 'file', questions: ['temporaryFolder', 'cloudFolder'] },
-  'shell.company.switch': { fields: { file: PATH_FIELD }, questions: [] },
+  // Only a company file on Recent Companies, by its path or its company name (main.js
+  // recentCompanyFor): that list, not the agent's save folders, decides which file it opens.
+  'shell.company.switch': {
+    fields: { file: { type: 'path', required: false }, company: { type: 'string', required: false } },
+    questions: [],
+    recentCompaniesOnly: true,
+  },
   'shell.company.close': { fields: {}, questions: ['closeWhileHosting'] },
   'shell.company.saveCopyAs': { fields: { file: PATH_FIELD }, saveDialog: 'file', newFile: 'file', questions: [], fixedAnswers: ['savedCopy'] },
   'shell.portable.open': {
@@ -1582,6 +1588,9 @@ function createShellCore({ key, flows, folders = () => [], now = () => Date.now(
       }
       for (const [k, f] of Object.entries(spec.fields)) {
         if (f.type !== 'path' || input[k] === undefined || input[k] === null) continue;
+        // A file the flow admits only from Recent Companies (main.js recentCompanyFor): that list,
+        // not the agent's save folders, decides which file it opens.
+        if (spec.recentCompaniesOnly) continue;
         const p = pathProblem(input[k], allowed, pathOptions);
         if (p) return refuse(p);
       }

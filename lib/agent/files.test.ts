@@ -1967,6 +1967,17 @@ describe('overlapsAppData (for the folder rules of other units)', () => {
     expect(overlapsAppData(filed)).toBe(true);
     expect(holdsAppDataBesideTheBooks(filed)).toBe(false);
     expect(holdsAppDataBesideTheBooks(path.join(filed, 'Receipts'))).toBe(false);
+    // As the desktop shell starts the server: the same file again as BKA_REAL_COMPANY_FILE (it is,
+    // whenever no practice copy is open). Found live: the default then never applied in the app.
+    const keepReal = process.env.BKA_REAL_COMPANY_FILE;
+    process.env.BKA_REAL_COMPANY_FILE = process.env.BKA_COMPANY_FILE;
+    try {
+      expect(holdsAppDataBesideTheBooks(filed)).toBe(false);
+      expect(overlapsAppData(filed)).toBe(true);
+    } finally {
+      if (keepReal === undefined) delete process.env.BKA_REAL_COMPANY_FILE;
+      else process.env.BKA_REAL_COMPANY_FILE = keepReal;
+    }
     // Every other place still counts: the working copies, the staged files, Ironbooks' own folder.
     for (const folder of [base, staged, data, work, working, appLocal()]) expect(holdsAppDataBesideTheBooks(folder), folder).toBe(true);
     // A backup folder the shell named inside the company file's folder makes that folder Ironbooks' data.

@@ -483,7 +483,11 @@ function ironbooksPlaces(withOpenFile: boolean): string[] {
     // sandboxRoot's own test, word for word: any value at all means the shell named the folder.
     if (!env.BKA_SANDBOX_ROOT) out.push(path.join(beside, SANDBOXES_FOLDER));
   }
-  for (const file of [withOpenFile ? companyFile() : null, envPlace('BKA_REAL_COMPANY_FILE')]) {
+  // The company file under both the names the shell gives it (BKA_COMPANY_FILE, and
+  // BKA_REAL_COMPANY_FILE, the same file whenever no practice copy is open): left out together when
+  // the company file's own folder is judged (holdsAppDataBesideTheBooks), or that folder would always
+  // count as holding Ironbooks' data and never be a folder agents may use by default.
+  for (const file of withOpenFile ? [companyFile(), envPlace('BKA_REAL_COMPANY_FILE')] : []) {
     if (file) out.push(file, path.join(path.dirname(file), 'archives'));
   }
   // The desktop app's settings folder (electron/main.js userData), as Electron names it

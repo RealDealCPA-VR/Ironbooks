@@ -670,7 +670,7 @@ function summaryOf(door: Door, operation: Operation, input: OperationInput, answ
 function shellPathFields(operation: Operation): Array<{ field: string; required: boolean }> {
   if (operation.kind !== 'shell' || operation.id === SAVE_FILE_OPERATION) return [];
   const def = SHELL_OPERATIONS.find((d) => d.id === operation.id);
-  if (!def) return [];
+  if (!def || def.recentCompaniesOnly === true) return [];
   return Object.entries(def.input)
     .filter(([, f]) => f.type === 'path')
     .map(([field, f]) => ({ field, required: f.required === true }));

@@ -112,8 +112,8 @@ const COMPANY_FILE_PATH = 'The full path of a company file (it ends in .ironbook
 
 /** What a restart into another company file does, as the person approving reads it. */
 const restartInto = (what: string) =>
-  `Ironbooks saves and closes the open company file and restarts into ${what}. The agent's connection ends with the restart; ` +
-  'it can connect again a minute later. Someone must sign in there again, unless this agent may work unattended in that file.';
+  `Ironbooks saves and closes the open company file and opens ${what} (in the same window, or by restarting). The connection of the agent that asked ends with it: ` +
+  "each company file has its own agents, and the next file's agent works once someone signs in there, unless that agent may work while nobody is signed in.";
 
 export const SHELL_OPERATIONS: readonly ShellOperationEntry[] = [
   {
@@ -152,9 +152,19 @@ export const SHELL_OPERATIONS: readonly ShellOperationEntry[] = [
     id: 'shell.company.switch',
     flow: 'openCompany',
     class: 'file',
-    describe: 'Switch to company file {file}',
-    why: `File > Recent Companies: only a company file already on that list. ${restartInto('the file asked for')}`,
-    input: { file: { type: 'path', required: true, describe: `A company file from Recent Companies. ${COMPANY_FILE_PATH}` } },
+    describe: 'Switch to company file {company}{file}',
+    why: `File > Recent Companies: only a company file already on that list, named by its company name as the list shows it, or by its full path. ${restartInto('the file asked for')}`,
+    input: {
+      company: {
+        type: 'string',
+        required: false,
+        describe: 'The company name of a company file in Recent Companies, as the list shows it (for example "Birch Books"). Give this or file.',
+      },
+      file: { type: 'path', required: false, describe: `A company file from Recent Companies. ${COMPANY_FILE_PATH} Give this or company.` },
+    },
+    // The desktop shell admits only a file on Recent Companies (its own list): the agent's save
+    // folders do not apply to which file it opens.
+    recentCompaniesOnly: true,
     questions: [],
     needsSecret: [],
     fileAdmin: true,

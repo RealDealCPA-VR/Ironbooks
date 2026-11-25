@@ -109,6 +109,12 @@ const TOKEN_RE = /^ibka_([0-9a-f]{8})_([A-Za-z0-9_-]{43})$/;
 
 export const NOT_CONNECTED_MESSAGE =
   'Ironbooks is not ready for this agent. Open the company file in Ironbooks on this computer and sign in, then try again.';
+/**
+ * This connection's company file is not open, and another one is (its own endpoint file is there):
+ * each company file has its own agents, so this connection waits for its own file, not a restart.
+ */
+export const OTHER_FILE_OPEN_MESSAGE =
+  "Another company file is open in Ironbooks now, not the one this connection works in. Nothing was sent. Each company file has its own agent connection: use the one for the company file that is open, or ask the person to switch Ironbooks back to this company's file (an agent with the Admin role may ask for the switch through the open file's connection). Then try again.";
 export const NOT_STARTED_MESSAGE =
   'Ironbooks is closed and did not open the company file for this agent. It does that only for an agent an Admin allowed to work while nobody is signed in, and never for a company file with passwords. Otherwise open the company file in Ironbooks on this computer and sign in, then try again.';
 export const LOST_ANSWER_MESSAGE =
@@ -278,6 +284,22 @@ export function readEndpoint(tag, dir = endpointDir()) {
     return { port, check: raw.check, tag };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Whether another company file than `tag`'s is open in Ironbooks on this computer: an endpoint file
+ * of another tag that reads as one (Ironbooks writes it while a file with agents is open and
+ * someone has signed in, and removes it when that file closes).
+ */
+export function otherFileOpen(tag, dir = endpointDir()) {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((n) => /^[0-9a-f]{8}\.json$/.test(n) && n !== `${tag}.json`)
+      .some((n) => readEndpoint(n.slice(0, -5), dir) !== null);
+  } catch {
+    return false;
   }
 }
 
@@ -598,6 +620,8 @@ export class IronbooksClient {
     } catch (err) {
       if (!isNotConnected(err)) throw err;
     }
+    // Another company file is open: no restart to wait for and nothing to start. Said at once.
+    if (otherFileOpen(tag, dir)) throw notConnected(OTHER_FILE_OPEN_MESSAGE);
     if (this.answered) this.lost = true;
     // Ironbooks answered this connector before: wait for it to come back before anything else.
     // Starting a second one meanwhile would only get in the way of the one that is restarting.

@@ -19,6 +19,7 @@ import {
   IronbooksError,
   LOST_ANSWER_MESSAGE,
   NOT_CONNECTED_MESSAGE,
+  OTHER_FILE_OPEN_MESSAGE,
   NOT_STARTED_MESSAGE,
   NO_TOKEN_MESSAGE,
   MAX_OPEN_WAITS,
@@ -172,9 +173,10 @@ describe('proof before the token', () => {
 
   it('no endpoint file: nothing is asked of anyone', async () => {
     expect((await failure(client().get('/api/accounts'))).message).toBe(NOT_CONNECTED_MESSAGE);
-    // A file for another company file's tag does not count.
+    // A file for another company file's tag is never used: the agent is told that another company
+    // file is open (each file has its own agents), at once, and nothing goes to anyone.
     writeEndpoint(app.port, {}, 'ffffffff');
-    expect((await failure(client().get('/api/accounts'))).message).toBe(NOT_CONNECTED_MESSAGE);
+    expect((await failure(client().get('/api/accounts'))).message).toBe(OTHER_FILE_OPEN_MESSAGE);
     expect(app.seen).toEqual([]);
   });
 

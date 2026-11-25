@@ -599,7 +599,14 @@ prompt `ironbooks_guide`.
 - **Never ask the person for a password, code or key, and never send one.** When an operation
   needs one, the person types it on their own screen.
 - **Restarts.** Opening, switching or restoring a company file and installing an update restart
-  Ironbooks. The answer says so; wait a minute, then read what you need again.
+  Ironbooks, or change the file open in its window. The answer says so; wait a minute, then read
+  what you need again.
+- **Several clients.** Each company file has its own agents and tokens, so give the agent one
+  connection per client's file; only the open file's connection answers (the others say another
+  company file is open). To move on to the next client, an agent with the Admin role asks for
+  `shell.company.switch` with the client's company name as Recent Companies shows it (`company`),
+  or its full path (`file`). An Admin approves at the computer, someone signs in to the next file,
+  and that file's connection takes over.
 
 ### Files
 

@@ -650,6 +650,11 @@ export interface ShellOperationDef {
   /** Ironbooks restarts (or changes company file): the agent's connection ends and it must ask again. */
   restarts: boolean;
   /**
+   * Its path names a company file that the desktop shell admits only from Recent Companies (its
+   * own list): the door does not judge that path by the agent's save folders.
+   */
+  recentCompaniesOnly?: boolean;
+  /**
    * Any agent role may ask for it (it is still asked every time, and approved as its class says:
    * an Admin at the host for 'file'). Without it a desktop operation needs an agent with the Admin
    * role, as no right in the permission map describes it.
