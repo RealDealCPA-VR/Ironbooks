@@ -8,12 +8,35 @@ permissions:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+env:
+  NEXT_TELEMETRY_DISABLED: '1'
 jobs:
-  verify:
+  # The tests are most of a run (about an hour in one job), so they are split across parallel jobs:
+  # vitest gives each shard its own share of the test files. To change the number of shards, change
+  # the list AND the "/8" in the Tests step.
+  test:
+    name: Tests (${{ matrix.shard }}/8)
     runs-on: windows-latest
-    timeout-minutes: 120
-    env:
-      NEXT_TELEMETRY_DISABLED: '1'
+    timeout-minutes: 60
+    strategy:
+      # Let every shard finish, so one run shows every failing test (not only the first).
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24' # the Node bundled in Electron 41 (the installed app's server runs on it)
+          cache: npm
+      - run: npm ci --legacy-peer-deps
+      - name: Tests
+        run: npx vitest run --maxWorkers=4 --shard=${{ matrix.shard }}/8
+
+  build:
+    name: Typecheck and build
+    runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -29,7 +52,5 @@ jobs:
           restore-keys: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
       - name: Typecheck
         run: npm run typecheck
-      - name: Tests
-        run: npx vitest run --maxWorkers=4
       - name: Production build
         run: npm run build
