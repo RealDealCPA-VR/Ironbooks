@@ -820,12 +820,17 @@ export const KB_ARTICLES: KbArticle[] = [
     steps: [
       { text: 'Turn payroll on in Preferences > Payroll & Employees.', link: L('Preferences', '/settings') },
       { text: 'Open Employees & payroll and add each employee.', link: L('Employees & payroll', '/employees') },
+      { text: 'On the employee, under "Federal W-4", choose the Filing status and fill in the other lines from their Form W-4.' },
+      { text: 'Choose the "State where the employee works". If they live or work in a place with its own income tax, click "+ Add a city or county tax" and pick it.' },
       { text: 'Open Payroll Setup for payroll items, state payroll taxes and, if you start mid-year, the year-to-date amounts already paid.', link: L('Payroll Setup', '/employees/setup') },
     ],
     go: L('Employees & payroll', '/employees'),
-    asks: ['set up payroll', 'add an employee', 'new employee', 'start payroll mid year', 'year to date payroll', 'state unemployment rate'],
-    keywords: 'employee w-4 ytd state tax workers comp',
-    notes: ['Ironbooks works out paychecks and taxes and gives you the form figures. It does not file taxes or move money for you. Check tax tables against current rules.'],
+    asks: ['set up payroll', 'add an employee', 'new employee', 'start payroll mid year', 'year to date payroll', 'state unemployment rate', 'filing status', 'city income tax', 'local tax', 'county tax'],
+    keywords: 'employee w-4 ytd state tax workers comp filing status married single head of household city county local wage tax',
+    notes: [
+      'Ironbooks works out paychecks and taxes and gives you the form figures. It does not file taxes or move money for you. Check tax tables against current rules.',
+      'City and county taxes: the common places have their rate built in. For a place that is not listed, choose "Other (not listed)" and type its name and rate. You can always type your own percent over a built-in rate.',
+    ],
   },
   {
     id: 'run-payroll',

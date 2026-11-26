@@ -2281,6 +2281,12 @@
           }
         },
         {
+          "text": "On the employee, under \"Federal W-4\", choose the Filing status and fill in the other lines from their Form W-4."
+        },
+        {
+          "text": "Choose the \"State where the employee works\". If they live or work in a place with its own income tax, click \"+ Add a city or county tax\" and pick it."
+        },
+        {
           "text": "Open Payroll Setup for payroll items, state payroll taxes and, if you start mid-year, the year-to-date amounts already paid.",
           "link": {
             "label": "Payroll Setup",
@@ -2289,7 +2295,8 @@
         }
       ],
       "notes": [
-        "Ironbooks works out paychecks and taxes and gives you the form figures. It does not file taxes or move money for you. Check tax tables against current rules."
+        "Ironbooks works out paychecks and taxes and gives you the form figures. It does not file taxes or move money for you. Check tax tables against current rules.",
+        "City and county taxes: the common places have their rate built in. For a place that is not listed, choose \"Other (not listed)\" and type its name and rate. You can always type your own percent over a built-in rate."
       ],
       "asks": [
         "set up payroll",
@@ -2297,7 +2304,11 @@
         "new employee",
         "start payroll mid year",
         "year to date payroll",
-        "state unemployment rate"
+        "state unemployment rate",
+        "filing status",
+        "city income tax",
+        "local tax",
+        "county tax"
       ],
       "links": [
         "/employees",

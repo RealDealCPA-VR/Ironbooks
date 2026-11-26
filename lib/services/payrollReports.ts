@@ -40,6 +40,7 @@ import {
 import { getCompany } from './company';
 import { payrollLiabilityAccountIds } from './liabilityPayments';
 import { stateInfo } from './statePayrollTax';
+import { localityOfLine, localWageBaseForLocality, type LocalTaxSetup } from './localPayrollTax';
 
 // ---------------------------------------------------------------------------
 // Wage bases: the Social Security wage base is YEAR-KEYED data in payrollTax.ts
@@ -136,6 +137,11 @@ interface EmployeeYearFigures {
   box14: Map<string, Dec>;
   /** Employee lines that carry a state code "(XX)" for W-2 Box 15 fallback. */
   stateLineNames: string[];
+  /**
+   * Local income tax by place (W-2 Boxes 18-20): the tax withheld, and the wages of the checks
+   * it was withheld on under both wage bases (the place decides which one is its Box 18).
+   */
+  local: Map<string, { gross: Dec; incomeTaxWages: Dec; ficaWages: Dec; withheld: Dec }>;
 }
 
 function emptyFigures(): EmployeeYearFigures {
@@ -152,6 +158,7 @@ function emptyFigures(): EmployeeYearFigures {
     box12: new Map(),
     box14: new Map(),
     stateLineNames: [],
+    local: new Map(),
   };
 }
 
@@ -171,6 +178,21 @@ function addCheck(f: EmployeeYearFigures, grossPay: string, lines: ReportLine[])
   f.medicare = f.medicare.plus(sumTracking(taxLines, 'medicare'));
   f.stateWithheld = f.stateWithheld.plus(sumTracking(taxLines, 'state_withholding'));
   for (const l of taxLines) if (lineTracking(l) === 'state_withholding') f.stateLineNames.push(l.name);
+  // Local taxes: one entry per place; a check's wages count once per place it was taxed by.
+  const placesOnCheck = new Set<string>();
+  for (const l of taxLines) {
+    if (lineTracking(l) !== 'local_tax') continue;
+    const place = localityOfLine(l.name);
+    const e = f.local.get(place) ?? { gross: Money.zero(), incomeTaxWages: Money.zero(), ficaWages: Money.zero(), withheld: Money.zero() };
+    e.withheld = e.withheld.plus(Money.of(l.amount));
+    if (!placesOnCheck.has(place)) {
+      placesOnCheck.add(place);
+      e.gross = e.gross.plus(b.gross);
+      e.incomeTaxWages = e.incomeTaxWages.plus(b.incomeTaxWages);
+      e.ficaWages = e.ficaWages.plus(b.ficaWages);
+    }
+    f.local.set(place, e);
+  }
 }
 
 /** W-2 Box 12 codes in the order the IRS lists them (alphabetical, single letters first). */
@@ -216,6 +238,15 @@ export interface W2StateBoxes {
   withheld: string;
 }
 
+export interface W2LocalBoxes {
+  /** Box 20: the locality's name. */
+  locality: string;
+  /** Box 18: local wages — the wages of the checks the tax was withheld on, on the place's wage base. */
+  wages: string;
+  /** Box 19: local income tax withheld. */
+  withheld: string;
+}
+
 export interface W2DataResult {
   company: { name: string; address: string | null; ein: string | null };
   employee: { firstName: string; lastName: string; ssn: string | null };
@@ -243,6 +274,8 @@ export interface W2DataResult {
   box14: Array<{ label: string; amount: string }>;
   /** Boxes 15-17: state wages + state income tax withheld. */
   state: W2StateBoxes;
+  /** Boxes 18-20: one entry per city / county whose income tax was withheld. */
+  local: W2LocalBoxes[];
 }
 
 /** Live paychecks (and YTD adjustments) of the company in [start, end), optionally one employee. */
@@ -319,6 +352,7 @@ export async function w2Data(
     box12: box12List(f.box12),
     box14: box14List(f.box14),
     state,
+    local: w2LocalBoxes(employee as Parameters<typeof employeeWorkState>[0], f),
   };
 }
 
@@ -352,6 +386,28 @@ function w2StateBoxes(
     wages: hasStateInfo ? toAmountString(f.incomeTaxWages) : '0.00',
     withheld: toAmountString(f.stateWithheld),
   };
+}
+
+/**
+ * W-2 Boxes 18-20 for one employee's year: each place whose local income tax was withheld, with
+ * the wages of those checks on the place's own wage base (some places tax 401(k) deferrals, so
+ * their Box 18 is the Medicare-wage basis or gross pay rather than the Box 1 basis). Shared by the W-2 and
+ * the W-3 totals.
+ */
+function w2LocalBoxes(employee: Parameters<typeof employeeWorkState>[0], f: EmployeeYearFigures): W2LocalBoxes[] {
+  const setups = ((employee.w4 ?? {}) as { localTaxes?: LocalTaxSetup[] | null }).localTaxes ?? null;
+  const state = employeeWorkState(employee);
+  return [...f.local.entries()]
+    .filter(([, v]) => v.withheld.greaterThan(0))
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([locality, v]) => {
+      const base = localWageBaseForLocality(locality, setups, state);
+      return {
+        locality,
+        wages: toAmountString(base === 'gross' ? v.gross : base === 'fica' ? v.ficaWages : v.incomeTaxWages),
+        withheld: toAmountString(v.withheld),
+      };
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,6 +1186,10 @@ export interface W3DataResult {
   stateWages: string;
   /** Box 17: total state income tax withheld. */
   stateWithheld: string;
+  /** Box 18: total local wages (sum of the W-2s' Box 18). */
+  localWages: string;
+  /** Box 19: total local income tax withheld. */
+  localWithheld: string;
 }
 
 /**
@@ -1168,6 +1228,8 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
   const t = emptyFigures();
   let ssWages = Money.zero();
   let stateWages = Money.zero();
+  let localWages = Money.zero();
+  let localWithheld = Money.zero();
   for (const [employeeId, f] of perEmployee) {
     t.incomeTaxWages = t.incomeTaxWages.plus(f.incomeTaxWages);
     t.ficaWages = t.ficaWages.plus(f.ficaWages);
@@ -1180,6 +1242,10 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
     ssWages = ssWages.plus(capAt(f.ficaWages, ssBase));
     const emp = empById.get(employeeId) ?? { w4: null, address: null };
     stateWages = stateWages.plus(Money.of(w2StateBoxes(emp, f, true).wages));
+    for (const l of w2LocalBoxes(emp, f)) {
+      localWages = localWages.plus(Money.of(l.wages));
+      localWithheld = localWithheld.plus(Money.of(l.withheld));
+    }
   }
   const deferred = ['D', 'E', 'F', 'G', 'H', 'S', 'Y', 'AA', 'BB', 'EE'].reduce(
     (s, code) => s.plus(t.box12.get(code) ?? Money.zero()),
@@ -1205,6 +1271,8 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
     box12: box12List(t.box12),
     stateWages: toAmountString(stateWages),
     stateWithheld: toAmountString(t.stateWithheld),
+    localWages: toAmountString(localWages),
+    localWithheld: toAmountString(localWithheld),
   };
 }
 

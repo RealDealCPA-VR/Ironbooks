@@ -15,7 +15,8 @@
  * A pay date in a year without its own table uses the nearest year's table AND reports it in
  * `notes` (e.g. a 2027 paycheck: "2027 state tables are not in this version; 2026 figures used").
  * Local taxes (PA EIT/LST, NYC/Yonkers, Ohio municipal, Indiana county, Michigan city) are not
- * calculated — add a local tax payroll item; the result's notes say so for those states.
+ * part of this module: they are set up per employee and calculated by localPayrollTax.ts; the
+ * result's notes remind the user of them for those states.
  *
  * Sources (each state's employer withholding guide for the year): AZ Form A-4; CA EDD DE 44
  * (Method B, exact calculation); CO DR 1098 / DR 0004; GA Employer's Tax Guide + HB 111 (2025);
@@ -111,30 +112,30 @@ const EMPLOYEE = 'Not calculated - enter a percent or amount on the employee';
 
 export const STATES: StateInfo[] = [
   { code: 'AK', name: 'Alaska', model: 'none', rateLabel: NONE },
-  { code: 'AL', name: 'Alabama', model: 'employee', rateLabel: EMPLOYEE, localNote: 'Some Alabama cities and counties levy occupational tax.' },
+  { code: 'AL', name: 'Alabama', model: 'employee', rateLabel: EMPLOYEE, localNote: 'Some Alabama cities and counties levy occupational tax: add it on the employee (City / county income tax).' },
   { code: 'AR', name: 'Arkansas', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'AZ', name: 'Arizona', model: 'formula', rateLabel: 'Employee-elected percent of gross wages (Form A-4; 2.0% when no A-4)' },
   { code: 'CA', name: 'California', model: 'formula', rateLabel: 'EDD DE 44 exact calculation (brackets, allowances)' },
-  { code: 'CO', name: 'Colorado', model: 'formula', rateLabel: 'Flat 4.4% after the DR 0004 allowance', localNote: 'Denver, Aurora and other Colorado occupational privilege taxes are not calculated.' },
+  { code: 'CO', name: 'Colorado', model: 'formula', rateLabel: 'Flat 4.4% after the DR 0004 allowance', localNote: 'Denver and other Colorado occupational privilege taxes are not calculated unless you add them on the employee (City / county income tax).' },
   { code: 'CT', name: 'Connecticut', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'DC', name: 'District of Columbia', model: 'employee', rateLabel: EMPLOYEE },
-  { code: 'DE', name: 'Delaware', model: 'employee', rateLabel: EMPLOYEE, localNote: 'Wilmington city wage tax is not calculated.' },
+  { code: 'DE', name: 'Delaware', model: 'employee', rateLabel: EMPLOYEE, localNote: 'Wilmington city wage tax is not calculated unless you add them on the employee (City / county income tax).' },
   { code: 'FL', name: 'Florida', model: 'none', rateLabel: NONE },
   { code: 'GA', name: 'Georgia', model: 'formula', rateLabel: 'Flat rate after standard deduction and dependents (G-4)' },
   { code: 'HI', name: 'Hawaii', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'IA', name: 'Iowa', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'ID', name: 'Idaho', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'IL', name: 'Illinois', model: 'formula', rateLabel: 'Flat 4.95% after IL-W-4 allowances' },
-  { code: 'IN', name: 'Indiana', model: 'formula', rateLabel: 'Flat state rate after WH-4 exemptions', localNote: 'Indiana county tax is not calculated - add a local tax item.' },
+  { code: 'IN', name: 'Indiana', model: 'formula', rateLabel: 'Flat state rate after WH-4 exemptions', localNote: 'Indiana county tax is not calculated unless you add them on the employee (City / county income tax).' },
   { code: 'KS', name: 'Kansas', model: 'employee', rateLabel: EMPLOYEE },
-  { code: 'KY', name: 'Kentucky', model: 'formula', rateLabel: 'Flat rate after the standard deduction', localNote: 'Kentucky city / county occupational taxes are not calculated.' },
+  { code: 'KY', name: 'Kentucky', model: 'formula', rateLabel: 'Flat rate after the standard deduction', localNote: 'Kentucky city / county occupational taxes are not calculated unless you add them on the employee (City / county income tax).' },
   { code: 'LA', name: 'Louisiana', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'MA', name: 'Massachusetts', model: 'formula', rateLabel: 'Circular M: 5% after exemptions and FICA, plus 4% surtax on very high wages' },
   { code: 'MD', name: 'Maryland', model: 'employee', rateLabel: EMPLOYEE, localNote: 'Maryland county tax is part of state withholding there.' },
   { code: 'ME', name: 'Maine', model: 'employee', rateLabel: EMPLOYEE },
-  { code: 'MI', name: 'Michigan', model: 'formula', rateLabel: 'Flat 4.25% after MI-W4 exemptions', localNote: 'Michigan city income taxes (Detroit and others) are not calculated.' },
+  { code: 'MI', name: 'Michigan', model: 'formula', rateLabel: 'Flat 4.25% after MI-W4 exemptions', localNote: 'Michigan city income taxes (Detroit and others) are not calculated unless you add them on the employee (City / county income tax).' },
   { code: 'MN', name: 'Minnesota', model: 'employee', rateLabel: EMPLOYEE },
-  { code: 'MO', name: 'Missouri', model: 'employee', rateLabel: EMPLOYEE, localNote: 'Kansas City and St. Louis earnings taxes are not calculated.' },
+  { code: 'MO', name: 'Missouri', model: 'employee', rateLabel: EMPLOYEE, localNote: 'Kansas City and St. Louis earnings taxes are not calculated unless you add them on the employee (City / county income tax).' },
   { code: 'MS', name: 'Mississippi', model: 'formula', rateLabel: 'Flat rate above $10,000 after exemptions and standard deduction' },
   { code: 'MT', name: 'Montana', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'NC', name: 'North Carolina', model: 'formula', rateLabel: 'Flat rate after standard deduction and NC-4 allowances' },
@@ -144,11 +145,11 @@ export const STATES: StateInfo[] = [
   { code: 'NJ', name: 'New Jersey', model: 'formula', rateLabel: 'NJ-WT rate table A or B after allowances' },
   { code: 'NM', name: 'New Mexico', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'NV', name: 'Nevada', model: 'none', rateLabel: NONE },
-  { code: 'NY', name: 'New York', model: 'formula', rateLabel: 'NYS brackets after the deduction and IT-2104 allowances', localNote: 'New York City and Yonkers taxes are not calculated - add a local tax item.' },
-  { code: 'OH', name: 'Ohio', model: 'formula', rateLabel: 'Ohio brackets after IT 4 exemptions', localNote: 'Ohio municipal and school district taxes are not calculated.' },
+  { code: 'NY', name: 'New York', model: 'formula', rateLabel: 'NYS brackets after the deduction and IT-2104 allowances', localNote: 'New York City and Yonkers taxes are not calculated unless you add them on the employee (City / county income tax).' },
+  { code: 'OH', name: 'Ohio', model: 'formula', rateLabel: 'Ohio brackets after IT 4 exemptions', localNote: 'Ohio municipal and school district taxes are not calculated unless you add them on the employee (City / county income tax).' },
   { code: 'OK', name: 'Oklahoma', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'OR', name: 'Oregon', model: 'employee', rateLabel: EMPLOYEE },
-  { code: 'PA', name: 'Pennsylvania', model: 'formula', rateLabel: 'Flat 3.07% (no allowances)', localNote: 'Pennsylvania local earned income tax (EIT) and local services tax (LST) are not calculated - add a local tax item.' },
+  { code: 'PA', name: 'Pennsylvania', model: 'formula', rateLabel: 'Flat 3.07% (no allowances)', localNote: 'Pennsylvania local earned income tax (EIT) and local services tax (LST) are not calculated unless you add them on the employee (City / county income tax).' },
   { code: 'RI', name: 'Rhode Island', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'SC', name: 'South Carolina', model: 'employee', rateLabel: EMPLOYEE },
   { code: 'SD', name: 'South Dakota', model: 'none', rateLabel: NONE },

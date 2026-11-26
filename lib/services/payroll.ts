@@ -58,7 +58,8 @@ import {
   type W4Data,
 } from '@/lib/services/payrollTax';
 import { getPayrollItemsByIds, resolveItemTracking, type PayrollItem } from './payrollItems';
-import { calculateStateWithholding, normalizeStateW4, type StateW4 } from './statePayrollTax';
+import { calculateStateWithholding, normalizeStateW4, stateInfo, type StateW4 } from './statePayrollTax';
+import { calculateLocalWithholding, localTaxLineName, normalizeLocalTaxes, type LocalTaxSetup } from './localPayrollTax';
 import {
   inferEmployeeTaxTracking,
   inferEmployerTracking,
@@ -469,6 +470,16 @@ export async function updateEmployee(
         else delete w4Obj.stateW4;
       } catch (err) {
         throw validation(err instanceof Error ? err.message : 'The state tax settings are not valid.');
+      }
+    }
+    // City / county income taxes: validated and normalized; none = not set.
+    if ('localTaxes' in w4Obj) {
+      try {
+        const local = normalizeLocalTaxes(w4Obj.localTaxes);
+        if (local) w4Obj.localTaxes = local;
+        else delete w4Obj.localTaxes;
+      } catch (err) {
+        throw validation(err instanceof Error ? err.message : 'The local tax settings are not valid.');
       }
     }
   }
@@ -1188,6 +1199,8 @@ async function preparePaycheck(
     if (!hasTaxYearTable(year)) {
       notes.push(`Federal withholding tables for ${year} are not in this version; the nearest year's figures were used. Check the amounts before paying.`);
     }
+    /** State income tax the formula gave for this check, before extra withholding (Yonkers). */
+    let stateFormulaTax: Dec | null = null;
     if (state) {
       let sw;
       try {
@@ -1203,7 +1216,17 @@ async function preparePaycheck(
       } catch (err) {
         throw validation(err instanceof Error ? err.message : 'The state withholding could not be calculated.');
       }
-      notes.push(...sw.notes);
+      // The state's "local taxes are not calculated" reminder is dropped once the employee has
+      // a local tax of that state set up.
+      const hasLocalSetup = (((w4 as { localTaxes?: LocalTaxSetup[] | null }).localTaxes ?? []) as LocalTaxSetup[]).some(
+        (t) => t?.state === state,
+      );
+      const localReminder = stateInfo(state)?.localNote;
+      notes.push(...sw.notes.filter((n) => !(hasLocalSetup && n === localReminder)));
+      if (sw.method === 'formula') {
+        const extra = (w4 as { stateW4?: StateW4 }).stateW4?.extraWithholding;
+        stateFormulaTax = Money.of(sw.amount).minus(extra != null && extra !== '' ? Money.of(extra) : 0);
+      }
       if (Money.gt(sw.amount, 0)) {
         const stateItem = await stateWithholdingItem(ctx);
         if (stateItem) itemMap.set(stateItem.id, stateItem);
@@ -1213,6 +1236,43 @@ async function preparePaycheck(
           amount: sw.amount,
           payrollItemId: stateItem?.id ?? null,
           taxTracking: 'state_withholding',
+        });
+      }
+    }
+
+    // City / county income taxes set up on the employee (localPayrollTax.ts): one line per place,
+    // posted to the company's local tax payroll item (its liability account) when there is one.
+    const localTaxes = ((w4 as { localTaxes?: LocalTaxSetup[] | null }).localTaxes ?? []) as LocalTaxSetup[];
+    if (Array.isArray(localTaxes) && localTaxes.length > 0) {
+      const localItems = await localTaxItems(ctx);
+      for (const setup of localTaxes) {
+        let lw;
+        try {
+          lw = calculateLocalWithholding({
+            setup,
+            payDate: input.payDate,
+            incomeTaxWagesPerPeriod: incomeTaxWages,
+            ficaWagesPerPeriod: ficaWages,
+            grossPerPeriod: gross,
+            periodsPerYear,
+            stateTaxPerPeriod: stateFormulaTax,
+            stateW4: (w4 as { stateW4?: StateW4 }).stateW4 ?? null,
+          });
+        } catch (err) {
+          throw validation(err instanceof Error ? err.message : 'The local tax could not be calculated.');
+        }
+        notes.push(...lw.notes);
+        if (!Money.gt(lw.amount, 0)) continue;
+        // The item named for the place, else the company's only / first local tax item.
+        const wanted = lw.name.toLowerCase();
+        const localItem = localItems.find((i) => i.name.toLowerCase().includes(wanted)) ?? localItems[0] ?? null;
+        if (localItem) itemMap.set(localItem.id, localItem);
+        taxLines.push({
+          kind: 'tax',
+          name: localTaxLineName(lw.name),
+          amount: lw.amount,
+          payrollItemId: localItem?.id ?? null,
+          taxTracking: 'local_tax',
         });
       }
     }
@@ -1240,7 +1300,9 @@ async function preparePaycheck(
         }
         seenTracking.add(tr);
         const list = isEmployee ? taxLines : (employerTaxLines ??= []);
-        const idx = list.findIndex((l) => l.taxTracking === tr);
+        // Several lines can share a type (two local taxes): the one posted to this item first.
+        const own = list.findIndex((l) => l.taxTracking === tr && l.payrollItemId === item.id);
+        const idx = own >= 0 ? own : list.findIndex((l) => l.taxTracking === tr);
         const line: PaycheckLineInput = {
           kind: isEmployee ? 'tax' : 'employer_contribution',
           // Keep the engine's standard name (it carries the state code, e.g. "(CA)").
@@ -1342,6 +1404,22 @@ async function stateWithholdingItem(ctx: ServiceContext): Promise<PayrollItem | 
       ),
     );
   return rows.find((r) => r.name.toLowerCase() === 'state withholding') ?? rows[0] ?? null;
+}
+
+/** The company's active local tax items (tax tracking 'local_tax'), oldest first. */
+async function localTaxItems(ctx: ServiceContext): Promise<PayrollItem[]> {
+  return ctx.db
+    .select()
+    .from(payrollItems)
+    .where(
+      and(
+        eq(payrollItems.companyId, ctx.companyId),
+        eq(payrollItems.kind, 'tax'),
+        eq(payrollItems.taxTracking, 'local_tax'),
+        eq(payrollItems.isActive, true),
+      ),
+    )
+    .orderBy(payrollItems.createdAt);
 }
 
 /** The paycheck_lines rows for a prepared check. */

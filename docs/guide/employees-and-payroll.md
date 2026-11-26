@@ -24,9 +24,13 @@ Turn payroll on, add each employee with their pay rate and tax settings, then en
 
 1. Turn payroll on in Preferences > Payroll & Employees. → **Setup › Preferences** (`/settings`)
 2. Open Employees & payroll and add each employee. → **Accounting › Employees & payroll** (`/employees`)
-3. Open Payroll Setup for payroll items, state payroll taxes and, if you start mid-year, the year-to-date amounts already paid. → **Accounting › Payroll Setup** (`/employees/setup`)
+3. On the employee, under "Federal W-4", choose the Filing status and fill in the other lines from their Form W-4.
+4. Choose the "State where the employee works". If they live or work in a place with its own income tax, click "+ Add a city or county tax" and pick it.
+5. Open Payroll Setup for payroll items, state payroll taxes and, if you start mid-year, the year-to-date amounts already paid. → **Accounting › Payroll Setup** (`/employees/setup`)
 
 > Good to know: Ironbooks works out paychecks and taxes and gives you the form figures. It does not file taxes or move money for you. Check tax tables against current rules.
+>
+> Good to know: City and county taxes: the common places have their rate built in. For a place that is not listed, choose "Other (not listed)" and type its name and rate. You can always type your own percent over a built-in rate.
 
 *In the app: Help & Glossary → "How do I set up payroll and add employees?", or ask Ask AI.*
 

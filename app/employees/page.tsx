@@ -41,10 +41,19 @@ import {
 } from '@/lib/services/payrollTaxTracking';
 import Decimal from 'decimal.js';
 import {
+  STATES,
   STATE_W4_FIELDS,
   stateInfo,
   type StateW4,
 } from '@/lib/services/statePayrollTax';
+import {
+  MAX_LOCAL_TAXES,
+  OTHER_LOCAL,
+  describeLocalTax,
+  localJurisdiction,
+  localJurisdictionsFor,
+  type LocalTaxSetup,
+} from '@/lib/services/localPayrollTax';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,6 +84,8 @@ interface EmployeeW4 {
   state?: string;
   /** State withholding certificate (statePayrollTax.ts StateW4). */
   stateW4?: StateW4 | null;
+  /** City / county income taxes withheld from pay (localPayrollTax.ts LocalTaxSetup). */
+  localTaxes?: LocalTaxSetup[] | null;
   /** Legacy field from earlier versions (count of dependents, not used in the math). */
   dependents?: number;
 }
@@ -119,6 +130,18 @@ interface Paycheck {
   ytdNet: string | null;
 }
 
+/** One local tax row on the employee form (blank jurisdiction = not chosen yet). */
+interface LocalTaxRow {
+  state: string;
+  /** '' | a built-in place id | OTHER_LOCAL */
+  jurisdiction: string;
+  name: string;
+  resident: boolean;
+  percent: string;
+  amountPerCheck: string;
+  allowances: string;
+}
+
 interface EmployeeFormState {
   firstName: string;
   lastName: string;
@@ -150,6 +173,7 @@ interface EmployeeFormState {
   stNjTable: string;
   stPct: string;
   stAmt: string;
+  localTaxes: LocalTaxRow[];
   phone: string;
   hireDate: string;
   releaseDate: string;
@@ -306,6 +330,7 @@ const EMPTY_EMPLOYEE_FORM: EmployeeFormState = {
   stNjTable: '',
   stPct: '',
   stAmt: '',
+  localTaxes: [],
   phone: '',
   hireDate: '',
   releaseDate: '',
@@ -454,6 +479,15 @@ function employeeToForm(emp: Employee): EmployeeFormState {
     stNjTable: emp.w4?.stateW4?.njTable ?? '',
     stPct: emp.w4?.stateW4?.fallbackPercent != null ? String(emp.w4.stateW4.fallbackPercent) : '',
     stAmt: emp.w4?.stateW4?.fallbackAmount != null ? String(emp.w4.stateW4.fallbackAmount) : '',
+    localTaxes: (emp.w4?.localTaxes ?? []).map((t) => ({
+      state: t.state,
+      jurisdiction: t.jurisdiction,
+      name: t.name,
+      resident: t.resident !== false,
+      percent: t.percent ?? '',
+      amountPerCheck: t.amountPerCheck ?? '',
+      allowances: t.allowances != null ? String(t.allowances) : '',
+    })),
     phone: emp.phone ?? '',
     hireDate: emp.hireDate ? String(emp.hireDate).slice(0, 10) : '',
     releaseDate: emp.releaseDate ? String(emp.releaseDate).slice(0, 10) : '',
@@ -507,7 +541,8 @@ function StateTaxFields({
   if (!info) {
     return (
       <p className="text-xs text-navy/50 mt-3">
-        Enter a work state (or an address state) to set up state income tax withholding.
+        Choose the state where the employee works (or the state in their address) to set up state income tax
+        withholding.
       </p>
     );
   }
@@ -610,15 +645,211 @@ function StateTaxFields({
   );
 }
 
+/** The employee form's local tax rows → the stored list (rows with no place chosen dropped). */
+function localTaxesFromForm(rows: LocalTaxRow[]): LocalTaxSetup[] {
+  return rows
+    .filter((r) => r.jurisdiction)
+    .map((r) => {
+      const place = localJurisdiction(r.jurisdiction);
+      return {
+        state: place?.state ?? r.state,
+        jurisdiction: r.jurisdiction,
+        name: place?.name ?? r.name.trim(),
+        resident: r.resident,
+        ...(r.percent.trim() ? { percent: r.percent.trim() } : {}),
+        ...(r.amountPerCheck.trim() ? { amountPerCheck: r.amountPerCheck.trim() } : {}),
+        ...(place?.method === 'nyc' && r.allowances.trim() ? { allowances: Number(r.allowances) } : {}),
+      };
+    });
+}
+
+/**
+ * City / county income taxes for the employee: a picker of the places the app knows in the work
+ * state (with their rates built in), or "Other" to type a place and its rate. Several can apply
+ * to one person — the city they work in and the one they live in, say.
+ */
+function LocalTaxFields({
+  form,
+  onLocalTaxes,
+}: {
+  form: EmployeeFormState;
+  onLocalTaxes: (rows: LocalTaxRow[]) => void;
+}) {
+  const code = (form.workState.trim() || form.addrState.trim()).toUpperCase();
+  const info = stateInfo(code);
+  const places = localJurisdictionsFor(code);
+  const rows = form.localTaxes;
+  const set = (i: number, patch: Partial<LocalTaxRow>) => onLocalTaxes(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const add = () =>
+    onLocalTaxes([...rows, { state: code, jurisdiction: '', name: '', resident: true, percent: '', amountPerCheck: '', allowances: '' }]);
+
+  return (
+    <div className="mt-4">
+      <p className="text-xs font-semibold text-navy/50 uppercase tracking-wide mb-1">City / county income tax</p>
+      {rows.length === 0 && (
+        <p className="text-[11px] text-navy/50 mb-2">
+          {!info
+            ? 'Choose the state first. If the employee also owes a city or county income tax, add it here.'
+            : places.length > 0
+              ? `Some places in ${info.name} tax wages. If the employee lives or works in one, add it and the tax is withheld from each paycheck.`
+              : `The app knows of no city or county income tax withheld from pay in ${info.name}. If one applies, add it and enter its rate.`}
+        </p>
+      )}
+      <div className="flex flex-col gap-3">
+        {rows.map((row, i) => {
+          const place = localJurisdiction(row.jurisdiction);
+          const rowState = place?.state ?? (row.state || code);
+          // The places of the row's own state (it stays put if the work state is changed later).
+          const options = rowState === code ? places : localJurisdictionsFor(rowState);
+          const isOther = row.jurisdiction === OTHER_LOCAL;
+          const needsOwnFigure = isOther || (!!place && place.method !== 'nyc' && place.rates.length === 0);
+          const preview: LocalTaxSetup | null = row.jurisdiction
+            ? {
+                state: rowState,
+                jurisdiction: row.jurisdiction,
+                name: place?.name ?? row.name,
+                resident: row.resident,
+                ...(row.percent.trim() ? { percent: row.percent.trim() } : {}),
+                ...(row.amountPerCheck.trim() ? { amountPerCheck: row.amountPerCheck.trim() } : {}),
+              }
+            : null;
+          let how = '';
+          try {
+            how = preview ? describeLocalTax(preview) : '';
+          } catch {
+            how = ''; // a half-typed percent
+          }
+          return (
+            <div key={i} className="rounded-lg border border-slate-200 p-3" data-local-tax-row="">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label htmlFor={`locPlace${i}`}>City or county{rowState ? ` (${rowState})` : ''}</Label>
+                  <Select
+                    id={`locPlace${i}`}
+                    value={row.jurisdiction}
+                    onChange={(e) => set(i, { jurisdiction: e.target.value, state: rowState, percent: '', amountPerCheck: '', allowances: '' })}
+                  >
+                    <option value="">Choose…</option>
+                    {options.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                    <option value={OTHER_LOCAL}>Other (not listed)…</option>
+                  </Select>
+                </div>
+                <div>
+                  <Label htmlFor={`locRes${i}`}>The employee</Label>
+                  <Select
+                    id={`locRes${i}`}
+                    value={row.resident ? 'resident' : 'nonresident'}
+                    onChange={(e) => set(i, { resident: e.target.value === 'resident' })}
+                  >
+                    <option value="resident">Lives there</option>
+                    <option value="nonresident">Works there, lives elsewhere</option>
+                  </Select>
+                </div>
+                {isOther && (
+                  <div className="col-span-2">
+                    <Label htmlFor={`locName${i}`}>Name of the city, county or district *</Label>
+                    <Input id={`locName${i}`} maxLength={60} value={row.name} onChange={(e) => set(i, { name: e.target.value })} />
+                  </div>
+                )}
+                {row.jurisdiction && (
+                  <>
+                    <div>
+                      <Label htmlFor={`locPct${i}`}>{needsOwnFigure ? 'Percent of wages' : 'Use this percent instead'}</Label>
+                      <Input
+                        id={`locPct${i}`}
+                        inputMode="decimal"
+                        placeholder={needsOwnFigure ? 'e.g. 1.5' : 'Built-in rate'}
+                        value={row.percent}
+                        onChange={(e) => set(i, { percent: e.target.value })}
+                      />
+                    </div>
+                    <div>
+                      <Label htmlFor={`locAmt${i}`}>Or an amount per paycheck</Label>
+                      <Input
+                        id={`locAmt${i}`}
+                        inputMode="decimal"
+                        placeholder="0.00"
+                        value={row.amountPerCheck}
+                        onChange={(e) => set(i, { amountPerCheck: e.target.value })}
+                      />
+                    </div>
+                  </>
+                )}
+                {place?.method === 'nyc' && (
+                  <div>
+                    <Label htmlFor={`locAllow${i}`}>New York City allowances (IT-2104)</Label>
+                    <Input id={`locAllow${i}`} type="number" min="0" step="1" value={row.allowances} onChange={(e) => set(i, { allowances: e.target.value })} />
+                  </div>
+                )}
+              </div>
+              <div className="mt-2 flex items-start justify-between gap-3">
+                <p className="text-[11px] text-navy/60">
+                  {how && !/[.:]$/.test(how) ? `${how}.` : how}
+                  {place?.note ? ` ${place.note}` : ''}
+                </p>
+                <button type="button" className="shrink-0 text-xs text-electric hover:underline" onClick={() => onLocalTaxes(rows.filter((_, j) => j !== i))}>
+                  Remove
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {rows.length < MAX_LOCAL_TAXES && (
+        <button type="button" className="mt-2 text-xs text-electric hover:underline" onClick={add}>
+          {rows.length === 0 ? '+ Add a city or county tax' : '+ Add another'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+const STATE_OPTIONS = [...STATES].sort((a, b) => a.name.localeCompare(b.name));
+
+/** A two-letter state picker (all states and DC, by name). */
+function StateSelect({
+  id,
+  value,
+  onChange,
+  blankLabel,
+  'aria-label': ariaLabel,
+}: {
+  id?: string;
+  value: string;
+  onChange: (code: string) => void;
+  blankLabel: string;
+  'aria-label'?: string;
+}) {
+  const code = value.trim().toUpperCase();
+  return (
+    <Select id={id} aria-label={ariaLabel} value={code} onChange={(e) => onChange(e.target.value)}>
+      <option value="">{blankLabel}</option>
+      {/* A code typed in an earlier version that is not a state stays visible until changed. */}
+      {code && !stateInfo(code) && <option value={code}>{code}</option>}
+      {STATE_OPTIONS.map((s) => (
+        <option key={s.code} value={s.code}>
+          {s.name}
+        </option>
+      ))}
+    </Select>
+  );
+}
+
 function EmployeeForm({
   form,
   onChange,
+  onLocalTaxes,
   ssnLast4,
   showPayrollInfo,
   wcCodes = [],
 }: {
   form: EmployeeFormState;
   onChange: (field: keyof EmployeeFormState, value: string) => void;
+  onLocalTaxes: (rows: LocalTaxRow[]) => void;
   ssnLast4?: string | null;
   showPayrollInfo?: boolean;
   wcCodes?: WcCode[];
@@ -800,13 +1031,12 @@ function EmployeeForm({
             </label>
             <div className="grid grid-cols-2 gap-3 mt-3">
               <div>
-                <Label htmlFor="empWorkState">Work state (for state payroll taxes)</Label>
-                <Input
+                <Label htmlFor="empWorkState">State where the employee works</Label>
+                <StateSelect
                   id="empWorkState"
-                  maxLength={2}
-                  placeholder="Same as address"
                   value={form.workState}
-                  onChange={(e) => onChange('workState', e.target.value.toUpperCase())}
+                  onChange={(code) => onChange('workState', code)}
+                  blankLabel="Same as the address below"
                 />
               </div>
               <div>
@@ -825,6 +1055,7 @@ function EmployeeForm({
               </div>
             </div>
             <StateTaxFields form={form} onChange={onChange} />
+            <LocalTaxFields form={form} onLocalTaxes={onLocalTaxes} />
           </div>
 
           <div className="border-t border-slate-200 pt-3">
@@ -848,11 +1079,11 @@ function EmployeeForm({
                   value={form.addrCity}
                   onChange={(e) => onChange('addrCity', e.target.value)}
                 />
-                <Input
-                  placeholder="State"
-                  maxLength={2}
+                <StateSelect
+                  aria-label="State"
                   value={form.addrState}
-                  onChange={(e) => onChange('addrState', e.target.value.toUpperCase())}
+                  onChange={(code) => onChange('addrState', code)}
+                  blankLabel="State"
                 />
                 <Input
                   placeholder="ZIP"
@@ -1155,19 +1386,38 @@ export default function EmployeesPage() {
       toast('Pay rate must be 0 or more', 'danger'); return;
     }
     setAddSaving(true);
+    let created: Employee | null = null;
     try {
-      await api.post('/api/employees', {
+      created = await api.post<Employee>('/api/employees', {
         firstName: addForm.firstName.trim(),
         lastName: addForm.lastName.trim(),
         email: addForm.email.trim() || undefined,
         payType: addForm.payType,
         payRate: addForm.payRate,
       });
+      // The W-4, state and local tax setup, SSN and address are saved onto the new employee.
+      await api.patch(`/api/employees/${created.id}`, buildPatchBody(addForm));
       toast('Employee created', 'success');
       setAddOpen(false);
       await fetchAll();
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Failed to create employee', 'danger');
+      if (created) {
+        // The employee exists but the tax details were refused: carry on in the edit form, with
+        // what was typed, so nothing is lost and a second "Create" can't add a duplicate.
+        toast(
+          `${created.firstName} ${created.lastName} was added, but the payroll details were not saved: ${err instanceof ApiError ? err.message : 'something went wrong'}`,
+          'danger',
+        );
+        setAddOpen(false);
+        await fetchAll();
+        setEditId(created.id);
+        setEditForm({ ...addForm });
+        setAccrualRow(null);
+        setAccrualForm(EMPTY_ACCRUAL_FORM);
+        setEditOpen(true);
+      } else {
+        toast(err instanceof ApiError ? err.message : 'Failed to create employee', 'danger');
+      }
     } finally {
       setAddSaving(false);
     }
@@ -1243,6 +1493,7 @@ export default function EmployeesPage() {
   }
 
   function buildPatchBody(form: EmployeeFormState) {
+    const localTaxes = localTaxesFromForm(form.localTaxes);
     const hasAddress =
       form.addrLine1.trim() || form.addrLine2.trim() || form.addrCity.trim() ||
       form.addrState.trim() || form.addrZip.trim();
@@ -1264,6 +1515,7 @@ export default function EmployeesPage() {
               exempt: form.exempt === 'true',
               ...(form.workState.trim() ? { state: form.workState.trim().toUpperCase() } : {}),
               stateW4: stateW4FromForm(form),
+              ...(localTaxes.length ? { localTaxes } : {}),
             }
           : {
               formYear: 2020,
@@ -1276,6 +1528,7 @@ export default function EmployeesPage() {
               exempt: form.exempt === 'true',
               ...(form.workState.trim() ? { state: form.workState.trim().toUpperCase() } : {}),
               stateW4: stateW4FromForm(form),
+              ...(localTaxes.length ? { localTaxes } : {}),
             },
       phone: form.phone.trim() || null,
       hireDate: form.hireDate || null,
@@ -2226,7 +2479,13 @@ export default function EmployeesPage() {
           </>
         }
       >
-        <EmployeeForm form={addForm} onChange={updateAddForm} />
+        <EmployeeForm
+          form={addForm}
+          onChange={updateAddForm}
+          onLocalTaxes={(rows) => setAddForm((prev) => ({ ...prev, localTaxes: rows }))}
+          showPayrollInfo
+          wcCodes={wcCodes}
+        />
       </Modal>
 
       {/* ---- Edit Employee Modal ---- */}
@@ -2248,6 +2507,7 @@ export default function EmployeesPage() {
         <EmployeeForm
           form={editForm}
           onChange={updateEditForm}
+          onLocalTaxes={(rows) => setEditForm((prev) => ({ ...prev, localTaxes: rows }))}
           ssnLast4={editingEmployee?.ssnLast4}
           showPayrollInfo
           wcCodes={wcCodes}

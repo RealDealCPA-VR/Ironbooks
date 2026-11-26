@@ -30,6 +30,9 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api, ApiError } from '@/lib/client';
+import { STATES } from '@/lib/services/statePayrollTax';
+
+const STATE_OPTIONS = [...STATES].sort((a, b) => a.name.localeCompare(b.name));
 
 interface Employee {
   id: string;
@@ -511,12 +514,19 @@ function StateTaxes({ rows, onChanged }: { rows: StateSetting[]; onChanged: () =
         Your state sends you an unemployment (SUI) rate every year. Enter it here with the yearly wage limit, and new
         paychecks will add the employer&apos;s unemployment tax for employees who work in that state. If your state has
         employee disability insurance (SDI — for example California), enter that rate too; it is withheld from pay.
-        The employee&apos;s work state comes from their W-4 state (or their address).
+        The state is the one the employee works in, chosen on the employee (or the state in their address).
       </p>
       <div className="grid gap-3 sm:grid-cols-4">
         <div>
           <Label htmlFor="st-state" required>State</Label>
-          <Input id="st-state" maxLength={2} value={form.state} onChange={(e) => set('state', e.target.value)} placeholder="CA" />
+          <Select id="st-state" value={form.state} onChange={(e) => set('state', e.target.value)}>
+            <option value="">Choose…</option>
+            {STATE_OPTIONS.map((s) => (
+              <option key={s.code} value={s.code}>
+                {s.name}
+              </option>
+            ))}
+          </Select>
         </div>
         <div>
           <Label htmlFor="st-year" required>Year</Label>

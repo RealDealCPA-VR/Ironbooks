@@ -551,11 +551,17 @@ export function RecordChangesPrompt({
             }
           }}
         >
+          {/* One wrapper per label: the Button is a flex row with a gap, and a bare text node
+              beside the underlined letter would be spaced away from it ("Y es"). */}
           <Button autoFocus onClick={onYes} data-shortcut="record-yes">
-            <span className="underline underline-offset-2">Y</span>es
+            <span>
+              <span className="underline underline-offset-2">Y</span>es
+            </span>
           </Button>
           <Button variant="secondary" onClick={onNo} data-shortcut="record-no">
-            <span className="underline underline-offset-2">N</span>o
+            <span>
+              <span className="underline underline-offset-2">N</span>o
+            </span>
           </Button>
           <Button variant="secondary" onClick={onCancel} data-shortcut="record-cancel">
             Cancel

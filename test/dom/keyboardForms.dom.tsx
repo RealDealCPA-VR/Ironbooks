@@ -245,6 +245,11 @@ domTest('Esc on a changed form asks; No closes without saving, Yes records, Canc
   await press('Escape');
   await until(prompt, 'the record-your-changes question');
   equal(state(), 'open', 'the form stays open while asking');
+  // Each answer's label is one piece: the button spaces its children apart, so a bare "es" beside
+  // the underlined "Y" would show as "Y es".
+  for (const label of ['Yes', 'No']) {
+    equal(button(label)?.childNodes.length, 1, `the ${label} label is one piece`);
+  }
   // Cancel (Esc on the question): back to the form, nothing lost.
   await press('Escape');
   await until(() => !prompt(), 'the question closes');

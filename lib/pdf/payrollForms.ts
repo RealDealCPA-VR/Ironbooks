@@ -99,6 +99,8 @@ export interface W2PdfInput {
   box14?: Array<{ label: string; amount: string | number }> | null;
   /** Boxes 15-17: state code, state wages, state income tax withheld. */
   state?: { code: string | null; wages: string | number; withheld: string | number } | null;
+  /** Boxes 18-20: local wages, local income tax and the locality's name, one entry per place. */
+  local?: Array<{ locality: string; wages: string | number; withheld: string | number }> | null;
 }
 
 /**
@@ -275,6 +277,18 @@ export async function renderW2Pdf(input: W2PdfInput): Promise<Uint8Array> {
     cursor -= 50;
   }
 
+  // Boxes 18-20: local wages / local income tax / locality name, one row per place.
+  const local = (input.local ?? []).filter((l) => parseFloat(String(l.withheld)) > 0);
+  for (const l of local) {
+    const BOX3W = (MR - ML) / 3 - 4;
+    const COL3B = ML + (MR - ML) / 3 + 2;
+    const COL3C = ML + (2 * (MR - ML)) / 3 + 4;
+    drawBox('Local wages, tips, etc.', '18', l.wages,    COL1,  cursor, BOX3W);
+    drawBox('Local income tax',        '19', l.withheld, COL3B, cursor, BOX3W);
+    drawTextBox('Locality name',       '20', l.locality.slice(0, 22), COL3C, cursor, BOX3W);
+    cursor -= 50;
+  }
+
   // ----- Totals summary -----
   cursor -= 8;
   hRule(cursor);
@@ -306,6 +320,13 @@ export async function renderW2Pdf(input: W2PdfInput): Promise<Uint8Array> {
           ['Box 17 — State income tax withheld',                    input.state.withheld],
         ] as Array<[string, string | number]>)
       : []),
+    ...local.flatMap(
+      (l) =>
+        [
+          [`Box 18 — Local wages (${l.locality})`,    l.wages],
+          [`Box 19 — Local income tax (${l.locality})`, l.withheld],
+        ] as Array<[string, string | number]>,
+    ),
     ['Total taxes withheld (Boxes 2 + 4 + 6)',     totalWithheld],
   ];
 
@@ -777,6 +798,8 @@ export interface W3PdfInput {
   deferredCompensation?: string | number; // Box 12a (codes D, E, F, G, H, S)
   stateWages: string | number;       // Box 16
   stateWithheld: string | number;    // Box 17
+  localWages?: string | number;      // Box 18
+  localWithheld?: string | number;   // Box 19
 }
 
 /**
@@ -867,6 +890,10 @@ export async function renderW3Pdf(input: W3PdfInput): Promise<Uint8Array> {
   }
   drawLineW3('16', 'State wages, tips, etc.',          input.stateWages);
   drawLineW3('17', 'State income tax',                 input.stateWithheld);
+  if (input.localWithheld != null && parseFloat(String(input.localWithheld)) > 0) {
+    drawLineW3('18', 'Local wages, tips, etc.',        input.localWages ?? 0);
+    drawLineW3('19', 'Local income tax',               input.localWithheld);
+  }
 
   cursor -= 4;
   hRule(cursor, ML, MR, 1, C_NAVY);
